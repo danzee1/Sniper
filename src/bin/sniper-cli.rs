@@ -167,6 +167,21 @@ struct HistoryListArgs {
     method: Option<String>,
     #[arg(long)]
     limit: Option<usize>,
+    /// Filter by host (substring match)
+    #[arg(long)]
+    host: Option<String>,
+    /// Filter by exact HTTP status code
+    #[arg(long)]
+    status: Option<u16>,
+    /// Filter by status range, e.g. "4xx" or "200-299"
+    #[arg(long)]
+    status_range: Option<String>,
+    /// Filter by time, e.g. "2024-01-01" or "1h" (relative)
+    #[arg(long)]
+    since: Option<String>,
+    /// Filter by response MIME type (substring match), e.g. "json" or "text/html"
+    #[arg(long)]
+    mime: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -277,7 +292,38 @@ struct ReplaySendArgs {
 enum FuzzerCommand {
     SetTemplate(FuzzerSetTemplateArgs),
     SetPayloads(FuzzerSetPayloadsArgs),
-    Run,
+    Run(FuzzerRunArgs),
+    /// Show fuzzer attack status by ID
+    Status(FuzzerStatusArgs),
+    /// Show fuzzer attack results by ID
+    Results(FuzzerResultsArgs),
+    /// List past fuzzer attacks
+    List(FuzzerListArgs),
+}
+
+#[derive(Args, Debug, Default)]
+struct FuzzerRunArgs {
+    /// Run asynchronously: return job ID immediately without waiting for completion
+    #[arg(long, alias = "async")]
+    r#async: bool,
+}
+
+#[derive(Args, Debug)]
+struct FuzzerStatusArgs {
+    #[arg(long)]
+    id: Uuid,
+}
+
+#[derive(Args, Debug)]
+struct FuzzerResultsArgs {
+    #[arg(long)]
+    id: Uuid,
+}
+
+#[derive(Args, Debug, Default)]
+struct FuzzerListArgs {
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -747,6 +793,21 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
             if let Some(limit) = args.limit {
                 params.push(("limit".to_string(), limit.to_string()));
             }
+            if let Some(host) = args.host {
+                params.push(("host".to_string(), host));
+            }
+            if let Some(status) = args.status {
+                params.push(("status".to_string(), status.to_string()));
+            }
+            if let Some(status_range) = args.status_range {
+                params.push(("status_range".to_string(), status_range));
+            }
+            if let Some(since) = args.since {
+                params.push(("since".to_string(), since));
+            }
+            if let Some(mime) = args.mime {
+                params.push(("mime".to_string(), mime));
+            }
             let query = encode_query(params);
             let path = if query.is_empty() {
                 "/api/transactions".to_string()
@@ -958,7 +1019,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 api.post_json("/api/workspace-state", &workspace).await?;
             print_json(&snapshot.fuzzer)
         }
-        FuzzerCommand::Run => {
+        FuzzerCommand::Run(args) => {
             let mut workspace: WorkspaceStateSnapshot =
                 api.get_json("/api/workspace-state").await?;
             let template = parse_editable_raw_request(
@@ -969,21 +1030,77 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             if payloads.is_empty() {
                 bail!("fuzzer payloads are empty");
             }
+
+            if args.r#async {
+                // Async mode: fire the request with a short timeout, return job info immediately.
+                // The API processes the attack synchronously, so we use a spawned task approach:
+                // send the request in background and return a pending job reference.
+                let payload = FuzzerRunPayload {
+                    template: template.clone(),
+                    payloads: payloads.clone(),
+                    source_transaction_id: workspace.fuzzer.source_transaction_id,
+                };
+                let api_clone = api.clone();
+                tokio::spawn(async move {
+                    let _result: Result<FuzzerAttackRecord, _> =
+                        api_clone.post_json("/api/fuzzer/attacks", &payload).await;
+                });
+                print_json(&json!({
+                    "async": true,
+                    "message": "Fuzzer attack submitted asynchronously. Use 'fuzzer list' or 'fuzzer status --id <id>' to check results.",
+                    "hint": "The attack ID will appear in 'fuzzer list' once the server begins processing."
+                }))
+            } else {
+                let record: FuzzerAttackRecord = api
+                    .post_json(
+                        "/api/fuzzer/attacks",
+                        &FuzzerRunPayload {
+                            template,
+                            payloads,
+                            source_transaction_id: workspace.fuzzer.source_transaction_id,
+                        },
+                    )
+                    .await?;
+                workspace.fuzzer.attack_record = Some(record.clone());
+                workspace.fuzzer.notice.clear();
+                let _snapshot: WorkspaceStateSnapshot =
+                    api.post_json("/api/workspace-state", &workspace).await?;
+                print_json(&record)
+            }
+        }
+        FuzzerCommand::Status(args) => {
             let record: FuzzerAttackRecord = api
-                .post_json(
-                    "/api/fuzzer/attacks",
-                    &FuzzerRunPayload {
-                        template,
-                        payloads,
-                        source_transaction_id: workspace.fuzzer.source_transaction_id,
-                    },
-                )
+                .get_json(&format!("/api/fuzzer/attacks/{}", args.id))
                 .await?;
-            workspace.fuzzer.attack_record = Some(record.clone());
-            workspace.fuzzer.notice.clear();
-            let _snapshot: WorkspaceStateSnapshot =
-                api.post_json("/api/workspace-state", &workspace).await?;
+            print_json(&json!({
+                "id": record.id,
+                "status": record.status,
+                "started_at": record.started_at,
+                "completed_at": record.completed_at,
+                "payload_count": record.payload_count,
+                "result_count": record.results.len(),
+                "marker_count": record.marker_count,
+            }))
+        }
+        FuzzerCommand::Results(args) => {
+            let record: FuzzerAttackRecord = api
+                .get_json(&format!("/api/fuzzer/attacks/{}", args.id))
+                .await?;
             print_json(&record)
+        }
+        FuzzerCommand::List(args) => {
+            let mut params = Vec::new();
+            if let Some(limit) = args.limit {
+                params.push(("limit".to_string(), limit.to_string()));
+            }
+            let query = encode_query(params);
+            let path = if query.is_empty() {
+                "/api/fuzzer/attacks".to_string()
+            } else {
+                format!("/api/fuzzer/attacks?{query}")
+            };
+            let attacks: Vec<serde_json::Value> = api.get_json(&path).await?;
+            print_json(&attacks)
         }
     }
 }

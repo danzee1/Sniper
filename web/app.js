@@ -265,7 +265,6 @@ const state = {
   _historyEntries: null,
   toolsReady: false,
   workbenchHeight: null,
-  _cachedVisibleEntries: null,
 };
 
 const els = {
@@ -545,6 +544,10 @@ const els = {
   fuzzerPayloadsEditor: document.getElementById("fuzzerPayloadsEditor"),
   fuzzerMeta: document.getElementById("fuzzerMeta"),
   fuzzerResultsBody: document.getElementById("fuzzerResultsBody"),
+  fuzzerDetailPanel: document.getElementById("fuzzerDetailPanel"),
+  fuzzerDetailReqCM: document.getElementById("fuzzerDetailReqCM"),
+  fuzzerDetailResCM: document.getElementById("fuzzerDetailResCM"),
+  fuzzerDetailResponseMeta: document.getElementById("fuzzerDetailResponseMeta"),
   startFuzzerButton: document.getElementById("startFuzzerButton"),
   resetFuzzerButton: document.getElementById("resetFuzzerButton"),
   contextMenu: document.getElementById("contextMenu"),
@@ -576,6 +579,14 @@ const els = {
   wsHandshakeSearchInput: document.getElementById("wsHandshakeSearchInput"),
   wsHandshakeSearchMeta: document.getElementById("wsHandshakeSearchMeta"),
   wsMessageHighlight: document.getElementById("wsMessageHighlight"),
+  // CodeMirror containers
+  findingsReqCM: document.getElementById("findingsReqCM"),
+  findingsResCM: document.getElementById("findingsResCM"),
+  websocketHandshakeCM: document.getElementById("websocketHandshakeCM"),
+  interceptRequestCM: document.getElementById("interceptRequestCM"),
+  interceptResponseCM: document.getElementById("interceptResponseCM"),
+  replayRequestCM: document.getElementById("replayRequestCM"),
+  fuzzerRequestCM: document.getElementById("fuzzerRequestCM"),
 };
 
 const mainTabs = Array.from(document.querySelectorAll(".main-tab"));
@@ -842,19 +853,28 @@ function bindEvents() {
 
   els.replayRequestSearchInput.addEventListener("input", () => {
     state.replayMessageSearch.request = els.replayRequestSearchInput.value;
-    updateReplaySearchPane("request", els.replayRequestEditor.value || "");
+    const cv = getCMView("replayReq");
+    const reqText = cv ? cv.getContent() : (els.replayRequestEditor ? els.replayRequestEditor.value : "") || "";
+    updateReplaySearchPane("request", reqText);
   });
 
   els.replayResponseSearchInput.addEventListener("input", () => {
     state.replayMessageSearch.response = els.replayResponseSearchInput.value;
-    updateReplaySearchPane("response", els.replayResponseView.textContent || "");
+    const resText = _replayResponseCMView
+      ? _replayResponseCMView.view.state.doc.toString()
+      : (els.replayResponseView ? els.replayResponseView.textContent : "") || "";
+    updateReplaySearchPane("response", resText);
   });
 
   // Search hit navigation: click counter to cycle through matches
   initSearchHitNavigation(els.requestSearchMeta, () => els.requestView);
   initSearchHitNavigation(els.responseSearchMeta, () => els.responseView);
+  // CM search navigation: click counter cycles through CM matches
+  initCMSearchNavigation(els.requestSearchMeta, "request");
+  initCMSearchNavigation(els.responseSearchMeta, "response");
   initSearchHitNavigation(els.replayRequestSearchMeta, () => els.replayRequestHighlight);
   initSearchHitNavigation(els.replayResponseSearchMeta, () => els.replayResponseView);
+  initCMSearchNavigation(els.replayRequestSearchMeta, "replayReq");
 
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
@@ -1163,6 +1183,42 @@ function bindEvents() {
   });
   els.resetFuzzerButton.addEventListener("click", resetFuzzer);
 
+  // Fuzzer result row click → show detail
+  els.fuzzerResultsBody.addEventListener("click", (e) => {
+    const row = e.target.closest(".fuzzer-result-row");
+    if (!row) return;
+    // Highlight selected row
+    els.fuzzerResultsBody.querySelectorAll(".fuzzer-result-selected").forEach((r) => r.classList.remove("fuzzer-result-selected"));
+    row.classList.add("fuzzer-result-selected");
+    const txId = row.dataset.transactionId;
+    if (txId) {
+      showFuzzerResultDetail(txId).catch((err) => console.error(err));
+    } else {
+      // No transaction (error result) — show note
+      const result = state.fuzzerAttackRecord?.results?.[Number(row.dataset.resultIndex)];
+      if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.remove("hidden");
+      if (els.fuzzerDetailReqCM) updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, result?.note || "No transaction was captured for this payload.", { mode: "http" });
+      if (els.fuzzerDetailResCM) updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
+    }
+  });
+
+  // Fuzzer detail view mode tabs (Pretty/Raw/Hex)
+  document.querySelectorAll(".fuzzer-detail-view-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.fuzzerDetailTarget;
+      const view = btn.dataset.fuzzerDetailView;
+      _fuzzerDetailViewModes[target] = view;
+      // Update tab active state
+      document.querySelectorAll(`.fuzzer-detail-view-tab[data-fuzzer-detail-target="${target}"]`).forEach((b) => {
+        b.classList.toggle("active", b.dataset.fuzzerDetailView === view);
+      });
+      // Re-render with current record
+      if (state._fuzzerDetailRecord) {
+        renderFuzzerDetailPanes(state._fuzzerDetailRecord);
+      }
+    });
+  });
+
   document.getElementById("newSequenceButton").addEventListener("click", () => {
     createNewSequence().catch((e) => console.error(e));
   });
@@ -1182,7 +1238,8 @@ function bindEvents() {
   state._replayRedoStack = [];
   state._replayLastSnapshot = null;
 
-  els.replayRequestHighlight.addEventListener("input", () => {
+  els.replayRequestHighlight?.addEventListener("input", () => {
+    if (els.replayRequestCM) return; // CM handles editing
     if (state.replayMessageViews.request === "hex") return;
     const tab = getActiveReplayTab();
     if (!tab) return;
@@ -1205,7 +1262,8 @@ function bindEvents() {
     renderReplayTabs();
     scheduleWorkspaceStateSave();
   });
-  els.replayRequestHighlight.addEventListener("keydown", (e) => {
+  els.replayRequestHighlight?.addEventListener("keydown", (e) => {
+    if (els.replayRequestCM) return; // CM handles editing
     if (state.replayMessageViews.request === "hex") return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !e.altKey) {
       e.preventDefault();
@@ -1233,12 +1291,13 @@ function bindEvents() {
       scheduleWorkspaceStateSave();
     }
   });
-  els.replayRequestHighlight.addEventListener("paste", (e) => {
+  els.replayRequestHighlight?.addEventListener("paste", (e) => {
+    if (els.replayRequestCM) return; // CM handles paste
     e.preventDefault();
     const text = e.clipboardData.getData("text/plain");
     document.execCommand("insertText", false, text);
   });
-  els.replayRequestHighlight.addEventListener("contextmenu", showReplayContextMenu);
+  els.replayRequestHighlight?.addEventListener("contextmenu", showReplayContextMenu);
   initReplayContextMenu();
   // Replay Pretty/Raw/Hex view tabs
   document.querySelectorAll(".replay-view-tab").forEach((btn) => {
@@ -1290,12 +1349,26 @@ function bindEvents() {
   document.getElementById("replayHttpVersionSelect")?.addEventListener("change", (e) => {
     const ver = e.target.value;
     if (!ver) return; // "Auto" selected — don't modify request text
+    const cv = getCMView("replayReq");
+    if (cv) {
+      const text = cv.getContent();
+      const lines = text.split("\n");
+      if (lines.length > 0) {
+        lines[0] = lines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, ` ${ver}`);
+        if (!lines[0].match(/HTTP\//i)) lines[0] += ` ${ver}`;
+        const newText = lines.join("\n");
+        cv.setContent(newText);
+        const tab = getActiveReplayTab();
+        if (tab) tab.requestText = newText;
+      }
+      return;
+    }
+    // Legacy path
     const hl = els.replayRequestHighlight;
     if (!hl) return;
     const text = hl.innerText || "";
     const lines = text.split("\n");
     if (lines.length > 0) {
-      // Replace HTTP version in first line: "GET /path HTTP/1.1" → "GET /path HTTP/2"
       lines[0] = lines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, ` ${ver}`);
       if (!lines[0].match(/HTTP\//i)) lines[0] += ` ${ver}`;
       const newText = lines.join("\n");
@@ -1309,33 +1382,44 @@ function bindEvents() {
   els.replayPortInput.addEventListener("input", () => {
     applyReplayTargetFields().catch((error) => console.error(error));
   });
-  els.fuzzerRequestEditor.addEventListener("input", () => {
-    state.fuzzerRequestText = els.fuzzerRequestEditor.value;
-    renderFuzzerRequestHighlight(state.fuzzerRequestText);
-    scheduleWorkspaceStateSave();
-  });
-  els.fuzzerRequestEditor.addEventListener("scroll", syncFuzzerRequestHighlightScroll);
+  if (els.fuzzerRequestEditor) {
+    els.fuzzerRequestEditor.addEventListener("input", () => {
+      if (els.fuzzerRequestCM) return; // CM handles it
+      state.fuzzerRequestText = els.fuzzerRequestEditor.value;
+      renderFuzzerRequestHighlight(state.fuzzerRequestText);
+      scheduleWorkspaceStateSave();
+    });
+    els.fuzzerRequestEditor.addEventListener("scroll", syncFuzzerRequestHighlightScroll);
+  }
   els.fuzzerPayloadsEditor.addEventListener("input", () => {
     state.fuzzerPayloadsText = els.fuzzerPayloadsEditor.value;
     scheduleWorkspaceStateSave();
   });
-  els.interceptRequestEditor.addEventListener("input", () => {
-    if (state.selectedInterceptRecord) {
-      state.interceptEditorSeedId = state.selectedInterceptRecord.id;
-    }
-    renderInterceptRequestHighlight(els.interceptRequestEditor.value);
-  });
-  els.interceptRequestEditor.addEventListener("scroll", syncInterceptRequestHighlightScroll);
-  els.interceptResponseEditor.addEventListener("input", () => {
-    if (state.selectedResponseInterceptRecord) {
-      state.responseInterceptEditorSeedId = state.selectedResponseInterceptRecord.id;
-    }
-    renderInterceptResponseHighlight(els.interceptResponseEditor.value);
-  });
-  els.interceptResponseEditor.addEventListener("scroll", () => {
-    els.interceptResponseHighlight.scrollTop = els.interceptResponseEditor.scrollTop;
-    els.interceptResponseHighlight.scrollLeft = els.interceptResponseEditor.scrollLeft;
-  });
+  if (els.interceptRequestEditor) {
+    els.interceptRequestEditor.addEventListener("input", () => {
+      if (els.interceptRequestCM) return; // CM handles it
+      if (state.selectedInterceptRecord) {
+        state.interceptEditorSeedId = state.selectedInterceptRecord.id;
+      }
+      renderInterceptRequestHighlight(els.interceptRequestEditor.value);
+    });
+    els.interceptRequestEditor.addEventListener("scroll", syncInterceptRequestHighlightScroll);
+  }
+  if (els.interceptResponseEditor) {
+    els.interceptResponseEditor.addEventListener("input", () => {
+      if (els.interceptResponseCM) return; // CM handles it
+      if (state.selectedResponseInterceptRecord) {
+        state.responseInterceptEditorSeedId = state.selectedResponseInterceptRecord.id;
+      }
+      renderInterceptResponseHighlight(els.interceptResponseEditor.value);
+    });
+    els.interceptResponseEditor.addEventListener("scroll", () => {
+      if (els.interceptResponseHighlight) {
+        els.interceptResponseHighlight.scrollTop = els.interceptResponseEditor.scrollTop;
+        els.interceptResponseHighlight.scrollLeft = els.interceptResponseEditor.scrollLeft;
+      }
+    });
+  }
 
   document.addEventListener("keydown", (event) => {
     const activeModalAction = getActiveModalAction();
@@ -1677,12 +1761,23 @@ function bindEvents() {
   // WS Handshake search
   if (els.wsHandshakeSearchInput) {
     els.wsHandshakeSearchInput.addEventListener("input", () => {
+      // CM path
+      const cv = getCMView("wsHandshake");
+      if (cv) {
+        const query = (els.wsHandshakeSearchInput.value || "").trim();
+        const result = cv.applySearch(query);
+        if (els.wsHandshakeSearchMeta) {
+          els.wsHandshakeSearchMeta.innerHTML = buildSearchMeta(cv.view.state.doc.lines, "raw", result.matchCount);
+        }
+        return;
+      }
       updateWsHandshakeSearch();
     });
     initSearchHitNavigation(els.wsHandshakeSearchMeta, () => {
       const resBtn = document.getElementById("wsHandshakeResBtn");
       return resBtn?.classList.contains("active") ? els.websocketResponseView : els.websocketRequestView;
     });
+    initCMSearchNavigation(els.wsHandshakeSearchMeta, "wsHandshake");
   }
   bindMessagePaneActivation();
   bindPaneResizer(els.requestResponseResizer, "request-response");
@@ -1701,16 +1796,26 @@ function bindEvents() {
     wsReqBtn.addEventListener("click", () => {
       wsReqBtn.classList.add("active");
       wsResBtn.classList.remove("active");
-      els.websocketRequestView.classList.remove("hidden");
-      els.websocketResponseView.classList.add("hidden");
+      if (els.websocketHandshakeCM && state.selectedWebsocketRecord) {
+        const text = buildRawWebsocketRequest(state.selectedWebsocketRecord);
+        updateCodePaneCM("wsHandshake", els.websocketHandshakeCM, text, { mode: "http" });
+      } else {
+        els.websocketRequestView?.classList.remove("hidden");
+        els.websocketResponseView?.classList.add("hidden");
+      }
       updateWsHandshakeLineNumbers();
       updateWsHandshakeSearch();
     });
     wsResBtn.addEventListener("click", () => {
       wsResBtn.classList.add("active");
       wsReqBtn.classList.remove("active");
-      els.websocketResponseView.classList.remove("hidden");
-      els.websocketRequestView.classList.add("hidden");
+      if (els.websocketHandshakeCM && state.selectedWebsocketRecord) {
+        const text = buildRawWebsocketResponse(state.selectedWebsocketRecord);
+        updateCodePaneCM("wsHandshake", els.websocketHandshakeCM, text, { mode: "http" });
+      } else {
+        els.websocketResponseView?.classList.remove("hidden");
+        els.websocketRequestView?.classList.add("hidden");
+      }
       updateWsHandshakeLineNumbers();
       updateWsHandshakeSearch();
     });
@@ -3246,17 +3351,46 @@ function showFindingDetail(finding, record) {
   if (record) {
     const reqText = buildFindingsRawMessage(record, "request");
     const resText = buildFindingsRawMessage(record, "response");
-    renderFindingsCodePane(els.findingsReqView, els.findingsReqLines, reqText, evidence, "request", finding);
-    renderFindingsCodePane(els.findingsResView, els.findingsResLines, resText, evidence, "response", finding);
+    // CM path
+    if (els.findingsReqCM) {
+      updateCodePaneCM("findingsReq", els.findingsReqCM, reqText, { mode: "http" });
+      const reqSearchMeta = els.findingsReqSearchMeta;
+      if (reqSearchMeta) reqSearchMeta.innerHTML = buildSearchMeta(countLines(reqText), "raw", 0);
+      if (els.findingsReqSearchInput) els.findingsReqSearchInput.value = "";
+      initCMSearchNavigation(els.findingsReqSearchMeta, "findingsReq");
+    }
+    if (els.findingsResCM) {
+      updateCodePaneCM("findingsRes", els.findingsResCM, resText, { mode: "http" });
+      const resSearchMeta = els.findingsResSearchMeta;
+      if (resSearchMeta) resSearchMeta.innerHTML = buildSearchMeta(countLines(resText), "raw", 0);
+      if (els.findingsResSearchInput) els.findingsResSearchInput.value = "";
+      initCMSearchNavigation(els.findingsResSearchMeta, "findingsRes");
+    }
+    // Legacy fallback
+    if (!els.findingsReqCM) {
+      renderFindingsCodePane(els.findingsReqView, els.findingsReqLines, reqText, evidence, "request", finding);
+    }
+    if (!els.findingsResCM) {
+      renderFindingsCodePane(els.findingsResView, els.findingsResLines, resText, evidence, "response", finding);
+    }
   } else {
-    els.findingsReqView.innerHTML = '<span class="code-line code-line-empty">Transaction not available.</span>';
-    els.findingsReqLines.textContent = "";
-    els.findingsResView.innerHTML = '<span class="code-line code-line-empty">Transaction not available.</span>';
-    els.findingsResLines.textContent = "";
+    if (els.findingsReqCM) {
+      updateCodePaneCM("findingsReq", els.findingsReqCM, "Transaction not available.", { mode: "http" });
+    } else if (els.findingsReqView) {
+      els.findingsReqView.innerHTML = '<span class="code-line code-line-empty">Transaction not available.</span>';
+      if (els.findingsReqLines) els.findingsReqLines.textContent = "";
+    }
+    if (els.findingsResCM) {
+      updateCodePaneCM("findingsRes", els.findingsResCM, "Transaction not available.", { mode: "http" });
+    } else if (els.findingsResView) {
+      els.findingsResView.innerHTML = '<span class="code-line code-line-empty">Transaction not available.</span>';
+      if (els.findingsResLines) els.findingsResLines.textContent = "";
+    }
   }
 }
 
 function renderFindingsCodePane(viewEl, lineEl, text, evidence, target, finding) {
+  if (!viewEl || !lineEl) return;
   if (!text) {
     viewEl.innerHTML = '<span class="code-line code-line-empty">&nbsp;</span>';
     lineEl.textContent = "";
@@ -3802,6 +3936,16 @@ function bindFindingsEvents() {
   if (els.findingsReqSearchInput) {
     els.findingsReqSearchInput.addEventListener("input", () => {
       const query = els.findingsReqSearchInput.value;
+      // CM path
+      const cv = getCMView("findingsReq");
+      if (cv) {
+        const result = cv.applySearch(query);
+        const lineCount = cv.view.state.doc.lines;
+        els.findingsReqSearchMeta.innerHTML = buildSearchMeta(lineCount, "raw", result.matchCount);
+        return;
+      }
+      // Legacy fallback
+      if (!els.findingsReqView) return;
       const { count } = applyCodeSearch(els.findingsReqView, query);
       const lines = els.findingsReqView.querySelectorAll(".code-line").length;
       els.findingsReqSearchMeta.innerHTML = buildSearchMeta(lines, "raw", count);
@@ -3810,6 +3954,16 @@ function bindFindingsEvents() {
   if (els.findingsResSearchInput) {
     els.findingsResSearchInput.addEventListener("input", () => {
       const query = els.findingsResSearchInput.value;
+      // CM path
+      const cv = getCMView("findingsRes");
+      if (cv) {
+        const result = cv.applySearch(query);
+        const lineCount = cv.view.state.doc.lines;
+        els.findingsResSearchMeta.innerHTML = buildSearchMeta(lineCount, "raw", result.matchCount);
+        return;
+      }
+      // Legacy fallback
+      if (!els.findingsResView) return;
       const { count } = applyCodeSearch(els.findingsResView, query);
       const lines = els.findingsResView.querySelectorAll(".code-line").length;
       els.findingsResSearchMeta.innerHTML = buildSearchMeta(lines, "raw", count);
@@ -3817,6 +3971,8 @@ function bindFindingsEvents() {
   }
   initSearchHitNavigation(els.findingsReqSearchMeta, () => els.findingsReqView);
   initSearchHitNavigation(els.findingsResSearchMeta, () => els.findingsResView);
+  initCMSearchNavigation(els.findingsReqSearchMeta, "findingsReq");
+  initCMSearchNavigation(els.findingsResSearchMeta, "findingsRes");
 
   // Quick toggle (on/off in toolbar)
   if (els.scannerQuickToggle) {
@@ -4518,28 +4674,28 @@ function renderMessagePanes() {
     ? buildMessagePresentation("response", responseRecord)
     : "No response selected.";
 
+  const reqMode = state.messageViews.request;
+  const resMode = state.messageViews.response;
+  // Map view mode to CM highlight mode: pretty/raw → http, hex → hex, diff → diff
+  const cmMode = (m) => (m === "hex" ? "hex" : m === "diff" ? "diff" : "http");
   const requestPane = els.requestViewCM
-    ? updateCodePaneCM("request", els.requestViewCM, requestText)
-    : updateCodePane(els.requestView, els.requestLines, requestText, state.messageViews.request, "request");
+    ? updateCodePaneCM("request", els.requestViewCM, requestText, { mode: cmMode(reqMode), search: state.messageSearch.request })
+    : (els.requestView && els.requestLines ? updateCodePane(els.requestView, els.requestLines, requestText, reqMode, "request") : null);
   const responsePane = els.responseViewCM
-    ? updateCodePaneCM("response", els.responseViewCM, responseText)
-    : updateCodePane(els.responseView, els.responseLines, responseText, state.messageViews.response, "response");
+    ? updateCodePaneCM("response", els.responseViewCM, responseText, { mode: cmMode(resMode), search: state.messageSearch.response })
+    : (els.responseView && els.responseLines ? updateCodePane(els.responseView, els.responseLines, responseText, resMode, "response") : null);
   if (els.requestSearchInput.value !== state.messageSearch.request) {
     els.requestSearchInput.value = state.messageSearch.request;
   }
   if (els.responseSearchInput.value !== state.messageSearch.response) {
     els.responseSearchInput.value = state.messageSearch.response;
   }
-  els.requestSearchMeta.innerHTML = buildSearchMeta(
-    requestPane.lineCount,
-    state.messageViews.request,
-    requestPane.matchCount,
-  );
-  els.responseSearchMeta.innerHTML = buildSearchMeta(
-    responsePane.lineCount,
-    state.messageViews.response,
-    responsePane.matchCount,
-  );
+  els.requestSearchMeta.innerHTML = requestPane
+    ? buildSearchMeta(requestPane.lineCount, state.messageViews.request, requestPane.matchCount)
+    : buildSearchMeta(0, state.messageViews.request, 0);
+  els.responseSearchMeta.innerHTML = responsePane
+    ? buildSearchMeta(responsePane.lineCount, state.messageViews.response, responsePane.matchCount)
+    : buildSearchMeta(0, state.messageViews.response, 0);
 }
 
 function renderViewTabs() {
@@ -4599,8 +4755,15 @@ function renderIntercepts() {
     state.interceptEditorSeedId = null;
     els.interceptDetailPath.textContent = "Intercept";
     els.interceptDetailTitle.textContent = "No request selected";
-    els.interceptRequestEditor.value = "";
-    renderInterceptRequestHighlight("");
+    if (els.interceptRequestCM) {
+      updateCodePaneCM("interceptReq", els.interceptRequestCM, "", {
+        mode: "http", readOnly: false,
+        placeholder: "Intercepted request will appear here...",
+      });
+    } else {
+      els.interceptRequestEditor.value = "";
+      renderInterceptRequestHighlight("");
+    }
     els.interceptMeta.textContent = state.runtime?.intercept_enabled
       ? "Intercept is on. New requests will queue here."
       : "Intercept is off. Toggle it on to pause requests before forwarding.";
@@ -4611,11 +4774,23 @@ function renderIntercepts() {
 
   els.interceptDetailPath.textContent = `${state.selectedInterceptRecord.request.scheme.toUpperCase()} / ${state.selectedInterceptRecord.peer_addr}`;
   els.interceptDetailTitle.textContent = `${state.selectedInterceptRecord.request.method} ${state.selectedInterceptRecord.request.host}`;
-  if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id || document.activeElement !== els.interceptRequestEditor) {
-    els.interceptRequestEditor.value = buildEditableRawRequest(state.selectedInterceptRecord.request);
-    state.interceptEditorSeedId = state.selectedInterceptRecord.id;
+  if (els.interceptRequestCM) {
+    const cv = getCMView("interceptReq");
+    const isFocused = cv && cv.view.hasFocus;
+    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id || !isFocused) {
+      const rawText = buildEditableRawRequest(state.selectedInterceptRecord.request);
+      updateCodePaneCM("interceptReq", els.interceptRequestCM, rawText, {
+        mode: "http", readOnly: false,
+      });
+      state.interceptEditorSeedId = state.selectedInterceptRecord.id;
+    }
+  } else {
+    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id || document.activeElement !== els.interceptRequestEditor) {
+      els.interceptRequestEditor.value = buildEditableRawRequest(state.selectedInterceptRecord.request);
+      state.interceptEditorSeedId = state.selectedInterceptRecord.id;
+    }
+    renderInterceptRequestHighlight(els.interceptRequestEditor.value);
   }
-  renderInterceptRequestHighlight(els.interceptRequestEditor.value);
   els.interceptMeta.textContent = [
     state.selectedInterceptRecord.is_websocket ? "WebSocket upgrade" : "HTTP request",
     `queued at ${formatTimestamp(state.selectedInterceptRecord.started_at)}`,
@@ -4674,10 +4849,15 @@ function renderWebsocketSessions() {
   });
 
   if (!state.selectedWebsocketRecord) {
-    els.websocketRequestView.textContent = state.websocketSessions.length && !sortedEntries.length
+    const noSessionMsg = state.websocketSessions.length && !sortedEntries.length
       ? "No WebSocket session matches the current filter."
       : "Select a WebSocket session.";
-    els.websocketResponseView.textContent = "No response selected.";
+    if (els.websocketHandshakeCM) {
+      updateCodePaneCM("wsHandshake", els.websocketHandshakeCM, noSessionMsg, { mode: "http" });
+    } else {
+      if (els.websocketRequestView) els.websocketRequestView.textContent = noSessionMsg;
+      if (els.websocketResponseView) els.websocketResponseView.textContent = "No response selected.";
+    }
     els.websocketFramesBody.innerHTML = `
       <div class="ws-frame-empty">${
         state.websocketSessions.length && !sortedEntries.length
@@ -4691,25 +4871,40 @@ function renderWebsocketSessions() {
   const session = state.selectedWebsocketRecord;
   const reqText = buildRawWebsocketRequest(session);
   const resText = buildRawWebsocketResponse(session);
-  const savedReqFocus = window._saveCodeViewFocus?.(els.websocketRequestView);
-  const savedResFocus = window._saveCodeViewFocus?.(els.websocketResponseView);
-  els.websocketRequestView.innerHTML = renderHttpHtml(reqText, "request");
-  els.websocketResponseView.innerHTML = renderHttpHtml(resText, "response");
-  window._restoreCodeViewFocus?.(els.websocketRequestView, savedReqFocus);
-  window._restoreCodeViewFocus?.(els.websocketResponseView, savedResFocus);
   // Preserve current handshake tab selection (default to Request)
   const resBtn = document.getElementById("wsHandshakeResBtn");
   const showingResponse = resBtn?.classList.contains("active");
-  els.websocketRequestView.classList.toggle("hidden", !!showingResponse);
-  els.websocketResponseView.classList.toggle("hidden", !showingResponse);
-  // Update line numbers for active handshake view
   const activeHandshakeText = showingResponse ? resText : reqText;
+
+  // CM path
+  if (els.websocketHandshakeCM) {
+    updateCodePaneCM("wsHandshake", els.websocketHandshakeCM, activeHandshakeText, { mode: "http" });
+    // Hide legacy views
+    if (els.websocketRequestView) els.websocketRequestView.classList.add("hidden");
+    if (els.websocketResponseView) els.websocketResponseView.classList.add("hidden");
+    // Apply handshake search via CM
+    const query = (els.wsHandshakeSearchInput?.value || "").trim();
+    if (query) {
+      const cv = getCMView("wsHandshake");
+      if (cv) cv.applySearch(query);
+    }
+  } else {
+    // Legacy fallback
+    const savedReqFocus = window._saveCodeViewFocus?.(els.websocketRequestView);
+    const savedResFocus = window._saveCodeViewFocus?.(els.websocketResponseView);
+    els.websocketRequestView.innerHTML = renderHttpHtml(reqText, "request");
+    els.websocketResponseView.innerHTML = renderHttpHtml(resText, "response");
+    window._restoreCodeViewFocus?.(els.websocketRequestView, savedReqFocus);
+    window._restoreCodeViewFocus?.(els.websocketResponseView, savedResFocus);
+    els.websocketRequestView.classList.toggle("hidden", !!showingResponse);
+    els.websocketResponseView.classList.toggle("hidden", !showingResponse);
+    updateWsHandshakeSearch();
+  }
+  // Update line numbers for active handshake view
   const hsLineCount = countLines(activeHandshakeText);
   if (els.wsHandshakeLines) {
     els.wsHandshakeLines.textContent = buildLineNumbers(hsLineCount);
   }
-  // Apply handshake search
-  updateWsHandshakeSearch();
   els.websocketFramesBody.innerHTML = session.frames.length
     ? session.frames
         .map((frame, idx) => {
@@ -4962,8 +5157,15 @@ function renderReplay() {
   }
 
   if (!tab) {
-    els.replayRequestEditor.value = "";
-    renderReplayRequestHighlight("");
+    if (els.replayRequestCM) {
+      updateCodePaneCM("replayReq", els.replayRequestCM, "", {
+        mode: "http", readOnly: false,
+        placeholder: "Paste or type an HTTP request here...",
+      });
+    } else {
+      if (els.replayRequestEditor) els.replayRequestEditor.value = "";
+      renderReplayRequestHighlight("");
+    }
     els.replayHostInput.value = "";
     els.replayPortInput.value = "";
     els.replaySchemeSelect.value = "https";
@@ -4979,24 +5181,72 @@ function renderReplay() {
 
   syncReplayToolbar(tab);
   const reqMode = state.replayMessageViews.request;
-  if (reqMode === "hex") {
-    els.replayRequestHighlight.removeAttribute("contenteditable");
+  if (els.replayRequestCM) {
+    // CM path for all modes
+    if (reqMode === "hex") {
+      // Hex mode: read-only hex dump view
+      if (!tab.requestBytes) {
+        tab.requestBytes = new TextEncoder().encode(tab.requestText);
+        tab.requestOriginalBytes = new Uint8Array(tab.requestBytes);
+      }
+      const hexText = toHexDumpFromBytes(tab.requestBytes);
+      updateCodePaneCM("replayReq", els.replayRequestCM, hexText, {
+        mode: "hex", readOnly: true,
+      });
+      updateReplaySearchPane("request", hexText);
+    } else {
+      // Pretty/Raw mode: editable
+      if (tab.requestBytes) {
+        tab.requestText = new TextDecoder().decode(tab.requestBytes);
+        tab.requestBytes = null;
+        tab.requestOriginalBytes = null;
+      }
+      let displayText = tab.requestText;
+      if (reqMode === "pretty") {
+        const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
+        displayText = prettyFormat(tab.requestText, fakeMsg);
+      } else if (reqMode === "raw") {
+        displayText = compactFormat(tab.requestText);
+      }
+      updateCodePaneCM("replayReq", els.replayRequestCM, displayText, {
+        mode: "http", readOnly: false,
+      });
+      // Attach onChange to sync tab.requestText
+      const cv = getCMView("replayReq");
+      if (cv && !cv._replayOnChangeWired) {
+        cv._replayOnChangeWired = true;
+        addCMUpdateListener(cv.view, (newText) => {
+          const activeTab = getActiveReplayTab();
+          if (activeTab) {
+            activeTab.requestText = newText;
+            syncReplayToolbar(activeTab);
+            renderReplayTabs();
+            scheduleWorkspaceStateSave();
+          }
+        });
+      }
+      updateReplaySearchPane("request", displayText);
+    }
+  } else if (reqMode === "hex") {
+    if (els.replayRequestHighlight) els.replayRequestHighlight.removeAttribute("contenteditable");
     if (!tab.requestBytes) {
       tab.requestBytes = new TextEncoder().encode(tab.requestText);
       tab.requestOriginalBytes = new Uint8Array(tab.requestBytes);
     }
-    els.replayRequestHighlight.innerHTML = renderEditableHexHtml(tab.requestBytes, tab.requestOriginalBytes);
-    bindHexByteHandlers(els.replayRequestHighlight, tab);
+    if (els.replayRequestHighlight) {
+      els.replayRequestHighlight.innerHTML = renderEditableHexHtml(tab.requestBytes, tab.requestOriginalBytes);
+      bindHexByteHandlers(els.replayRequestHighlight, tab);
+    }
     updateReplaySearchPane("request", toHexDumpFromBytes(tab.requestBytes));
   } else {
-    // Sync bytes back to text when leaving hex mode
+    // Legacy non-CM path
     if (tab.requestBytes) {
       tab.requestText = new TextDecoder().decode(tab.requestBytes);
-      els.replayRequestEditor.value = tab.requestText;
+      if (els.replayRequestEditor) els.replayRequestEditor.value = tab.requestText;
       tab.requestBytes = null;
       tab.requestOriginalBytes = null;
     }
-    if (!els.replayRequestHighlight.isContentEditable) {
+    if (els.replayRequestHighlight && !els.replayRequestHighlight.isContentEditable) {
       els.replayRequestHighlight.setAttribute("contenteditable", "plaintext-only");
     }
     let displayText = tab.requestText;
@@ -5006,7 +5256,7 @@ function renderReplay() {
     } else if (reqMode === "raw") {
       displayText = compactFormat(tab.requestText);
     }
-    els.replayRequestEditor.value = tab.requestText;
+    if (els.replayRequestEditor) els.replayRequestEditor.value = tab.requestText;
     renderReplayRequestHighlight(displayText);
     updateReplaySearchPane("request", displayText);
   }
@@ -5129,7 +5379,7 @@ function syncInterceptRequestHighlightScroll() {
 }
 
 function renderInterceptResponseHighlight(text) {
-  if (!els.interceptResponseHighlight) return;
+  if (!els.interceptResponseHighlight || !els.interceptResponseEditor) return;
   els.interceptResponseHighlight.innerHTML = renderCodeHtml(text, "pretty", "response");
   els.interceptResponseHighlight.scrollTop = els.interceptResponseEditor.scrollTop;
   els.interceptResponseHighlight.scrollLeft = els.interceptResponseEditor.scrollLeft;
@@ -5157,13 +5407,29 @@ function syncFuzzerRequestHighlightScroll() {
 }
 
 let _replayResponseCMView = null;
+let _replayResponseCMMode = null;
 function renderReplayResponseView(text) {
   // Use CodeMirror if container exists
   if (els.replayResponseCM) {
+    const mode = state.replayMessageViews.response;
+    const cmMode = mode === "hex" ? "hex" : mode === "diff" ? "diff" : "http";
+    // Recreate if mode changed
+    if (_replayResponseCMView && _replayResponseCMMode !== cmMode) {
+      _replayResponseCMView.destroy();
+      _replayResponseCMView = null;
+    }
     if (!_replayResponseCMView) {
-      _replayResponseCMView = new SniperCodeView(els.replayResponseCM, { readOnly: true });
+      const opts = { readOnly: true };
+      if (cmMode === "http") opts.httpHighlight = true;
+      else if (cmMode === "hex") opts.hexHighlight = true;
+      else if (cmMode === "diff") opts.diffHighlight = true;
+      _replayResponseCMView = new SniperCodeView(els.replayResponseCM, opts);
+      _replayResponseCMMode = cmMode;
     }
     _replayResponseCMView.setContent(text || "");
+    // Apply search
+    const query = (state.replayMessageSearch?.response || "").trim();
+    _replayResponseCMView.applySearch(query);
     return;
   }
   // Fallback to legacy
@@ -5217,34 +5483,65 @@ function renderReplayViewContent(target) {
 
   if (target === "request") {
     const mode = state.replayMessageViews.request;
-    if (mode === "hex") {
-      els.replayRequestHighlight.removeAttribute("contenteditable");
-      if (!tab.requestBytes) {
-        tab.requestBytes = new TextEncoder().encode(tab.requestText);
-        tab.requestOriginalBytes = new Uint8Array(tab.requestBytes);
+    if (els.replayRequestCM) {
+      // CM path for all modes
+      if (mode === "hex") {
+        if (!tab.requestBytes) {
+          tab.requestBytes = new TextEncoder().encode(tab.requestText);
+          tab.requestOriginalBytes = new Uint8Array(tab.requestBytes);
+        }
+        const hexText = toHexDumpFromBytes(tab.requestBytes);
+        updateCodePaneCM("replayReq", els.replayRequestCM, hexText, { mode: "hex", readOnly: true });
+        updateReplaySearchPane("request", hexText);
+      } else {
+        if (tab.requestBytes) {
+          tab.requestText = new TextDecoder().decode(tab.requestBytes);
+          tab.requestBytes = null;
+          tab.requestOriginalBytes = null;
+        }
+        let displayText = tab.requestText;
+        if (mode === "pretty") {
+          const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
+          displayText = prettyFormat(tab.requestText, fakeMsg);
+        } else if (mode === "raw") {
+          displayText = compactFormat(tab.requestText);
+        }
+        updateCodePaneCM("replayReq", els.replayRequestCM, displayText, { mode: "http", readOnly: false });
+        updateReplaySearchPane("request", displayText);
       }
-      els.replayRequestHighlight.innerHTML = renderEditableHexHtml(tab.requestBytes, tab.requestOriginalBytes);
-      bindHexByteHandlers(els.replayRequestHighlight, tab);
-      updateReplaySearchPane("request", toHexDumpFromBytes(tab.requestBytes));
     } else {
-      if (tab.requestBytes) {
-        tab.requestText = new TextDecoder().decode(tab.requestBytes);
-        els.replayRequestEditor.value = tab.requestText;
-        tab.requestBytes = null;
-      tab.requestOriginalBytes = null;
+      // Legacy non-CM path
+      if (mode === "hex") {
+        if (els.replayRequestHighlight) els.replayRequestHighlight.removeAttribute("contenteditable");
+        if (!tab.requestBytes) {
+          tab.requestBytes = new TextEncoder().encode(tab.requestText);
+          tab.requestOriginalBytes = new Uint8Array(tab.requestBytes);
+        }
+        if (els.replayRequestHighlight) {
+          els.replayRequestHighlight.innerHTML = renderEditableHexHtml(tab.requestBytes, tab.requestOriginalBytes);
+          bindHexByteHandlers(els.replayRequestHighlight, tab);
+        }
+        updateReplaySearchPane("request", toHexDumpFromBytes(tab.requestBytes));
+      } else {
+        if (tab.requestBytes) {
+          tab.requestText = new TextDecoder().decode(tab.requestBytes);
+          if (els.replayRequestEditor) els.replayRequestEditor.value = tab.requestText;
+          tab.requestBytes = null;
+          tab.requestOriginalBytes = null;
+        }
+        if (els.replayRequestHighlight && !els.replayRequestHighlight.isContentEditable) {
+          els.replayRequestHighlight.setAttribute("contenteditable", "plaintext-only");
+        }
+        let displayText = tab.requestText;
+        if (mode === "pretty") {
+          const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
+          displayText = prettyFormat(tab.requestText, fakeMsg);
+        } else if (mode === "raw") {
+          displayText = compactFormat(tab.requestText);
+        }
+        renderReplayRequestHighlight(displayText);
+        updateReplaySearchPane("request", displayText);
       }
-      if (!els.replayRequestHighlight.isContentEditable) {
-        els.replayRequestHighlight.setAttribute("contenteditable", "plaintext-only");
-      }
-      let displayText = tab.requestText;
-      if (mode === "pretty") {
-        const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
-        displayText = prettyFormat(tab.requestText, fakeMsg);
-      } else if (mode === "raw") {
-        displayText = compactFormat(tab.requestText);
-      }
-      renderReplayRequestHighlight(displayText);
-      updateReplaySearchPane("request", displayText);
     }
   }
 
@@ -5270,15 +5567,33 @@ function updateReplaySearchPane(target, text) {
   const query = state.replayMessageSearch[target];
   const input = isRequest ? els.replayRequestSearchInput : els.replayResponseSearchInput;
   const meta = isRequest ? els.replayRequestSearchMeta : els.replayResponseSearchMeta;
-  const view = isRequest ? els.replayRequestHighlight : els.replayResponseView;
 
   if (input && input.value !== query) {
     input.value = query;
   }
 
-  if (!view || !meta) {
+  if (!meta) return;
+
+  // CM path for request
+  if (isRequest) {
+    const cv = getCMView("replayReq");
+    if (cv) {
+      const result = cv.applySearch(query || "");
+      const mode = state.replayMessageViews[target] || "pretty";
+      meta.innerHTML = buildSearchMeta(cv.view.state.doc.lines, mode, result.matchCount);
+      return;
+    }
+  }
+  // CM path for response (via existing _replayResponseCMView)
+  if (!isRequest && _replayResponseCMView) {
+    const result = _replayResponseCMView.applySearch(query || "");
+    const mode = state.replayMessageViews[target] || "pretty";
+    meta.innerHTML = buildSearchMeta(_replayResponseCMView.view.state.doc.lines, mode, result.matchCount);
     return;
   }
+
+  const view = isRequest ? els.replayRequestHighlight : els.replayResponseView;
+  if (!view) return;
 
   const searchResult = applyCodeSearch(view, query);
   const mode = state.replayMessageViews[target] || "pretty";
@@ -5463,10 +5778,31 @@ function renderTarget() {
 }
 
 function renderFuzzer() {
-  if (els.fuzzerRequestEditor.value !== state.fuzzerRequestText) {
-    els.fuzzerRequestEditor.value = state.fuzzerRequestText;
+  if (els.fuzzerRequestCM) {
+    // CM path
+    const cv = getCMView("fuzzerReq");
+    if (!cv || cv.getContent() !== state.fuzzerRequestText) {
+      updateCodePaneCM("fuzzerReq", els.fuzzerRequestCM, state.fuzzerRequestText, {
+        mode: "http", readOnly: false,
+        payloadHighlight: true,
+        placeholder: "Paste an HTTP request with $payload$ or {{PAYLOAD}} markers...",
+      });
+      // Wire onChange to sync state
+      const newCv = getCMView("fuzzerReq");
+      if (newCv && !newCv._fuzzerOnChangeWired) {
+        newCv._fuzzerOnChangeWired = true;
+        addCMUpdateListener(newCv.view, (newText) => {
+          state.fuzzerRequestText = newText;
+          scheduleWorkspaceStateSave();
+        });
+      }
+    }
+  } else if (els.fuzzerRequestEditor) {
+    if (els.fuzzerRequestEditor.value !== state.fuzzerRequestText) {
+      els.fuzzerRequestEditor.value = state.fuzzerRequestText;
+    }
+    renderFuzzerRequestHighlight(state.fuzzerRequestText);
   }
-  renderFuzzerRequestHighlight(state.fuzzerRequestText);
   if (els.fuzzerPayloadsEditor.value !== state.fuzzerPayloadsText) {
     els.fuzzerPayloadsEditor.value = state.fuzzerPayloadsText;
   }
@@ -5488,7 +5824,7 @@ function renderFuzzer() {
   ].join(" · ");
   els.fuzzerResultsBody.innerHTML = state.fuzzerAttackRecord.results
     .map((result) => `
-      <tr>
+      <tr class="fuzzer-result-row" data-transaction-id="${result.transaction_id || ""}" data-result-index="${result.index}">
         <td>${result.index + 1}</td>
         <td class="cell-url">${escapeHtml(result.payload)}</td>
         <td>${escapeHtml(formatStatus(result.status))}</td>
@@ -5498,6 +5834,85 @@ function renderFuzzer() {
       </tr>
     `)
     .join("");
+}
+
+// ─── Fuzzer result detail panel ────────────────────────────────────────────
+
+let _fuzzerDetailViewModes = { request: "pretty", response: "pretty" };
+
+/** Show request/response detail for a fuzzer result. */
+async function showFuzzerResultDetail(transactionId) {
+  if (!transactionId || !els.fuzzerDetailPanel) return;
+
+  els.fuzzerDetailPanel.classList.remove("hidden");
+
+  try {
+    const resp = await fetch(`/api/transactions/${transactionId}`);
+    if (!resp.ok) {
+      updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, `Failed to load transaction: ${resp.status}`, { mode: "http" });
+      updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
+      return;
+    }
+    const record = await resp.json();
+
+    // Store for mode switching
+    state._fuzzerDetailRecord = record;
+
+    renderFuzzerDetailPanes(record);
+  } catch (err) {
+    updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, `Error: ${err.message}`, { mode: "http" });
+  }
+}
+
+function renderFuzzerDetailPanes(record) {
+  if (!record) return;
+
+  const reqMode = _fuzzerDetailViewModes.request;
+  const resMode = _fuzzerDetailViewModes.response;
+
+  // Request
+  const rawReq = buildRawRequest(record);
+  let reqText = rawReq;
+  if (reqMode === "pretty") {
+    const fakeMsg = { content_type: record.request?.content_type };
+    reqText = prettyFormat(rawReq, fakeMsg);
+  } else if (reqMode === "hex") {
+    reqText = toHexDump(rawReq);
+  }
+  const cmReqMode = reqMode === "hex" ? "hex" : "http";
+  if (els.fuzzerDetailReqCM) {
+    updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, reqText, { mode: cmReqMode });
+  }
+
+  // Response
+  if (record.response) {
+    const rawRes = buildRawResponse(record);
+    let resText = rawRes;
+    if (resMode === "pretty") {
+      resText = prettyFormat(rawRes, record.response);
+    } else if (resMode === "hex") {
+      resText = toHexDump(rawRes);
+    }
+    const cmResMode = resMode === "hex" ? "hex" : "http";
+    if (els.fuzzerDetailResCM) {
+      updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, resText, { mode: cmResMode });
+    }
+    if (els.fuzzerDetailResponseMeta) {
+      els.fuzzerDetailResponseMeta.textContent = `${record.status ?? ""} · ${record.response?.content_type || ""}`;
+    }
+  } else {
+    if (els.fuzzerDetailResCM) {
+      updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "No response captured.", { mode: "http" });
+    }
+    if (els.fuzzerDetailResponseMeta) {
+      els.fuzzerDetailResponseMeta.textContent = "";
+    }
+  }
+}
+
+function hideFuzzerDetailPanel() {
+  if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.add("hidden");
+  state._fuzzerDetailRecord = null;
 }
 
 function createNewMatchReplaceRule() {
@@ -5663,7 +6078,10 @@ async function runFuzzerAttack() {
     body_encoding: "utf8",
     preview_truncated: false,
   };
-  const template = parseEditableRawRequest(els.fuzzerRequestEditor.value, fallback);
+  const fuzzerReqText = getCMView("fuzzerReq")
+    ? getCMView("fuzzerReq").getContent()
+    : (els.fuzzerRequestEditor ? els.fuzzerRequestEditor.value : "");
+  const template = parseEditableRawRequest(fuzzerReqText, fallback);
   const payloads = els.fuzzerPayloadsEditor.value
     .split("\n")
     .map((line) => line.trim())
@@ -5684,7 +6102,7 @@ async function runFuzzerAttack() {
   }
   state.fuzzerBaseRequest = template;
   state.fuzzerNotice = "";
-  state.fuzzerRequestText = els.fuzzerRequestEditor.value;
+  state.fuzzerRequestText = fuzzerReqText;
   state.fuzzerPayloadsText = els.fuzzerPayloadsEditor.value;
   state.fuzzerAttackRecord = await response.json();
   scheduleWorkspaceStateSave();
@@ -6071,8 +6489,11 @@ async function forwardSelectedIntercept() {
   }
 
   const id = state.selectedInterceptRecord.id;
+  const interceptReqText = getCMView("interceptReq")
+    ? getCMView("interceptReq").getContent()
+    : (els.interceptRequestEditor ? els.interceptRequestEditor.value : "");
   const request = parseEditableRawRequest(
-    els.interceptRequestEditor.value,
+    interceptReqText,
     state.selectedInterceptRecord.request,
   );
 
@@ -6250,8 +6671,15 @@ function renderResponseIntercepts() {
     if (state.interceptQueueTab === "response") {
       els.interceptDetailPath.textContent = "Response Intercept";
       els.interceptDetailTitle.textContent = "No response selected";
-      els.interceptResponseEditor.value = "";
-      renderInterceptResponseHighlight("");
+      if (els.interceptResponseCM) {
+        updateCodePaneCM("interceptRes", els.interceptResponseCM, "", {
+          mode: "http", readOnly: false,
+          placeholder: "Intercepted response will appear here...",
+        });
+      } else {
+        els.interceptResponseEditor.value = "";
+        renderInterceptResponseHighlight("");
+      }
       els.interceptMeta.textContent = state.runtime?.intercept_enabled
         ? "Intercept is on. Matched responses will queue here."
         : "Intercept is off. Toggle it on to pause responses before forwarding.";
@@ -6265,11 +6693,23 @@ function renderResponseIntercepts() {
   if (state.interceptQueueTab === "response") {
     els.interceptDetailPath.textContent = `${rec.scheme.toUpperCase()} / ${rec.method} ${rec.host}${rec.path}`;
     els.interceptDetailTitle.textContent = `${rec.status} Response`;
-    if (state.responseInterceptEditorSeedId !== rec.id || document.activeElement !== els.interceptResponseEditor) {
-      els.interceptResponseEditor.value = buildEditableRawResponse(rec.response);
-      state.responseInterceptEditorSeedId = rec.id;
+    if (els.interceptResponseCM) {
+      const cv = getCMView("interceptRes");
+      const isFocused = cv && cv.view.hasFocus;
+      if (state.responseInterceptEditorSeedId !== rec.id || !isFocused) {
+        const rawText = buildEditableRawResponse(rec.response);
+        updateCodePaneCM("interceptRes", els.interceptResponseCM, rawText, {
+          mode: "http", readOnly: false,
+        });
+        state.responseInterceptEditorSeedId = rec.id;
+      }
+    } else {
+      if (state.responseInterceptEditorSeedId !== rec.id || document.activeElement !== els.interceptResponseEditor) {
+        els.interceptResponseEditor.value = buildEditableRawResponse(rec.response);
+        state.responseInterceptEditorSeedId = rec.id;
+      }
+      renderInterceptResponseHighlight(els.interceptResponseEditor.value);
     }
-    renderInterceptResponseHighlight(els.interceptResponseEditor.value);
     els.interceptMeta.textContent = `Response queued at ${formatTimestamp(rec.started_at)}`;
   }
   els.forwardResponseInterceptButton.disabled = false;
@@ -6280,8 +6720,11 @@ async function forwardSelectedResponseIntercept() {
   if (!state.selectedResponseInterceptRecord) return;
 
   const id = state.selectedResponseInterceptRecord.id;
+  const interceptResText = getCMView("interceptRes")
+    ? getCMView("interceptRes").getContent()
+    : (els.interceptResponseEditor ? els.interceptResponseEditor.value : "");
   const editedResponse = parseEditableRawResponse(
-    els.interceptResponseEditor.value,
+    interceptResText,
     state.selectedResponseInterceptRecord.response,
   );
 
@@ -6450,8 +6893,11 @@ async function sendReplay() {
   let request, requestText, target;
   try {
     const fallback = tab.baseRequest || createDefaultEditableRequest();
-    request = parseEditableRawRequest(els.replayRequestEditor.value, fallback);
-    requestText = els.replayRequestEditor.value;
+    const replayReqText = getCMView("replayReq")
+      ? getCMView("replayReq").getContent()
+      : (els.replayRequestEditor ? els.replayRequestEditor.value : tab.requestText);
+    request = parseEditableRawRequest(replayReqText, fallback);
+    requestText = replayReqText;
     target = getRepeaterTargetConfig(tab, request);
   } catch (e) {
     setReplaySending(false);
@@ -6580,7 +7026,10 @@ async function followRedirect() {
 
   // Build new request from current request
   const fallback = tab.baseRequest || createDefaultEditableRequest();
-  const currentRequest = parseEditableRawRequest(els.replayRequestEditor.value, fallback);
+  const replayReqText = getCMView("replayReq")
+    ? getCMView("replayReq").getContent()
+    : (els.replayRequestEditor ? els.replayRequestEditor.value : tab.requestText);
+  const currentRequest = parseEditableRawRequest(replayReqText, fallback);
 
   // 301/302/303 → GET (drop body), 307/308 → keep method
   const useGet = status === 301 || status === 302 || status === 303;
@@ -6650,8 +7099,12 @@ async function followRedirect() {
   const requestText = buildEditableRawRequest(newRequest);
   tab.requestText = requestText;
   tab.baseRequest = cloneEditableRequest(newRequest);
-  els.replayRequestEditor.value = requestText;
-  renderReplayRequestHighlight(requestText);
+  if (getCMView("replayReq")) {
+    getCMView("replayReq").setContent(requestText);
+  } else if (els.replayRequestEditor) {
+    els.replayRequestEditor.value = requestText;
+    renderReplayRequestHighlight(requestText);
+  }
 
   // Send the follow request
   const target = { scheme: newScheme, host: newHost, port: newPort };
@@ -6706,7 +7159,8 @@ function duplicateActiveReplayTab() {
   }
 
   const fallback = tab.baseRequest || createDefaultEditableRequest();
-  const requestText = els.replayRequestEditor?.value || tab.requestText || buildEditableRawRequest(fallback);
+  const requestText = (getCMView("replayReq") ? getCMView("replayReq").getContent() : null)
+    || els.replayRequestEditor?.value || tab.requestText || buildEditableRawRequest(fallback);
   let request = cloneEditableRequest(fallback);
   try {
     request = parseEditableRawRequest(requestText, fallback);
@@ -9323,15 +9777,28 @@ function updateWsHandshakeLineNumbers() {
   const resBtn = document.getElementById("wsHandshakeResBtn");
   const showingResponse = resBtn?.classList.contains("active");
   const activeView = showingResponse ? els.websocketResponseView : els.websocketRequestView;
+  if (!activeView) return;
   const lineCount = activeView.querySelectorAll(".code-line").length || 1;
   els.wsHandshakeLines.textContent = buildLineNumbers(lineCount);
 }
 
 function updateWsHandshakeSearch() {
+  const query = els.wsHandshakeSearchInput?.value || "";
+  // CM path
+  const cv = getCMView("wsHandshake");
+  if (cv) {
+    const result = cv.applySearch(query);
+    const lineCount = cv.view.state.doc.lines;
+    if (els.wsHandshakeSearchMeta) {
+      els.wsHandshakeSearchMeta.innerHTML = buildSearchMeta(lineCount, "pretty", result.matchCount);
+    }
+    return;
+  }
+  // Legacy path
   const resBtn = document.getElementById("wsHandshakeResBtn");
   const showingResponse = resBtn?.classList.contains("active");
   const activeView = showingResponse ? els.websocketResponseView : els.websocketRequestView;
-  const query = els.wsHandshakeSearchInput?.value || "";
+  if (!activeView) return;
   const result = applyCodeSearch(activeView, query);
   const lineCount = activeView.querySelectorAll(".code-line").length || 1;
   if (els.wsHandshakeSearchMeta) {
@@ -10832,11 +11299,16 @@ function changeReplayMethod(newMethod) {
   const tab = getActiveReplayTab();
   if (!tab) return;
 
-  const text = tab.requestText || els.replayRequestEditor.value || "";
+  const cv = getCMView("replayReq");
+  const text = cv ? cv.getContent() : (tab.requestText || (els.replayRequestEditor ? els.replayRequestEditor.value : "") || "");
   const updated = text.replace(/^[A-Z]+(\s)/i, newMethod + "$1");
   tab.requestText = updated;
-  els.replayRequestEditor.value = updated;
-  renderReplayRequestHighlight(updated);
+  if (cv) {
+    cv.setContent(updated);
+  } else if (els.replayRequestEditor) {
+    els.replayRequestEditor.value = updated;
+    renderReplayRequestHighlight(updated);
+  }
   updateReplaySearchPane("request", updated);
   syncReplayToolbar(tab);
   renderReplayTabs();
@@ -11212,8 +11684,13 @@ function initReplayContextMenu() {
           // Add empty body section
           tab.requestText = text + "\n\n";
         }
-        els.replayRequestEditor.value = tab.requestText;
-        renderReplayRequestHighlight(tab.requestText);
+        const cv = getCMView("replayReq");
+        if (cv) {
+          cv.setContent(tab.requestText);
+        } else if (els.replayRequestEditor) {
+          els.replayRequestEditor.value = tab.requestText;
+          renderReplayRequestHighlight(tab.requestText);
+        }
         scheduleWorkspaceStateSave();
       } else if (action === "add-content-type-json") {
         setReplayHeader("Content-Type", "application/json");
@@ -11263,8 +11740,13 @@ function setReplayHeader(name, value) {
   }
 
   tab.requestText = lines.join("\n") + body;
-  els.replayRequestEditor.value = tab.requestText;
-  renderReplayRequestHighlight(tab.requestText);
+  const cv = getCMView("replayReq");
+  if (cv) {
+    cv.setContent(tab.requestText);
+  } else if (els.replayRequestEditor) {
+    els.replayRequestEditor.value = tab.requestText;
+    renderReplayRequestHighlight(tab.requestText);
+  }
   updateReplaySearchPane("request", tab.requestText);
   scheduleWorkspaceStateSave();
 }
@@ -11453,7 +11935,14 @@ const sniperCMTheme = CM.EditorView.theme({
     fontFamily: "var(--mono)",
   },
   ".cm-activeLine": {
+    backgroundColor: "rgba(255, 255, 255, 0.07)",
+    outline: "1px solid rgba(255, 255, 255, 0.12)",
+    outlineOffset: "-1px",
+    borderRadius: "2px",
+  },
+  "&:not(.cm-focused) .cm-activeLine": {
     backgroundColor: "transparent",
+    outline: "none",
   },
   ".cm-selectionBackground, ::selection": {
     backgroundColor: "rgba(255,255,255,0.12) !important",
@@ -11480,34 +11969,340 @@ const sniperCMTheme = CM.EditorView.theme({
   "&.cm-focused": {
     outline: "none",
   },
+  /* ── HTTP syntax highlight tokens (scoped via CM theme for WKWebView) ── */
+  ".tok-method":       { color: "var(--token-method-color, #73c991)" },
+  ".tok-target":       { color: "var(--token-target-color, #e0e4ea)" },
+  ".tok-url":          { color: "var(--token-url-color, #6cb6d9)" },
+  ".tok-version":      { color: "var(--token-version-color, #808898)" },
+  ".tok-header":       { color: "var(--token-info-color, #c9a96e)" },
+  ".tok-status":       { color: "var(--token-info-color, #c9a96e)", fontWeight: "700" },
+  ".tok-status-ok":    { color: "var(--success, #73c991)", fontWeight: "700" },
+  ".tok-status-info":  { color: "var(--info, #6cb6d9)", fontWeight: "700" },
+  ".tok-status-warn":  { color: "var(--warning, #e0a050)", fontWeight: "700" },
+  ".tok-status-error": { color: "var(--danger, #f87171)", fontWeight: "700" },
+  ".tok-plain":        { color: "var(--token-plain-color, #cdd2da)" },
+  ".tok-punct":        { color: "var(--token-plain-color, #cdd2da)" },
+  ".tok-cookie-name":  { color: "#e06c88" },
+  ".tok-cookie-val":   { color: "var(--text-soft, #aab0bc)" },
+  ".tok-cookie-sep":   { color: "#6cb6d9" },
+  ".tok-cookie-flag":  { color: "#7cb8a0" },
+  ".tok-json-key":     { color: "var(--token-info-color, #c9a96e)" },
+  ".tok-json-str":     { color: "var(--token-string-color, #e8e8e8)" },
+  ".tok-json-num":     { color: "var(--warning, #e0a050)" },
+  ".tok-json-bool":    { color: "#b89f7c" },
+  ".tok-query-key":    { color: "var(--token-info-color, #c9a96e)" },
+  ".tok-query-val":    { color: "var(--token-query-value-color, #e8e8e8)" },
+  ".tok-markup-tag":   { color: "var(--token-info-color, #c9a96e)" },
+  ".tok-markup-attr":  { color: "var(--token-info-color, #c9a96e)" },
+  ".tok-markup-str":   { color: "var(--token-string-color, #e8e8e8)" },
+  ".tok-meta":         { color: "#b89f7c" },
+  ".tok-kw":           { color: "var(--token-info-color, #c9a96e)" },
+  /* ── Hex view tokens ── */
+  ".tok-hex-offset":   { color: "var(--token-info-color, #c9a96e)", display: "inline-block", width: "70px", paddingRight: "12px", overflow: "hidden", verticalAlign: "top", whiteSpace: "pre", fontFamily: "'Menlo', 'Monaco', 'Cascadia Mono', 'Courier New', monospace", fontSize: "11px" },
+  ".tok-hex-bytes":    { color: "var(--token-string-color, #e8e8e8)", display: "inline-block", width: "355px", paddingRight: "8px", overflow: "hidden", verticalAlign: "top", whiteSpace: "pre", fontFamily: "'Menlo', 'Monaco', 'Cascadia Mono', 'Courier New', monospace", fontSize: "11px" },
+  ".tok-hex-ascii":    { color: "var(--token-plain-color, #cdd2da)", fontFamily: "'Menlo', 'Monaco', 'Cascadia Mono', 'Courier New', monospace", fontSize: "11px" },
+  /* ── Diff view tokens ── */
+  ".tok-diff-added":   { color: "var(--success, #50c878)", background: "rgba(80, 200, 120, 0.12)" },
+  ".tok-diff-removed": { color: "var(--danger, #e05252)", background: "rgba(200, 80, 80, 0.12)", textDecoration: "line-through" },
+  ".tok-diff-header":  { color: "var(--point, #7d91ab)", fontWeight: "600" },
+  /* ── Payload placeholder ── */
+  ".tok-payload":      { color: "#f8d06b", background: "rgba(248, 208, 107, 0.18)", borderRadius: "3px", padding: "0 2px", fontWeight: "600" },
+  /* ── Search highlight ── */
+  ".tok-search-hit":   { background: "rgba(132, 151, 173, 0.2)", borderRadius: "4px", padding: "0 1px" },
+  ".tok-search-active": { background: "rgba(201, 169, 110, 0.4)", borderRadius: "4px", padding: "0 1px" },
 }, { dark: true });
 
-const sniperHighlightStyle = CM.syntaxHighlighting(CM.HighlightStyle.define([
-  { tag: CM.tags.keyword, color: "var(--token-method-color, #22863a)" },           // HTTP method
-  { tag: CM.tags.url, color: "var(--token-url-color, #e0a050)" },                  // URL path
-  { tag: CM.tags.comment, color: "var(--token-version-color, #6a737d)" },          // HTTP version
-  { tag: CM.tags.number, color: "var(--token-info-color, #e0a050)" },              // status code
-  { tag: CM.tags.propertyName, color: "var(--token-header-color, #6cb6d9)" },      // header name
-  { tag: CM.tags.string, color: "var(--token-plain-color, #f1f1f1)" },             // header value
-  { tag: CM.tags.punctuation, color: "var(--token-punctuation-color, #888)" },     // colon, braces
-  { tag: CM.tags.labelName, color: "var(--token-json-key-color, #c9a96e)" },       // JSON key
-  { tag: CM.tags.bool, color: "var(--token-json-key-color, #c9a96e)" },            // JSON bool
-  { tag: CM.tags.null, color: "var(--token-json-key-color, #c9a96e)" },            // JSON null
-]));
+// ─── HTTP decoration plugin ─────────────────────────────────────────────────
+//
+// Reuses the existing highlight* functions (highlightStartLine, highlightHeaderLine,
+// highlightBodyLine, highlightCookieValue) to produce CM Decoration.mark() spans
+// with the same CSS classes as the legacy <pre> renderer.  This ensures pixel-perfect
+// colour parity with the non-CM code path.
+
+/** Map legacy CSS class → CM-scoped tok-* class. */
+const _tokMap = {
+  "token-method": "tok-method",
+  "token-target": "tok-target",
+  "token-url": "tok-url",
+  "token-version": "tok-version",
+  "token-header": "tok-header",
+  "token-plain": "tok-plain",
+  "token-punctuation": "tok-punct",
+  "token-cookie-name": "tok-cookie-name",
+  "token-cookie-value": "tok-cookie-val",
+  "token-cookie-sep": "tok-cookie-sep",
+  "token-cookie-flag": "tok-cookie-flag",
+  "token-json-key": "tok-json-key",
+  "token-json-string": "tok-json-str",
+  "token-json-number": "tok-json-num",
+  "token-json-boolean": "tok-json-bool",
+  "token-meta": "tok-meta",
+  "token-query-key": "tok-query-key",
+  "token-query-value": "tok-query-val",
+  "token-markup-tag": "tok-markup-tag",
+  "token-markup-attr": "tok-markup-attr",
+  "token-markup-string": "tok-markup-str",
+  "token-js-keyword": "tok-kw",
+  "token-js-string": "tok-json-str",
+  "token-css-property": "tok-kw",
+  "token-css-selector": "tok-kw",
+  "token-css-keyword": "tok-kw",
+  "token-css-value": "tok-json-str",
+  "token-hex-offset": "tok-header",
+  "token-hex-bytes": "tok-json-str",
+  "token-hex-ascii": "tok-plain",
+  "token-string": "tok-json-str",
+};
+
+function mapTokenClass(legacyCls) {
+  // Handle compound status classes like "token-status ok"
+  if (legacyCls.startsWith("token-status")) {
+    const tone = legacyCls.replace("token-status", "").trim();
+    if (tone === "ok") return "tok-status-ok";
+    if (tone === "info") return "tok-status-info";
+    if (tone === "warn") return "tok-status-warn";
+    if (tone === "error") return "tok-status-error";
+    return "tok-status";
+  }
+  return _tokMap[legacyCls] || "";
+}
+
+/** Parse an HTML-highlighted line into [{cls, start, end}] token ranges. */
+function extractTokenRanges(htmlStr, plainText) {
+  const ranges = [];
+  const tagRe = /<span class="([^"]+)">([^<]*)<\/span>/g;
+  let m;
+  let searchFrom = 0;
+  while ((m = tagRe.exec(htmlStr)) !== null) {
+    const cls = mapTokenClass(m[1]);
+    if (!cls) continue;
+    const text = m[2].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+    if (!text) continue;
+    const idx = plainText.indexOf(text, searchFrom);
+    if (idx === -1) continue;
+    ranges.push({ cls, from: idx, to: idx + text.length });
+    searchFrom = idx + text.length;
+  }
+  return ranges;
+}
+
+/** Build a RangeSet<Decoration> for an HTTP message document. */
+function buildHttpDecorations(view) {
+  const doc = view.state.doc;
+  const text = doc.toString();
+  if (!text) return CM.Decoration.none;
+
+  const lines = text.split("\n");
+  const builder = [];
+
+  // Determine where blank separator line is (end of headers)
+  let blankIdx = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i] === "") { blankIdx = i; break; }
+  }
+
+  // Detect body highlight mode from Content-Type header
+  let bodyMode = "plain";
+  for (let i = 1; i < (blankIdx === -1 ? lines.length : blankIdx); i++) {
+    const lower = lines[i].toLowerCase();
+    if (lower.startsWith("content-type:")) {
+      bodyMode = inferBodyHighlightMode(lines[i].slice(13).trim());
+      break;
+    }
+  }
+
+  // Detect request vs response from first line
+  const isResponse = /^HTTP\/[\d.]+\s/.test(lines[0]);
+  const target = isResponse ? "response" : "request";
+
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineStart = offset;
+    offset += line.length + 1; // +1 for \n
+
+    if (!line) continue;
+
+    let highlighted;
+    if (i === 0) {
+      highlighted = highlightStartLine(line, target);
+    } else if (blankIdx === -1 || i < blankIdx) {
+      highlighted = highlightHeaderLine(line);
+    } else if (i > blankIdx) {
+      highlighted = highlightBodyLine(line, bodyMode);
+    } else {
+      continue; // blank line
+    }
+
+    const ranges = extractTokenRanges(highlighted, line);
+    for (const r of ranges) {
+      const from = lineStart + r.from;
+      const to = lineStart + r.to;
+      if (from >= to || to > doc.length) continue;
+      builder.push(CM.Decoration.mark({ class: r.cls }).range(from, to));
+    }
+  }
+
+  // Sort by from position (required by RangeSet)
+  builder.sort((a, b) => a.from - b.from || a.to - b.to);
+  return CM.Decoration.set(builder);
+}
+
+const httpDecoPlugin = CM.ViewPlugin.fromClass(
+  class {
+    constructor(view) { this.decorations = buildHttpDecorations(view); }
+    update(update) {
+      if (update.docChanged || update.viewportChanged || update.startState.facet !== update.state.facet) {
+        this.decorations = buildHttpDecorations(update.view);
+      }
+    }
+  },
+  { decorations: (v) => v.decorations },
+);
+
+/** Build decorations for hex dump (offset / bytes / ascii columns). */
+function buildHexDecorations(view) {
+  const doc = view.state.doc;
+  const text = doc.toString();
+  if (!text) return CM.Decoration.none;
+  const builder = [];
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    if (line.length >= 10) {
+      // offset column: "00000000" (8 chars), same as non-CM .hex-col-offset
+      builder.push(CM.Decoration.mark({ class: "tok-hex-offset" }).range(offset, offset + 8));
+      if (line.length > 10) {
+        // bytes column: chars 10-58 (49 chars of hex pairs), same as non-CM .hex-col-bytes
+        const hEnd = Math.min(59, line.length);
+        builder.push(CM.Decoration.mark({ class: "tok-hex-bytes" }).range(offset + 10, offset + hEnd));
+      }
+      if (line.length > 60) {
+        // ascii column: rest of line
+        builder.push(CM.Decoration.mark({ class: "tok-hex-ascii" }).range(offset + 60, offset + line.length));
+      }
+    }
+    offset += line.length + 1;
+  }
+  return CM.Decoration.set(builder);
+}
+
+const hexDecoPlugin = CM.ViewPlugin.fromClass(
+  class {
+    constructor(view) { this.decorations = buildHexDecorations(view); }
+    update(update) {
+      if (update.docChanged) this.decorations = buildHexDecorations(update.view);
+    }
+  },
+  { decorations: (v) => v.decorations },
+);
+
+/** Build decorations for diff view (+/- lines). */
+function buildDiffDecorations(view) {
+  const doc = view.state.doc;
+  const text = doc.toString();
+  if (!text) return CM.Decoration.none;
+  const builder = [];
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    if (line.length > 0) {
+      let cls = "";
+      if (line.startsWith("--- ") || line.startsWith("+++ ")) cls = "tok-diff-header";
+      else if (line.startsWith("+ ")) cls = "tok-diff-added";
+      else if (line.startsWith("- ")) cls = "tok-diff-removed";
+      if (cls) builder.push(CM.Decoration.mark({ class: cls }).range(offset, offset + line.length));
+    }
+    offset += line.length + 1;
+  }
+  return CM.Decoration.set(builder);
+}
+
+const diffDecoPlugin = CM.ViewPlugin.fromClass(
+  class {
+    constructor(view) { this.decorations = buildDiffDecorations(view); }
+    update(update) {
+      if (update.docChanged) this.decorations = buildDiffDecorations(update.view);
+    }
+  },
+  { decorations: (v) => v.decorations },
+);
+
+// ─── Payload placeholder decoration plugin ($payload$ / {{PAYLOAD}}) ────────
+function buildPayloadDecorations(view) {
+  const doc = view.state.doc;
+  const text = doc.toString();
+  if (!text) return CM.Decoration.none;
+  const re = /\$payload\$|\{\{PAYLOAD\}\}/gi;
+  const builder = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    builder.push(CM.Decoration.mark({ class: "tok-payload" }).range(m.index, m.index + m[0].length));
+  }
+  return builder.length ? CM.Decoration.set(builder) : CM.Decoration.none;
+}
+
+const payloadDecoPlugin = CM.ViewPlugin.fromClass(
+  class {
+    constructor(view) { this.decorations = buildPayloadDecorations(view); }
+    update(update) {
+      if (update.docChanged) this.decorations = buildPayloadDecorations(update.view);
+    }
+  },
+  { decorations: (v) => v.decorations },
+);
+
+/** Add an update listener to a CM EditorView; returns a dispose function. */
+function addCMUpdateListener(view, callback) {
+  const listener = CM.EditorView.updateListener.of((update) => {
+    if (update.docChanged) callback(update.state.doc.toString());
+  });
+  view.dispatch({ effects: CM.StateEffect.appendConfig.of(listener) });
+  return () => {}; // CM does not support removing extensions, but the view will be destroyed
+}
+
+/** Build search highlight decorations. Returns { decos, matchCount, matchPositions }. */
+function buildSearchDecorations(doc, query) {
+  if (!query) return { decos: CM.Decoration.none, matchCount: 0, matchPositions: [] };
+  const text = doc.toString();
+  const lower = text.toLowerCase();
+  const lq = query.toLowerCase();
+  const builder = [];
+  const positions = [];
+  let pos = 0;
+  while ((pos = lower.indexOf(lq, pos)) !== -1) {
+    builder.push(CM.Decoration.mark({ class: "tok-search-hit" }).range(pos, pos + lq.length));
+    positions.push(pos);
+    pos += lq.length;
+  }
+  return { decos: CM.Decoration.set(builder), matchCount: positions.length, matchPositions: positions };
+}
 
 function createBaseExtensions(options = {}) {
   const exts = [
     sniperCMTheme,
-    sniperHighlightStyle,
     CM.lineNumbers(),
     CM.highlightSpecialChars(),
     CM.drawSelection(),
-    CM.EditorView.lineWrapping,
     CM.highlightSelectionMatches(),
   ];
+  // Hex mode: no line wrapping for column alignment
+  if (!options.hexHighlight) {
+    exts.push(CM.EditorView.lineWrapping);
+  }
   if (options.readOnly) {
     exts.push(CM.EditorState.readOnly.of(true));
-    exts.push(CM.EditorView.editable.of(false));
+    // Keep editable:true so text selection and native copy work.
+    // readOnly prevents actual edits while allowing cursor placement.
+    // Cmd+C with no selection → copy current line
+    exts.push(CM.keymap.of([{
+      key: "Mod-c",
+      run(view) {
+        const sel = view.state.selection.main;
+        if (sel.from !== sel.to) return false; // has selection → let native copy handle it
+        const line = view.state.doc.lineAt(sel.head);
+        navigator.clipboard.writeText(line.text).catch(() => {});
+        return true;
+      },
+    }]));
   } else {
     exts.push(CM.history());
     exts.push(CM.keymap.of([...CM.defaultKeymap, ...CM.historyKeymap, ...CM.searchKeymap]));
@@ -11515,22 +12310,48 @@ function createBaseExtensions(options = {}) {
   if (options.placeholder) {
     exts.push(CM.placeholder(options.placeholder));
   }
+  if (options.httpHighlight) exts.push(httpDecoPlugin);
+  if (options.hexHighlight) {
+    exts.push(hexDecoPlugin);
+    // Match non-CM hex font exactly
+    exts.push(CM.EditorView.theme({
+      ".cm-content": { fontFamily: "'Menlo', 'Monaco', 'Cascadia Mono', 'Courier New', monospace", fontSize: "11px", lineHeight: "1.48" },
+      ".cm-line": { fontFamily: "'Menlo', 'Monaco', 'Cascadia Mono', 'Courier New', monospace", fontSize: "11px" },
+    }));
+  }
+  if (options.diffHighlight) exts.push(diffDecoPlugin);
+  if (options.payloadHighlight) exts.push(payloadDecoPlugin);
   return exts;
 }
+
+// Search decoration effect & field
+const setSearchQuery = CM.StateEffect.define();
+const searchDecoField = CM.StateField.define({
+  create() { return { decos: CM.Decoration.none, matchCount: 0, matchPositions: [] }; },
+  update(value, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setSearchQuery)) {
+        return buildSearchDecorations(tr.state.doc, e.value);
+      }
+    }
+    if (tr.docChanged && value.matchCount > 0) {
+      // Rebuild when doc changes while search is active
+      return value; // keep stale until next explicit setSearchQuery
+    }
+    return value;
+  },
+  provide: (f) => CM.EditorView.decorations.from(f, (val) => val.decos),
+});
 
 /** Reusable CodeMirror wrapper for Sniper code views. */
 class SniperCodeView {
   constructor(container, options = {}) {
-    this._langCompartment = new CM.Compartment();
-    this._readOnlyCompartment = new CM.Compartment();
     this._options = options;
+    this._searchNavIndex = -1;
     this.view = new CM.EditorView({
       state: CM.EditorState.create({
         doc: "",
-        extensions: [
-          ...createBaseExtensions(options),
-          this._langCompartment.of([]),
-        ],
+        extensions: [...createBaseExtensions(options), searchDecoField],
       }),
       parent: container,
     });
@@ -11541,6 +12362,29 @@ class SniperCodeView {
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: text || "" },
     });
+  }
+
+  /** Apply search highlights and return match info. */
+  applySearch(query) {
+    this._searchNavIndex = -1;
+    this.view.dispatch({ effects: setSearchQuery.of(query || "") });
+    const field = this.view.state.field(searchDecoField);
+    // Scroll to first match
+    if (field.matchPositions.length > 0) {
+      const pos = field.matchPositions[0];
+      this.view.dispatch({ selection: { anchor: pos }, scrollIntoView: true });
+    }
+    return field;
+  }
+
+  /** Navigate to next search match (cyclic). Returns current index or -1. */
+  nextSearchMatch() {
+    const field = this.view.state.field(searchDecoField);
+    if (!field.matchPositions.length) return -1;
+    this._searchNavIndex = (this._searchNavIndex + 1) % field.matchPositions.length;
+    const pos = field.matchPositions[this._searchNavIndex];
+    this.view.dispatch({ selection: { anchor: pos, head: pos + 1 }, scrollIntoView: true });
+    return this._searchNavIndex;
   }
 
   getContent() {
@@ -11555,11 +12399,59 @@ class SniperCodeView {
 // CodeMirror-based code pane instances (lazy-initialized)
 const _cmViews = {};
 
-function updateCodePaneCM(key, container, text) {
-  if (!_cmViews[key]) {
-    _cmViews[key] = new SniperCodeView(container, { readOnly: true });
+/** Hook CM search navigation onto a search-meta element. */
+function initCMSearchNavigation(metaElement, cmKey) {
+  if (!metaElement) return;
+  metaElement.addEventListener("click", (e) => {
+    if (!e.target.closest(".search-hit-count")) return;
+    const cv = _cmViews[cmKey];
+    if (!cv) return;
+    cv.nextSearchMatch();
+  });
+}
+
+function updateCodePaneCM(key, container, text, options = {}) {
+  const mode = options.mode || "http"; // "http" | "hex" | "diff"
+  const editable = options.readOnly === false;
+  // Recreate CM view if highlight mode or editable changed
+  if (_cmViews[key] && (_cmViews[key]._hlMode !== mode || !!_cmViews[key]._editable !== editable)) {
+    _cmViews[key].destroy();
+    delete _cmViews[key];
   }
-  _cmViews[key].setContent(text || "");
+  if (!_cmViews[key]) {
+    const cmOpts = {};
+    cmOpts.readOnly = !editable;
+    if (mode === "http") cmOpts.httpHighlight = true;
+    else if (mode === "hex") cmOpts.hexHighlight = true;
+    else if (mode === "diff") cmOpts.diffHighlight = true;
+    if (options.placeholder) cmOpts.placeholder = options.placeholder;
+    if (options.payloadHighlight) cmOpts.payloadHighlight = true;
+    _cmViews[key] = new SniperCodeView(container, cmOpts);
+    _cmViews[key]._hlMode = mode;
+    _cmViews[key]._editable = editable;
+    // Wire optional onChange callback for editable instances
+    if (editable && options.onChange) {
+      _cmViews[key].view.dispatch = ((origDispatch) => {
+        return function (tr) {
+          origDispatch.call(this, tr);
+        };
+      })(_cmViews[key].view.dispatch);
+      // Use CM updateListener instead
+      _cmViews[key]._onChangeDispose = addCMUpdateListener(_cmViews[key].view, options.onChange);
+    }
+  }
+  const cv = _cmViews[key];
+  cv.setContent(text || "");
+
+  // Search highlights
+  const query = (options.search || "").trim();
+  const searchResult = cv.applySearch(query);
+
   const lineCount = (text || "").split("\n").length;
-  return { lineCount, matchCount: 0 };
+  return { lineCount, matchCount: searchResult.matchCount };
+}
+
+/** Helper: get a CM view from the managed pool by key. */
+function getCMView(key) {
+  return _cmViews[key] || null;
 }

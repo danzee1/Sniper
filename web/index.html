@@ -364,16 +364,10 @@
                   </div>
                 </header>
                 <div class="editor-panel" id="interceptRequestEditorPanel">
-                  <div class="replay-highlight-shell">
-                    <pre id="interceptRequestHighlight" class="simple-code-view replay-highlight-view" aria-hidden="true"></pre>
-                    <textarea id="interceptRequestEditor" class="request-editor request-editor-highlighted" spellcheck="false" placeholder="Select an intercepted request to edit and forward it."></textarea>
-                  </div>
+                  <div id="interceptRequestCM" class="cm-container" style="height:100%"></div>
                 </div>
                 <div class="editor-panel hidden" id="interceptResponseEditorPanel">
-                  <div class="replay-highlight-shell">
-                    <pre id="interceptResponseHighlight" class="simple-code-view replay-highlight-view" aria-hidden="true"></pre>
-                    <textarea id="interceptResponseEditor" class="request-editor request-editor-highlighted" spellcheck="false" placeholder="Select an intercepted response to edit and forward it."></textarea>
-                  </div>
+                  <div id="interceptResponseCM" class="cm-container" style="height:100%"></div>
                 </div>
                 <footer class="pane-footer">
                   <span id="interceptMeta">Intercept is empty.</span>
@@ -426,9 +420,7 @@
                     <button class="ws-swap-btn" id="wsSwapPanes" type="button" title="Swap panels">⇄</button>
                   </header>
                   <div class="editor-shell" style="flex:1;min-height:0">
-                    <div class="code-gutter" id="wsHandshakeLines"></div>
-                    <pre class="code-view" id="websocketRequestView" tabindex="0">Select a WebSocket session.</pre>
-                    <pre class="code-view hidden" id="websocketResponseView" tabindex="0">No response selected.</pre>
+                    <div id="websocketHandshakeCM" class="cm-container"></div>
                   </div>
                   <footer class="pane-footer">
                     <label class="pane-search" aria-label="Search handshake">
@@ -625,8 +617,7 @@
                 <section class="findings-pane">
                   <header class="pane-header"><strong>Request</strong></header>
                   <div class="editor-shell">
-                    <div class="code-gutter" id="findingsReqLines"></div>
-                    <pre class="code-view" id="findingsReqView" tabindex="0"></pre>
+                    <div id="findingsReqCM" class="cm-container"></div>
                   </div>
                   <footer class="pane-footer">
                     <label class="pane-search" aria-label="Search request">
@@ -638,8 +629,7 @@
                 <section class="findings-pane">
                   <header class="pane-header"><strong>Response</strong></header>
                   <div class="editor-shell">
-                    <div class="code-gutter" id="findingsResLines"></div>
-                    <pre class="code-view" id="findingsResView" tabindex="0"></pre>
+                    <div id="findingsResCM" class="cm-container"></div>
                   </div>
                   <footer class="pane-footer">
                     <label class="pane-search" aria-label="Search response">
@@ -910,10 +900,7 @@
                 </div>
               </header>
               <div class="editor-panel">
-                <div class="replay-highlight-shell">
-                  <textarea id="replayRequestEditor" class="request-editor request-editor-hidden-data" spellcheck="false"></textarea>
-                  <pre id="replayRequestHighlight" class="simple-code-view replay-highlight-editable" contenteditable="plaintext-only" spellcheck="false" data-placeholder="Paste or send a captured request here."></pre>
-                </div>
+                <div id="replayRequestCM" class="cm-container" style="height:100%"></div>
               </div>
               <footer class="pane-footer">
                 <label class="pane-search">
@@ -1112,10 +1099,7 @@
                 <h2>Request template</h2>
               </header>
               <div class="editor-panel">
-                <div class="replay-highlight-shell">
-                  <pre id="fuzzerRequestHighlight" class="simple-code-view replay-highlight-view" aria-hidden="true"></pre>
-                  <textarea id="fuzzerRequestEditor" class="request-editor request-editor-highlighted" spellcheck="false" placeholder="Press Command+I in HTTP or paste a request template with markers."></textarea>
-                </div>
+                <div id="fuzzerRequestCM" class="cm-container" style="height:100%"></div>
               </div>
             </section>
 
@@ -1128,14 +1112,14 @@
               </div>
             </section>
 
-            <section class="panel-card fuzzer-results-card">
+            <section class="panel-card fuzzer-results-card" style="display:flex;flex-direction:column;min-height:0">
               <header class="panel-toolbar">
                 <div>
                   <h2>Run results</h2>
                   <p class="inline-copy" id="fuzzerMeta">No fuzz run has been started yet.</p>
                 </div>
               </header>
-              <div class="history-table-shell">
+              <div class="history-table-shell" style="flex:1;min-height:0;overflow:auto">
                 <table class="mini-table">
                   <thead>
                     <tr>
@@ -1149,6 +1133,38 @@
                   </thead>
                   <tbody id="fuzzerResultsBody"></tbody>
                 </table>
+              </div>
+              <!-- Fuzzer result detail: Request / Response split pane -->
+              <div id="fuzzerDetailPanel" class="fuzzer-detail-panel hidden">
+                <div class="split-pane-horizontal" style="display:flex;flex:1;min-height:0">
+                  <section class="message-pane" style="flex:1;min-width:0;display:flex;flex-direction:column">
+                    <header class="pane-header">
+                      <strong>Request</strong>
+                      <div class="view-tabs">
+                        <button class="view-tab active fuzzer-detail-view-tab" data-fuzzer-detail-target="request" data-fuzzer-detail-view="pretty">Pretty</button>
+                        <button class="view-tab fuzzer-detail-view-tab" data-fuzzer-detail-target="request" data-fuzzer-detail-view="raw">Raw</button>
+                        <button class="view-tab fuzzer-detail-view-tab" data-fuzzer-detail-target="request" data-fuzzer-detail-view="hex">Hex</button>
+                      </div>
+                    </header>
+                    <div class="editor-shell" style="flex:1;min-height:0">
+                      <div id="fuzzerDetailReqCM" class="cm-container"></div>
+                    </div>
+                  </section>
+                  <section class="message-pane" style="flex:1;min-width:0;display:flex;flex-direction:column">
+                    <header class="pane-header">
+                      <strong>Response</strong>
+                      <span class="inline-copy" id="fuzzerDetailResponseMeta"></span>
+                      <div class="view-tabs">
+                        <button class="view-tab active fuzzer-detail-view-tab" data-fuzzer-detail-target="response" data-fuzzer-detail-view="pretty">Pretty</button>
+                        <button class="view-tab fuzzer-detail-view-tab" data-fuzzer-detail-target="response" data-fuzzer-detail-view="raw">Raw</button>
+                        <button class="view-tab fuzzer-detail-view-tab" data-fuzzer-detail-target="response" data-fuzzer-detail-view="hex">Hex</button>
+                      </div>
+                    </header>
+                    <div class="editor-shell" style="flex:1;min-height:0">
+                      <div id="fuzzerDetailResCM" class="cm-container"></div>
+                    </div>
+                  </section>
+                </div>
               </div>
             </section>
           </section>

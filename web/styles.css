@@ -2637,6 +2637,47 @@ body.pane-resizing-y {
   grid-column: 1 / -1;
 }
 
+.fuzzer-detail-panel {
+  border-top: 1px solid var(--border);
+  flex: 0 0 260px;
+  min-height: 180px;
+  max-height: 50%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.fuzzer-detail-panel.hidden {
+  display: none;
+}
+
+.fuzzer-detail-panel .split-pane-horizontal {
+  gap: 1px;
+  background: var(--border);
+}
+
+.fuzzer-detail-panel .message-pane {
+  background: var(--panel-code);
+}
+
+.fuzzer-detail-panel .pane-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  font-size: var(--font-xs);
+  border-bottom: 1px solid var(--border);
+}
+
+.fuzzer-detail-panel .view-tabs {
+  margin-left: auto;
+}
+
+/* Selected fuzzer result row */
+.fuzzer-result-selected {
+  background: var(--row-selected, rgba(255, 255, 255, 0.06)) !important;
+}
+
 .fuzzer-shell .panel-toolbar h2 {
   font-size: var(--font-md);
   line-height: 1.22;
@@ -5503,10 +5544,10 @@ body.pane-resizing-y {
   height: 100%;
 }
 .cm-container .cm-editor .cm-content {
-  color: #f1f1f1 !important;
+  color: var(--text, #f1f1f1);
 }
 .cm-container .cm-editor .cm-line {
-  color: #f1f1f1;
+  color: var(--text, #f1f1f1);
 }
 .cm-container .cm-scroller {
   scrollbar-width: thin;

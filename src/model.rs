@@ -53,7 +53,12 @@ impl EditableResponse {
         let content_type = headers
             .get(http::header::CONTENT_TYPE)
             .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        let body_encoding = if is_textual_body(content_type.as_deref(), body) {
+
+        // Decompress body based on Content-Encoding header (gzip, deflate, br)
+        let decoded_body = decode_content_encoding(headers, body);
+        let body_ref = decoded_body.as_deref().unwrap_or(body);
+
+        let body_encoding = if is_textual_body(content_type.as_deref(), body_ref) {
             BodyEncoding::Utf8
         } else {
             BodyEncoding::Base64
@@ -63,8 +68,8 @@ impl EditableResponse {
             status,
             headers: header_records(headers),
             body: match body_encoding {
-                BodyEncoding::Utf8 => String::from_utf8_lossy(body).into_owned(),
-                BodyEncoding::Base64 => STANDARD.encode(body),
+                BodyEncoding::Utf8 => String::from_utf8_lossy(body_ref).into_owned(),
+                BodyEncoding::Base64 => STANDARD.encode(body_ref),
             },
             body_encoding,
         }
@@ -97,7 +102,12 @@ impl EditableRequest {
         let content_type = headers
             .get(http::header::CONTENT_TYPE)
             .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
-        let body_encoding = if is_textual_body(content_type.as_deref(), body) {
+
+        // Decompress body based on Content-Encoding header (gzip, deflate, br)
+        let decoded_body = decode_content_encoding(headers, body);
+        let body_ref = decoded_body.as_deref().unwrap_or(body);
+
+        let body_encoding = if is_textual_body(content_type.as_deref(), body_ref) {
             BodyEncoding::Utf8
         } else {
             BodyEncoding::Base64
@@ -123,8 +133,8 @@ impl EditableRequest {
             path: path.into(),
             headers,
             body: match body_encoding {
-                BodyEncoding::Utf8 => String::from_utf8_lossy(body).into_owned(),
-                BodyEncoding::Base64 => STANDARD.encode(body),
+                BodyEncoding::Utf8 => String::from_utf8_lossy(body_ref).into_owned(),
+                BodyEncoding::Base64 => STANDARD.encode(body_ref),
             },
             body_encoding,
             preview_truncated: false,

@@ -170,6 +170,11 @@ struct TransactionQuery {
     q: Option<String>,
     method: Option<String>,
     limit: Option<usize>,
+    host: Option<String>,
+    status: Option<u16>,
+    status_range: Option<String>,
+    since: Option<String>,
+    mime: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,6 +655,11 @@ async fn list_transactions(
                 query: query.q,
                 method: query.method,
                 limit: query.limit,
+                host: query.host,
+                status: query.status,
+                status_range: query.status_range,
+                since: query.since,
+                mime: query.mime,
             })
             .await,
     )
