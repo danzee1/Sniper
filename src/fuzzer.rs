@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 static MARKER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new("§[^§]*§").expect("valid marker regex"));
+    LazyLock::new(|| Regex::new(r"\$payload\$").expect("valid marker regex"));
 
 use crate::{model::EditableRequest, proxy, state::AppState};
 
@@ -151,7 +151,7 @@ pub async fn run_attack(
     let marker_count = count_request_markers(&template);
     if marker_count == 0 {
         return Err(anyhow!(
-            "Request template is missing markers. Use §value§ markers or {{PAYLOAD}}."
+            "Request template is missing $payload$ markers."
         ));
     }
 
@@ -183,7 +183,7 @@ pub async fn run_attack(
 
     for (index, payload) in normalized_payloads.iter().enumerate() {
         let request = apply_payload_to_request(&template, payload)?;
-        match proxy::send_replay_request(state.clone(), request, None, source_transaction_id, None)
+        match proxy::send_replay_request(state.clone(), request, None, source_transaction_id, Some("HTTP/1.1".to_string()))
             .await
         {
             Ok(record) => {
@@ -284,25 +284,13 @@ fn apply_payload_to_request(template: &EditableRequest, payload: &str) -> Result
 }
 
 fn count_markers(value: &str) -> usize {
-    let count = MARKER_REGEX.find_iter(value).count();
-    if count > 0 {
-        count
-    } else {
-        value.matches("{{PAYLOAD}}").count() + value.matches("{{INTRUDER}}").count()
-    }
+    MARKER_REGEX.find_iter(value).count()
 }
 
 fn replace_markers(value: &str, payload: &str) -> Result<String> {
     if MARKER_REGEX.is_match(value) {
         return Ok(MARKER_REGEX.replace_all(value, payload).into_owned());
     }
-
-    if value.contains("{{PAYLOAD}}") || value.contains("{{INTRUDER}}") {
-        return Ok(value
-            .replace("{{PAYLOAD}}", payload)
-            .replace("{{INTRUDER}}", payload));
-    }
-
     Ok(value.to_string())
 }
 
@@ -312,17 +300,17 @@ mod tests {
     use crate::model::{BodyEncoding, HeaderRecord};
 
     #[test]
-    fn counts_and_replaces_burp_markers() {
+    fn counts_and_replaces_payload_markers() {
         let request = EditableRequest {
             scheme: "https".to_string(),
             host: "example.com".to_string(),
             method: "GET".to_string(),
-            path: "/items/§1§".to_string(),
+            path: "/items/$payload$".to_string(),
             headers: vec![HeaderRecord {
                 name: "x-test".to_string(),
-                value: "§header§".to_string(),
+                value: "$payload$".to_string(),
             }],
-            body: "{\"id\":\"§body§\"}".to_string(),
+            body: "{\"id\":\"$payload$\"}".to_string(),
             body_encoding: BodyEncoding::Utf8,
             preview_truncated: false,
         };

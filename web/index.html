@@ -1085,7 +1085,7 @@
         <section class="fuzzer-shell hidden" id="fuzzerShell">
           <header class="panel-toolbar replay-header">
             <div>
-              <p class="inline-copy">Use <code>§payload§</code> markers or <code>{{PAYLOAD}}</code> placeholders in the request.</p>
+              <p class="inline-copy">Use <code>$payload$</code> markers in the request template.</p>
             </div>
             <div class="toolbar-actions">
               <button class="secondary-action" id="resetFuzzerButton" type="button">Reset</button>
@@ -1094,24 +1094,29 @@
           </header>
 
           <section class="fuzzer-layout">
-            <section class="panel-card">
-              <header class="panel-toolbar">
-                <h2>Request template</h2>
-              </header>
-              <div class="editor-panel">
-                <div id="fuzzerRequestCM" class="cm-container" style="height:100%"></div>
-              </div>
-            </section>
-
-            <section class="panel-card">
-              <header class="panel-toolbar">
-                <h2>Payloads</h2>
-              </header>
-              <div class="editor-panel">
-                <textarea id="fuzzerPayloadsEditor" class="request-editor" spellcheck="false" placeholder="one payload per line"></textarea>
-              </div>
-            </section>
-
+            <!-- Top row: Request template | resizer | Payloads -->
+            <div class="fuzzer-top-row">
+              <section class="panel-card fuzzer-template-card">
+                <header class="panel-toolbar">
+                  <h2>Request template</h2>
+                </header>
+                <div class="editor-panel">
+                  <div id="fuzzerRequestCM" class="cm-container" style="height:100%"></div>
+                </div>
+              </section>
+              <div class="fuzzer-col-resizer" id="fuzzerColResizer"></div>
+              <section class="panel-card fuzzer-payloads-card">
+                <header class="panel-toolbar">
+                  <h2>Payloads</h2>
+                </header>
+                <div class="editor-panel">
+                  <textarea id="fuzzerPayloadsEditor" class="request-editor" spellcheck="false" placeholder="one payload per line"></textarea>
+                </div>
+              </section>
+            </div>
+            <!-- Horizontal resizer between top row and results -->
+            <div class="fuzzer-row-resizer" id="fuzzerRowResizer"></div>
+            <!-- Bottom: Run results + detail -->
             <section class="panel-card fuzzer-results-card" style="display:flex;flex-direction:column;min-height:0">
               <header class="panel-toolbar">
                 <div>
@@ -1135,6 +1140,7 @@
                 </table>
               </div>
               <!-- Fuzzer result detail: Request / Response split pane -->
+              <div class="fuzzer-detail-resizer hidden" id="fuzzerDetailResizer"></div>
               <div id="fuzzerDetailPanel" class="fuzzer-detail-panel hidden">
                 <div class="split-pane-horizontal" style="display:flex;flex:1;min-height:0">
                   <section class="message-pane" style="flex:1;min-width:0;display:flex;flex-direction:column">

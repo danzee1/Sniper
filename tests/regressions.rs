@@ -141,7 +141,7 @@ async fn replay_rejects_truncated_captured_request_reuse() {
         preview_truncated: true,
     };
 
-    let error = send_replay_request(state, request, None, Some(source_id))
+    let error = send_replay_request(state, request, None, Some(source_id), None)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("truncated at the preview cap"));
@@ -196,7 +196,7 @@ async fn replay_preserves_custom_host_header() {
         port: upstream_addr.port().to_string(),
     };
 
-    let record = send_replay_request(state, request, Some(target), None)
+    let record = send_replay_request(state, request, Some(target), None, None)
         .await
         .unwrap();
     let response_body = record.response.as_ref().expect("response should exist");

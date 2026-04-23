@@ -1094,7 +1094,7 @@ function bindEvents() {
   // Pane context menu (right-click on Request/Response code-view)
   const paneCtx = document.getElementById("paneContextMenu");
   if (paneCtx) {
-    [els.requestView, els.responseView].forEach((view) => {
+    [els.requestView, els.responseView, els.requestViewCM, els.responseViewCM].forEach((view) => {
       if (!view) return;
       view.addEventListener("contextmenu", (e) => {
         if (!state.selectedId) return;
@@ -1179,28 +1179,64 @@ function bindEvents() {
     loadTargetSiteMap(true).catch((error) => console.error(error));
   });
   els.startFuzzerButton.addEventListener("click", () => {
-    runFuzzerAttack().catch((error) => console.error(error));
+    runFuzzerAttack().catch((error) => {
+      console.error("Fuzzer start error:", error);
+      state.fuzzerAttackRecord = null;
+      state.fuzzerNotice = error.message || "An unexpected error occurred while starting the fuzzer.";
+      renderFuzzer();
+    });
   });
   els.resetFuzzerButton.addEventListener("click", resetFuzzer);
 
-  // Fuzzer result row click → show detail
-  els.fuzzerResultsBody.addEventListener("click", (e) => {
-    const row = e.target.closest(".fuzzer-result-row");
+  // Fuzzer layout resizers
+  initFuzzerResizers();
+
+  // Fuzzer result row selection helper
+  function selectFuzzerRow(row) {
     if (!row) return;
-    // Highlight selected row
     els.fuzzerResultsBody.querySelectorAll(".fuzzer-result-selected").forEach((r) => r.classList.remove("fuzzer-result-selected"));
     row.classList.add("fuzzer-result-selected");
+    row.scrollIntoView({ block: "nearest" });
     const txId = row.dataset.transactionId;
     if (txId) {
       showFuzzerResultDetail(txId).catch((err) => console.error(err));
     } else {
-      // No transaction (error result) — show note
       const result = state.fuzzerAttackRecord?.results?.[Number(row.dataset.resultIndex)];
       if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.remove("hidden");
+      const _dr = document.getElementById("fuzzerDetailResizer");
+      if (_dr) _dr.classList.remove("hidden");
       if (els.fuzzerDetailReqCM) updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, result?.note || "No transaction was captured for this payload.", { mode: "http" });
       if (els.fuzzerDetailResCM) updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
     }
+  }
+
+  // Fuzzer results shell (for keyboard navigation + focus)
+  const fuzzerResultsShell = els.fuzzerResultsBody.closest(".history-table-shell");
+
+  // Fuzzer result row click → show detail
+  els.fuzzerResultsBody.addEventListener("click", (e) => {
+    const row = e.target.closest(".fuzzer-result-row");
+    if (row) {
+      selectFuzzerRow(row);
+      if (fuzzerResultsShell) fuzzerResultsShell.focus({ preventScroll: true });
+    }
   });
+
+  // Fuzzer results keyboard navigation (↑↓)
+  if (fuzzerResultsShell) {
+    fuzzerResultsShell.setAttribute("tabindex", "0");
+    fuzzerResultsShell.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+      e.preventDefault();
+      const selected = els.fuzzerResultsBody.querySelector(".fuzzer-result-selected");
+      const rows = Array.from(els.fuzzerResultsBody.querySelectorAll(".fuzzer-result-row"));
+      if (!rows.length) return;
+      let idx = selected ? rows.indexOf(selected) : -1;
+      if (e.key === "ArrowDown") idx = Math.min(idx + 1, rows.length - 1);
+      else idx = Math.max(idx - 1, 0);
+      selectFuzzerRow(rows[idx]);
+    });
+  }
 
   // Fuzzer detail view mode tabs (Pretty/Raw/Hex)
   document.querySelectorAll(".fuzzer-detail-view-tab").forEach((btn) => {
@@ -1298,6 +1334,7 @@ function bindEvents() {
     document.execCommand("insertText", false, text);
   });
   els.replayRequestHighlight?.addEventListener("contextmenu", showReplayContextMenu);
+  els.replayRequestCM?.addEventListener("contextmenu", showReplayContextMenu);
   initReplayContextMenu();
   // Replay Pretty/Raw/Hex view tabs
   document.querySelectorAll(".replay-view-tab").forEach((btn) => {
@@ -5391,8 +5428,8 @@ function renderFuzzerRequestHighlight(text) {
   }
 
   let html = renderCodeHtml(text, "pretty", "request");
-  // Highlight payload placeholders: $payload$ and {{PAYLOAD}}
-  html = html.replace(/(\$payload\$|\{\{PAYLOAD\}\})/gi, '<span class="hl-payload-placeholder">$1</span>');
+  // Highlight $payload$ markers
+  html = html.replace(/(\$payload\$)/gi, '<span class="hl-payload-placeholder">$1</span>');
   els.fuzzerRequestHighlight.innerHTML = html;
   syncFuzzerRequestHighlightScroll();
 }
@@ -5785,7 +5822,7 @@ function renderFuzzer() {
       updateCodePaneCM("fuzzerReq", els.fuzzerRequestCM, state.fuzzerRequestText, {
         mode: "http", readOnly: false,
         payloadHighlight: true,
-        placeholder: "Paste an HTTP request with $payload$ or {{PAYLOAD}} markers...",
+        placeholder: "Paste an HTTP request with $payload$ markers...",
       });
       // Wire onChange to sync state
       const newCv = getCMView("fuzzerReq");
@@ -5811,9 +5848,14 @@ function renderFuzzer() {
     els.fuzzerMeta.textContent = state.fuzzerNotice || "No fuzz run has been started yet.";
     els.fuzzerResultsBody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="6">${escapeHtml(state.fuzzerNotice || "Use Command+I from HTTP or paste a template with markers to run the fuzzer.")}</td>
+        <td colspan="6">${escapeHtml(state.fuzzerNotice || "Use $payload$ markers in the request template, then click Start.")}</td>
       </tr>
     `;
+    // Hide detail panel and its resizer when no attack record
+    if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.add("hidden");
+    const _dr = document.getElementById("fuzzerDetailResizer");
+    if (_dr) _dr.classList.add("hidden");
+    state._fuzzerDetailRecord = null;
     return;
   }
 
@@ -5845,6 +5887,8 @@ async function showFuzzerResultDetail(transactionId) {
   if (!transactionId || !els.fuzzerDetailPanel) return;
 
   els.fuzzerDetailPanel.classList.remove("hidden");
+  const detailResizer = document.getElementById("fuzzerDetailResizer");
+  if (detailResizer) detailResizer.classList.remove("hidden");
 
   try {
     const resp = await fetch(`/api/transactions/${transactionId}`);
@@ -5864,8 +5908,18 @@ async function showFuzzerResultDetail(transactionId) {
   }
 }
 
+function syncFuzzerDetailTabs() {
+  document.querySelectorAll(".fuzzer-detail-view-tab").forEach((btn) => {
+    const target = btn.dataset.fuzzerDetailTarget;
+    const view = btn.dataset.fuzzerDetailView;
+    btn.classList.toggle("active", view === _fuzzerDetailViewModes[target]);
+  });
+}
+
 function renderFuzzerDetailPanes(record) {
   if (!record) return;
+
+  syncFuzzerDetailTabs();
 
   const reqMode = _fuzzerDetailViewModes.request;
   const resMode = _fuzzerDetailViewModes.response;
@@ -5912,6 +5966,8 @@ function renderFuzzerDetailPanes(record) {
 
 function hideFuzzerDetailPanel() {
   if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.add("hidden");
+  const dr = document.getElementById("fuzzerDetailResizer");
+  if (dr) dr.classList.add("hidden");
   state._fuzzerDetailRecord = null;
 }
 
@@ -6057,6 +6113,105 @@ async function sendToSequenceFromSelection() {
   renderToolPanels();
 }
 
+function initFuzzerResizers() {
+  const colHandle = document.getElementById("fuzzerColResizer");
+  const rowHandle = document.getElementById("fuzzerRowResizer");
+  const topRow = document.querySelector(".fuzzer-top-row");
+  const templateCard = document.querySelector(".fuzzer-template-card");
+  const payloadsCard = document.querySelector(".fuzzer-payloads-card");
+
+  // Column resizer: template ↔ payloads
+  if (colHandle && topRow && templateCard && payloadsCard) {
+    colHandle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startTemplateW = templateCard.offsetWidth;
+      const startPayloadsW = payloadsCard.offsetWidth;
+      const totalW = startTemplateW + startPayloadsW;
+      document.body.classList.add("pane-resizing-x");
+      colHandle.classList.add("active");
+      const onMove = (me) => {
+        const delta = me.clientX - startX;
+        const newTemplateW = Math.max(200, Math.min(totalW - 120, startTemplateW + delta));
+        const newPayloadsW = totalW - newTemplateW;
+        templateCard.style.flex = `0 0 ${newTemplateW}px`;
+        payloadsCard.style.flex = `0 0 ${newPayloadsW}px`;
+      };
+      const onUp = () => {
+        document.body.classList.remove("pane-resizing-x");
+        colHandle.classList.remove("active");
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    colHandle.addEventListener("dblclick", () => {
+      templateCard.style.flex = "";
+      payloadsCard.style.flex = "";
+    });
+  }
+
+  // Row resizer: top row ↔ results
+  if (rowHandle && topRow) {
+    rowHandle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startH = topRow.offsetHeight;
+      const layout = topRow.closest(".fuzzer-layout");
+      const layoutH = layout ? layout.offsetHeight : 800;
+      document.body.classList.add("pane-resizing-y");
+      rowHandle.classList.add("active");
+      const onMove = (me) => {
+        const delta = me.clientY - startY;
+        const newH = Math.max(120, Math.min(layoutH - 200, startH + delta));
+        topRow.style.height = `${newH}px`;
+      };
+      const onUp = () => {
+        document.body.classList.remove("pane-resizing-y");
+        rowHandle.classList.remove("active");
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    rowHandle.addEventListener("dblclick", () => {
+      topRow.style.height = "";
+    });
+  }
+
+  // Detail resizer: results table ↔ detail panel
+  const detailHandle = document.getElementById("fuzzerDetailResizer");
+  const detailPanel = els.fuzzerDetailPanel;
+  if (detailHandle && detailPanel) {
+    detailHandle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startH = detailPanel.offsetHeight;
+      const parentH = detailPanel.parentElement.offsetHeight;
+      document.body.classList.add("pane-resizing-y");
+      detailHandle.classList.add("active");
+      const onMove = (me) => {
+        const delta = startY - me.clientY; // drag up = bigger detail
+        const newH = Math.max(100, Math.min(parentH - 100, startH + delta));
+        detailPanel.style.flex = `0 0 ${newH}px`;
+      };
+      const onUp = () => {
+        document.body.classList.remove("pane-resizing-y");
+        detailHandle.classList.remove("active");
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    detailHandle.addEventListener("dblclick", () => {
+      detailPanel.style.flex = "";
+    });
+  }
+}
+
 function resetFuzzer() {
   state.fuzzerRequestText = state.fuzzerBaseRequest
     ? buildEditableRawRequest(state.fuzzerBaseRequest)
@@ -6081,11 +6236,36 @@ async function runFuzzerAttack() {
   const fuzzerReqText = getCMView("fuzzerReq")
     ? getCMView("fuzzerReq").getContent()
     : (els.fuzzerRequestEditor ? els.fuzzerRequestEditor.value : "");
-  const template = parseEditableRawRequest(fuzzerReqText, fallback);
+
+  if (!fuzzerReqText.trim()) {
+    state.fuzzerAttackRecord = null;
+    state.fuzzerNotice = "Request template is empty. Paste a raw HTTP request with $payload$ markers, or send one from HTTP History (Command+I).";
+    renderFuzzer();
+    return;
+  }
+
+  let template;
+  try {
+    template = parseEditableRawRequest(fuzzerReqText, fallback);
+  } catch (parseErr) {
+    state.fuzzerAttackRecord = null;
+    state.fuzzerNotice = parseErr.message || "Failed to parse the request template.";
+    renderFuzzer();
+    return;
+  }
+
   const payloads = els.fuzzerPayloadsEditor.value
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+
+  if (payloads.length === 0) {
+    state.fuzzerAttackRecord = null;
+    state.fuzzerNotice = "No payloads provided. Enter one payload per line in the Payloads panel.";
+    renderFuzzer();
+    return;
+  }
+
   const response = await fetch("/api/fuzzer/attacks", {
     method: "POST",
     headers: {
@@ -12226,12 +12406,12 @@ const diffDecoPlugin = CM.ViewPlugin.fromClass(
   { decorations: (v) => v.decorations },
 );
 
-// ─── Payload placeholder decoration plugin ($payload$ / {{PAYLOAD}}) ────────
+// ─── Payload marker decoration plugin ($payload$) ────────
 function buildPayloadDecorations(view) {
   const doc = view.state.doc;
   const text = doc.toString();
   if (!text) return CM.Decoration.none;
-  const re = /\$payload\$|\{\{PAYLOAD\}\}/gi;
+  const re = /\$payload\$/gi;
   const builder = [];
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -12305,7 +12485,7 @@ function createBaseExtensions(options = {}) {
     }]));
   } else {
     exts.push(CM.history());
-    exts.push(CM.keymap.of([...CM.defaultKeymap, ...CM.historyKeymap, ...CM.searchKeymap]));
+    exts.push(CM.keymap.of([...CM.defaultKeymap, ...CM.historyKeymap]));
   }
   if (options.placeholder) {
     exts.push(CM.placeholder(options.placeholder));
