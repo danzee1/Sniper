@@ -277,16 +277,15 @@ impl AppState {
     /// Download the latest DMG from GitHub releases, mount it, copy the new
     /// app bundle over the current one, then restart the process.
     /// Sends progress events through the provided sender.
-    pub async fn self_update(
-        &self,
-        tx: tokio::sync::mpsc::Sender<UpdateProgress>,
-    ) -> Result<()> {
+    pub async fn self_update(&self, tx: tokio::sync::mpsc::Sender<UpdateProgress>) -> Result<()> {
         use std::process::Command;
         use tokio::io::AsyncWriteExt;
 
         let app_bundle = self.app_bundle_path()?;
 
-        tx.send(UpdateProgress::step("Checking for updates...")).await.ok();
+        tx.send(UpdateProgress::step("Checking for updates..."))
+            .await
+            .ok();
 
         let client = reqwest::Client::builder()
             .user_agent(format!(
@@ -316,7 +315,9 @@ impl AppState {
             .context("no DMG asset found in the latest release")?;
 
         let total_size = dmg_asset.size;
-        tx.send(UpdateProgress::step("Downloading update...")).await.ok();
+        tx.send(UpdateProgress::step("Downloading update..."))
+            .await
+            .ok();
 
         // Stream-download DMG with progress
         let tmp_dir = std::env::temp_dir().join("sniper-update");
@@ -331,10 +332,7 @@ impl AppState {
             .error_for_status()
             .context("DMG download failed")?;
 
-        let content_length = response
-            .content_length()
-            .or(total_size)
-            .unwrap_or(0);
+        let content_length = response.content_length().or(total_size).unwrap_or(0);
 
         let mut file = tokio::fs::File::create(&dmg_path).await?;
         let mut stream = response.bytes_stream();
@@ -356,7 +354,9 @@ impl AppState {
         drop(file);
 
         // Mount the DMG (no -quiet so we get stdout with mount point)
-        tx.send(UpdateProgress::step("Installing update...")).await.ok();
+        tx.send(UpdateProgress::step("Installing update..."))
+            .await
+            .ok();
 
         let mount_output = Command::new("hdiutil")
             .args(["attach", "-nobrowse"])
@@ -407,10 +407,7 @@ impl AppState {
                 .args(["detach", "-quiet"])
                 .arg(&mount_point)
                 .output();
-            anyhow::bail!(
-                "cp failed: {}",
-                String::from_utf8_lossy(&cp_output.stderr)
-            );
+            anyhow::bail!("cp failed: {}", String::from_utf8_lossy(&cp_output.stderr));
         }
 
         // Detach DMG & clean up
@@ -596,7 +593,12 @@ pub struct UpdateProgress {
 
 impl UpdateProgress {
     fn step(msg: &str) -> Self {
-        Self { step: msg.to_string(), percent: None, downloaded: None, total: None }
+        Self {
+            step: msg.to_string(),
+            percent: None,
+            downloaded: None,
+            total: None,
+        }
     }
     fn download(pct: u8, downloaded: u64, total: u64) -> Self {
         Self {
@@ -609,10 +611,7 @@ impl UpdateProgress {
 }
 
 fn normalize_version_text(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches(|ch| ch == 'v' || ch == 'V')
-        .to_string()
+    value.trim().trim_start_matches(['v', 'V']).to_string()
 }
 
 fn parse_version(value: &str) -> Option<Version> {

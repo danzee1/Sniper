@@ -322,3 +322,9 @@ impl WsReplayStore {
         self.connections.write().await.remove(&id);
     }
 }
+
+impl Default for WsReplayStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}

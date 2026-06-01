@@ -150,9 +150,7 @@ pub async fn run_attack(
     let started_at = Utc::now();
     let marker_count = count_request_markers(&template);
     if marker_count == 0 {
-        return Err(anyhow!(
-            "Request template is missing $payload$ markers."
-        ));
+        return Err(anyhow!("Request template is missing $payload$ markers."));
     }
 
     let normalized_payloads = payloads
@@ -183,8 +181,14 @@ pub async fn run_attack(
 
     for (index, payload) in normalized_payloads.iter().enumerate() {
         let request = apply_payload_to_request(&template, payload)?;
-        match proxy::send_replay_request(state.clone(), request, None, source_transaction_id, Some("HTTP/1.1".to_string()))
-            .await
+        match proxy::send_replay_request(
+            state.clone(),
+            request,
+            None,
+            source_transaction_id,
+            Some("HTTP/1.1".to_string()),
+        )
+        .await
         {
             Ok(record) => {
                 results.push(FuzzerAttackResult {

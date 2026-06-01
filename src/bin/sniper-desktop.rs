@@ -1,7 +1,14 @@
 use std::{env, fs, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
-use sniper::{api, config::AppConfig, proxy, runtime_state::{self, RuntimeStateSnapshot}, skills, state::AppState};
+use sniper::{
+    api,
+    config::AppConfig,
+    proxy,
+    runtime_state::{self, RuntimeStateSnapshot},
+    skills,
+    state::AppState,
+};
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -122,13 +129,16 @@ fn main() -> Result<()> {
             let session = oast_state.session().await;
             // Sync OAST config from runtime settings
             let runtime_snap = session.runtime.snapshot().await;
-            session.oast.update_config(sniper::oast::OastConfig {
-                enabled: runtime_snap.oast_enabled,
-                server_url: runtime_snap.oast_server_url.clone(),
-                token: runtime_snap.oast_token.clone(),
-                polling_interval_secs: runtime_snap.oast_polling_interval_secs,
-                provider: runtime_snap.oast_provider.clone(),
-            }).await;
+            session
+                .oast
+                .update_config(sniper::oast::OastConfig {
+                    enabled: runtime_snap.oast_enabled,
+                    server_url: runtime_snap.oast_server_url.clone(),
+                    token: runtime_snap.oast_token.clone(),
+                    polling_interval_secs: runtime_snap.oast_polling_interval_secs,
+                    provider: runtime_snap.oast_provider.clone(),
+                })
+                .await;
             let _ = sniper::oast::start_oast_poller(session.oast.clone()).await;
         });
     }
@@ -325,7 +335,11 @@ fn install_cli_path() {
         let mut line = String::from("\n");
         line.push_str(&export_line);
         line.push('\n');
-        match std::fs::OpenOptions::new().create(true).append(true).open(rc_path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(rc_path)
+        {
             Ok(mut f) => {
                 use std::io::Write;
                 if let Err(e) = f.write_all(line.as_bytes()) {

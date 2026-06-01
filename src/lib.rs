@@ -1,13 +1,15 @@
+#![allow(clippy::too_many_arguments)]
+
 pub mod api;
 pub mod certificate;
 pub mod config;
 pub mod event_log;
-pub mod intercept;
 pub mod fuzzer;
+pub mod intercept;
 pub mod match_replace;
 pub mod model;
-pub mod proxy;
 pub mod oast;
+pub mod proxy;
 pub mod runtime;
 pub mod runtime_state;
 pub mod scanner;

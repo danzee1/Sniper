@@ -1,7 +1,10 @@
 use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -13,7 +16,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use http::{
     header::{
-        HeaderMap, HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+        HeaderMap, HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST,
         SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL,
         UPGRADE,
     },
@@ -44,11 +47,13 @@ use uuid::Uuid;
 
 use crate::{
     event_log::EventLevel,
-    intercept::{InterceptRecord, InterceptResolution, ResponseInterceptRecord, ResponseInterceptResolution},
+    intercept::{
+        InterceptRecord, InterceptResolution, ResponseInterceptRecord, ResponseInterceptResolution,
+    },
     model::{
-        BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, MessageRecord, RequestTargetOverride,
-        TransactionRecord, WebSocketFrameDirection, WebSocketFrameKind, WebSocketFrameRecord,
-        WebSocketSessionRecord,
+        BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, MessageRecord,
+        RequestTargetOverride, TransactionRecord, WebSocketFrameDirection, WebSocketFrameKind,
+        WebSocketFrameRecord, WebSocketSessionRecord,
     },
     session::SessionContext,
     special_host,
@@ -175,10 +180,7 @@ pub async fn rebind_proxy(
                     );
                 }
             }
-            return Err(format!(
-                "Could not bind to {} ({})",
-                new_addr, bind_err
-            ));
+            return Err(format!("Could not bind to {} ({})", new_addr, bind_err));
         }
     };
 
@@ -211,9 +213,8 @@ pub async fn serve_proxy(listener: TcpListener, state: Arc<AppState>) -> Result<
         let state = state.clone();
 
         tokio::spawn(async move {
-            let service = service_fn(move |request| {
-                handle_request(request, state.clone(), peer_addr)
-            });
+            let service =
+                service_fn(move |request| handle_request(request, state.clone(), peer_addr));
 
             if let Err(error) = http1::Builder::new()
                 .preserve_header_case(true)
@@ -246,11 +247,18 @@ pub async fn send_replay_request(
 
     let started_at = Utc::now();
     let started = Instant::now();
-    let (request, mut notes, original_request_capture) = apply_request_match_replace(session.as_ref(), request, state.config.body_preview_bytes).await;
+    let (request, mut notes, original_request_capture) =
+        apply_request_match_replace(session.as_ref(), request, state.config.body_preview_bytes)
+            .await;
     let request = build_replay_exchange_request(&request, target.as_ref())?;
     let upstream_insecure = session.runtime.upstream_insecure().await;
-    let client =
-        build_replay_client(upstream_insecure, &request, target.as_ref(), http_version.as_deref()).await?;
+    let client = build_replay_client(
+        upstream_insecure,
+        &request,
+        target.as_ref(),
+        http_version.as_deref(),
+    )
+    .await?;
     notes.push("Sent from Replay.".to_string());
     let exchange = execute_http_exchange(
         state.clone(),
@@ -557,10 +565,7 @@ async fn handle_http(
     session: Arc<SessionContext>,
     peer_addr: SocketAddr,
 ) -> Response<Body> {
-    handle_forwardable_request(
-        request, state, session, peer_addr, "http", None, false,
-    )
-    .await
+    handle_forwardable_request(request, state, session, peer_addr, "http", None, false).await
 }
 
 async fn handle_forwardable_request(
@@ -788,7 +793,10 @@ async fn serve_special_host_tls(
         handle_special_host_request(request, state.clone(), session.clone())
     });
     let mut builder = AutoBuilder::new(TokioExecutor::new());
-    builder.http1().preserve_header_case(true).title_case_headers(true);
+    builder
+        .http1()
+        .preserve_header_case(true)
+        .title_case_headers(true);
     builder
         .serve_connection(io, service)
         .await
@@ -919,7 +927,10 @@ async fn serve_https_mitm(
         )
     });
     let mut builder = AutoBuilder::new(TokioExecutor::new());
-    builder.http1().preserve_header_case(true).title_case_headers(true);
+    builder
+        .http1()
+        .preserve_header_case(true)
+        .title_case_headers(true);
     builder
         .serve_connection_with_upgrades(io, service)
         .await
@@ -1032,8 +1043,12 @@ async fn forward_http_request(
             return dropped.response;
         }
     };
-    let (forwarded_request, notes, original_request_capture) =
-        apply_request_match_replace(session.as_ref(), intercepted_request, state.config.body_preview_bytes).await;
+    let (forwarded_request, notes, original_request_capture) = apply_request_match_replace(
+        session.as_ref(),
+        intercepted_request,
+        state.config.body_preview_bytes,
+    )
+    .await;
 
     let client = build_client(session.runtime.upstream_insecure().await);
     let exchange = execute_http_exchange(
@@ -1088,9 +1103,10 @@ async fn forward_http_request(
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     rebuild_response(headers, status, body)
                 }
-                ResponseInterceptResolution::Drop => {
-                    text_response(StatusCode::BAD_GATEWAY, "Response dropped in intercept.".to_string())
-                }
+                ResponseInterceptResolution::Drop => text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Response dropped in intercept.".to_string(),
+                ),
             }
         }
         Err(error) => text_response(error.status, error.message),
@@ -1133,8 +1149,12 @@ async fn forward_websocket_request(
             return dropped.response;
         }
     };
-    let (forwarded_request, request_notes, original_request_capture) =
-        apply_request_match_replace(session.as_ref(), forwarded_request, state.config.body_preview_bytes).await;
+    let (forwarded_request, request_notes, original_request_capture) = apply_request_match_replace(
+        session.as_ref(),
+        forwarded_request,
+        state.config.body_preview_bytes,
+    )
+    .await;
 
     if !is_websocket_upgrade_editable(&forwarded_request) {
         let client = build_client(session.runtime.upstream_insecure().await);
@@ -1450,7 +1470,11 @@ async fn maybe_intercept_response(
             "Response queued",
             format!(
                 "{} {} {}{} → {}",
-                record.method, status.as_u16(), record.host, record.path, record.id
+                record.method,
+                status.as_u16(),
+                record.host,
+                record.path,
+                record.id
             ),
         )
         .await;
@@ -1657,7 +1681,8 @@ async fn execute_http_exchange(
                             notes,
                             original_request_capture,
                             original_response_capture,
-                        ).with_http_version(resp_version),
+                        )
+                        .with_http_version(resp_version),
                         response: Ok(UpstreamResponse {
                             status,
                             headers: applied_response.headers,
@@ -1768,7 +1793,11 @@ async fn apply_request_match_replace(
             preview_bytes,
         ))
     };
-    (applied_request.request, applied_request.notes, original_capture)
+    (
+        applied_request.request,
+        applied_request.notes,
+        original_capture,
+    )
 }
 
 async fn validate_reusable_request_source(
@@ -1825,13 +1854,35 @@ fn editable_request_from_parts(
 }
 
 fn header_map_from_records(headers: &[HeaderRecord]) -> HeaderMap {
+    // Used to reconstruct outbound REQUEST headers (Replay, intercept-forward,
+    // upstream proxy, etc.). Per RFC 7230 §3.2.2 and RFC 6265 §5.4, browsers
+    // MUST send a single `Cookie:` header with `; ` separated pairs. Some
+    // upstream servers reject requests with multiple `Cookie:` headers (502
+    // upstream connect failure observed on hyper/h1 frame parsing). Consolidate
+    // all Cookie values into one header to match real browser behaviour.
+    //
+    // Note: this function is REQUEST-side only. `Set-Cookie` (response) must
+    // never be merged — those use the dedicated response path.
     let mut map = HeaderMap::new();
+    let mut cookies: Vec<String> = Vec::new();
     for header in headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(header.name.as_bytes()),
-            HeaderValue::from_str(&header.value),
-        ) {
+        let Ok(name) = HeaderName::from_bytes(header.name.as_bytes()) else {
+            continue;
+        };
+        if name == COOKIE {
+            let trimmed = header.value.trim();
+            if !trimmed.is_empty() {
+                cookies.push(trimmed.to_string());
+            }
+            continue;
+        }
+        if let Ok(value) = HeaderValue::from_str(&header.value) {
             map.append(name, value);
+        }
+    }
+    if !cookies.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&cookies.join("; ")) {
+            map.insert(COOKIE, value);
         }
     }
     map
@@ -2033,21 +2084,79 @@ fn build_websocket_client_response_headers(
 }
 
 static LAST_PERSIST: Mutex<Option<Instant>> = Mutex::new(None);
+static PERSIST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
+static PERSIST_TRAILING_SCHEDULED: AtomicBool = AtomicBool::new(false);
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
 
 async fn persist_session_quiet(state: &Arc<AppState>, session: &Arc<SessionContext>) {
+    if let Some(delay) = persist_debounce_remaining() {
+        PERSIST_DIRTY.store(true, Ordering::Release);
+        schedule_delayed_persist(state, session, delay);
+        return;
+    }
+
+    if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        PERSIST_DIRTY.store(true, Ordering::Release);
+        schedule_delayed_persist(state, session, PERSIST_DEBOUNCE);
+        return;
+    }
+
+    spawn_persist_task(Arc::clone(state), Arc::clone(session));
+}
+
+fn persist_debounce_remaining() -> Option<Duration> {
+    let last = LAST_PERSIST.lock().unwrap_or_else(|e| e.into_inner());
+    last.and_then(|ts| PERSIST_DEBOUNCE.checked_sub(ts.elapsed()))
+}
+
+fn schedule_delayed_persist(state: &Arc<AppState>, session: &Arc<SessionContext>, delay: Duration) {
+    if PERSIST_TRAILING_SCHEDULED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let state = Arc::clone(state);
+    let session = Arc::clone(session);
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        PERSIST_TRAILING_SCHEDULED.store(false, Ordering::Release);
+        if !PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        start_persist_or_reschedule(state, session);
+    });
+}
+
+fn start_persist_or_reschedule(state: Arc<AppState>, session: Arc<SessionContext>) {
+    if let Some(delay) = persist_debounce_remaining() {
+        PERSIST_DIRTY.store(true, Ordering::Release);
+        schedule_delayed_persist(&state, &session, delay);
+        return;
+    }
+
+    if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        PERSIST_DIRTY.store(true, Ordering::Release);
+        schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE);
+        return;
+    }
+
+    spawn_persist_task(state, session);
+}
+
+fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>) {
     {
         let mut last = LAST_PERSIST.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ts) = *last {
-            if ts.elapsed() < PERSIST_DEBOUNCE {
-                return;
-            }
-        }
         *last = Some(Instant::now());
     }
-    if let Err(error) = state.persist_session_context(session).await {
-        warn!(?error, session_id = %session.id(), "failed to persist session snapshot");
-    }
+
+    tokio::spawn(async move {
+        if let Err(error) = state.persist_session_context(&session).await {
+            warn!(?error, session_id = %session.id(), "failed to persist session snapshot");
+        }
+        PERSIST_IN_FLIGHT.store(false, Ordering::Release);
+        if PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
+            schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE);
+        }
+    });
 }
 
 async fn relay_websocket_session(
@@ -2247,5 +2356,79 @@ fn binary_frame_record(
         body_encoding: BodyEncoding::Base64,
         body_size: bytes.len(),
         preview_truncated: bytes.len() > max_preview,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::HeaderRecord;
+
+    fn record(name: &str, value: &str) -> HeaderRecord {
+        HeaderRecord {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn merges_multiple_cookie_headers_into_one() {
+        let records = vec![
+            record("cookie", "ssoLogin_pc_kr=null"),
+            record("cookie", "ssoLogin_pc_en=null"),
+            record("cookie", "DFPKO_JSESSIONID=abc123"),
+            record("cookie", "uid=42"),
+        ];
+        let map = header_map_from_records(&records);
+        assert_eq!(map.get_all(COOKIE).iter().count(), 1);
+        let merged = map.get(COOKIE).unwrap().to_str().unwrap();
+        assert_eq!(
+            merged,
+            "ssoLogin_pc_kr=null; ssoLogin_pc_en=null; DFPKO_JSESSIONID=abc123; uid=42"
+        );
+    }
+
+    #[test]
+    fn preserves_other_repeated_headers() {
+        let records = vec![
+            record("accept", "text/html"),
+            record("accept-encoding", "gzip"),
+            record("accept-encoding", "deflate"),
+        ];
+        let map = header_map_from_records(&records);
+        assert_eq!(map.get_all("accept-encoding").iter().count(), 2);
+        assert_eq!(map.get("accept").unwrap(), "text/html");
+    }
+
+    #[test]
+    fn skips_empty_cookie_values() {
+        let records = vec![
+            record("cookie", "a=1"),
+            record("cookie", "   "),
+            record("cookie", ""),
+            record("cookie", "b=2"),
+        ];
+        let map = header_map_from_records(&records);
+        assert_eq!(map.get(COOKIE).unwrap(), "a=1; b=2");
+    }
+
+    #[test]
+    fn handles_request_without_cookies() {
+        let records = vec![record("user-agent", "test")];
+        let map = header_map_from_records(&records);
+        assert!(map.get(COOKIE).is_none());
+        assert_eq!(map.get("user-agent").unwrap(), "test");
+    }
+
+    #[test]
+    fn cookie_header_name_is_case_insensitive() {
+        let records = vec![
+            record("Cookie", "a=1"),
+            record("COOKIE", "b=2"),
+            record("cookie", "c=3"),
+        ];
+        let map = header_map_from_records(&records);
+        assert_eq!(map.get_all(COOKIE).iter().count(), 1);
+        assert_eq!(map.get(COOKIE).unwrap(), "a=1; b=2; c=3");
     }
 }

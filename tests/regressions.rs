@@ -36,7 +36,6 @@ async fn proxy_applies_request_match_replace_only_once() {
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
         body_preview_bytes: 4096,
-        upstream_insecure: false,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-match-replace-{}",
             Uuid::new_v4()
@@ -98,11 +97,8 @@ async fn replay_rejects_truncated_captured_request_reuse() {
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
         body_preview_bytes: 4,
-        upstream_insecure: false,
-        data_dir: std::env::temp_dir().join(format!(
-            "sniper-test-regression-replay-{}",
-            Uuid::new_v4()
-        )),
+        data_dir: std::env::temp_dir()
+            .join(format!("sniper-test-regression-replay-{}", Uuid::new_v4())),
     };
     let state = Arc::new(AppState::new(config).unwrap());
     let session = state.session().await;
@@ -167,7 +163,6 @@ async fn replay_preserves_custom_host_header() {
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
         body_preview_bytes: 4096,
-        upstream_insecure: false,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-replay-host-header-{}",
             Uuid::new_v4()
@@ -225,7 +220,6 @@ async fn intercept_forward_keeps_client_request_alive() {
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
         body_preview_bytes: 4096,
-        upstream_insecure: false,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-intercept-forward-{}",
             Uuid::new_v4()
@@ -240,6 +234,7 @@ async fn intercept_forward_keeps_client_request_alive() {
             websocket_capture_enabled: None,
             scope_patterns: None,
             passthrough_hosts: None,
+            ..Default::default()
         })
         .await;
 

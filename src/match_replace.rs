@@ -92,6 +92,12 @@ impl MatchReplaceStore {
     }
 }
 
+impl Default for MatchReplaceStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -> AppliedRequest {
     let mut request = request;
     let mut notes = Vec::new();
@@ -132,10 +138,20 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
             rule.target,
             MatchReplaceTarget::Any | MatchReplaceTarget::HeaderValue
         ) {
+            if let Ok((value, changed)) = replace_text(&request.host, &rule) {
+                if changed {
+                    request.host = value;
+                    matched = true;
+                }
+            }
+
             for header in &mut request.headers {
                 if let Ok((value, changed)) = replace_text(&header.value, &rule) {
                     if changed {
                         header.value = value;
+                        if header.name.eq_ignore_ascii_case("host") {
+                            request.host = header.value.clone();
+                        }
                         matched = true;
                     }
                 }
@@ -260,7 +276,9 @@ fn replace_text(value: &str, rule: &MatchReplaceRule) -> Result<(String, bool)> 
 fn replace_case_insensitive(value: &str, search: &str, replace: &str) -> Result<(String, bool)> {
     let escaped = regex::escape(search);
     let regex = RegexBuilder::new(&escaped).case_insensitive(true).build()?;
-    let replaced = regex.replace_all(value, regex::NoExpand(replace)).into_owned();
+    let replaced = regex
+        .replace_all(value, regex::NoExpand(replace))
+        .into_owned();
     let changed = replaced != value;
     Ok((replaced, changed))
 }

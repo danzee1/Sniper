@@ -10,18 +10,13 @@ use crate::model::{EditableRequest, EditableResponse};
 
 // ── Intercept Rules ──
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterceptScope {
+    #[default]
     Request,
     Response,
     Both,
-}
-
-impl Default for InterceptScope {
-    fn default() -> Self {
-        Self::Request
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,13 +40,8 @@ impl InterceptRule {
         }
 
         if !self.host_pattern.is_empty() {
-            let host = request
-                .host
-                .split_once(':')
-                .map(|(h, _)| h)
-                .unwrap_or(&request.host)
-                .to_ascii_lowercase();
-            let pattern = self.host_pattern.to_ascii_lowercase();
+            let host = host_without_port(&request.host).to_ascii_lowercase();
+            let pattern = host_without_port(&self.host_pattern).to_ascii_lowercase();
             if let Some(suffix) = pattern.strip_prefix("*.") {
                 if host != suffix && !host.ends_with(&format!(".{suffix}")) {
                     return false;
@@ -67,7 +57,11 @@ impl InterceptRule {
 
         if !self.method_filter.is_empty() {
             let method_upper = request.method.to_ascii_uppercase();
-            if !self.method_filter.iter().any(|m| m.to_ascii_uppercase() == method_upper) {
+            if !self
+                .method_filter
+                .iter()
+                .any(|m| m.to_ascii_uppercase() == method_upper)
+            {
                 return false;
             }
         }
@@ -127,7 +121,7 @@ impl InterceptRuleStore {
     pub async fn matches_any_response(&self, request: &EditableRequest) -> bool {
         let rules = self.rules.read().await;
         if rules.is_empty() {
-            return true; // No rules = intercept everything (backward compat)
+            return false; // No rules keeps the legacy request-only intercept behavior.
         }
         rules.iter().any(|rule| {
             rule.matches(request)
@@ -137,6 +131,12 @@ impl InterceptRuleStore {
 
     pub async fn snapshot(&self) -> Vec<InterceptRule> {
         self.rules.read().await.clone()
+    }
+}
+
+impl Default for InterceptRuleStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -209,7 +209,7 @@ impl InterceptQueue {
 
         receiver
             .await
-            .unwrap_or_else(|_| InterceptResolution::Drop(record.request))
+            .unwrap_or(InterceptResolution::Drop(record.request))
     }
 
     pub async fn list(&self) -> Vec<InterceptSummary> {
@@ -271,6 +271,12 @@ impl InterceptQueue {
             .send(InterceptResolution::Drop(pending.record.request))
             .map_err(|_| anyhow!("intercept consumer dropped before drop"))?;
         Ok(())
+    }
+}
+
+impl Default for InterceptQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -343,9 +349,7 @@ impl ResponseInterceptQueue {
             responder: sender,
         });
 
-        receiver
-            .await
-            .unwrap_or(ResponseInterceptResolution::Drop)
+        receiver.await.unwrap_or(ResponseInterceptResolution::Drop)
     }
 
     pub async fn list(&self) -> Vec<ResponseInterceptSummary> {
@@ -386,9 +390,9 @@ impl ResponseInterceptQueue {
         let mut queue = self.queue.lock().await;
         let count = queue.len();
         while let Some(pending) = queue.pop_front() {
-            let _ = pending
-                .responder
-                .send(ResponseInterceptResolution::Forward(pending.record.response));
+            let _ = pending.responder.send(ResponseInterceptResolution::Forward(
+                pending.record.response,
+            ));
         }
         count
     }
@@ -408,4 +412,26 @@ impl ResponseInterceptQueue {
             .map_err(|_| anyhow!("response intercept consumer dropped before drop"))?;
         Ok(())
     }
+}
+
+impl Default for ResponseInterceptQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn host_without_port(host: &str) -> &str {
+    let trimmed = host.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    if trimmed.matches(':').count() == 1 {
+        return trimmed
+            .split_once(':')
+            .map(|(value, _)| value)
+            .unwrap_or(trimmed);
+    }
+    trimmed
 }

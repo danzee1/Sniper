@@ -42,6 +42,7 @@ pub struct ReplayTabState {
     #[serde(rename = "type", default)]
     pub tab_type: String,
     pub sequence: usize,
+    pub custom_label: String,
     pub base_request: Option<EditableRequest>,
     pub source_transaction_id: Option<Uuid>,
     pub notice: String,
@@ -108,5 +109,11 @@ impl WorkspaceStateStore {
         let mut current = self.inner.write().await;
         *current = snapshot;
         current.clone()
+    }
+}
+
+impl Default for WorkspaceStateStore {
+    fn default() -> Self {
+        Self::new()
     }
 }

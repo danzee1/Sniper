@@ -21,7 +21,6 @@ async fn proxy_captures_basic_http_exchange() {
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
         body_preview_bytes: 4096,
-        upstream_insecure: false,
         data_dir: std::env::temp_dir().join(format!("sniper-test-http-{}", uuid::Uuid::new_v4())),
     };
     let state = Arc::new(AppState::new(config).unwrap());

@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aes::Aes256;
 use aes::cipher::{AsyncStreamCipher, KeyIvInit};
+use aes::Aes256;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use cfb_mode::Decryptor as CfbDecryptor;
@@ -19,18 +19,13 @@ use uuid::Uuid;
 
 // ── Provider enum ──
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum OastProvider {
     Interactsh,
     Boast,
+    #[default]
     Custom,
-}
-
-impl Default for OastProvider {
-    fn default() -> Self {
-        Self::Custom
-    }
 }
 
 impl std::fmt::Display for OastProvider {
@@ -111,6 +106,7 @@ impl OastCallback {
 
 // ── Registration state for Interactsh ──
 
+#[allow(clippy::large_enum_variant)]
 enum RegistrationState {
     None,
     Interactsh {
@@ -205,7 +201,9 @@ impl OastStore {
     }
 
     /// Blocking mutable access to entries — for use outside async context (e.g. session restore).
-    pub fn entries_mut_blocking(&self) -> tokio::sync::RwLockWriteGuard<'_, VecDeque<OastCallback>> {
+    pub fn entries_mut_blocking(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, VecDeque<OastCallback>> {
         // tokio::sync::RwLock doesn't have blocking_write, so use try_write in a spin.
         // At init time there's no contention so this succeeds immediately.
         loop {
@@ -256,7 +254,9 @@ fn extract_domain(url: &str) -> String {
 
 fn random_hex(len: usize) -> String {
     let mut rng = rand::thread_rng();
-    (0..len).map(|_| format!("{:x}", rng.gen::<u8>() & 0x0f)).collect()
+    (0..len)
+        .map(|_| format!("{:x}", rng.gen::<u8>() & 0x0f))
+        .collect()
 }
 
 // ── Public utility functions (backward compatible) ──
@@ -271,7 +271,10 @@ pub fn generate_correlation_id() -> String {
 /// Build an OAST payload URL from server URL and correlation ID.
 pub fn build_oast_payload(server_url: &str, correlation_id: &str) -> String {
     let base = server_url.trim_end_matches('/');
-    if let Some(domain) = base.strip_prefix("https://").or_else(|| base.strip_prefix("http://")) {
+    if let Some(domain) = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+    {
         format!("{correlation_id}.{domain}")
     } else {
         format!("{base}/{correlation_id}")
@@ -362,12 +365,18 @@ async fn register_interactsh(
         "correlation-id": correlation_id,
     });
 
-    let mut req = client.post(&url).json(&body).timeout(Duration::from_secs(15));
+    let mut req = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(15));
     if !token.is_empty() {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
 
-    let resp = req.send().await.map_err(|e| format!("register request failed: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("register request failed: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
@@ -403,7 +412,10 @@ async fn deregister_interactsh(
         "secret-key": secret_key,
     });
 
-    let mut req = client.post(&url).json(&body).timeout(Duration::from_secs(10));
+    let mut req = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(10));
     if !token.is_empty() {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
@@ -542,7 +554,10 @@ fn decrypt_interactsh_entry(entry: &str, aes_key: &[u8]) -> Option<OastCallback>
     // Ensure AES key is correct length (256-bit = 32 bytes)
     if aes_key.len() != 32 {
         // Interactsh sometimes returns shorter keys; pad or truncate
-        debug!(key_len = aes_key.len(), "Interactsh: unexpected AES key length");
+        debug!(
+            key_len = aes_key.len(),
+            "Interactsh: unexpected AES key length"
+        );
         // Try to use as-is if 16 or 24 bytes by padding to 32
         let mut padded = [0u8; 32];
         let copy_len = aes_key.len().min(32);
@@ -560,14 +575,13 @@ fn decrypt_interactsh_entry_with_key(
 ) -> Option<OastCallback> {
     let mut plaintext = ciphertext.to_vec();
 
-    let decryptor: CfbDecryptor<Aes256> =
-        match CfbDecryptor::<Aes256>::new_from_slices(key, iv) {
-            Ok(d) => d,
-            Err(e) => {
-                debug!(error = %e, "Interactsh: AES-CFB init failed");
-                return None;
-            }
-        };
+    let decryptor: CfbDecryptor<Aes256> = match CfbDecryptor::<Aes256>::new_from_slices(key, iv) {
+        Ok(d) => d,
+        Err(e) => {
+            debug!(error = %e, "Interactsh: AES-CFB init failed");
+            return None;
+        }
+    };
 
     decryptor.decrypt(&mut plaintext);
 
@@ -636,7 +650,12 @@ async fn poll_boast(base_url: &str, client: &reqwest::Client) -> Vec<OastCallbac
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/events");
 
-    let resp = match client.get(&url).timeout(Duration::from_secs(10)).send().await {
+    let resp = match client
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             debug!(error = %e, "BOAST poll failed");
@@ -708,7 +727,12 @@ async fn poll_custom(config: &OastConfig, client: &reqwest::Client) -> Vec<OastC
         format!("{base}/poll?token={}", config.token)
     };
 
-    let response = match client.get(&poll_url).timeout(Duration::from_secs(10)).send().await {
+    let response = match client
+        .get(&poll_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             debug!(error = %e, "OAST poll failed");
@@ -729,7 +753,12 @@ async fn poll_custom(config: &OastConfig, client: &reqwest::Client) -> Vec<OastC
         remote_addr: String,
         #[serde(default, alias = "raw-request", alias = "raw_request")]
         raw_data: String,
-        #[serde(default, alias = "unique-id", alias = "unique_id", alias = "correlation_id")]
+        #[serde(
+            default,
+            alias = "unique-id",
+            alias = "unique_id",
+            alias = "correlation_id"
+        )]
         correlation_id: String,
     }
 

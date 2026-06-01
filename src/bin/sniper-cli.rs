@@ -11,8 +11,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use sniper::{
     certificate::default_data_dir,
-    intercept::{InterceptRecord, InterceptRule, InterceptSummary, ResponseInterceptRecord, ResponseInterceptSummary},
     fuzzer::FuzzerAttackRecord,
+    intercept::{
+        InterceptRecord, InterceptRule, InterceptSummary, ResponseInterceptRecord,
+        ResponseInterceptSummary,
+    },
     match_replace::{MatchReplaceRule, MatchReplaceRulesPayload},
     model::{
         BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, RequestTargetOverride,
@@ -837,7 +840,8 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
             print_json(&tab)
         }
         HistoryCommand::Fuzzer(args) => {
-            let mut workspace: WorkspaceStateSnapshot = api.get_json("/api/workspace-state").await?;
+            let mut workspace: WorkspaceStateSnapshot =
+                api.get_json("/api/workspace-state").await?;
             let (base_request, source_transaction_id, request_text) =
                 resolve_request_source(&api, Some(args.id), None, false).await?;
             workspace.fuzzer.base_request = base_request;
@@ -1327,10 +1331,7 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
         }
         SequenceCommand::Run(args) => {
             let result: serde_json::Value = api
-                .post_json(
-                    &format!("/api/sequences/{}/run", args.id),
-                    &json!({}),
-                )
+                .post_json(&format!("/api/sequences/{}/run", args.id), &json!({}))
                 .await?;
             print_json(&result)
         }
@@ -1379,17 +1380,24 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             print_json(&limited)
         }
         OastCommand::Get(args) => {
-            let cb: serde_json::Value =
-                api.get_json(&format!("/api/oast/callbacks/{}", args.id)).await?;
+            let cb: serde_json::Value = api
+                .get_json(&format!("/api/oast/callbacks/{}", args.id))
+                .await?;
             print_json(&cb)
         }
         OastCommand::Generate => {
-            let result: serde_json::Value =
-                api.request_json::<(), serde_json::Value>(reqwest::Method::POST, "/api/oast/generate", None).await?;
+            let result: serde_json::Value = api
+                .request_json::<(), serde_json::Value>(
+                    reqwest::Method::POST,
+                    "/api/oast/generate",
+                    None,
+                )
+                .await?;
             print_json(&result)
         }
         OastCommand::Clear => {
-            api.post_status("/api/oast/callbacks/clear", &serde_json::json!({})).await?;
+            api.post_status("/api/oast/callbacks/clear", &serde_json::json!({}))
+                .await?;
             print_json(&serde_json::json!({"status": "cleared"}))
         }
         OastCommand::Configure(args) => {
@@ -1404,7 +1412,10 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
                 update.insert("oast_token".into(), serde_json::Value::String(token));
             }
             if let Some(interval) = args.interval {
-                update.insert("oast_polling_interval_secs".into(), serde_json::json!(interval));
+                update.insert(
+                    "oast_polling_interval_secs".into(),
+                    serde_json::json!(interval),
+                );
             }
             if args.enable {
                 update.insert("oast_enabled".into(), serde_json::Value::Bool(true));
@@ -1415,21 +1426,28 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             if update.is_empty() {
                 // Just show current settings
                 let runtime: serde_json::Value = api.get_json("/api/runtime").await?;
-                let oast_fields: serde_json::Map<String, serde_json::Value> = runtime.as_object()
-                    .map(|o| o.iter()
-                        .filter(|(k, _)| k.starts_with("oast_"))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect())
+                let oast_fields: serde_json::Map<String, serde_json::Value> = runtime
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter(|(k, _)| k.starts_with("oast_"))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 print_json(&oast_fields)
             } else {
-                let result: serde_json::Value =
-                    api.post_json("/api/runtime", &serde_json::Value::Object(update)).await?;
-                let oast_fields: serde_json::Map<String, serde_json::Value> = result.as_object()
-                    .map(|o| o.iter()
-                        .filter(|(k, _)| k.starts_with("oast_"))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect())
+                let result: serde_json::Value = api
+                    .post_json("/api/runtime", &serde_json::Value::Object(update))
+                    .await?;
+                let oast_fields: serde_json::Map<String, serde_json::Value> = result
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter(|(k, _)| k.starts_with("oast_"))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 print_json(&oast_fields)
             }
@@ -1469,7 +1487,8 @@ async fn open_replay_tab(
     workspace.replay.tab_sequence = sequence;
     workspace.replay.active_tab_id = Some(tab.id.clone());
     workspace.replay.tabs.push(tab.clone());
-    let snapshot: WorkspaceStateSnapshot = api.post_json("/api/workspace-state", &workspace).await?;
+    let snapshot: WorkspaceStateSnapshot =
+        api.post_json("/api/workspace-state", &workspace).await?;
     let tab = find_replay_tab(&snapshot.replay, &tab.id)?;
     Ok(tab.clone())
 }
@@ -1919,7 +1938,8 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
             .codex_dir
             .clone()
             .unwrap_or_else(skills::default_codex_skills_dir);
-        let path = skills::install_skill_folder(&root, skills::SKILL_NAME, skills::CODEX_SKILL_TEMPLATE)?;
+        let path =
+            skills::install_skill_folder(&root, skills::SKILL_NAME, skills::CODEX_SKILL_TEMPLATE)?;
         installed.push(skills::InstalledSkill {
             agent: "codex",
             path: path.display().to_string(),
@@ -1930,7 +1950,8 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
             .claude_dir
             .clone()
             .unwrap_or_else(skills::default_claude_skills_dir);
-        let path = skills::install_skill_folder(&root, skills::SKILL_NAME, skills::CLAUDE_SKILL_TEMPLATE)?;
+        let path =
+            skills::install_skill_folder(&root, skills::SKILL_NAME, skills::CLAUDE_SKILL_TEMPLATE)?;
         installed.push(skills::InstalledSkill {
             agent: "claude",
             path: path.display().to_string(),
@@ -1984,12 +2005,10 @@ fn parse_editable_raw_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_editable_raw_request, normalize_api_base_url, parse_editable_raw_request,
-    };
+    use super::{build_editable_raw_request, normalize_api_base_url, parse_editable_raw_request};
     use sniper::model::{BodyEncoding, EditableRequest, HeaderRecord};
     use sniper::skills;
-    use std::{fs, path::PathBuf};
+    use std::fs;
     use uuid::Uuid;
 
     #[test]
@@ -2048,9 +2067,10 @@ mod tests {
     #[test]
     fn install_skill_folder_writes_skill_markdown() {
         let root = std::env::temp_dir().join(format!("sniper-skill-test-{}", Uuid::new_v4()));
-        let skill_dir = skills::install_skill_folder(&root, "sniper-operator", "# test skill\n").unwrap();
+        let skill_dir =
+            skills::install_skill_folder(&root, "sniper-operator", "# test skill\n").unwrap();
         let skill_md = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
         assert_eq!(skill_md, "# test skill\n");
-        fs::remove_dir_all(PathBuf::from(root)).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

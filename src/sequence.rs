@@ -182,12 +182,7 @@ impl SequenceStore {
     }
 
     pub async fn get_run(&self, id: Uuid) -> Option<SequenceRunRecord> {
-        self.runs
-            .read()
-            .await
-            .iter()
-            .find(|r| r.id == id)
-            .cloned()
+        self.runs.read().await.iter().find(|r| r.id == id).cloned()
     }
 
     pub async fn snapshot_definitions(&self) -> Vec<SequenceDefinition> {
@@ -254,23 +249,21 @@ fn extract_from_response(
 
         let value = match rule.source {
             ExtractionSource::ResponseHeader => source_text,
-            ExtractionSource::ResponseBody => {
-                match Regex::new(&rule.pattern) {
-                    Ok(regex) => regex
-                        .captures(&source_text)
-                        .and_then(|caps| caps.get(rule.group).map(|m| m.as_str().to_string()))
-                        .unwrap_or_default(),
-                    Err(e) => {
-                        tracing::warn!(
-                            variable = %rule.variable_name,
-                            pattern = %rule.pattern,
-                            error = %e,
-                            "Invalid regex pattern in extraction rule"
-                        );
-                        String::new()
-                    }
+            ExtractionSource::ResponseBody => match Regex::new(&rule.pattern) {
+                Ok(regex) => regex
+                    .captures(&source_text)
+                    .and_then(|caps| caps.get(rule.group).map(|m| m.as_str().to_string()))
+                    .unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!(
+                        variable = %rule.variable_name,
+                        pattern = %rule.pattern,
+                        error = %e,
+                        "Invalid regex pattern in extraction rule"
+                    );
+                    String::new()
                 }
-            }
+            },
         };
 
         if !value.is_empty() {
@@ -308,14 +301,8 @@ pub async fn run_sequence(
     for step in &definition.steps {
         let request = apply_variables_to_request(&step.request, &variables);
 
-        match proxy::send_replay_request(
-            state.clone(),
-            request,
-            step.target.clone(),
-            None,
-            None,
-        )
-        .await
+        match proxy::send_replay_request(state.clone(), request, step.target.clone(), None, None)
+            .await
         {
             Ok(record) => {
                 let response_body = record

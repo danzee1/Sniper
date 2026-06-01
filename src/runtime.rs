@@ -170,6 +170,12 @@ impl RuntimeSettings {
     }
 }
 
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn normalize_scope_patterns(patterns: Vec<String>) -> Vec<String> {
     patterns
         .into_iter()
@@ -195,18 +201,34 @@ fn matches_passthrough(host: &str, patterns: &[String]) -> bool {
 }
 
 fn host_matches_any(host: &str, patterns: &[String]) -> bool {
-    let hostname = host
-        .split_once(':')
-        .map(|(value, _)| value)
-        .unwrap_or(host)
-        .trim()
-        .to_ascii_lowercase();
+    let hostname = normalize_host_for_matching(host);
 
     patterns.iter().any(|pattern| {
-        if let Some(suffix) = pattern.strip_prefix("*.") {
+        let normalized = normalize_host_for_matching(pattern);
+        if let Some(suffix) = normalized.strip_prefix("*.") {
             hostname == suffix || hostname.ends_with(&format!(".{suffix}"))
         } else {
-            hostname == *pattern
+            hostname == normalized
         }
     })
+}
+
+fn normalize_host_for_matching(host: &str) -> String {
+    host_without_port(host).to_ascii_lowercase()
+}
+
+fn host_without_port(host: &str) -> &str {
+    let trimmed = host.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    if trimmed.matches(':').count() == 1 {
+        return trimmed
+            .split_once(':')
+            .map(|(value, _)| value)
+            .unwrap_or(trimmed);
+    }
+    trimmed
 }

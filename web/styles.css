@@ -3405,10 +3405,10 @@ body.pane-resizing-y {
 .replay-tab-strip {
   display: flex;
   align-items: center;
-  gap: 10px;
-  min-height: 52px;
+  gap: 6px;
+  min-height: 34px;
   min-width: 0;
-  padding: 9px 12px;
+  padding: 4px 8px;
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.02);
   overflow: hidden;
@@ -3417,7 +3417,7 @@ body.pane-resizing-y {
 .replay-tab-list {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 5px;
   min-width: 0;
   flex: 1 1 0%;
   width: 0;
@@ -3432,7 +3432,7 @@ body.pane-resizing-y {
   min-width: 0;
   max-width: 100%;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.03);
 }
 
@@ -3450,11 +3450,23 @@ body.pane-resizing-y {
 }
 
 .replay-tab-button {
-  max-width: 220px;
-  padding: 7px 11px;
+  max-width: 180px;
+  padding: 4px 8px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.replay-tab-name-input {
+  width: 150px;
+  max-width: 180px;
+  min-width: 96px;
+  padding: 3px 8px;
+  border: none;
+  outline: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font: inherit;
 }
 
 .replay-tab.active .replay-tab-button,
@@ -3465,16 +3477,16 @@ body.pane-resizing-y {
 }
 
 .replay-tab-close {
-  width: 30px;
-  height: 30px;
+  width: 24px;
+  height: 24px;
   border-left: 1px solid rgba(255, 255, 255, 0.05);
-  font-size: 18px;
+  font-size: 15px;
   line-height: 1;
 }
 
 .replay-tab-pin-btn {
-  width: 26px;
-  height: 26px;
+  width: 22px;
+  height: 22px;
   padding: 0;
   border: none;
   border-right: 1px solid rgba(255, 255, 255, 0.06);
@@ -3520,7 +3532,13 @@ body.pane-resizing-y {
 }
 
 .replay-tab-add {
-  min-width: 42px;
+  min-width: 32px;
+  min-height: 26px;
+  padding: 0;
+  font-size: var(--font-sm);
+}
+
+button.utility-button.replay-tab-add {
   padding: 0;
 }
 
@@ -3528,9 +3546,9 @@ body.pane-resizing-y {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   min-width: 0;
-  padding: 9px 12px;
+  padding: 5px 8px;
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.02);
 }
@@ -3538,16 +3556,17 @@ body.pane-resizing-y {
 .replay-toolbar-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
   flex: 0 1 auto;
 }
 
 .replay-toolbar-actions .primary-action,
 .replay-toolbar-actions .secondary-action {
-  min-height: 34px;
-  padding: 0 12px;
-  font-size: var(--font-sm);
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: var(--font-xs);
 }
 
 .replay-toolbar-copy {
@@ -3555,11 +3574,11 @@ body.pane-resizing-y {
 }
 
 .replay-send-button {
-  min-width: 58px;
+  min-width: 52px;
 }
 
 .replay-history-button {
-  min-width: 34px;
+  min-width: 28px;
   padding-inline: 0;
 }
 
@@ -3567,7 +3586,7 @@ body.pane-resizing-y {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 14px;
+  gap: 8px;
   min-width: 0;
   flex: 1 1 0%;
   overflow: hidden;
@@ -4393,32 +4412,33 @@ body.pane-resizing-y {
 
 .replay-target-bar {
   display: grid;
-  grid-template-columns: 96px minmax(180px, 1fr) 72px 88px;
-  gap: 10px;
+  grid-template-columns: 86px minmax(160px, 1fr) 64px 76px;
+  gap: 8px;
   min-width: 0;
-  width: min(100%, 680px);
+  width: min(100%, 610px);
 }
 
 .compact-field {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 3px;
 }
 
 .compact-field span {
   color: var(--text-dim);
   font-size: var(--font-2xs);
   letter-spacing: 0.08em;
+  line-height: 1.1;
   text-transform: uppercase;
 }
 
 .compact-field input,
 .compact-field select {
   width: 100%;
-  min-height: 38px;
-  padding: 8px 10px;
+  min-height: 28px;
+  padding: 4px 8px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--panel-code);
   color: var(--text);
 }

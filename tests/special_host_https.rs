@@ -15,7 +15,6 @@ async fn https_sniper_serves_the_certificate_portal() {
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
         body_preview_bytes: 4096,
-        upstream_insecure: false,
         data_dir: std::env::temp_dir()
             .join(format!("sniper-test-special-host-{}", uuid::Uuid::new_v4())),
     };

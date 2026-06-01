@@ -95,6 +95,20 @@ const HISTORY_COLUMN_DEFS = {
   started_at: { label: "Time", cssClass: "col-time", sortKey: "started_at" },
 };
 const DEFAULT_HISTORY_COLUMN_ORDER = ["index", "host", "method", "path", "status", "length", "mime", "notes", "tls", "started_at"];
+const HISTORY_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+const HISTORY_SORT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const HTTP_HISTORY_PAGE_SIZE = 5000;
+const HTTP_HISTORY_MAX_LOADED_ITEMS = 12000;
+const HTTP_HISTORY_BACKFILL_DELAY_MS = 80;
+const HTTP_HISTORY_SCROLL_PREFETCH_ROWS = 120;
+const HTTP_HISTORY_POLL_FALLBACK_MS = 30000;
 const WS_COLUMN_RULES = {
   index:       { default: 48,  min: 36,  max: 80 },
   host:        { default: 260, min: 120, max: 600 },
@@ -175,10 +189,28 @@ function showToast(message, type = "success", durationMs = 2000) {
   }, durationMs);
 }
 
+function createHistoryPagingState() {
+  return {
+    generation: 0,
+    pageSize: HTTP_HISTORY_PAGE_SIZE,
+    offset: 0,
+    beforeSequence: null,
+    total: 0,
+    filteredTotal: null,
+    hasMore: true,
+    loading: false,
+    fullyLoaded: false,
+    backfillScheduled: false,
+    trimmedHeadCount: 0,
+    trimmedTailCount: 0,
+  };
+}
+
 const state = {
   items: [],
   selectedId: null,
   selectedRecord: null,
+  historyPaging: createHistoryPagingState(),
   sessions: [],
   activeSession: null,
   selectedSessionId: null,
@@ -190,7 +222,7 @@ const state = {
   inspectorCollapsed: true,
   query: "",
   method: "",
-  sortKey: "started_at",
+  sortKey: "index",
   sortDirection: "desc",
   settings: null,
   appVersion: null,
@@ -241,6 +273,7 @@ const state = {
   replayTabs: [],
   activeReplayTabId: null,
   replayTabSequence: 0,
+  replayRenamingTabId: null,
   replayMessageViews: { request: "pretty", response: "pretty" },
   interceptEditorSeedId: null,
   interceptInScopeOnly: false,
@@ -262,10 +295,18 @@ const state = {
   fuzzerPayloadsText: "",
   fuzzerAttackRecord: null,
   _cachedVisibleEntries: null,
+  _cachedVisibleEntriesKey: "",
+  _visibleEntriesSearchCache: null,
   _historyEntries: null,
+  _itemById: new Map(),
+  _itemIndexById: new Map(),
+  _itemsVersion: 0,
   toolsReady: false,
   workbenchHeight: null,
 };
+
+let _historyPagingGeneration = 0;
+let _lastHttpHistoryFallbackPoll = Date.now();
 
 const els = {
   dashboardShell: document.getElementById("dashboardShell"),
@@ -755,6 +796,9 @@ function bindEvents() {
       if (state.activeProxyTab === "websockets-history") {
         loadWebsockets(true).catch((error) => console.error(error));
       }
+      if (state.activeProxyTab === "http-history") {
+        scheduleIncrementalRefresh();
+      }
       if (state.activeProxyTab === "proxy-settings") {
         loadRuntimeSettings().catch((error) => console.error(error));
       }
@@ -829,26 +873,38 @@ function bindEvents() {
     openContextMenu(event.clientX, event.clientY, row.dataset.id);
   });
 
+  let _searchDebounce = 0;
+  els.searchInput.addEventListener("input", () => {
+    // Pause incremental refresh while user is actively typing
+    _searchActiveUntil = Date.now() + 800;
+    clearTimeout(_searchDebounce);
+    _searchDebounce = setTimeout(() => {
+      state.query = els.searchInput.value.trim();
+      scheduleRefresh();
+    }, 60);
+  });
   els.searchInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
+      clearTimeout(_searchDebounce);
       state.query = els.searchInput.value.trim();
       scheduleRefresh();
     }
   });
   els.searchInput.addEventListener("search", () => {
     // Triggered when user clears the search field via the X button
+    clearTimeout(_searchDebounce);
     state.query = els.searchInput.value.trim();
     scheduleRefresh();
   });
 
   els.requestSearchInput.addEventListener("input", () => {
     state.messageSearch.request = els.requestSearchInput.value;
-    renderMessagePanes();
+    updateMessagePaneSearch("request");
   });
 
   els.responseSearchInput.addEventListener("input", () => {
     state.messageSearch.response = els.responseSearchInput.value;
-    renderMessagePanes();
+    updateMessagePaneSearch("response");
   });
 
   els.replayRequestSearchInput.addEventListener("input", () => {
@@ -1560,7 +1616,7 @@ function bindEvents() {
       event.preventDefault();
       const colors = ["red", "orange", "yellow", "green", "blue", "purple"];
       const color = colors[parseInt(event.key) - 1];
-      const item = state.items.find((i) => i.id === state.selectedId);
+      const item = getHistoryItem(state.selectedId);
       const newColor = item?.color_tag === color ? null : color;
       if (item) item.color_tag = newColor;
       invalidateVisibleEntriesCache();
@@ -1872,25 +1928,6 @@ function bindEvents() {
     normalizeWorkbenchStackHeight();
   });
 
-  // Event delegation for history table rows (Phase 1 perf optimization)
-  els.historyTableBody.addEventListener("click", (event) => {
-    const row = event.target.closest(".history-row");
-    if (!row || !row.dataset.id) return;
-    const id = row.dataset.id;
-    state.selectedId = id;
-    updateHistorySelection(id);
-    scrollSelectedHistoryRowIntoView();
-    loadTransactionDetail(id).catch((error) => console.error(error));
-  });
-  els.historyTableBody.addEventListener("contextmenu", (event) => {
-    const row = event.target.closest(".history-row");
-    if (!row || !row.dataset.id) return;
-    event.preventDefault();
-    const id = row.dataset.id;
-    state.selectedId = id;
-    updateHistorySelection(id);
-    openContextMenu(event.clientX, event.clientY, id);
-  });
 }
 
 async function loadSettings(retries = 5) {
@@ -2046,6 +2083,7 @@ function applyWorkspaceState(snapshot) {
   state.activeReplayTabId = tabs.some((tab) => tab.id === replayWS.active_tab_id)
     ? replayWS.active_tab_id
     : tabs[0]?.id ?? null;
+  state.replayRenamingTabId = null;
 
   const fuzzerWS = snapshot?.fuzzer || {};
   state.fuzzerBaseRequest = fuzzerWS.base_request ? cloneEditableRequest(fuzzerWS.base_request) : null;
@@ -2066,6 +2104,7 @@ function hydrateReplayTab(tab) {
       id: typeof tab.id === "string" && tab.id ? tab.id : crypto.randomUUID(),
       type: "websocket",
       sequence: Number.isFinite(tab.sequence) ? tab.sequence : state.replayTabSequence + 1,
+      customLabel: normalizeReplayTabCustomLabel(tab.custom_label || tab.label || ""),
       pinned: !!tab.pinned,
       label: `WS ${tab.ws_host || "draft"}`,
       wsScheme: tab.ws_scheme || "wss",
@@ -2104,6 +2143,7 @@ function hydrateReplayTab(tab) {
   return {
     id: typeof tab.id === "string" && tab.id ? tab.id : crypto.randomUUID(),
     sequence: Number.isFinite(tab.sequence) ? tab.sequence : state.replayTabSequence + 1,
+    customLabel: normalizeReplayTabCustomLabel(tab.custom_label || ""),
     pinned: !!tab.pinned,
     baseRequest: fallbackRequest,
     sourceTransactionId: tab.source_transaction_id || null,
@@ -2150,6 +2190,7 @@ function snapshotWorkspaceState() {
             id: tab.id,
             type: "websocket",
             sequence: tab.sequence,
+            custom_label: tab.customLabel || "",
             pinned: !!tab.pinned,
             ws_scheme: tab.wsScheme || "wss",
             ws_host: tab.wsHost || "",
@@ -2167,6 +2208,7 @@ function snapshotWorkspaceState() {
         return {
           id: tab.id,
           sequence: tab.sequence,
+          custom_label: tab.customLabel || "",
           pinned: !!tab.pinned,
           base_request: tab.baseRequest ? cloneEditableRequest(tab.baseRequest) : null,
           source_transaction_id: tab.sourceTransactionId || null,
@@ -2268,6 +2310,7 @@ function resetSessionScopedUiState() {
   state.replayTabs = [];
   state.activeReplayTabId = null;
   state.replayTabSequence = 0;
+  state.replayRenamingTabId = null;
   state.fuzzerBaseRequest = null;
   state.fuzzerSourceTransactionId = null;
   state.fuzzerNotice = "";
@@ -2328,23 +2371,145 @@ async function loadRuntimeSettings() {
   renderProxySettings();
 }
 
+function buildTransactionsPageUrl({ limit, offset = 0, beforeSequence = null } = {}) {
+  const params = new URLSearchParams();
+  const filters = state.filterSettings;
+  params.set("limit", String(limit ?? HTTP_HISTORY_PAGE_SIZE));
+  if (beforeSequence != null) {
+    params.set("before_sequence", String(beforeSequence));
+  } else {
+    params.set("offset", String(offset));
+  }
+  params.set("sort_key", state.sortKey || "index");
+  params.set("sort_direction", state.sortDirection || "desc");
+  params.set("hide_connect", "true");
+  if (state.query) params.set("q", state.query);
+  if (state.method) params.set("method", state.method);
+  if (filters.inScopeOnly) params.set("in_scope_only", "true");
+  if (filters.hideWithoutResponses) params.set("hide_without_responses", "true");
+  if (filters.onlyParameterized) params.set("only_parameterized", "true");
+  if (filters.onlyNotes) params.set("only_notes", "true");
+  params.set("status_classes", selectedStatusClasses(filters).join(","));
+  params.set("mime_types", selectedMimeTypes(filters).join(","));
+  if (filters.hiddenExtensions) params.set("hidden_extensions", filters.hiddenExtensions);
+  if (filters.port) params.set("port", filters.port);
+  if (filters.colorTags?.size) params.set("color_tags", [...filters.colorTags].join(","));
+  if (filters.searchTerm) {
+    params.set("advanced_search", filters.searchTerm);
+    if (filters.regex) params.set("advanced_regex", "true");
+    if (filters.caseSensitive) params.set("advanced_case_sensitive", "true");
+    if (filters.negativeSearch) params.set("advanced_negative", "true");
+  }
+  return `/api/transactions-page?${params.toString()}`;
+}
+
+function selectedStatusClasses(filters) {
+  const status = filters.status || {};
+  const selected = [];
+  if (status.success) selected.push("success");
+  if (status.redirect) selected.push("redirect");
+  if (status.clientError) selected.push("client_error");
+  if (status.serverError) selected.push("server_error");
+  if (status.other) selected.push("other");
+  return selected;
+}
+
+function selectedMimeTypes(filters) {
+  const mime = filters.mime || {};
+  const selected = [];
+  if (mime.html) selected.push("html");
+  if (mime.script) selected.push("script");
+  if (mime.json) selected.push("json");
+  if (mime.css) selected.push("css");
+  if (mime.image) selected.push("image");
+  if (mime.other) selected.push("other");
+  return selected;
+}
+
+async function fetchTransactionPage(offsetOrOptions = 0) {
+  const options = typeof offsetOrOptions === "object"
+    ? offsetOrOptions
+    : { offset: offsetOrOptions };
+  const response = await fetch(buildTransactionsPageUrl({
+    limit: state.historyPaging.pageSize,
+    offset: options.offset ?? 0,
+    beforeSequence: options.beforeSequence ?? null,
+  }));
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
+}
+
+function applyPendingAnnotationsToItems(items) {
+  if (!state._pendingAnnotations) return;
+  const freshById = new Map(items.map((item) => [item.id, item]));
+  for (const [id, patch] of state._pendingAnnotations) {
+    const item = freshById.get(id);
+    if (item) Object.assign(item, patch);
+  }
+}
+
+function updateHistoryPagingCursor(items) {
+  if (!canUseSequenceCursorForHistoryPaging()) {
+    state.historyPaging.beforeSequence = null;
+    return;
+  }
+  if (!items.length) return;
+  let oldest = state.historyPaging.beforeSequence;
+  for (const item of items) {
+    if (item.sequence == null) continue;
+    oldest = oldest == null ? item.sequence : Math.min(oldest, item.sequence);
+  }
+  state.historyPaging.beforeSequence = oldest;
+}
+
+function refreshHistoryPagingCursorFromItems() {
+  if (!canUseSequenceCursorForHistoryPaging() || !state.historyPaging) {
+    if (state.historyPaging) state.historyPaging.beforeSequence = null;
+    return;
+  }
+  let oldest = null;
+  for (const item of state.items) {
+    if (item.sequence == null) continue;
+    oldest = oldest == null ? item.sequence : Math.min(oldest, item.sequence);
+  }
+  state.historyPaging.beforeSequence = oldest;
+  state.historyPaging.offset = state.items.length;
+}
+
+function isKnownCount(value) {
+  return Number.isFinite(value);
+}
+
 async function loadTransactions(preserveSelection = true) {
-  const response = await fetch("/api/transactions?limit=0");
-  const freshItems = await response.json();
+  clearHistoryBackfill();
+  state.historyPaging = createHistoryPagingState();
+  state.historyPaging.generation = ++_historyPagingGeneration;
+  const generation = state.historyPaging.generation;
+  const page = await fetchTransactionPage(0);
+  if (state.historyPaging.generation !== generation) {
+    return;
+  }
+  const freshItems = page.items || [];
 
   // Preserve in-flight annotation changes (optimistic updates)
-  if (state._pendingAnnotations) {
-    for (const [id, patch] of state._pendingAnnotations) {
-      const item = freshItems.find((i) => i.id === id);
-      if (item) Object.assign(item, patch);
-    }
-  }
+  applyPendingAnnotationsToItems(freshItems);
   state.items = freshItems;
+  state._itemsVersion += 1;
+  // Pre-compute search haystacks and CONNECT count to avoid first-search latency
+  precomputeItemIndexes();
+  updateHistoryPagingCursor(freshItems);
+  state.historyPaging.offset = freshItems.length;
+  state.historyPaging.total = page.total ?? freshItems.length;
+  state.historyPaging.filteredTotal = page.filtered_total ?? null;
+  state.historyPaging.hasMore = Boolean(page.has_more);
+  state.historyPaging.fullyLoaded = !state.historyPaging.hasMore;
   invalidateVisibleEntriesCache();
 
-  const visibleItems = getVisibleItems();
-  if (!preserveSelection || !visibleItems.some((item) => item.id === state.selectedId)) {
-    state.selectedId = visibleItems[0]?.id ?? null;
+  const visibleEntries = getVisibleEntries();
+  if (!preserveSelection || !visibleEntries.some((entry) => entry.item.id === state.selectedId)) {
+    state.selectedId = visibleEntries[0]?.item.id ?? null;
   }
 
   renderHistory();
@@ -2361,11 +2526,17 @@ async function loadTransactions(preserveSelection = true) {
 async function loadTransactionDetail(id) {
   const response = await fetch(`/api/transactions/${id}`);
   if (!response.ok) {
-    renderEmptyDetail();
+    if (state.selectedId === id) {
+      renderEmptyDetail();
+    }
     return;
   }
 
-  state.selectedRecord = await response.json();
+  const record = await response.json();
+  if (state.selectedId !== id) {
+    return;
+  }
+  state.selectedRecord = record;
   renderDetail(state.selectedRecord);
 }
 
@@ -2416,7 +2587,7 @@ function renderInterceptRules() {
   if (!container) return;
   const rules = state.interceptRules || [];
   if (!rules.length) {
-    container.innerHTML = `<div class="intercept-rules-empty">No rules — all in-scope requests &amp; responses will be intercepted.</div>`;
+    container.innerHTML = `<div class="intercept-rules-empty">No rules: all in-scope requests will be intercepted. Add a response or Req+Res rule to intercept responses.</div>`;
     return;
   }
   container.innerHTML = rules.map((rule) => {
@@ -2624,7 +2795,11 @@ async function pollAuxiliaryData() {
   }
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "http-history") {
-    tasks.push(loadTransactions(true));
+    const now = Date.now();
+    if (now - _lastHttpHistoryFallbackPoll >= HTTP_HISTORY_POLL_FALLBACK_MS) {
+      _lastHttpHistoryFallbackPoll = now;
+      scheduleIncrementalRefresh();
+    }
   }
 
   if (state.activeTool === "logger") {
@@ -2659,9 +2834,15 @@ function connectEvents() {
   }
   eventSource = new EventSource("/api/events");
 
-  eventSource.addEventListener("transaction", () => {
+  eventSource.addEventListener("transaction", (event) => {
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");
+    if (!applyTransactionDeltaEvent(event)) {
+      scheduleIncrementalRefresh();
+    }
+  });
+
+  eventSource.addEventListener("transactions_gap", () => {
     scheduleRefresh();
   });
 
@@ -2689,6 +2870,381 @@ function scheduleRefresh() {
     loadTransactions(true).catch((error) => console.error(error));
   }, 160);
 }
+
+function mergeHistoryItems(items, { prepend = false } = {}) {
+  applyPendingAnnotationsToItems(items);
+  const newItems = [];
+  let connectCount = 0;
+  for (const item of items) {
+    if (getHistoryItem(item.id)) continue;
+    prepareHistoryItem(item);
+    if (item.method === "CONNECT") connectCount++;
+    newItems.push(item);
+  }
+  if (!newItems.length) return 0;
+
+  if (prepend) {
+    state.items = newItems.concat(state.items);
+  } else {
+    state.items.push(...newItems);
+  }
+  state._connectCount = (state._connectCount || 0) + connectCount;
+  trimHistoryCache(prepend ? "recent" : "older");
+  rebuildHistoryItemIndex();
+  state._itemsVersion += 1;
+  invalidateVisibleEntriesCache();
+  return newItems.length;
+}
+
+function trimHistoryCache(prefer = "recent") {
+  if (!canUseSequenceCursorForHistoryPaging()) return 0;
+  const overflow = state.items.length - HTTP_HISTORY_MAX_LOADED_ITEMS;
+  if (overflow <= 0) {
+    refreshHistoryPagingCursorFromItems();
+    return 0;
+  }
+
+  let removed;
+  if (prefer === "older") {
+    removed = state.items.splice(0, overflow);
+    state.historyPaging.trimmedHeadCount += removed.length;
+    adjustHistoryScrollAfterHeadTrim(removed.length);
+  } else {
+    removed = state.items.splice(state.items.length - overflow, overflow);
+    state.historyPaging.trimmedTailCount += removed.length;
+    state.historyPaging.hasMore = true;
+    state.historyPaging.fullyLoaded = false;
+  }
+
+  if (removed.some((item) => item.id === state.selectedId)) {
+    state.selectedId = null;
+    state.selectedRecord = null;
+    renderEmptyDetail();
+  }
+  state._connectCount = state.items.reduce((count, item) => count + (item.method === "CONNECT" ? 1 : 0), 0);
+  refreshHistoryPagingCursorFromItems();
+  return removed.length;
+}
+
+function adjustHistoryScrollAfterHeadTrim(removedCount) {
+  const shell = els.historyTable?.closest(".history-table-shell");
+  if (!shell || removedCount <= 0) return;
+  shell.scrollTop = Math.max(0, shell.scrollTop - removedCount * HISTORY_ROW_HEIGHT);
+}
+
+async function loadMoreTransactions({ background = false } = {}) {
+  const paging = state.historyPaging || (state.historyPaging = createHistoryPagingState());
+  if (paging.loading || !paging.hasMore) {
+    return 0;
+  }
+
+  let shouldRenderAfterLoad = !background;
+  const generation = paging.generation;
+  const offset = paging.offset ?? state.items.length;
+  paging.loading = true;
+  if (!background) renderHistory();
+  try {
+    const page = paging.beforeSequence == null
+      ? await fetchTransactionPage(offset)
+      : await fetchTransactionPage({ beforeSequence: paging.beforeSequence });
+    if (state.historyPaging !== paging || state.historyPaging.generation !== generation) {
+      return 0;
+    }
+    const pageItems = page.items || [];
+    updateHistoryPagingCursor(pageItems);
+    const added = mergeHistoryItems(pageItems);
+    const hadMore = paging.hasMore;
+    paging.offset = canUseSequenceCursorForHistoryPaging()
+      ? state.items.length
+      : offset + pageItems.length;
+    paging.total = page.total ?? paging.total;
+    paging.filteredTotal = page.filtered_total ?? paging.filteredTotal;
+    paging.hasMore = Boolean(page.has_more);
+    paging.fullyLoaded = !paging.hasMore;
+    if (added || hadMore !== paging.hasMore || !background) {
+      shouldRenderAfterLoad = true;
+    }
+    return added;
+  } catch (error) {
+    console.error("Failed to load older transactions:", error);
+    return 0;
+  } finally {
+    paging.loading = false;
+    if (shouldRenderAfterLoad) renderHistory();
+  }
+}
+
+let _historyBackfillTimer = 0;
+function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS) {
+  const paging = state.historyPaging;
+  if (!paging || paging.loading || paging.backfillScheduled || !paging.hasMore || paging.fullyLoaded) {
+    return;
+  }
+  paging.backfillScheduled = true;
+  const generation = paging.generation;
+  _historyBackfillTimer = window.setTimeout(async () => {
+    _historyBackfillTimer = 0;
+    const currentPaging = state.historyPaging;
+    if (!currentPaging) return;
+    if (currentPaging.generation !== generation) return;
+    currentPaging.backfillScheduled = false;
+    if (_searchActiveUntil > Date.now()) {
+      scheduleHistoryBackfill(HTTP_HISTORY_BACKFILL_DELAY_MS);
+      return;
+    }
+    await loadMoreTransactions({ background: true });
+  }, delayMs);
+}
+
+function clearHistoryBackfill() {
+  if (_historyBackfillTimer) {
+    clearTimeout(_historyBackfillTimer);
+    _historyBackfillTimer = 0;
+  }
+  if (state.historyPaging) {
+    state.historyPaging.backfillScheduled = false;
+  }
+}
+
+function canMergeRecentTransactions() {
+  const filters = state.filterSettings || {};
+  return state.sortKey === "index"
+    && state.sortDirection === "desc"
+    && !(filters.searchTerm && filters.regex);
+}
+
+function canUseSequenceCursorForHistoryPaging() {
+  return state.sortKey === "index" && state.sortDirection === "desc";
+}
+
+function isHttpHistoryVisible() {
+  return state.activeTool === "proxy" && state.activeProxyTab === "http-history";
+}
+
+/** Incremental refresh: fetch only recent transactions and merge into cache. */
+let _incrementalTimer = 0;
+let _transactionDeltaTimer = 0;
+const _pendingTransactionSummaries = [];
+
+function applyTransactionDeltaEvent(event) {
+  if (!isHttpHistoryVisible()) {
+    return true;
+  }
+  if (!canMergeRecentTransactions() || _searchActiveUntil > Date.now()) {
+    return false;
+  }
+
+  try {
+    const summary = JSON.parse(event.data || "null");
+    if (!summary || !summary.id) return false;
+    _pendingTransactionSummaries.push(summary);
+    scheduleTransactionDeltaFlush();
+    return true;
+  } catch (error) {
+    console.error("Failed to parse transaction event:", error);
+    return false;
+  }
+}
+
+function scheduleTransactionDeltaFlush() {
+  if (_transactionDeltaTimer) return;
+  _transactionDeltaTimer = window.setTimeout(() => {
+    _transactionDeltaTimer = 0;
+    flushTransactionDeltas();
+  }, 120);
+}
+
+function flushTransactionDeltas() {
+  if (!_pendingTransactionSummaries.length) return;
+  const pending = _pendingTransactionSummaries.splice(0);
+  if (!isHttpHistoryVisible()) return;
+  if (!canMergeRecentTransactions() || _searchActiveUntil > Date.now()) {
+    scheduleIncrementalRefresh();
+    return;
+  }
+
+  const fresh = [];
+  let totalAdded = 0;
+  for (const summary of pending) {
+    if (!summary?.id || getHistoryItem(summary.id)) continue;
+    totalAdded += 1;
+    if (!summaryMatchesActiveHistoryFilters(summary)) continue;
+    fresh.push(summary);
+  }
+
+  fresh.sort((a, b) => Number(b.sequence ?? 0) - Number(a.sequence ?? 0));
+  const added = mergeHistoryItems(fresh, { prepend: true });
+  if (state.historyPaging) {
+    state.historyPaging.total += totalAdded;
+    if (isKnownCount(state.historyPaging.filteredTotal)) {
+      state.historyPaging.filteredTotal += added;
+    }
+    state.historyPaging.offset = state.items.length;
+  }
+  if (totalAdded || added) {
+    renderHistory();
+  }
+}
+
+function summaryMatchesActiveHistoryFilters(item) {
+  if (item.method === "CONNECT") return false;
+  if (state.method && String(item.method || "").toLowerCase() !== state.method.toLowerCase()) return false;
+
+  const filters = state.filterSettings;
+  if (filters.inScopeOnly && !isInScopeHost(item.host || "")) return false;
+  if (filters.hideWithoutResponses && !item.has_response) return false;
+  if (filters.onlyParameterized && !String(item.path || "").includes("?")) return false;
+  if (filters.onlyNotes && !item.note_count) return false;
+  if (!summaryMatchesStatusFilter(item, filters)) return false;
+  if (!summaryMatchesMimeFilter(item, filters)) return false;
+  if (!summaryMatchesHiddenExtensions(item, filters)) return false;
+  if (!summaryMatchesPortFilter(item, filters)) return false;
+  if (!summaryMatchesColorTags(item, filters)) return false;
+  if (!summaryMatchesAdvancedSearch(item, filters)) return false;
+  if (state.query && !summaryQuickSearchHaystack(item).includes(state.query.toLowerCase())) return false;
+  return true;
+}
+
+function summaryMatchesStatusFilter(item, filters) {
+  const selected = selectedStatusClasses(filters);
+  if (!selected.length) return false;
+  const status = Number(item.status);
+  const statusClass = Number.isFinite(status) && status >= 200 && status < 300
+    ? "success"
+    : Number.isFinite(status) && status >= 300 && status < 400
+      ? "redirect"
+      : Number.isFinite(status) && status >= 400 && status < 500
+        ? "client_error"
+        : Number.isFinite(status) && status >= 500 && status < 600
+          ? "server_error"
+          : "other";
+  return selected.includes(statusClass);
+}
+
+function summaryMatchesMimeFilter(item, filters) {
+  const selected = selectedMimeTypes(filters);
+  return selected.length > 0 && selected.includes(inferMimeType(item));
+}
+
+function summaryMatchesHiddenExtensions(item, filters) {
+  const hidden = String(filters.hiddenExtensions || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  if (!hidden.length) return true;
+  const extension = extractSummaryPathExtension(item.path || "");
+  return !extension || !hidden.includes(extension);
+}
+
+function extractSummaryPathExtension(path) {
+  const clean = String(path || "").split("?")[0];
+  const index = clean.lastIndexOf(".");
+  if (index < 0) return "";
+  const extension = clean.slice(index + 1).toLowerCase();
+  return /^[a-z0-9]+$/.test(extension) ? extension : "";
+}
+
+function summaryMatchesPortFilter(item, filters) {
+  const expected = String(filters.port || "").trim();
+  if (!expected) return true;
+  return extractHostPort(item.host || "") === expected;
+}
+
+function summaryMatchesColorTags(item, filters) {
+  const tags = filters.colorTags;
+  if (!tags?.size) return true;
+  return tags.has(item.color_tag || "");
+}
+
+function summaryMatchesAdvancedSearch(item, filters) {
+  const term = String(filters.searchTerm || "").trim();
+  if (!term) return true;
+  const haystack = `${item.host || ""} ${item.method || ""} ${item.path || ""} ${item.content_type || ""}`;
+  let matched = false;
+  if (filters.regex) {
+    try {
+      matched = new RegExp(term, filters.caseSensitive ? "" : "i").test(haystack);
+    } catch (_) {
+      return !filters.negativeSearch;
+    }
+  } else {
+    matched = filters.caseSensitive
+      ? haystack.includes(term)
+      : haystack.toLowerCase().includes(term.toLowerCase());
+  }
+  return filters.negativeSearch ? !matched : matched;
+}
+
+function summaryQuickSearchHaystack(item) {
+  const totalBytes = (item.request_bytes ?? 0) + (item.response_bytes ?? 0);
+  const startedAt = item.started_at || "";
+  let formattedTime = "";
+  try {
+    formattedTime = startedAt ? formatTimestamp(startedAt) : "";
+  } catch (_) {
+    formattedTime = "";
+  }
+  return [
+    item.id || "",
+    Number(item.sequence ?? 0) + 1,
+    item.method || "",
+    item.host || "",
+    item.path || "",
+    item.status ?? "",
+    item.content_type || "",
+    inferMimeType(item),
+    totalBytes,
+    formatSize(totalBytes),
+    startedAt,
+    formattedTime,
+  ].join(" ").toLowerCase();
+}
+
+function scheduleIncrementalRefresh() {
+  if (_incrementalTimer) return;
+  _incrementalTimer = window.setTimeout(async () => {
+    _incrementalTimer = 0;
+    // Skip incremental refresh while user is actively typing in search
+    if (_searchActiveUntil > Date.now()) {
+      // Reschedule a tick later instead of dropping
+      scheduleIncrementalRefresh();
+      return;
+    }
+    try {
+      if (!canMergeRecentTransactions()) {
+        scheduleRefresh();
+        return;
+      }
+      const resp = await fetch(buildTransactionsPageUrl({ limit: 50, offset: 0 }));
+      const page = await resp.json();
+      const recent = page.items || [];
+      const previousTotal = state.historyPaging?.total;
+      const previousFilteredTotal = state.historyPaging?.filteredTotal;
+      const previousHasMore = state.historyPaging?.hasMore;
+      const added = mergeHistoryItems(recent, { prepend: true });
+      if (state.historyPaging) {
+        if (page.total != null) state.historyPaging.total = page.total;
+        if (page.filtered_total != null) state.historyPaging.filteredTotal = page.filtered_total;
+        state.historyPaging.hasMore = Boolean(page.has_more);
+        state.historyPaging.fullyLoaded = !state.historyPaging.hasMore;
+      }
+      if (added > 0 && state.historyPaging) state.historyPaging.offset = state.items.length;
+      if (
+        added > 0
+        || previousTotal !== state.historyPaging?.total
+        || previousFilteredTotal !== state.historyPaging?.filteredTotal
+        || previousHasMore !== state.historyPaging?.hasMore
+      ) {
+        renderHistory();
+      }
+    } catch (err) {
+      console.error("Incremental refresh failed:", err);
+    }
+  }, 300);
+}
+
+// Search activity guard: incremental refresh pauses while user is typing
+let _searchActiveUntil = 0;
 
 function renderToolPanels() {
   if (!IMPLEMENTED_TOOLS.has(state.activeTool)) {
@@ -4243,24 +4799,23 @@ function updateProxyStatusIndicator(online) {
     : `Proxy failed to bind on ${state.settings?.proxy_addr || "..."}. Restart the app after freeing the port.`;
 }
 
-function updateHistorySelection(newId) {
-  const prev = els.historyTableBody.querySelector(".history-row.selected");
-  if (prev) prev.classList.remove("selected");
-  if (newId) {
-    const next = els.historyTableBody.querySelector(`.history-row[data-id="${newId}"]`);
-    if (next) next.classList.add("selected");
-  }
-}
-
 function renderHistory() {
-  invalidateVisibleEntriesCache();
   const visibleEntries = getVisibleEntries();
-  const visibleItems = visibleEntries.map((entry) => entry.item);
   const hiddenConnectCount = countHiddenConnectItems();
+  const paging = state.historyPaging || createHistoryPagingState();
   const summary = [];
-  const totalCount = visibleItems.length;
-  summary.push(`${totalCount} item(s) visible`);
-  if (hiddenConnectCount) summary.push(`${hiddenConnectCount} CONNECT tunnel(s) hidden`);
+  const totalCount = visibleEntries.length;
+  summary.push(`${totalCount} loaded item(s) visible`);
+  if (hiddenConnectCount) summary.push(`${hiddenConnectCount}${paging.fullyLoaded ? "" : " loaded"} CONNECT tunnel(s) hidden`);
+  if (isKnownCount(paging.filteredTotal)) {
+    summary.push(`${state.items.length}/${paging.filteredTotal} server-matched summaries loaded`);
+  }
+  if (paging.total && (!isKnownCount(paging.filteredTotal) || paging.total !== paging.filteredTotal)) {
+    summary.push(`${paging.total} total captured`);
+  }
+  if (!paging.fullyLoaded) {
+    summary.push(paging.loading ? "loading older history" : "scroll for older history");
+  }
   if (state.query) summary.push(`search: "${state.query}"`);
   if (state.method) summary.push(`method: ${state.method}`);
   if (state.filterSettings.inScopeOnly) summary.push("scope only");
@@ -4276,10 +4831,10 @@ function renderHistory() {
   // Store entries for virtual scroll
   state._historyEntries = visibleEntries;
 
-  if (!visibleItems.length) {
+  if (!visibleEntries.length) {
     els.historyTableBody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="${state.historyColumnOrder.length}">${hiddenConnectCount ? "Only CONNECT tunnels were captured, and they are hidden from HTTP history. Trust the Sniper Root CA and retry the HTTPS client if you expect decrypted traffic." : "No traffic matches the current filter settings."}</td>
+        <td colspan="${state.historyColumnOrder.length}">${historyEmptyMessage(hiddenConnectCount, paging)}</td>
       </tr>
     `;
     return;
@@ -4295,13 +4850,20 @@ function renderHistoryVirtual() {
   const shell = els.historyTable.closest(".history-table-shell");
   if (!shell) return;
 
-  const scrollTop = shell.scrollTop;
   const viewportHeight = shell.clientHeight;
   const totalCount = entries.length;
   const colCount = state.historyColumnOrder.length;
+  const maxScrollTop = Math.max(0, totalCount * HISTORY_ROW_HEIGHT - viewportHeight);
+  const scrollTop = Math.min(shell.scrollTop, maxScrollTop);
+  if (shell.scrollTop !== scrollTop) {
+    shell.scrollTop = scrollTop;
+  }
 
   const startIdx = Math.max(0, Math.floor(scrollTop / HISTORY_ROW_HEIGHT) - HISTORY_BUFFER_ROWS);
   const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / HISTORY_ROW_HEIGHT) + HISTORY_BUFFER_ROWS);
+  if (totalCount - endIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS) {
+    scheduleHistoryBackfill(0);
+  }
 
   const topPadding = startIdx * HISTORY_ROW_HEIGHT;
   const bottomPadding = Math.max(0, (totalCount - endIdx) * HISTORY_ROW_HEIGHT);
@@ -4320,6 +4882,18 @@ function renderHistoryVirtual() {
     (topPadding > 0 ? `<tr class="virtual-spacer"><td colspan="${colCount}" style="height:${topPadding}px;padding:0;border:none"></td></tr>` : "") +
     rows.join("") +
     (bottomPadding > 0 ? `<tr class="virtual-spacer"><td colspan="${colCount}" style="height:${bottomPadding}px;padding:0;border:none"></td></tr>` : "");
+}
+
+function historyEmptyMessage(hiddenConnectCount, paging) {
+  if (hiddenConnectCount) {
+    return "Only CONNECT tunnels were captured, and they are hidden from HTTP history. Trust the Sniper Root CA and retry the HTTPS client if you expect decrypted traffic.";
+  }
+  if (!paging.fullyLoaded) {
+    return paging.loading
+      ? "No loaded traffic matches yet. Older history is still loading."
+      : "No loaded traffic matches yet. Older history will load as needed.";
+  }
+  return "No traffic matches the current filter settings.";
 }
 
 function updateHistorySelection(newId) {
@@ -4541,6 +5115,16 @@ function getActiveMessagePane() {
     return "response";
   }
 
+  if (document.activeElement instanceof Node) {
+    if (els.requestViewCM?.contains(document.activeElement)) {
+      return "request";
+    }
+
+    if (els.responseViewCM?.contains(document.activeElement)) {
+      return "response";
+    }
+  }
+
   const selection = window.getSelection();
   const anchorNode = selection?.anchorNode;
   if (anchorNode instanceof Node) {
@@ -4551,12 +5135,32 @@ function getActiveMessagePane() {
     if (els.responseView?.contains(anchorNode)) {
       return "response";
     }
+
+    if (els.requestViewCM?.contains(anchorNode)) {
+      return "request";
+    }
+
+    if (els.responseViewCM?.contains(anchorNode)) {
+      return "response";
+    }
   }
 
   return state.activeMessagePane;
 }
 
 function getSelectedCodePaneText() {
+  const activePane = getActiveMessagePane();
+  if (activePane === "request" || activePane === "response") {
+    const activeCMText = getSelectedCMText(activePane);
+    if (activeCMText) return activeCMText;
+  }
+
+  const cmSelections = ["request", "response"]
+    .filter((pane) => pane !== activePane)
+    .map((pane) => getSelectedCMText(pane))
+    .filter(Boolean);
+  if (cmSelections.length === 1) return cmSelections[0];
+
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed || !selection.toString()) {
     return "";
@@ -4571,6 +5175,8 @@ function getSelectedCodePaneText() {
   if (
     els.requestView?.contains(container)
     || els.responseView?.contains(container)
+    || els.requestViewCM?.contains(container)
+    || els.responseViewCM?.contains(container)
   ) {
     return selection.toString();
   }
@@ -4580,11 +5186,23 @@ function getSelectedCodePaneText() {
   if (
     (anchorNode instanceof Node && (els.requestView?.contains(anchorNode) || els.responseView?.contains(anchorNode)))
     || (focusNode instanceof Node && (els.requestView?.contains(focusNode) || els.responseView?.contains(focusNode)))
+    || (anchorNode instanceof Node && (els.requestViewCM?.contains(anchorNode) || els.responseViewCM?.contains(anchorNode)))
+    || (focusNode instanceof Node && (els.requestViewCM?.contains(focusNode) || els.responseViewCM?.contains(focusNode)))
   ) {
     return selection.toString();
   }
 
   return "";
+}
+
+function getSelectedCMText(targetPane) {
+  const codeView = getCMView(targetPane);
+  const view = codeView?.view;
+  if (!view) return "";
+  const ranges = view.state.selection.ranges
+    .filter((range) => !range.empty)
+    .map((range) => view.state.sliceDoc(range.from, range.to));
+  return ranges.join("\n");
 }
 
 async function copyTextToClipboard(text) {
@@ -4615,6 +5233,17 @@ async function copyTextToClipboard(text) {
 }
 
 function selectCodePaneContents(targetPane) {
+  const codeView = getCMView(targetPane);
+  const cmView = codeView?.view;
+  if (cmView) {
+    cmView.focus();
+    cmView.dispatch({
+      selection: { anchor: 0, head: cmView.state.doc.length },
+      scrollIntoView: true,
+    });
+    return;
+  }
+
   const viewElement = targetPane === "response" ? els.responseView : els.requestView;
   if (!viewElement) {
     return;
@@ -4733,6 +5362,30 @@ function renderMessagePanes() {
   els.responseSearchMeta.innerHTML = responsePane
     ? buildSearchMeta(responsePane.lineCount, state.messageViews.response, responsePane.matchCount)
     : buildSearchMeta(0, state.messageViews.response, 0);
+}
+
+function updateMessagePaneSearch(target) {
+  const query = state.messageSearch[target] || "";
+  const mode = state.messageViews[target];
+  const meta = target === "response" ? els.responseSearchMeta : els.requestSearchMeta;
+  const cmView = getCMView(target);
+  if (cmView) {
+    const result = cmView.applySearch(query);
+    if (meta) {
+      meta.innerHTML = buildSearchMeta(cmView.view.state.doc.lines, mode, result.matchCount);
+    }
+    return;
+  }
+
+  const viewElement = target === "response" ? els.responseView : els.requestView;
+  if (!viewElement) {
+    if (meta) meta.innerHTML = buildSearchMeta(0, mode, 0);
+    return;
+  }
+  const result = applyCodeSearch(viewElement, query);
+  if (meta) {
+    meta.innerHTML = buildSearchMeta(countLines(viewElement.textContent || ""), mode, result.count);
+  }
 }
 
 function renderViewTabs() {
@@ -6045,6 +6698,7 @@ async function saveTargetScope() {
   renderInterceptStatus();
   renderProxySettings();
   await loadTargetSiteMap();
+  invalidateVisibleEntriesCache();
   renderHistory();
 }
 
@@ -6659,6 +7313,7 @@ async function saveProxySettings() {
 
   renderInterceptStatus();
   renderProxySettings();
+  invalidateVisibleEntriesCache();
   renderHistory();
   return startupResult;
 }
@@ -7334,6 +7989,7 @@ function duplicateActiveReplayTab() {
       path: tab.wsPath,
       headers: [...(tab.wsHeaders || [])],
       handshakeText: tab.wsHandshakeText || "",
+      customLabel: tab.customLabel || "",
     });
     return;
   }
@@ -7368,6 +8024,7 @@ function duplicateActiveReplayTab() {
     sourceTransactionId: tab.sourceTransactionId,
     notice: tab.notice,
     requestText,
+    customLabel: tab.customLabel || "",
     responseRecord: cloneTransactionRecord(tab.responseRecord),
     targetScheme: target.scheme,
     targetHost: target.host,
@@ -7394,6 +8051,7 @@ function createReplayTab(seed = {}) {
   return {
     id: crypto.randomUUID(),
     sequence: state.replayTabSequence,
+    customLabel: normalizeReplayTabCustomLabel(seed.customLabel || ""),
     pinned: !!seed.pinned,
     baseRequest,
     sourceTransactionId: seed.sourceTransactionId || null,
@@ -7446,10 +8104,14 @@ function renderReplayTabs() {
       const pinned = tab.pinned ? "pinned" : "";
       const showPinBtn = isActive || tab.pinned;
       const pinBtn = showPinBtn ? `<button class="replay-tab-pin-btn ${tab.pinned ? "on" : ""}" type="button" aria-label="Pin tab">\uD83D\uDCCC</button>` : "";
+      const label = replayTabLabel(tab);
+      const labelControl = state.replayRenamingTabId === tab.id
+        ? `<input class="replay-tab-name-input" type="text" value="${escapeHtml(tab.customLabel || "")}" placeholder="${escapeHtml(label)}" maxlength="80" aria-label="Replay tab name">`
+        : `<button class="replay-tab-button" type="button" title="${escapeHtml(label)}">${escapeHtml(label)}</button>`;
       return `
         <div class="replay-tab ${active} ${pinned}" data-replay-tab-id="${tab.id}">
           ${pinBtn}
-          <button class="replay-tab-button" type="button">${escapeHtml(replayTabLabel(tab))}</button>
+          ${labelControl}
           <button class="replay-tab-close" type="button" aria-label="Close replay tab">\u00d7</button>
         </div>
       `;
@@ -7458,8 +8120,36 @@ function renderReplayTabs() {
 
   Array.from(els.replayTabStrip.querySelectorAll(".replay-tab")).forEach((tabElement) => {
     const id = tabElement.dataset.replayTabId;
+    const nameInput = tabElement.querySelector(".replay-tab-name-input");
+    if (nameInput) {
+      nameInput.addEventListener("click", (event) => event.stopPropagation());
+      nameInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          commitReplayTabRename(id, nameInput.value);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          state.replayRenamingTabId = null;
+          renderReplayTabs();
+        }
+      });
+      nameInput.addEventListener("blur", () => {
+        commitReplayTabRename(id, nameInput.value);
+      });
+      requestAnimationFrame(() => {
+        if (state.replayRenamingTabId === id) {
+          nameInput.focus();
+          nameInput.select();
+        }
+      });
+    }
     tabElement.querySelector(".replay-tab-button")?.addEventListener("click", () => {
+      if (state.activeReplayTabId === id) {
+        beginReplayTabRename(id);
+        return;
+      }
       state.activeReplayTabId = id;
+      state.replayRenamingTabId = null;
       scheduleWorkspaceStateSave();
       renderReplay();
     });
@@ -7475,6 +8165,34 @@ function renderReplayTabs() {
 
   // Scroll active tab into view
   scrollActiveReplayTabIntoView();
+}
+
+function beginReplayTabRename(id) {
+  if (!state.replayTabs.some((tab) => tab.id === id)) {
+    return;
+  }
+  state.replayRenamingTabId = id;
+  renderReplayTabs();
+}
+
+function commitReplayTabRename(id, value) {
+  if (state.replayRenamingTabId !== id) {
+    return;
+  }
+  const tab = state.replayTabs.find((item) => item.id === id);
+  if (!tab) {
+    state.replayRenamingTabId = null;
+    renderReplayTabs();
+    return;
+  }
+  tab.customLabel = normalizeReplayTabCustomLabel(value);
+  state.replayRenamingTabId = null;
+  scheduleWorkspaceStateSave();
+  renderReplayTabs();
+}
+
+function normalizeReplayTabCustomLabel(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
 function toggleReplayTabPin(id) {
@@ -7504,6 +8222,9 @@ function closeRepeaterTab(id) {
   if (closingTab.type === "websocket") {
     stopWsPoll(closingTab);
   }
+  if (state.replayRenamingTabId === id) {
+    state.replayRenamingTabId = null;
+  }
 
   state.replayTabs.splice(index, 1);
   if (!state.replayTabs.length) {
@@ -7519,6 +8240,13 @@ function closeRepeaterTab(id) {
 }
 
 function replayTabLabel(tab) {
+  if (tab.customLabel) {
+    return tab.customLabel;
+  }
+  return replayTabAutoLabel(tab);
+}
+
+function replayTabAutoLabel(tab) {
   if (tab.type === "websocket") {
     const host = tab.wsHost || "draft";
     return `${tab.sequence}. WS ${host}`;
@@ -7961,9 +8689,9 @@ function renderHistoryCell(colKey, item, entry) {
     case "status":
       return `<td><span class="status-pill-row ${statusTone(item.status)}">${escapeHtml(formatStatus(item.status))}</span></td>`;
     case "length":
-      return `<td class="col-center">${escapeHtml(formatSize((item.request_bytes ?? 0) + (item.response_bytes ?? 0)))}</td>`;
+      return `<td class="col-center">${escapeHtml(item._sizeLabel || formatSize((item.request_bytes ?? 0) + (item.response_bytes ?? 0)))}</td>`;
     case "mime":
-      return `<td class="col-center">${escapeHtml(inferMimeType(item))}</td>`;
+      return `<td class="col-center">${escapeHtml(item._mime || inferMimeType(item))}</td>`;
     case "notes": {
       const tagDot = item.color_tag ? `<span class="row-color-tag row-color-tag-${escapeHtml(item.color_tag)}"></span>` : "";
       const noteIndicator = item.has_user_note ? `<span class="note-icon" title="Has note">\ud83d\udcdd</span>` : "";
@@ -7974,7 +8702,7 @@ function renderHistoryCell(colKey, item, entry) {
       return `<td class="tls-cell">${tls}</td>`;
     }
     case "started_at":
-      return `<td>${escapeHtml(formatTimestamp(item.started_at))}</td>`;
+      return `<td>${escapeHtml(getHistoryTimeLabel(item))}</td>`;
     default:
       return "<td></td>";
   }
@@ -8360,9 +9088,6 @@ function findingsBodyPlaceholder(msg) {
   if (msg.body_encoding === "base64") {
     const ct = msg.content_type || "binary";
     return `[${ct}, ${formatSize(msg.body_size)}]`;
-  }
-  if (msg.body_preview.length > 16000) {
-    return msg.body_preview.slice(0, 16000) + "\n\n[preview truncated for performance]";
   }
   return msg.preview_truncated
     ? `${msg.body_preview}\n\n[preview truncated]`
@@ -9572,7 +10297,7 @@ function toggleSort(key) {
   }
 
   invalidateVisibleEntriesCache();
-  renderHistory();
+  scheduleRefresh();
 }
 
 function renderSortHeaders() {
@@ -10104,20 +10829,21 @@ function renderProtocolStrip(protocolState) {
 }
 
 function inferMimeType(item) {
+  if (item._mime) return item._mime;
   const contentType = (item.content_type || "").toLowerCase();
-  if (contentType.includes("html")) return "html";
-  if (contentType.includes("javascript")) return "script";
-  if (contentType.includes("json") || contentType.includes("text")) return "json";
-  if (contentType.includes("css")) return "css";
-  if (contentType.includes("image")) return "image";
+  if (contentType.includes("html")) return (item._mime = "html");
+  if (contentType.includes("javascript")) return (item._mime = "script");
+  if (contentType.includes("css")) return (item._mime = "css");
+  if (contentType.includes("json") || contentType.includes("text")) return (item._mime = "json");
+  if (contentType.includes("image")) return (item._mime = "image");
   const path = (item.path || "").toLowerCase();
-  if (path.endsWith(".js")) return "script";
-  if (path.endsWith(".css")) return "css";
-  if (path.endsWith(".json")) return "json";
-  if (path.endsWith(".html")) return "html";
-  if (/\.(png|jpg|jpeg|gif|svg|ico)$/i.test(path)) return "image";
-  if (item.is_websocket) return "websocket";
-  return "other";
+  if (path.endsWith(".js")) return (item._mime = "script");
+  if (path.endsWith(".css")) return (item._mime = "css");
+  if (path.endsWith(".json")) return (item._mime = "json");
+  if (path.endsWith(".html")) return (item._mime = "html");
+  if (/\.(png|jpg|jpeg|gif|svg|ico)$/i.test(path)) return (item._mime = "image");
+  if (item.is_websocket) return (item._mime = "websocket");
+  return (item._mime = "other");
 }
 
 function isTlsRecord(item) {
@@ -10130,155 +10856,25 @@ function getVisibleItems() {
 
 function invalidateVisibleEntriesCache() {
   state._cachedVisibleEntries = null;
+  state._cachedVisibleEntriesKey = "";
 }
 
 function getVisibleEntries() {
-  if (state._cachedVisibleEntries) return state._cachedVisibleEntries;
+  const cacheKey = String(state._itemsVersion);
+  if (state._cachedVisibleEntries && state._cachedVisibleEntriesKey === cacheKey) {
+    return state._cachedVisibleEntries;
+  }
 
-  const direction = state.sortDirection === "asc" ? 1 : -1;
+  const result = [];
+  const items = state.items;
+  for (let i = 0, len = items.length; i < len; i++) {
+    const item = items[i];
+    result.push({ item, index: i });
+  }
 
-  state._cachedVisibleEntries = state.items
-    .filter((item) => item.method !== "CONNECT")
-    .filter(matchesQuickFilters)
-    .filter(matchesAdvancedFilters)
-    .map((item, index) => ({ item, index }))
-    .sort((left, right) => {
-      const leftSeq = left.item.sequence ?? left.index;
-      const rightSeq = right.item.sequence ?? right.index;
-
-      if (state.sortKey === "index") {
-        return (leftSeq - rightSeq) * direction;
-      }
-
-      const comparison = compareSortValues(
-        getSortValue(left.item, state.sortKey),
-        getSortValue(right.item, state.sortKey),
-      );
-
-      if (comparison !== 0) {
-        return comparison * direction;
-      }
-
-      return leftSeq - rightSeq;
-    });
-
+  state._cachedVisibleEntries = result;
+  state._cachedVisibleEntriesKey = cacheKey;
   return state._cachedVisibleEntries;
-}
-
-function matchesQuickFilters(item) {
-  const methodMatch = !state.method || item.method === state.method;
-  if (!methodMatch) {
-    return false;
-  }
-
-  if (!state.query) {
-    return true;
-  }
-
-  const q = state.query.toLowerCase();
-  const haystack = `${item.host} ${item.method} ${item.path || ""} ${item.status || ""} ${inferMimeType(item)} ${formatSize((item.request_bytes ?? 0) + (item.response_bytes ?? 0))} ${item.sequence != null ? item.sequence + 1 : ""} ${formatTimestamp(item.started_at || "")}`.toLowerCase();
-  return haystack.includes(q);
-}
-
-function matchesAdvancedFilters(item) {
-  const filters = state.filterSettings;
-
-  if (filters.inScopeOnly && !isInScopeHost(item.host)) {
-    return false;
-  }
-
-  if (filters.hideWithoutResponses && !item.has_response) {
-    return false;
-  }
-
-  if (filters.onlyParameterized && !(item.path || "").includes("?")) {
-    return false;
-  }
-
-  if (filters.onlyNotes && !(item.note_count > 0)) {
-    return false;
-  }
-
-  if (!matchesStatusFilter(item)) {
-    return false;
-  }
-
-  if (!matchesMimeFilter(item)) {
-    return false;
-  }
-
-  if (!matchesExtensionFilter(item)) {
-    return false;
-  }
-
-  if (!matchesPortFilter(item)) {
-    return false;
-  }
-
-  if (!matchesColorTagFilter(item)) {
-    return false;
-  }
-
-  return matchesAdvancedSearch(item);
-}
-
-function matchesStatusFilter(item) {
-  const status = item.status;
-  if (status >= 200 && status < 300) return state.filterSettings.status.success;
-  if (status >= 300 && status < 400) return state.filterSettings.status.redirect;
-  if (status >= 400 && status < 500) return state.filterSettings.status.clientError;
-  if (status >= 500 && status < 600) return state.filterSettings.status.serverError;
-  return state.filterSettings.status.other;
-}
-
-function matchesMimeFilter(item) {
-  const mime = inferMimeType(item);
-  switch (mime) {
-    case "html":
-      return state.filterSettings.mime.html;
-    case "script":
-      return state.filterSettings.mime.script;
-    case "json":
-      return state.filterSettings.mime.json;
-    case "css":
-      return state.filterSettings.mime.css;
-    case "image":
-      return state.filterSettings.mime.image;
-    default:
-      return state.filterSettings.mime.other;
-  }
-}
-
-function matchesExtensionFilter(item) {
-  const path = item.path || "";
-  const extension = extractPathExtension(path);
-  if (!extension) {
-    return true;
-  }
-
-  const hidden = state.filterSettings.hiddenExtensions
-    .split(",")
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
-
-  return !hidden.includes(extension);
-}
-
-function matchesPortFilter(item) {
-  if (!state.filterSettings.port) {
-    return true;
-  }
-
-  const port = item.host.split(":")[1] || "";
-  return port === state.filterSettings.port;
-}
-
-function matchesColorTagFilter(item) {
-  const tags = state.filterSettings.colorTags;
-  if (!tags || tags.size === 0) {
-    return true;
-  }
-  return tags.has(item.color_tag);
 }
 
 function syncColorTagFilterUI() {
@@ -10288,41 +10884,15 @@ function syncColorTagFilterUI() {
   });
 }
 
-function matchesAdvancedSearch(item) {
-  if (!state.filterSettings.searchTerm) {
-    return true;
-  }
-
-  const haystack = `${item.host} ${item.method} ${item.path || ""} ${item.content_type || ""}`;
-  let matched = false;
-
-  if (state.filterSettings.regex) {
-    try {
-      const flags = state.filterSettings.caseSensitive ? "u" : "iu";
-      matched = new RegExp(state.filterSettings.searchTerm, flags).test(haystack);
-    } catch (_error) {
-      matched = true;
-    }
-  } else {
-    const left = state.filterSettings.caseSensitive ? haystack : haystack.toLowerCase();
-    const right = state.filterSettings.caseSensitive
-      ? state.filterSettings.searchTerm
-      : state.filterSettings.searchTerm.toLowerCase();
-    matched = left.includes(right);
-  }
-
-  return state.filterSettings.negativeSearch ? !matched : matched;
-}
-
 function isInScopeHost(host) {
   const patterns = state.runtime?.scope_patterns || [];
   if (!patterns.length) {
     return true;
   }
 
-  const hostname = host.split(":")[0].toLowerCase();
+  const hostname = hostWithoutPort(host).toLowerCase();
   return patterns.some((pattern) => {
-    const normalized = pattern.toLowerCase();
+    const normalized = hostWithoutPort(pattern).toLowerCase();
     if (normalized.startsWith("*.")) {
       const suffix = normalized.slice(2);
       return hostname === suffix || hostname.endsWith(`.${suffix}`);
@@ -10331,13 +10901,74 @@ function isInScopeHost(host) {
   });
 }
 
-function extractPathExtension(path) {
-  const clean = path.split("?")[0];
-  const match = clean.match(/\.([a-z0-9]+)$/i);
-  return match ? match[1].toLowerCase() : "";
+function hostWithoutPort(host) {
+  const value = String(host || "").trim();
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    if (end > 0) return value.slice(1, end);
+  }
+  return (value.match(/:/g) || []).length === 1 ? value.split(":")[0] : value;
+}
+
+function extractHostPort(host) {
+  const value = String(host || "").trim();
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    return end > 0 && value[end + 1] === ":" ? value.slice(end + 2) : "";
+  }
+  return (value.match(/:/g) || []).length === 1 ? value.split(":")[1] : "";
+}
+
+/** Pre-compute per-item display values and lookup indexes used by the history table. */
+function precomputeItemIndexes() {
+  let connectCount = 0;
+  const items = state.items;
+  for (let i = 0, len = items.length; i < len; i++) {
+    const item = items[i];
+    prepareHistoryItem(item);
+    if (item.method === "CONNECT") connectCount++;
+  }
+  state._connectCount = connectCount;
+  rebuildHistoryItemIndex();
+}
+
+function prepareHistoryItem(item) {
+  item._totalBytes = (item.request_bytes ?? 0) + (item.response_bytes ?? 0);
+  item._sizeLabel = formatSize(item._totalBytes);
+  item._mime = inferMimeType(item);
+  item._timeLabel = "";
+  return item;
+}
+
+function getHistoryTimeLabel(item) {
+  if (!item._timeLabel) {
+    item._timeLabel = formatTimestamp(item.started_at);
+  }
+  return item._timeLabel;
+}
+
+function rebuildHistoryItemIndex() {
+  state._itemById = new Map();
+  state._itemIndexById = new Map();
+  for (let i = 0, len = state.items.length; i < len; i++) {
+    const item = state.items[i];
+    state._itemById.set(item.id, item);
+    state._itemIndexById.set(item.id, i);
+  }
+}
+
+function getHistoryItem(id) {
+  return state._itemById?.get(id) || null;
+}
+
+function getHistoryItemIndex(id) {
+  const index = state._itemIndexById?.get(id);
+  return Number.isInteger(index) ? index : -1;
 }
 
 function countHiddenConnectItems() {
+  // Use precomputed count when available; fall back to scan otherwise.
+  if (typeof state._connectCount === "number") return state._connectCount;
   return state.items.filter((item) => item.method === "CONNECT").length;
 }
 
@@ -10365,40 +10996,15 @@ function defaultSortDirection(key) {
   return ["index", "started_at", "status", "length", "notes", "tls"].includes(key) ? "desc" : "asc";
 }
 
-function getSortValue(item, key) {
-  switch (key) {
-    case "host":
-      return item.host.toLowerCase();
-    case "method":
-      return item.method;
-    case "path":
-      return (item.path || "").toLowerCase();
-    case "status":
-      return item.status ?? -1;
-    case "length":
-      return (item.request_bytes ?? 0) + (item.response_bytes ?? 0);
-    case "mime":
-      return inferMimeType(item);
-    case "notes":
-      return item.note_count ?? 0;
-    case "tls":
-      return isTlsRecord(item) ? 1 : 0;
-    case "started_at":
-      return Date.parse(item.started_at) || 0;
-    default:
-      return "";
-  }
-}
-
 function compareSortValues(left, right) {
   if (typeof left === "number" && typeof right === "number") {
     return left - right;
   }
 
-  return String(left).localeCompare(String(right), undefined, {
-    numeric: true,
-    sensitivity: "base",
-  });
+  const leftText = String(left);
+  const rightText = String(right);
+  if (leftText === rightText) return 0;
+  return HISTORY_SORT_COLLATOR.compare(leftText, rightText);
 }
 
 function formatKind(kind) {
@@ -10436,14 +11042,7 @@ function methodTone(method) {
 }
 
 function formatTimestamp(value) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(new Date(value));
+  return HISTORY_TIME_FORMATTER.format(new Date(value));
 }
 
 function formatSize(bytes) {
@@ -10479,6 +11078,7 @@ function createWsReplayTab(seed = {}) {
     id: crypto.randomUUID(),
     type: "websocket",
     sequence: state.replayTabSequence,
+    customLabel: normalizeReplayTabCustomLabel(seed.customLabel || ""),
     label: `WS ${seed.host || "draft"}`,
     wsScheme: seed.scheme || "wss",
     wsHost: seed.host || "",
@@ -11124,7 +11724,7 @@ async function setCompareBase(transactionId) {
   compareBaseId = transactionId;
   const btn = document.getElementById("compareWithBaseBtn");
   if (btn) btn.disabled = false;
-  const item = state.items.find((i) => i.id === transactionId);
+  const item = getHistoryItem(transactionId);
   if (btn && item) btn.textContent = `Compare with #${item.index ?? "?"}`;
 }
 
@@ -11144,8 +11744,8 @@ async function openCompareModal(targetId) {
 
 function renderCompareModal() {
   if (!compareBaseRecord || !compareTargetRecord) return;
-  const baseItem = state.items.find((i) => i.id === compareBaseRecord.id);
-  const targetItem = state.items.find((i) => i.id === compareTargetRecord.id);
+  const baseItem = getHistoryItem(compareBaseRecord.id);
+  const targetItem = getHistoryItem(compareTargetRecord.id);
   const baseLabel = `#${baseItem?.index ?? "?"} ${compareBaseRecord.method} ${compareBaseRecord.host}${compareBaseRecord.path}`;
   const targetLabel = `#${targetItem?.index ?? "?"} ${compareTargetRecord.method} ${compareTargetRecord.host}${compareTargetRecord.path}`;
   document.getElementById("compareKicker").textContent = `${baseLabel}  vs  ${targetLabel}`;
@@ -11180,7 +11780,7 @@ function openContextMenu(x, y, transactionId) {
   const menu = els.contextMenu;
   menu.classList.remove("hidden");
 
-  const item = state.items.find((i) => i.id === transactionId);
+  const item = getHistoryItem(transactionId);
   const currentColor = item?.color_tag || "";
 
   menu.querySelectorAll(".color-dot").forEach((dot) => {
@@ -11203,35 +11803,6 @@ function openContextMenu(x, y, transactionId) {
 function closeContextMenu() {
   els.contextMenu.classList.add("hidden");
   contextMenuTargetId = null;
-}
-
-/* ─── WS Frame Context Menu ─── */
-
-function openWsFrameContextMenu(x, y) {
-  const menu = els.wsFrameContextMenu;
-  if (!menu) return;
-  menu.classList.remove("hidden");
-  const maxX = window.innerWidth - menu.offsetWidth - 8;
-  const maxY = window.innerHeight - menu.offsetHeight - 8;
-  menu.style.left = `${Math.min(x, maxX)}px`;
-  menu.style.top = `${Math.min(y, maxY)}px`;
-}
-
-function closeWsFrameContextMenu() {
-  if (els.wsFrameContextMenu) els.wsFrameContextMenu.classList.add("hidden");
-}
-
-if (els.wsFrameContextMenu) {
-  document.getElementById("wsFrameToReplayBtn").addEventListener("click", () => {
-    closeWsFrameContextMenu();
-    sendWsFrameToReplay(state.selectedFrameIdx ?? 0);
-  });
-  document.addEventListener("click", (e) => {
-    if (!els.wsFrameContextMenu.contains(e.target)) closeWsFrameContextMenu();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeWsFrameContextMenu();
-  });
 }
 
 async function loadUserNote(transactionId) {
@@ -11259,9 +11830,12 @@ async function updateAnnotations(transactionId, payload) {
     });
     if (response.ok) {
       const summary = await response.json();
-      const index = state.items.findIndex((i) => i.id === transactionId);
+      const index = getHistoryItemIndex(transactionId);
       if (index !== -1) {
         Object.assign(state.items[index], summary);
+        prepareHistoryItem(state.items[index]);
+        state._itemById.set(transactionId, state.items[index]);
+        state._itemsVersion += 1;
         invalidateVisibleEntriesCache();
         renderHistory();
       }
@@ -11717,7 +12291,7 @@ async function historyRequestToFormat(transactionId, format) {
 }
 
 function copyTransactionUrl(transactionId) {
-  const item = state.items.find((i) => i.id === transactionId);
+  const item = getHistoryItem(transactionId);
   if (!item) return;
   const scheme = item.scheme || "https";
   const host = item.host || "";
@@ -12175,6 +12749,7 @@ const sniperCMTheme = CM.EditorView.theme({
   ".tok-markup-tag":   { color: "var(--token-info-color, #c9a96e)" },
   ".tok-markup-attr":  { color: "var(--token-info-color, #c9a96e)" },
   ".tok-markup-str":   { color: "var(--token-string-color, #e8e8e8)" },
+  ".tok-markup-meta":  { color: "#b89f7c" },
   ".tok-meta":         { color: "#b89f7c" },
   ".tok-kw":           { color: "var(--token-info-color, #c9a96e)" },
   /* ── Hex view tokens ── */
@@ -12222,6 +12797,7 @@ const _tokMap = {
   "token-markup-tag": "tok-markup-tag",
   "token-markup-attr": "tok-markup-attr",
   "token-markup-string": "tok-markup-str",
+  "token-markup-meta": "tok-markup-meta",
   "token-js-keyword": "tok-kw",
   "token-js-string": "tok-json-str",
   "token-css-property": "tok-kw",
@@ -12332,7 +12908,7 @@ const httpDecoPlugin = CM.ViewPlugin.fromClass(
   class {
     constructor(view) { this.decorations = buildHttpDecorations(view); }
     update(update) {
-      if (update.docChanged || update.viewportChanged || update.startState.facet !== update.state.facet) {
+      if (update.docChanged || update.startState.facet !== update.state.facet) {
         this.decorations = buildHttpDecorations(update.view);
       }
     }
@@ -12439,21 +13015,36 @@ function addCMUpdateListener(view, callback) {
   return () => {}; // CM does not support removing extensions, but the view will be destroyed
 }
 
+const CM_SEARCH_DECORATION_LIMIT = 5000;
+
 /** Build search highlight decorations. Returns { decos, matchCount, matchPositions }. */
-function buildSearchDecorations(doc, query) {
-  if (!query) return { decos: CM.Decoration.none, matchCount: 0, matchPositions: [] };
+function buildSearchDecorations(doc, query, activeIndex = -1) {
+  if (!query) return { query: "", activeIndex: -1, decos: CM.Decoration.none, matchCount: 0, matchPositions: [] };
   const text = doc.toString();
   const lower = text.toLowerCase();
   const lq = query.toLowerCase();
   const builder = [];
   const positions = [];
+  let matchCount = 0;
   let pos = 0;
   while ((pos = lower.indexOf(lq, pos)) !== -1) {
-    builder.push(CM.Decoration.mark({ class: "tok-search-hit" }).range(pos, pos + lq.length));
+    const matchIndex = positions.length;
     positions.push(pos);
-    pos += lq.length;
+    if (matchIndex < CM_SEARCH_DECORATION_LIMIT || matchIndex === activeIndex) {
+      const cls = matchIndex === activeIndex ? "tok-search-active" : "tok-search-hit";
+      builder.push(CM.Decoration.mark({ class: cls }).range(pos, pos + lq.length));
+    }
+    matchCount += 1;
+    pos += 1;
   }
-  return { decos: CM.Decoration.set(builder), matchCount: positions.length, matchPositions: positions };
+  const safeActiveIndex = activeIndex >= 0 && activeIndex < positions.length ? activeIndex : -1;
+  return {
+    query,
+    activeIndex: safeActiveIndex,
+    decos: CM.Decoration.set(builder),
+    matchCount,
+    matchPositions: positions,
+  };
 }
 
 function createBaseExtensions(options = {}) {
@@ -12506,17 +13097,20 @@ function createBaseExtensions(options = {}) {
 
 // Search decoration effect & field
 const setSearchQuery = CM.StateEffect.define();
+const setSearchActiveIndex = CM.StateEffect.define();
 const searchDecoField = CM.StateField.define({
-  create() { return { decos: CM.Decoration.none, matchCount: 0, matchPositions: [] }; },
+  create() { return { query: "", activeIndex: -1, decos: CM.Decoration.none, matchCount: 0, matchPositions: [] }; },
   update(value, tr) {
     for (const e of tr.effects) {
       if (e.is(setSearchQuery)) {
         return buildSearchDecorations(tr.state.doc, e.value);
       }
+      if (e.is(setSearchActiveIndex)) {
+        return buildSearchDecorations(tr.state.doc, value.query, e.value);
+      }
     }
     if (tr.docChanged && value.matchCount > 0) {
-      // Rebuild when doc changes while search is active
-      return value; // keep stale until next explicit setSearchQuery
+      return buildSearchDecorations(tr.state.doc, value.query, value.activeIndex);
     }
     return value;
   },
@@ -12563,7 +13157,11 @@ class SniperCodeView {
     if (!field.matchPositions.length) return -1;
     this._searchNavIndex = (this._searchNavIndex + 1) % field.matchPositions.length;
     const pos = field.matchPositions[this._searchNavIndex];
-    this.view.dispatch({ selection: { anchor: pos, head: pos + 1 }, scrollIntoView: true });
+    this.view.dispatch({
+      effects: setSearchActiveIndex.of(this._searchNavIndex),
+      selection: { anchor: pos, head: pos + field.query.length },
+      scrollIntoView: true,
+    });
     return this._searchNavIndex;
   }
 

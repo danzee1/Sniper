@@ -147,10 +147,7 @@ impl ScannerStore {
 
     /// Push a finding, deduplicating by host+category+title.
     pub async fn push(&self, finding: ScannerFinding) {
-        let dedup_key = format!(
-            "{}:{}:{}",
-            finding.host, finding.category, finding.title
-        );
+        let dedup_key = format!("{}:{}:{}", finding.host, finding.category, finding.title);
         {
             let mut seen = self.seen.write().await;
             if !seen.insert(dedup_key) {
@@ -316,7 +313,11 @@ pub fn scan_transaction(record: &TransactionRecord, config: &ScannerConfig) -> V
 }
 
 /// Execute a single custom regex rule against the transaction.
-fn check_custom_rule(record: &TransactionRecord, rule: &CustomRule, findings: &mut Vec<ScannerFinding>) {
+fn check_custom_rule(
+    record: &TransactionRecord,
+    rule: &CustomRule,
+    findings: &mut Vec<ScannerFinding>,
+) {
     let re = match Regex::new(&rule.pattern) {
         Ok(re) => re,
         Err(_) => return, // invalid pattern — skip silently
@@ -355,18 +356,15 @@ fn check_custom_rule(record: &TransactionRecord, rule: &CustomRule, findings: &m
                 vec![]
             }
         }
-        "request_header" => {
-            record
-                .request
-                .headers
-                .iter()
-                .filter(|h| {
-                    rule.header_name.is_empty()
-                        || h.name.eq_ignore_ascii_case(&rule.header_name)
-                })
-                .map(|h| ("request header", h.value.clone()))
-                .collect()
-        }
+        "request_header" => record
+            .request
+            .headers
+            .iter()
+            .filter(|h| {
+                rule.header_name.is_empty() || h.name.eq_ignore_ascii_case(&rule.header_name)
+            })
+            .map(|h| ("request header", h.value.clone()))
+            .collect(),
         _ => vec![],
     };
 
@@ -414,7 +412,9 @@ fn check_jwt(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
 
     // Check Authorization header in request
     if let Some(auth) = record.request.header_value("authorization") {
-        let token = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "));
+        let token = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "));
         if let Some(token) = token {
             if looks_like_jwt(token) {
                 jwt_sources.push(("Authorization header", token.to_string()));
@@ -483,9 +483,7 @@ fn looks_like_jwt(value: &str) -> bool {
 fn extract_jwt_from_text(text: &str) -> Vec<String> {
     // Simple pattern: eyJ followed by base64url.base64url.base64url
     let re = Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap();
-    re.find_iter(text)
-        .map(|m| m.as_str().to_string())
-        .collect()
+    re.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
 
 fn decode_jwt_part(part: &str) -> Option<String> {
@@ -650,13 +648,10 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
 }
 
 fn has_csp_frame_ancestors(response: &crate::model::MessageRecord) -> bool {
-    response
-        .headers
-        .iter()
-        .any(|h| {
-            h.name.eq_ignore_ascii_case("content-security-policy")
-                && h.value.to_ascii_lowercase().contains("frame-ancestors")
-        })
+    response.headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case("content-security-policy")
+            && h.value.to_ascii_lowercase().contains("frame-ancestors")
+    })
 }
 
 // ── Rule 3: Cookie Flags ──
@@ -672,12 +667,7 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
             continue;
         }
 
-        let cookie_name = header
-            .value
-            .split('=')
-            .next()
-            .unwrap_or("unknown")
-            .trim();
+        let cookie_name = header.value.split('=').next().unwrap_or("unknown").trim();
         let lower = header.value.to_ascii_lowercase();
 
         if !lower.contains("httponly") {
@@ -748,38 +738,114 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::Medium,
         ),
         // ── AI / ML tokens ──
-        (r"sk-proj-[A-Za-z0-9_-]{74,}", "OpenAI Project API Key", Severity::Critical),
-        (r"sk-svcacct-[A-Za-z0-9_-]{74,}", "OpenAI Service Account Key", Severity::Critical),
-        (r"sk-ant-api03-[a-zA-Z0-9_\-]{93}", "Anthropic API Key", Severity::Critical),
-        (r"sk-ant-admin01-[a-zA-Z0-9_\-]{80,}", "Anthropic Admin Key", Severity::Critical),
+        (
+            r"sk-proj-[A-Za-z0-9_-]{74,}",
+            "OpenAI Project API Key",
+            Severity::Critical,
+        ),
+        (
+            r"sk-svcacct-[A-Za-z0-9_-]{74,}",
+            "OpenAI Service Account Key",
+            Severity::Critical,
+        ),
+        (
+            r"sk-ant-api03-[a-zA-Z0-9_\-]{93}",
+            "Anthropic API Key",
+            Severity::Critical,
+        ),
+        (
+            r"sk-ant-admin01-[a-zA-Z0-9_\-]{80,}",
+            "Anthropic Admin Key",
+            Severity::Critical,
+        ),
         (r"hf_[a-zA-Z]{34}", "HuggingFace Token", Severity::High),
         (r"gsk_[a-zA-Z0-9]{48}", "Groq API Key", Severity::Critical),
-        (r"pplx-[a-zA-Z0-9]{48}", "Perplexity API Key", Severity::Critical),
-        (r"xai-[a-zA-Z0-9]{20,}", "xAI (Grok) API Key", Severity::Critical),
+        (
+            r"pplx-[a-zA-Z0-9]{48}",
+            "Perplexity API Key",
+            Severity::Critical,
+        ),
+        (
+            r"xai-[a-zA-Z0-9]{20,}",
+            "xAI (Grok) API Key",
+            Severity::Critical,
+        ),
         (r"r8_[a-zA-Z0-9]{38}", "Replicate API Token", Severity::High),
         // ── VCS / DevOps tokens ──
-        (r"ghp_[A-Za-z0-9]{36}", "GitHub Personal Access Token", Severity::High),
+        (
+            r"ghp_[A-Za-z0-9]{36}",
+            "GitHub Personal Access Token",
+            Severity::High,
+        ),
         (r"gho_[A-Za-z0-9]{36}", "GitHub OAuth Token", Severity::High),
         (r"ghs_[A-Za-z0-9]{36}", "GitHub App Token", Severity::High),
-        (r"ghr_[A-Za-z0-9]{36}", "GitHub Refresh Token", Severity::High),
-        (r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}", "GitHub Fine-Grained PAT", Severity::High),
-        (r"glpat-[A-Za-z0-9\-]{20,}", "GitLab Personal Access Token", Severity::High),
-        (r"gl[a-z]{2,4}-[A-Za-z0-9\-]{20,}", "GitLab Token", Severity::High),
-        (r"ATATT3[A-Za-z0-9_\-=]{100,}", "Atlassian/Jira API Token", Severity::High),
+        (
+            r"ghr_[A-Za-z0-9]{36}",
+            "GitHub Refresh Token",
+            Severity::High,
+        ),
+        (
+            r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}",
+            "GitHub Fine-Grained PAT",
+            Severity::High,
+        ),
+        (
+            r"glpat-[A-Za-z0-9\-]{20,}",
+            "GitLab Personal Access Token",
+            Severity::High,
+        ),
+        (
+            r"gl[a-z]{2,4}-[A-Za-z0-9\-]{20,}",
+            "GitLab Token",
+            Severity::High,
+        ),
+        (
+            r"ATATT3[A-Za-z0-9_\-=]{100,}",
+            "Atlassian/Jira API Token",
+            Severity::High,
+        ),
         (r"dop_v1_[a-f0-9]{64}", "DigitalOcean PAT", Severity::High),
         (r"dapi[a-f0-9]{32}", "Databricks API Token", Severity::High),
-        (r"LTAI[a-z0-9]{20}", "Alibaba Cloud Access Key", Severity::High),
-        (r"dckr_pat_[a-zA-Z0-9_-]{20,}", "Docker Hub PAT", Severity::High),
-        (r"pscale_tkn_[a-zA-Z0-9_=-]{32,}", "PlanetScale Token", Severity::High),
+        (
+            r"LTAI[a-z0-9]{20}",
+            "Alibaba Cloud Access Key",
+            Severity::High,
+        ),
+        (
+            r"dckr_pat_[a-zA-Z0-9_-]{20,}",
+            "Docker Hub PAT",
+            Severity::High,
+        ),
+        (
+            r"pscale_tkn_[a-zA-Z0-9_=-]{32,}",
+            "PlanetScale Token",
+            Severity::High,
+        ),
         (r"sbp_[a-f0-9]{40,}", "Supabase PAT", Severity::High),
-        (r"dt0c01\.[a-z0-9]{24}\.[a-z0-9]{64}", "Dynatrace API Token", Severity::High),
+        (
+            r"dt0c01\.[a-z0-9]{24}\.[a-z0-9]{64}",
+            "Dynatrace API Token",
+            Severity::High,
+        ),
         (r"pul-[a-f0-9]{40}", "Pulumi API Token", Severity::High),
-        (r"AKCp[A-Za-z0-9]{69}", "JFrog Artifactory Token", Severity::High),
+        (
+            r"AKCp[A-Za-z0-9]{69}",
+            "JFrog Artifactory Token",
+            Severity::High,
+        ),
         (r"ntn_[a-zA-Z0-9]{40,}", "Notion API Token", Severity::High),
         (r"figd_[a-zA-Z0-9_-]{40,}", "Figma PAT", Severity::High),
-        (r"EAA[MC][a-zA-Z0-9]{100,}", "Facebook Page Access Token", Severity::High),
+        (
+            r"EAA[MC][a-zA-Z0-9]{100,}",
+            "Facebook Page Access Token",
+            Severity::High,
+        ),
         // ── Chat / SaaS tokens ──
-        (r"xox[bpras]-[A-Za-z0-9\-]{10,}", "Slack Token", Severity::High),
+        (
+            r"xox[bpras]-[A-Za-z0-9\-]{10,}",
+            "Slack Token",
+            Severity::High,
+        ),
         (
             r"https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+",
             "Slack Webhook URL",
@@ -838,21 +904,13 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::High,
         ),
         // ── Communication / Messaging tokens ──
-        (
-            r"SK[0-9a-fA-F]{32}",
-            "Twilio API Key",
-            Severity::High,
-        ),
+        (r"SK[0-9a-fA-F]{32}", "Twilio API Key", Severity::High),
         (
             r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}",
             "SendGrid API Key",
             Severity::High,
         ),
-        (
-            r"key-[0-9a-zA-Z]{32}",
-            "Mailgun API Key",
-            Severity::High,
-        ),
+        (r"key-[0-9a-zA-Z]{32}", "Mailgun API Key", Severity::High),
         (
             r"[0-9]+:AA[A-Za-z0-9_-]{33}",
             "Telegram Bot Token",
@@ -874,16 +932,8 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             "Hashicorp Vault Token",
             Severity::High,
         ),
-        (
-            r"dp\.pt\.[a-z0-9]{43}",
-            "Doppler API Token",
-            Severity::High,
-        ),
-        (
-            r"lin_api_[a-zA-Z0-9]{40}",
-            "Linear API Key",
-            Severity::High,
-        ),
+        (r"dp\.pt\.[a-z0-9]{43}", "Doppler API Token", Severity::High),
+        (r"lin_api_[a-zA-Z0-9]{40}", "Linear API Key", Severity::High),
         // ── Monitoring / Observability ──
         (
             r"NRAK-[A-Z0-9]{27}",
@@ -932,16 +982,8 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::High,
         ),
         // ── Package registry tokens ──
-        (
-            r"npm_[A-Za-z0-9]{36}",
-            "npm Access Token",
-            Severity::High,
-        ),
-        (
-            r"pypi-[A-Za-z0-9_-]{50,}",
-            "PyPI API Token",
-            Severity::High,
-        ),
+        (r"npm_[A-Za-z0-9]{36}", "npm Access Token", Severity::High),
+        (r"pypi-[A-Za-z0-9_-]{50,}", "PyPI API Token", Severity::High),
         // ── Cloud / Infrastructure ──
         (
             r"(?i)heroku[a-z0-9_ .\-,]{0,25}[=:]\s*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -1092,10 +1134,22 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
 
     // Debug / infrastructure headers that should not be in production
     for (header_name, label, severity) in &[
-        ("x-backend-server", "X-Backend-Server header", Severity::Medium),
-        ("x-chromelogger-data", "ChromeLogger debug data", Severity::Medium),
+        (
+            "x-backend-server",
+            "X-Backend-Server header",
+            Severity::Medium,
+        ),
+        (
+            "x-chromelogger-data",
+            "ChromeLogger debug data",
+            Severity::Medium,
+        ),
         ("x-chromephp-data", "ChromePHP debug data", Severity::Medium),
-        ("x-debug-token-link", "Symfony debug profiler link", Severity::Medium),
+        (
+            "x-debug-token-link",
+            "Symfony debug profiler link",
+            Severity::Medium,
+        ),
     ] {
         if let Some(value) = response.header_value(header_name) {
             findings.push(make_finding(
@@ -1104,7 +1158,7 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
                 "disclosure",
                 format!("{label} exposed"),
                 format!("{label} found in response. This debug/infrastructure header should not be present in production."),
-                format!("{header_name}: {}", truncate_evidence(&value, 80)),
+                format!("{header_name}: {}", truncate_evidence(value, 80)),
             ));
         }
     }
@@ -1139,18 +1193,42 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         // ── SQL / Database ──
         ("sql syntax", "SQL error message", Severity::Medium),
         ("mysql", "MySQL error disclosure", Severity::Medium),
-        ("postgresql", "PostgreSQL error disclosure", Severity::Medium),
+        (
+            "postgresql",
+            "PostgreSQL error disclosure",
+            Severity::Medium,
+        ),
         ("ora-", "Oracle DB error disclosure", Severity::Medium),
         ("sqlite", "SQLite error disclosure", Severity::Medium),
         ("mongodb", "MongoDB error disclosure", Severity::Medium),
         ("mongoose", "Mongoose (MongoDB) error", Severity::Medium),
         ("redis", "Redis error disclosure", Severity::Low),
         ("mariadb", "MariaDB error disclosure", Severity::Medium),
-        ("microsoft sql server", "MSSQL error disclosure", Severity::Medium),
-        ("unclosed quotation mark", "SQL injection indicator", Severity::High),
-        ("unterminated string", "SQL injection indicator", Severity::High),
-        ("column count doesn't match", "SQL column mismatch error", Severity::Medium),
-        ("incorrect column name", "SQL column error", Severity::Medium),
+        (
+            "microsoft sql server",
+            "MSSQL error disclosure",
+            Severity::Medium,
+        ),
+        (
+            "unclosed quotation mark",
+            "SQL injection indicator",
+            Severity::High,
+        ),
+        (
+            "unterminated string",
+            "SQL injection indicator",
+            Severity::High,
+        ),
+        (
+            "column count doesn't match",
+            "SQL column mismatch error",
+            Severity::Medium,
+        ),
+        (
+            "incorrect column name",
+            "SQL column error",
+            Severity::Medium,
+        ),
         ("unknown table", "SQL unknown table error", Severity::Medium),
         // ── DB2 / Informix / Access / JDBC (ZAP) ──
         ("db2 driver", "DB2 error disclosure", Severity::Medium),
@@ -1158,16 +1236,28 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         ("odbc db2", "DB2 ODBC error", Severity::Medium),
         ("[cli driver][db2", "DB2 CLI error", Severity::Medium),
         ("[informix]", "Informix DB error", Severity::Medium),
-        ("odbc microsoft access", "MS Access ODBC error", Severity::Medium),
+        (
+            "odbc microsoft access",
+            "MS Access ODBC error",
+            Severity::Medium,
+        ),
         ("jdbc driver", "JDBC driver error", Severity::Medium),
         ("jdbc error", "JDBC error disclosure", Severity::Medium),
         ("ole db provider", "OLE DB error", Severity::Medium),
         // ── Generic errors ──
         ("syntax error", "Syntax error in response", Severity::Low),
         ("stack trace", "Stack trace disclosure", Severity::Medium),
-        ("internal server error", "Internal server error detail", Severity::Low),
+        (
+            "internal server error",
+            "Internal server error detail",
+            Severity::Low,
+        ),
         // ── Language-specific stack traces ──
-        ("traceback (most recent", "Python traceback", Severity::Medium),
+        (
+            "traceback (most recent",
+            "Python traceback",
+            Severity::Medium,
+        ),
         ("at java.", "Java stack trace", Severity::Medium),
         ("at system.", ".NET stack trace", Severity::Medium),
         ("exception in thread", "Java exception", Severity::Medium),
@@ -1178,20 +1268,48 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         ("fatal error:", "PHP fatal error", Severity::Medium),
         ("warning:</b>", "PHP warning (HTML)", Severity::Medium),
         ("notice:</b>", "PHP notice (HTML)", Severity::Low),
-        ("warning: mysql_query()", "PHP MySQL warning", Severity::Medium),
-        ("warning: pg_connect()", "PHP PostgreSQL warning", Severity::Medium),
-        ("warning: cannot modify header information", "PHP header warning", Severity::Low),
+        (
+            "warning: mysql_query()",
+            "PHP MySQL warning",
+            Severity::Medium,
+        ),
+        (
+            "warning: pg_connect()",
+            "PHP PostgreSQL warning",
+            Severity::Medium,
+        ),
+        (
+            "warning: cannot modify header information",
+            "PHP header warning",
+            Severity::Low,
+        ),
         // ── Node.js / JavaScript ──
         ("syntaxerror:", "JavaScript SyntaxError", Severity::Medium),
-        ("referenceerror:", "JavaScript ReferenceError", Severity::Medium),
+        (
+            "referenceerror:",
+            "JavaScript ReferenceError",
+            Severity::Medium,
+        ),
         ("typeerror:", "JavaScript TypeError", Severity::Low),
         ("node_modules/", "Node.js path disclosure", Severity::Low),
         // ── ASP / VBScript / ColdFusion ──
         ("microsoft vbscript", "VBScript error", Severity::Medium),
-        ("active server pages error", "Classic ASP error", Severity::Medium),
+        (
+            "active server pages error",
+            "Classic ASP error",
+            Severity::Medium,
+        ),
         ("adodb.field error", "ASP ADODB error", Severity::Medium),
-        ("server error in '/' application", "ASP.NET application error", Severity::Medium),
-        ("error occurred while processing request", "ColdFusion error", Severity::Medium),
+        (
+            "server error in '/' application",
+            "ASP.NET application error",
+            Severity::Medium,
+        ),
+        (
+            "error occurred while processing request",
+            "ColdFusion error",
+            Severity::Medium,
+        ),
         ("jrun servlet error", "JRun servlet error", Severity::Medium),
         ("disallowed parent path", "IIS path error", Severity::Medium),
         // ── Framework debug ──
@@ -1199,8 +1317,16 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         ("django.core", "Django debug info", Severity::Medium),
         ("laravel", "Laravel framework error", Severity::Medium),
         ("spring boot", "Spring Boot error page", Severity::Low),
-        ("whitelabel error page", "Spring Boot default error page", Severity::Low),
-        ("werkzeug debugger", "Flask/Werkzeug debugger exposed", Severity::High),
+        (
+            "whitelabel error page",
+            "Spring Boot default error page",
+            Severity::Low,
+        ),
+        (
+            "werkzeug debugger",
+            "Flask/Werkzeug debugger exposed",
+            Severity::High,
+        ),
         ("x-debug-token", "Symfony debug token", Severity::Medium),
     ];
 
@@ -1417,7 +1543,10 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     }
 
     // Also check SourceMap header
-    if let Some(sm) = response.header_value("sourcemap").or_else(|| response.header_value("x-sourcemap")) {
+    if let Some(sm) = response
+        .header_value("sourcemap")
+        .or_else(|| response.header_value("x-sourcemap"))
+    {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -1445,9 +1574,21 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
         for m in comment_re.find_iter(body) {
             let comment = m.as_str().to_ascii_lowercase();
             let sensitive_keywords = [
-                "todo", "fixme", "hack", "bug", "password", "secret",
-                "credential", "token", "api_key", "apikey", "admin",
-                "internal", "debug", "temporary", "remove before",
+                "todo",
+                "fixme",
+                "hack",
+                "bug",
+                "password",
+                "secret",
+                "credential",
+                "token",
+                "api_key",
+                "apikey",
+                "admin",
+                "internal",
+                "debug",
+                "temporary",
+                "remove before",
             ];
             for keyword in &sensitive_keywords {
                 if comment.contains(keyword) {
@@ -1536,9 +1677,16 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
     // Session token in URL
     let path_lower = record.path.to_ascii_lowercase();
     let session_params = [
-        "jsessionid", "phpsessid", "sessionid", "session_id",
-        "sid=", "aspsessionid", "token=", "access_token=",
-        "auth_token=", "api_key=",
+        "jsessionid",
+        "phpsessid",
+        "sessionid",
+        "session_id",
+        "sid=",
+        "aspsessionid",
+        "token=",
+        "access_token=",
+        "auth_token=",
+        "api_key=",
     ];
     for param in &session_params {
         if path_lower.contains(param) {
@@ -1611,9 +1759,17 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
                 if path_params.len() > 1 {
                     let query = path_params[1].to_ascii_lowercase();
                     let redirect_params = [
-                        "redirect", "url", "next", "return", "goto",
-                        "redir", "redirect_uri", "return_url", "continue",
-                        "dest", "destination",
+                        "redirect",
+                        "url",
+                        "next",
+                        "return",
+                        "goto",
+                        "redir",
+                        "redirect_uri",
+                        "return_url",
+                        "continue",
+                        "dest",
+                        "destination",
                     ];
                     for param in &redirect_params {
                         if query.contains(param) {
@@ -1625,7 +1781,7 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
                                     "auth",
                                     "Possible open redirect",
                                     format!("Redirect to external URL based on user-controlled parameter. Query contains '{param}' and Location points to a different host."),
-                                    format!("Location: {}", truncate_evidence(&loc, 80)),
+                                    format!("Location: {}", truncate_evidence(loc, 80)),
                                 ));
                                 break;
                             }
@@ -1664,7 +1820,10 @@ fn extract_json_number(json: &str, key: &str) -> Option<i64> {
     let rest = rest.trim_start().strip_prefix(':')?;
     let rest = rest.trim_start();
     // Parse number
-    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+    let num_str: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
     num_str.parse().ok()
 }
 
@@ -1699,23 +1858,31 @@ mod tests {
             MessageRecord {
                 headers: req_headers
                     .into_iter()
-                    .map(|(n, v)| HeaderRecord { name: n.into(), value: v.into() })
+                    .map(|(n, v)| HeaderRecord {
+                        name: n.into(),
+                        value: v.into(),
+                    })
                     .collect(),
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
                 preview_truncated: false,
                 content_type: None,
+                content_decoded: false,
             },
             Some(MessageRecord {
                 headers: res_headers
                     .into_iter()
-                    .map(|(n, v)| HeaderRecord { name: n.into(), value: v.into() })
+                    .map(|(n, v)| HeaderRecord {
+                        name: n.into(),
+                        value: v.into(),
+                    })
                     .collect(),
                 body_preview: res_body.into(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: res_body.len(),
                 preview_truncated: false,
+                content_decoded: false,
                 content_type: Some("text/html".into()),
             }),
             Vec::new(),
@@ -1737,7 +1904,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "jwt" && f.title.contains("without expiration")),
+            findings
+                .iter()
+                .any(|f| f.category == "jwt" && f.title.contains("without expiration")),
             "Should detect JWT without expiration"
         );
     }
@@ -1753,7 +1922,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.title.contains("Content-Security-Policy")),
+            findings
+                .iter()
+                .any(|f| f.title.contains("Content-Security-Policy")),
             "Should detect missing CSP"
         );
     }
@@ -1776,12 +1947,7 @@ mod tests {
 
     #[test]
     fn test_cors_wildcard() {
-        let record = make_record(
-            vec![],
-            vec![("access-control-allow-origin", "*")],
-            "",
-            200,
-        );
+        let record = make_record(vec![], vec![("access-control-allow-origin", "*")], "", 200);
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
@@ -1792,12 +1958,7 @@ mod tests {
 
     #[test]
     fn test_server_disclosure() {
-        let record = make_record(
-            vec![],
-            vec![("server", "Apache/2.4.51")],
-            "",
-            200,
-        );
+        let record = make_record(vec![], vec![("server", "Apache/2.4.51")], "", 200);
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
@@ -1828,7 +1989,10 @@ mod tests {
             vec![],
             vec![
                 ("content-type", "text/html"),
-                ("content-security-policy", "default-src 'self' 'unsafe-inline'"),
+                (
+                    "content-security-policy",
+                    "default-src 'self' 'unsafe-inline'",
+                ),
             ],
             "<html></html>",
             200,
@@ -1836,7 +2000,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
+            findings
+                .iter()
+                .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
             "Should detect CSP unsafe-inline"
         );
     }
@@ -1852,7 +2018,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "info" && f.title.contains("Directory listing")),
+            findings
+                .iter()
+                .any(|f| f.category == "info" && f.title.contains("Directory listing")),
             "Should detect directory listing"
         );
     }
@@ -1868,7 +2036,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "info" && f.title.contains("GraphQL introspection")),
+            findings
+                .iter()
+                .any(|f| f.category == "info" && f.title.contains("GraphQL introspection")),
             "Should detect GraphQL introspection"
         );
     }
@@ -1890,6 +2060,7 @@ mod tests {
                 body_size: 0,
                 preview_truncated: false,
                 content_type: None,
+                content_decoded: false,
             },
             Some(MessageRecord {
                 headers: vec![],
@@ -1898,6 +2069,7 @@ mod tests {
                 body_size: 0,
                 preview_truncated: false,
                 content_type: Some("text/html".into()),
+                content_decoded: false,
             }),
             Vec::new(),
             None,
@@ -1906,7 +2078,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "auth" && f.title.contains("Session/token")),
+            findings
+                .iter()
+                .any(|f| f.category == "auth" && f.title.contains("Session/token")),
             "Should detect session token in URL"
         );
     }
@@ -1931,6 +2105,7 @@ mod tests {
                 body_size: 0,
                 preview_truncated: false,
                 content_type: None,
+                content_decoded: false,
             },
             Some(MessageRecord {
                 headers: vec![],
@@ -1939,6 +2114,7 @@ mod tests {
                 body_size: 0,
                 preview_truncated: false,
                 content_type: Some("text/html".into()),
+                content_decoded: false,
             }),
             Vec::new(),
             None,
@@ -1957,16 +2133,13 @@ mod tests {
         // Build test key at runtime to avoid GitHub push protection false positive
         let fake_key = format!("sk_{}_{}a", "live", "TESTKEY000000000000000000");
         let body = format!(r#"<script>var key = "{fake_key}";</script>"#);
-        let record = make_record(
-            vec![],
-            vec![("content-type", "text/html")],
-            &body,
-            200,
-        );
+        let record = make_record(vec![], vec![("content-type", "text/html")], &body, 200);
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.title.contains("Stripe Secret Key")),
+            findings
+                .iter()
+                .any(|f| f.title.contains("Stripe Secret Key")),
             "Should detect Stripe secret key"
         );
     }
@@ -1982,7 +2155,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "info" && f.title.contains("HTML comment")),
+            findings
+                .iter()
+                .any(|f| f.category == "info" && f.title.contains("HTML comment")),
             "Should detect sensitive HTML comment"
         );
     }
@@ -1998,7 +2173,9 @@ mod tests {
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "info" && f.title.contains("Swagger")),
+            findings
+                .iter()
+                .any(|f| f.category == "info" && f.title.contains("Swagger")),
             "Should detect Swagger/OpenAPI spec exposure"
         );
     }

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -25,20 +25,21 @@ use uuid::Uuid;
 use crate::{
     config::{StartupSettingsUpdate, StartupSettingsView},
     event_log::EventLogEntry,
-    intercept::{InterceptRecord, InterceptSummary, ResponseInterceptRecord, ResponseInterceptSummary},
     fuzzer::{self, FuzzerAttackPayload, FuzzerAttackRecord, FuzzerAttackSummary},
-    sequence::{self, SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
+    intercept::{
+        InterceptRecord, InterceptSummary, ResponseInterceptRecord, ResponseInterceptSummary,
+    },
     match_replace::{MatchReplaceRule, MatchReplaceRulesPayload},
     model::{EditableRequest, EditableResponse, RequestTargetOverride},
     proxy,
     runtime::{RuntimeSettingsSnapshot, RuntimeSettingsUpdate},
+    sequence::{self, SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     session::SessionSummary,
     state::AppState,
-    store::ListFilters,
+    store::{ListFilters, TransactionListPage},
     target::{TargetHostNode, TargetPathNode},
     ui_settings::AppUiSettingsSnapshot,
     workspace::WorkspaceStateSnapshot,
-    ws_replay::{WsReplaySnapshot, WsReplayStatus},
 };
 
 #[derive(RustEmbed)]
@@ -121,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/oast/status", get(oast_status))
         .route("/api/target/site-map", get(get_target_site_map))
         .route("/api/transactions", get(list_transactions))
+        .route("/api/transactions-page", get(list_transactions_page))
         .route("/api/transactions/:id", get(get_transaction))
         .route(
             "/api/transactions/:id/annotations",
@@ -131,24 +133,36 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/intercepts/:id", get(get_intercept))
         .route("/api/intercepts/:id/forward", post(forward_intercept))
         .route("/api/intercepts/:id/drop", post(drop_intercept))
-        .route("/api/intercept-rules", get(list_intercept_rules).post(upsert_intercept_rule))
+        .route(
+            "/api/intercept-rules",
+            get(list_intercept_rules).post(upsert_intercept_rule),
+        )
         .route("/api/intercept-rules/:id", delete(delete_intercept_rule))
         .route("/api/response-intercepts", get(list_response_intercepts))
-        .route("/api/response-intercepts/forward-all", post(forward_all_response_intercepts))
+        .route(
+            "/api/response-intercepts/forward-all",
+            post(forward_all_response_intercepts),
+        )
         .route("/api/response-intercepts/:id", get(get_response_intercept))
-        .route("/api/response-intercepts/:id/forward", post(forward_response_intercept))
-        .route("/api/response-intercepts/:id/drop", post(drop_response_intercept))
+        .route(
+            "/api/response-intercepts/:id/forward",
+            post(forward_response_intercept),
+        )
+        .route(
+            "/api/response-intercepts/:id/drop",
+            post(drop_response_intercept),
+        )
         .route("/api/replay/send", post(send_replay))
         .route(
             "/api/fuzzer/attacks",
             get(list_fuzzer_attacks).post(run_fuzzer_attack),
         )
         .route("/api/fuzzer/attacks/:id", get(get_fuzzer_attack))
+        .route("/api/sequences", get(list_sequences).post(upsert_sequence))
         .route(
-            "/api/sequences",
-            get(list_sequences).post(upsert_sequence),
+            "/api/sequences/:id",
+            get(get_sequence).delete(delete_sequence),
         )
-        .route("/api/sequences/:id", get(get_sequence).delete(delete_sequence))
         .route("/api/sequences/:id/run", post(run_sequence))
         .route("/api/sequence-runs", get(list_sequence_runs))
         .route("/api/sequence-runs/:id", get(get_sequence_run))
@@ -170,11 +184,102 @@ struct TransactionQuery {
     q: Option<String>,
     method: Option<String>,
     limit: Option<usize>,
+    offset: Option<usize>,
+    before_sequence: Option<u64>,
+    sort_key: Option<String>,
+    sort_direction: Option<String>,
+    in_scope_only: Option<bool>,
+    hide_without_responses: Option<bool>,
+    only_parameterized: Option<bool>,
+    only_notes: Option<bool>,
+    status_classes: Option<String>,
+    mime_types: Option<String>,
+    hidden_extensions: Option<String>,
+    port: Option<String>,
+    color_tags: Option<String>,
+    advanced_search: Option<String>,
+    advanced_regex: Option<bool>,
+    advanced_case_sensitive: Option<bool>,
+    advanced_negative: Option<bool>,
+    hide_connect: Option<bool>,
     host: Option<String>,
     status: Option<u16>,
     status_range: Option<String>,
     since: Option<String>,
     mime: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TransactionPageResponse {
+    items: Vec<crate::model::TransactionSummary>,
+    total: usize,
+    filtered_total: Option<usize>,
+    offset: usize,
+    limit: usize,
+    has_more: bool,
+}
+
+fn csv_param(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn optional_csv_param(value: Option<String>) -> Option<Vec<String>> {
+    value.map(|raw| {
+        raw.split(',')
+            .map(|item| item.trim().to_ascii_lowercase())
+            .filter(|item| !item.is_empty())
+            .collect()
+    })
+}
+
+fn transaction_list_filters(query: TransactionQuery, scope_patterns: Vec<String>) -> ListFilters {
+    ListFilters {
+        query: query.q,
+        method: query.method,
+        limit: query.limit,
+        offset: query.offset,
+        before_sequence: query.before_sequence,
+        sort_key: query.sort_key,
+        sort_direction: query.sort_direction,
+        scope_patterns,
+        in_scope_only: query.in_scope_only.unwrap_or(false),
+        hide_connect: query.hide_connect.unwrap_or(false),
+        hide_without_responses: query.hide_without_responses.unwrap_or(false),
+        only_parameterized: query.only_parameterized.unwrap_or(false),
+        only_notes: query.only_notes.unwrap_or(false),
+        status_classes: optional_csv_param(query.status_classes),
+        mime_types: optional_csv_param(query.mime_types),
+        hidden_extensions: csv_param(query.hidden_extensions),
+        host: query.host,
+        status: query.status,
+        status_range: query.status_range,
+        since: query.since,
+        mime: query.mime,
+        port: query.port,
+        color_tags: csv_param(query.color_tags),
+        advanced_search: query.advanced_search,
+        advanced_regex: query.advanced_regex.unwrap_or(false),
+        advanced_case_sensitive: query.advanced_case_sensitive.unwrap_or(false),
+        advanced_negative: query.advanced_negative.unwrap_or(false),
+    }
+}
+
+impl From<TransactionListPage> for TransactionPageResponse {
+    fn from(page: TransactionListPage) -> Self {
+        Self {
+            items: page.items,
+            total: page.total,
+            filtered_total: page.filtered_total,
+            offset: page.offset,
+            limit: page.limit,
+            has_more: page.has_more,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,13 +468,16 @@ async fn update_runtime_settings(
         )
         .await;
     // Sync OAST config when runtime settings change
-    session.oast.update_config(crate::oast::OastConfig {
-        enabled: snapshot.oast_enabled,
-        server_url: snapshot.oast_server_url.clone(),
-        token: snapshot.oast_token.clone(),
-        polling_interval_secs: snapshot.oast_polling_interval_secs,
-        provider: snapshot.oast_provider.clone(),
-    }).await;
+    session
+        .oast
+        .update_config(crate::oast::OastConfig {
+            enabled: snapshot.oast_enabled,
+            server_url: snapshot.oast_server_url.clone(),
+            token: snapshot.oast_token.clone(),
+            polling_interval_secs: snapshot.oast_polling_interval_secs,
+            provider: snapshot.oast_provider.clone(),
+        })
+        .await;
 
     persist_session_quiet(&state).await;
     Json(snapshot)
@@ -485,10 +593,7 @@ async fn list_findings(
     Json(session.scanner.list(query.limit).await)
 }
 
-async fn get_finding(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+async fn get_finding(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let id = match Uuid::parse_str(&id) {
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -510,7 +615,9 @@ async fn clear_findings(State(state): State<Arc<AppState>>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn get_scanner_config(State(state): State<Arc<AppState>>) -> Json<crate::scanner::ScannerConfig> {
+async fn get_scanner_config(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::scanner::ScannerConfig> {
     let session = state.session().await;
     Json(session.scanner.get_config().await)
 }
@@ -540,9 +647,7 @@ async fn download_root_der(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-async fn reveal_certificate_folder(
-    State(state): State<Arc<AppState>>,
-) -> StatusCode {
+async fn reveal_certificate_folder(State(state): State<Arc<AppState>>) -> StatusCode {
     let export = state.certificates.export();
     let _ = std::process::Command::new("open")
         .args(["-R", &export.pem_path])
@@ -648,21 +753,29 @@ async fn list_transactions(
     Query(query): Query<TransactionQuery>,
 ) -> Json<Vec<crate::model::TransactionSummary>> {
     let session = state.session().await;
-    Json(
-        session
-            .store
-            .list(&ListFilters {
-                query: query.q,
-                method: query.method,
-                limit: query.limit,
-                host: query.host,
-                status: query.status,
-                status_range: query.status_range,
-                since: query.since,
-                mime: query.mime,
-            })
-            .await,
-    )
+    let runtime = session.runtime.snapshot().await;
+    let filters = transaction_list_filters(query, runtime.scope_patterns);
+    Json(session.store.list(&filters).await)
+}
+
+async fn list_transactions_page(
+    State(state): State<Arc<AppState>>,
+    Query(mut query): Query<TransactionQuery>,
+) -> Json<TransactionPageResponse> {
+    const DEFAULT_PAGE_LIMIT: usize = 5000;
+    const MAX_PAGE_LIMIT: usize = 10000;
+
+    query.limit = Some(
+        query
+            .limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGE_LIMIT),
+    );
+    let session = state.session().await;
+    let runtime = session.runtime.snapshot().await;
+    let filters = transaction_list_filters(query, runtime.scope_patterns);
+    let page = session.store.list_page(&filters).await;
+    Json(page.into())
 }
 
 async fn get_transaction(
@@ -923,9 +1036,7 @@ struct SequenceQuery {
     limit: Option<usize>,
 }
 
-async fn list_sequences(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<SequenceDefinition>> {
+async fn list_sequences(State(state): State<Arc<AppState>>) -> Json<Vec<SequenceDefinition>> {
     let session = state.session().await;
     Json(session.sequence.list_definitions().await)
 }
@@ -954,10 +1065,7 @@ async fn upsert_sequence(
     StatusCode::NO_CONTENT
 }
 
-async fn delete_sequence(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> StatusCode {
+async fn delete_sequence(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
     let id = match Uuid::parse_str(&id) {
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST,
@@ -971,10 +1079,7 @@ async fn delete_sequence(
     }
 }
 
-async fn run_sequence(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
+async fn run_sequence(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let id = match Uuid::parse_str(&id) {
         Ok(id) => id,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid sequence ID").into_response(),
@@ -1225,22 +1330,41 @@ async fn ws_replay_frames(
 
 async fn events(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let session = state.session().await;
+    let last_event_sequence = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let latest_sequence = session.store.latest_sequence();
     let mut transaction_receiver = session.store.subscribe();
     let mut log_receiver = session.event_log.subscribe();
 
     let stream = stream! {
+        if last_event_sequence.is_some_and(|last_sequence| latest_sequence > last_sequence) {
+            yield Ok(Event::default()
+                .event("transactions_gap")
+                .data("reconnect"));
+        }
         loop {
             tokio::select! {
                 result = transaction_receiver.recv() => {
                     match result {
                         Ok(summary) => {
                             if let Ok(payload) = serde_json::to_string(&summary) {
-                                yield Ok(Event::default().event("transaction").data(payload));
+                                yield Ok(Event::default()
+                                    .event("transaction")
+                                    .id(summary.sequence.to_string())
+                                    .data(payload));
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok(Event::default()
+                                .event("transactions_gap")
+                                .data("lagged"));
+                            continue;
+                        },
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -1269,8 +1393,14 @@ async fn events(
 async fn index() -> Response {
     (
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            ),
         ],
         include_str!("../web/index.html"),
     )
@@ -1286,21 +1416,18 @@ async fn decoder_asset(Path(path): Path<String>) -> Response {
 }
 
 async fn favicon_svg() -> Response {
-    asset_response(
-        "image/svg+xml",
-        include_str!("../web/favicon.svg"),
-    )
+    asset_response("image/svg+xml", include_str!("../web/favicon.svg"))
 }
 
 async fn logo_svg() -> Response {
-    asset_response(
-        "image/svg+xml",
-        include_str!("../web/logo.svg"),
-    )
+    asset_response("image/svg+xml", include_str!("../web/logo.svg"))
 }
 
 async fn bungee_font() -> Response {
-    binary_asset_response("font/ttf", include_bytes!("../web/fonts/Bungee-Regular.ttf"))
+    binary_asset_response(
+        "font/ttf",
+        include_bytes!("../web/fonts/Bungee-Regular.ttf"),
+    )
 }
 
 async fn styles_css() -> Response {
@@ -1325,7 +1452,10 @@ fn asset_response(content_type: &'static str, body: &'static str) -> Response {
     (
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            ),
         ],
         body,
     )
@@ -1455,12 +1585,15 @@ async fn get_oast_callback(
 ) -> Result<Json<crate::oast::OastCallback>, StatusCode> {
     let id = Uuid::parse_str(&id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let session = state.session().await;
-    session.oast.get(id).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+    session
+        .oast
+        .get(id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn clear_oast_callbacks(
-    State(state): State<Arc<AppState>>,
-) -> StatusCode {
+async fn clear_oast_callbacks(State(state): State<Arc<AppState>>) -> StatusCode {
     let session = state.session().await;
     session.oast.clear().await;
     persist_session_quiet(&state).await;
@@ -1473,9 +1606,7 @@ struct OastPayloadResponse {
     payload: String,
 }
 
-async fn generate_oast_payload(
-    State(state): State<Arc<AppState>>,
-) -> Json<OastPayloadResponse> {
+async fn generate_oast_payload(State(state): State<Arc<AppState>>) -> Json<OastPayloadResponse> {
     let session = state.session().await;
     // Try provider-aware generation first (uses registered Interactsh state)
     if let Some((cid, payload)) = crate::oast::generate_payload(&session.oast).await {
@@ -1502,9 +1633,7 @@ struct OastStatusResponse {
     payload_domain: Option<String>,
 }
 
-async fn oast_status(
-    State(state): State<Arc<AppState>>,
-) -> Json<OastStatusResponse> {
+async fn oast_status(State(state): State<Arc<AppState>>) -> Json<OastStatusResponse> {
     let session = state.session().await;
     let config = session.oast.get_config().await;
     let provider = format!("{}", config.provider);
@@ -1552,6 +1681,7 @@ mod tests {
             body_size: 0,
             preview_truncated: false,
             content_type: None,
+            content_decoded: false,
         };
 
         let session = state.session().await;

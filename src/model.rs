@@ -45,17 +45,14 @@ pub struct EditableResponse {
 }
 
 impl EditableResponse {
-    pub fn from_status_headers_body(
-        status: u16,
-        headers: &HeaderMap,
-        body: &[u8],
-    ) -> Self {
+    pub fn from_status_headers_body(status: u16, headers: &HeaderMap, body: &[u8]) -> Self {
         let content_type = headers
             .get(http::header::CONTENT_TYPE)
             .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
 
         // Decompress body based on Content-Encoding header (gzip, deflate, br)
         let decoded_body = decode_content_encoding(headers, body);
+        let content_decoded = decoded_body.is_some();
         let body_ref = decoded_body.as_deref().unwrap_or(body);
 
         let body_encoding = if is_textual_body(content_type.as_deref(), body_ref) {
@@ -66,7 +63,7 @@ impl EditableResponse {
 
         Self {
             status,
-            headers: header_records(headers),
+            headers: header_records_for_decoded_body(headers, content_decoded),
             body: match body_encoding {
                 BodyEncoding::Utf8 => String::from_utf8_lossy(body_ref).into_owned(),
                 BodyEncoding::Base64 => STANDARD.encode(body_ref),
@@ -105,6 +102,7 @@ impl EditableRequest {
 
         // Decompress body based on Content-Encoding header (gzip, deflate, br)
         let decoded_body = decode_content_encoding(headers, body);
+        let content_decoded = decoded_body.is_some();
         let body_ref = decoded_body.as_deref().unwrap_or(body);
 
         let body_encoding = if is_textual_body(content_type.as_deref(), body_ref) {
@@ -114,16 +112,19 @@ impl EditableRequest {
         };
 
         let host = host.into();
-        let mut headers = header_records(headers);
+        let mut headers = header_records_for_decoded_body(headers, content_decoded);
         // HTTP/2 sends the host as the :authority pseudo-header which hyper
         // places in the URI authority rather than in the headers map.  Ensure a
         // Host header is always present so match-replace rules and UI display
         // work consistently.
         if !headers.iter().any(|h| h.name.eq_ignore_ascii_case("host")) && !host.is_empty() {
-            headers.insert(0, HeaderRecord {
-                name: "host".to_string(),
-                value: host.clone(),
-            });
+            headers.insert(
+                0,
+                HeaderRecord {
+                    name: "host".to_string(),
+                    value: host.clone(),
+                },
+            );
         }
 
         Self {
@@ -153,7 +154,7 @@ impl EditableRequest {
             host: host.into(),
             method: method.into(),
             path: path.into(),
-            headers: message.headers.clone(),
+            headers: header_records_from_message(message),
             body: message.body_preview.clone(),
             body_encoding: message.body_encoding.clone(),
             preview_truncated: message.preview_truncated,
@@ -183,6 +184,8 @@ pub struct MessageRecord {
     pub body_size: usize,
     pub preview_truncated: bool,
     pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub content_decoded: bool,
 }
 
 impl MessageRecord {
@@ -193,8 +196,9 @@ impl MessageRecord {
 
         // Decompress body based on Content-Encoding header
         let decoded_body = decode_content_encoding(headers, body);
+        let content_decoded = decoded_body.is_some();
         let body_ref = decoded_body.as_deref().unwrap_or(body);
-        let original_size = body_ref.len();
+        let original_size = body.len();
 
         let preview_len = max_preview.min(body_ref.len());
         let preview_bytes = &body_ref[..preview_len];
@@ -214,8 +218,9 @@ impl MessageRecord {
                 BodyEncoding::Base64
             },
             body_size: original_size,
-            preview_truncated: original_size > max_preview,
+            preview_truncated: body_ref.len() > max_preview,
             content_type,
+            content_decoded,
         }
     }
 
@@ -513,6 +518,40 @@ fn header_records(headers: &HeaderMap) -> Vec<HeaderRecord> {
         .collect()
 }
 
+fn header_records_for_decoded_body(
+    headers: &HeaderMap,
+    content_decoded: bool,
+) -> Vec<HeaderRecord> {
+    let records = header_records(headers);
+    if content_decoded {
+        sanitize_decoded_body_headers(records)
+    } else {
+        records
+    }
+}
+
+fn header_records_from_message(message: &MessageRecord) -> Vec<HeaderRecord> {
+    if message.content_decoded {
+        sanitize_decoded_body_headers(message.headers.clone())
+    } else {
+        message.headers.clone()
+    }
+}
+
+fn sanitize_decoded_body_headers(headers: Vec<HeaderRecord>) -> Vec<HeaderRecord> {
+    headers
+        .into_iter()
+        .filter(|header| {
+            !header.name.eq_ignore_ascii_case("content-encoding")
+                && !header.name.eq_ignore_ascii_case("content-length")
+        })
+        .collect()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn decode_content_encoding(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> {
     if body.is_empty() {
         return None;
@@ -543,9 +582,7 @@ fn decode_content_encoding(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> 
             brotli::BrotliDecompress(&mut std::io::Cursor::new(body), &mut out).ok()?;
             out
         }
-        "zstd" | "zstandard" => {
-            zstd::decode_all(std::io::Cursor::new(body)).ok()?
-        }
+        "zstd" | "zstandard" => zstd::decode_all(std::io::Cursor::new(body)).ok()?,
         _ => return None,
     };
 
@@ -572,4 +609,112 @@ fn is_textual_body(content_type: Option<&str>, sample: &[u8]) -> bool {
     }
 
     std::str::from_utf8(sample).is_ok() && !sample.contains(&0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
+    use std::io::Write;
+
+    fn gzip(body: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn compressed_headers(compressed_len: usize) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert(CONTENT_LENGTH, compressed_len.to_string().parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn message_record_decodes_gzip_preview_but_keeps_wire_size() {
+        let raw = br#"{"ok":true}"#;
+        let compressed = gzip(raw);
+        let headers = compressed_headers(compressed.len());
+
+        let record = MessageRecord::from_headers_and_body(&headers, &compressed, 1024);
+
+        assert_eq!(record.body_preview, String::from_utf8_lossy(raw));
+        assert_eq!(record.body_encoding, BodyEncoding::Utf8);
+        assert_eq!(record.body_size, compressed.len());
+        assert!(!record.preview_truncated);
+        assert!(record.content_decoded);
+    }
+
+    #[test]
+    fn editable_request_from_compressed_body_sanitizes_decoded_entity_headers() {
+        let raw = br#"{"ok":true}"#;
+        let compressed = gzip(raw);
+        let headers = compressed_headers(compressed.len());
+
+        let request = EditableRequest::from_headers_and_body(
+            "https",
+            "example.com",
+            "POST",
+            "/submit",
+            &headers,
+            &compressed,
+        );
+
+        assert_eq!(request.body, String::from_utf8_lossy(raw));
+        assert!(request
+            .headers
+            .iter()
+            .all(|h| !h.name.eq_ignore_ascii_case("content-encoding")));
+        assert!(request
+            .headers
+            .iter()
+            .all(|h| !h.name.eq_ignore_ascii_case("content-length")));
+    }
+
+    #[test]
+    fn editable_request_from_decoded_message_sanitizes_entity_headers() {
+        let raw = br#"{"ok":true}"#;
+        let compressed = gzip(raw);
+        let headers = compressed_headers(compressed.len());
+        let message = MessageRecord::from_headers_and_body(&headers, &compressed, 1024);
+
+        let request = EditableRequest::from_message_record(
+            "https",
+            "example.com",
+            "POST",
+            "/submit",
+            &message,
+        );
+
+        assert_eq!(request.body, String::from_utf8_lossy(raw));
+        assert!(request
+            .headers
+            .iter()
+            .all(|h| !h.name.eq_ignore_ascii_case("content-encoding")));
+        assert!(request
+            .headers
+            .iter()
+            .all(|h| !h.name.eq_ignore_ascii_case("content-length")));
+    }
+
+    #[test]
+    fn editable_response_from_compressed_body_sanitizes_decoded_entity_headers() {
+        let raw = br#"{"ok":true}"#;
+        let compressed = gzip(raw);
+        let headers = compressed_headers(compressed.len());
+
+        let response = EditableResponse::from_status_headers_body(200, &headers, &compressed);
+
+        assert_eq!(response.body, String::from_utf8_lossy(raw));
+        assert!(response
+            .headers
+            .iter()
+            .all(|h| !h.name.eq_ignore_ascii_case("content-encoding")));
+        assert!(response
+            .headers
+            .iter()
+            .all(|h| !h.name.eq_ignore_ascii_case("content-length")));
+    }
 }
