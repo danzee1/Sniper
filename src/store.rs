@@ -151,7 +151,7 @@ impl CachedSummary {
         let quick_haystack = format!(
             "{} {} {} {} {} {} {} {} {} {} {} {}",
             summary.id,
-            summary.sequence + 1,
+            summary.sequence,
             summary.method,
             summary.host,
             summary.path,

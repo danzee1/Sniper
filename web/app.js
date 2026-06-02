@@ -642,6 +642,10 @@ let refreshTimer = null;
 let auxTimer = null;
 let eventSource = null;
 let workspaceSaveTimer = null;
+let workspaceSaveInFlight = false;
+let workspaceSaveDirty = false;
+let workspaceSaveVersion = 0;
+let workspaceSaveLoopPromise = null;
 let uiSettingsSaveTimer = null;
 let toolsBootPromise = null;
 let displaySettingsPreviewActive = false;
@@ -2249,14 +2253,48 @@ function scheduleWorkspaceStateSave() {
     return;
   }
 
+  workspaceSaveDirty = true;
+  workspaceSaveVersion += 1;
   window.clearTimeout(workspaceSaveTimer);
   workspaceSaveTimer = window.setTimeout(() => {
     workspaceSaveTimer = null;
-    saveWorkspaceState().catch((error) => console.error(error));
+    flushQueuedWorkspaceStateSave().catch((error) => console.error(error));
   }, 250);
 }
 
-async function saveWorkspaceState() {
+async function flushQueuedWorkspaceStateSave() {
+  if (!state.activeSession) {
+    return;
+  }
+  if (workspaceSaveLoopPromise) {
+    return workspaceSaveLoopPromise;
+  }
+
+  workspaceSaveLoopPromise = runQueuedWorkspaceStateSaves()
+    .finally(() => {
+      workspaceSaveLoopPromise = null;
+    });
+  return workspaceSaveLoopPromise;
+}
+
+async function runQueuedWorkspaceStateSaves() {
+  while (state.activeSession && workspaceSaveDirty) {
+    workspaceSaveDirty = false;
+    const version = workspaceSaveVersion;
+    const snapshot = snapshotWorkspaceState();
+    workspaceSaveInFlight = true;
+    try {
+      await saveWorkspaceState(snapshot);
+    } finally {
+      workspaceSaveInFlight = false;
+    }
+    if (workspaceSaveVersion !== version) {
+      workspaceSaveDirty = true;
+    }
+  }
+}
+
+async function saveWorkspaceState(snapshot = snapshotWorkspaceState()) {
   if (!state.activeSession) {
     return;
   }
@@ -2266,7 +2304,7 @@ async function saveWorkspaceState() {
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify(snapshotWorkspaceState()),
+    body: JSON.stringify(snapshot),
   });
 
   if (!response.ok) {
@@ -2277,16 +2315,32 @@ async function saveWorkspaceState() {
 async function flushWorkspaceState() {
   window.clearTimeout(workspaceSaveTimer);
   workspaceSaveTimer = null;
-  await saveWorkspaceState();
+  workspaceSaveDirty = true;
+  workspaceSaveVersion += 1;
+  await flushQueuedWorkspaceStateSave();
 }
 
 function resetSessionScopedUiState() {
   window.clearTimeout(refreshTimer);
+  refreshTimer = null;
   window.clearTimeout(workspaceSaveTimer);
   workspaceSaveTimer = null;
+  workspaceSaveDirty = false;
+  clearHistoryBackfill();
+  window.clearTimeout(_incrementalTimer);
+  _incrementalTimer = 0;
+  window.clearTimeout(_transactionDeltaTimer);
+  _transactionDeltaTimer = 0;
+  _pendingTransactionSummaries.length = 0;
   state.items = [];
+  state.historyPaging = createHistoryPagingState();
   state.selectedId = null;
   state.selectedRecord = null;
+  state._connectCount = 0;
+  state._itemById = new Map();
+  state._itemIndexById = new Map();
+  state._itemsVersion += 1;
+  invalidateVisibleEntriesCache();
   state.intercepts = [];
   state.responseIntercepts = [];
   state.selectedInterceptId = null;
@@ -2889,6 +2943,9 @@ function mergeHistoryItems(items, { prepend = false } = {}) {
     state.items.push(...newItems);
   }
   state._connectCount = (state._connectCount || 0) + connectCount;
+  if (state.historyPaging) {
+    state.historyPaging._trimmedTailOnLastMerge = false;
+  }
   trimHistoryCache(prepend ? "recent" : "older");
   rebuildHistoryItemIndex();
   state._itemsVersion += 1;
@@ -2912,6 +2969,7 @@ function trimHistoryCache(prefer = "recent") {
   } else {
     removed = state.items.splice(state.items.length - overflow, overflow);
     state.historyPaging.trimmedTailCount += removed.length;
+    state.historyPaging._trimmedTailOnLastMerge = true;
     state.historyPaging.hasMore = true;
     state.historyPaging.fullyLoaded = false;
   }
@@ -3186,7 +3244,7 @@ function summaryQuickSearchHaystack(item) {
   }
   return [
     item.id || "",
-    Number(item.sequence ?? 0) + 1,
+    item.sequence ?? "",
     item.method || "",
     item.host || "",
     item.path || "",
@@ -3221,11 +3279,17 @@ function scheduleIncrementalRefresh() {
       const previousTotal = state.historyPaging?.total;
       const previousFilteredTotal = state.historyPaging?.filteredTotal;
       const previousHasMore = state.historyPaging?.hasMore;
+      const wasFullyLoaded = state.historyPaging?.fullyLoaded === true;
+      if (state.historyPaging) {
+        state.historyPaging._trimmedTailOnLastMerge = false;
+      }
       const added = mergeHistoryItems(recent, { prepend: true });
       if (state.historyPaging) {
         if (page.total != null) state.historyPaging.total = page.total;
         if (page.filtered_total != null) state.historyPaging.filteredTotal = page.filtered_total;
-        state.historyPaging.hasMore = Boolean(page.has_more);
+        state.historyPaging.hasMore = wasFullyLoaded && !state.historyPaging._trimmedTailOnLastMerge
+          ? false
+          : Boolean(page.has_more);
         state.historyPaging.fullyLoaded = !state.historyPaging.hasMore;
       }
       if (added > 0 && state.historyPaging) state.historyPaging.offset = state.items.length;
@@ -5851,6 +5915,7 @@ function renderReplay() {
       updateCodePaneCM("replayReq", els.replayRequestCM, "", {
         mode: "http", readOnly: false,
         placeholder: "Paste or type an HTTP request here...",
+        onChange: syncReplayRequestTextFromEditor,
       });
     } else {
       if (els.replayRequestEditor) els.replayRequestEditor.value = "";
@@ -5900,21 +5965,8 @@ function renderReplay() {
       }
       updateCodePaneCM("replayReq", els.replayRequestCM, displayText, {
         mode: "http", readOnly: false,
+        onChange: syncReplayRequestTextFromEditor,
       });
-      // Attach onChange to sync tab.requestText
-      const cv = getCMView("replayReq");
-      if (cv && !cv._replayOnChangeWired) {
-        cv._replayOnChangeWired = true;
-        addCMUpdateListener(cv.view, (newText) => {
-          const activeTab = getActiveReplayTab();
-          if (activeTab) {
-            activeTab.requestText = newText;
-            syncReplayToolbar(activeTab);
-            renderReplayTabs();
-            scheduleWorkspaceStateSave();
-          }
-        });
-      }
       updateReplaySearchPane("request", displayText);
     }
   } else if (reqMode === "hex") {
@@ -6044,6 +6096,20 @@ function restoreContentEditableCaret(el, pos) {
     sel.removeAllRanges();
     sel.addRange(range);
   }
+}
+
+function syncReplayRequestTextFromEditor(newText) {
+  const activeTab = getActiveReplayTab();
+  if (!activeTab || activeTab.type === "websocket") {
+    return;
+  }
+  activeTab.requestText = newText;
+  activeTab.requestBytes = null;
+  activeTab.requestOriginalBytes = null;
+  syncReplayToolbar(activeTab);
+  renderReplayTabs();
+  updateReplaySearchPane("request", newText);
+  scheduleWorkspaceStateSave();
 }
 
 function syncReplayRequestHighlightScroll() {
@@ -6196,7 +6262,11 @@ function renderReplayViewContent(target) {
         } else if (mode === "raw") {
           displayText = compactFormat(tab.requestText);
         }
-        updateCodePaneCM("replayReq", els.replayRequestCM, displayText, { mode: "http", readOnly: false });
+        updateCodePaneCM("replayReq", els.replayRequestCM, displayText, {
+          mode: "http",
+          readOnly: false,
+          onChange: syncReplayRequestTextFromEditor,
+        });
         updateReplaySearchPane("request", displayText);
       }
     } else {
@@ -8200,7 +8270,7 @@ function toggleReplayTabPin(id) {
   if (!tab) return;
   tab.pinned = !tab.pinned;
   // Flush immediately so pin state survives quick app quit
-  saveWorkspaceState().catch((error) => console.error(error));
+  flushWorkspaceState().catch((error) => console.error(error));
   renderReplayTabs();
 }
 
@@ -8679,7 +8749,7 @@ function renderHistoryHeader() {
 function renderHistoryCell(colKey, item, entry) {
   switch (colKey) {
     case "index":
-      return `<td>${item.sequence != null ? item.sequence + 1 : entry.index + 1}</td>`;
+      return `<td>${item.sequence != null ? item.sequence : entry.index + 1}</td>`;
     case "host":
       return `<td class="cell-host">${escapeHtml(item.host)}</td>`;
     case "method":
@@ -13006,10 +13076,13 @@ const payloadDecoPlugin = CM.ViewPlugin.fromClass(
   { decorations: (v) => v.decorations },
 );
 
+const cmProgrammaticSetContent = CM.Annotation.define();
+
 /** Add an update listener to a CM EditorView; returns a dispose function. */
 function addCMUpdateListener(view, callback) {
   const listener = CM.EditorView.updateListener.of((update) => {
-    if (update.docChanged) callback(update.state.doc.toString());
+    const programmatic = update.transactions.some((tr) => tr.annotation(cmProgrammaticSetContent));
+    if (update.docChanged && !programmatic) callback(update.state.doc.toString());
   });
   view.dispatch({ effects: CM.StateEffect.appendConfig.of(listener) });
   return () => {}; // CM does not support removing extensions, but the view will be destroyed
@@ -13133,8 +13206,13 @@ class SniperCodeView {
 
   setContent(text) {
     const { view } = this;
+    const nextText = text || "";
+    if (view.state.doc.toString() === nextText) {
+      return;
+    }
     view.dispatch({
-      changes: { from: 0, to: view.state.doc.length, insert: text || "" },
+      changes: { from: 0, to: view.state.doc.length, insert: nextText },
+      annotations: cmProgrammaticSetContent.of(true),
     });
   }
 
@@ -13207,18 +13285,12 @@ function updateCodePaneCM(key, container, text, options = {}) {
     _cmViews[key] = new SniperCodeView(container, cmOpts);
     _cmViews[key]._hlMode = mode;
     _cmViews[key]._editable = editable;
-    // Wire optional onChange callback for editable instances
-    if (editable && options.onChange) {
-      _cmViews[key].view.dispatch = ((origDispatch) => {
-        return function (tr) {
-          origDispatch.call(this, tr);
-        };
-      })(_cmViews[key].view.dispatch);
-      // Use CM updateListener instead
-      _cmViews[key]._onChangeDispose = addCMUpdateListener(_cmViews[key].view, options.onChange);
-    }
   }
   const cv = _cmViews[key];
+  if (editable && options.onChange && !cv._onChangeWired) {
+    cv._onChangeDispose = addCMUpdateListener(cv.view, options.onChange);
+    cv._onChangeWired = true;
+  }
   cv.setContent(text || "");
 
   // Search highlights

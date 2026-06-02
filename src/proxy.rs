@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -1063,23 +1064,8 @@ async fn forward_http_request(
         original_request_capture,
     )
     .await;
-    let record = exchange.record.clone();
-    session.store.insert(record.clone()).await;
-    // Passive scanner: analyze transaction asynchronously
-    {
-        let scanner = session.scanner.clone();
-        let scan_record = record.clone();
-        tokio::spawn(async move {
-            let config = scanner.get_config().await;
-            let findings = crate::scanner::scan_transaction(&scan_record, &config);
-            for finding in findings {
-                scanner.push(finding).await;
-            }
-        });
-    }
-    persist_session_quiet(&state, &session).await;
-
-    match exchange.response {
+    let mut record = exchange.record.clone();
+    let client_response = match exchange.response {
         Ok(response) => {
             let intercepted = maybe_intercept_response(
                 state.clone(),
@@ -1101,16 +1087,30 @@ async fn forward_http_request(
                     let body = Bytes::from(edited.body_bytes());
                     let status = StatusCode::from_u16(edited.status)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    record.status = Some(status.as_u16());
+                    record.response = Some(MessageRecord::from_headers_and_body(
+                        &headers,
+                        body.as_ref(),
+                        state.config.body_preview_bytes,
+                    ));
                     rebuild_response(headers, status, body)
                 }
-                ResponseInterceptResolution::Drop => text_response(
-                    StatusCode::BAD_GATEWAY,
-                    "Response dropped in intercept.".to_string(),
-                ),
+                ResponseInterceptResolution::Drop => {
+                    let message = "Response dropped in intercept.";
+                    let (response, response_capture) =
+                        synthetic_error_response(StatusCode::BAD_GATEWAY, message, &state);
+                    record.status = Some(StatusCode::BAD_GATEWAY.as_u16());
+                    record.response = Some(response_capture);
+                    record.notes.push(message.to_string());
+                    response
+                }
             }
         }
         Err(error) => text_response(error.status, error.message),
-    }
+    };
+
+    store_record_and_scan(&state, &session, record).await;
+    client_response
 }
 
 async fn forward_websocket_request(
@@ -1495,6 +1495,32 @@ async fn maybe_intercept_response(
         .await;
     persist_session_quiet(&state, &session).await;
     resolution
+}
+
+async fn store_record_and_scan(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    record: TransactionRecord,
+) {
+    session.store.insert(record.clone()).await;
+    {
+        let scanner = session.scanner.clone();
+        let scan_record = record.clone();
+        let scan_state = Arc::clone(state);
+        let scan_session = Arc::clone(session);
+        tokio::spawn(async move {
+            let config = scanner.get_config().await;
+            let findings = crate::scanner::scan_transaction(&scan_record, &config);
+            let has_findings = !findings.is_empty();
+            for finding in findings {
+                scanner.push(finding).await;
+            }
+            if has_findings {
+                persist_session_quiet(&scan_state, &scan_session).await;
+            }
+        });
+    }
+    persist_session_quiet(state, session).await;
 }
 
 async fn execute_http_exchange(
@@ -2085,19 +2111,21 @@ fn build_websocket_client_response_headers(
 
 static LAST_PERSIST: Mutex<Option<Instant>> = Mutex::new(None);
 static PERSIST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
-static PERSIST_TRAILING_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static PERSIST_DIRTY_SESSIONS: LazyLock<Mutex<HashSet<Uuid>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static PERSIST_TRAILING_SESSIONS: LazyLock<Mutex<HashSet<Uuid>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
 
 async fn persist_session_quiet(state: &Arc<AppState>, session: &Arc<SessionContext>) {
     if let Some(delay) = persist_debounce_remaining() {
-        PERSIST_DIRTY.store(true, Ordering::Release);
+        mark_persist_dirty(session);
         schedule_delayed_persist(state, session, delay);
         return;
     }
 
     if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        PERSIST_DIRTY.store(true, Ordering::Release);
+        mark_persist_dirty(session);
         schedule_delayed_persist(state, session, PERSIST_DEBOUNCE);
         return;
     }
@@ -2111,15 +2139,21 @@ fn persist_debounce_remaining() -> Option<Duration> {
 }
 
 fn schedule_delayed_persist(state: &Arc<AppState>, session: &Arc<SessionContext>, delay: Duration) {
-    if PERSIST_TRAILING_SCHEDULED.swap(true, Ordering::AcqRel) {
-        return;
+    let session_id = session.id();
+    {
+        let mut scheduled = PERSIST_TRAILING_SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !scheduled.insert(session_id) {
+            return;
+        }
     }
     let state = Arc::clone(state);
     let session = Arc::clone(session);
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        PERSIST_TRAILING_SCHEDULED.store(false, Ordering::Release);
-        if !PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
+        clear_trailing_persist(session_id);
+        if !take_persist_dirty(session_id) {
             return;
         }
         start_persist_or_reschedule(state, session);
@@ -2128,13 +2162,13 @@ fn schedule_delayed_persist(state: &Arc<AppState>, session: &Arc<SessionContext>
 
 fn start_persist_or_reschedule(state: Arc<AppState>, session: Arc<SessionContext>) {
     if let Some(delay) = persist_debounce_remaining() {
-        PERSIST_DIRTY.store(true, Ordering::Release);
+        mark_persist_dirty(&session);
         schedule_delayed_persist(&state, &session, delay);
         return;
     }
 
     if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        PERSIST_DIRTY.store(true, Ordering::Release);
+        mark_persist_dirty(&session);
         schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE);
         return;
     }
@@ -2153,10 +2187,31 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>) {
             warn!(?error, session_id = %session.id(), "failed to persist session snapshot");
         }
         PERSIST_IN_FLIGHT.store(false, Ordering::Release);
-        if PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
+        if take_persist_dirty(session.id()) {
             schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE);
         }
     });
+}
+
+fn mark_persist_dirty(session: &SessionContext) {
+    let mut dirty = PERSIST_DIRTY_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dirty.insert(session.id());
+}
+
+fn take_persist_dirty(session_id: Uuid) -> bool {
+    let mut dirty = PERSIST_DIRTY_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dirty.remove(&session_id)
+}
+
+fn clear_trailing_persist(session_id: Uuid) {
+    let mut scheduled = PERSIST_TRAILING_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    scheduled.remove(&session_id);
 }
 
 async fn relay_websocket_session(

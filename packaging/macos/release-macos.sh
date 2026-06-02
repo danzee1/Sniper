@@ -8,16 +8,6 @@ cd "$ROOT_DIR"
 
 APP_NAME="${APP_NAME:-Sniper}"
 VERSION="${VERSION:-$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)}"
-APP_BUNDLE="$ROOT_DIR/dist/${APP_NAME}.app"
-
-if [[ -n "${DEVELOPER_ID_APP:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
-  xcrun notarytool submit "$APP_BUNDLE" \
-    --apple-id "$APPLE_ID" \
-    --team-id "$APPLE_TEAM_ID" \
-    --password "$APPLE_APP_PASSWORD" \
-    --wait
-  xcrun stapler staple "$APP_BUNDLE"
-fi
 
 "$ROOT_DIR/packaging/macos/make-dmg.sh"
 
@@ -29,6 +19,7 @@ if [[ -n "${DEVELOPER_ID_APP:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}
     --team-id "$APPLE_TEAM_ID" \
     --password "$APPLE_APP_PASSWORD" \
     --wait
+  xcrun stapler staple "$DMG_PATH"
 fi
 
 echo "macOS release artifacts ready in $ROOT_DIR/dist"

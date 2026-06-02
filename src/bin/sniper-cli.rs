@@ -596,11 +596,11 @@ struct ApiClient {
 
 impl ApiClient {
     async fn discover(cli_api: Option<String>) -> Result<Self> {
-        let base_url = discover_api_base_url(cli_api)?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .context("failed to build sniper-cli HTTP client")?;
+        let base_url = discover_api_base_url(cli_api, &client).await?;
         Ok(Self { base_url, client })
     }
 
@@ -1035,40 +1035,28 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 bail!("fuzzer payloads are empty");
             }
 
+            let record: FuzzerAttackRecord = api
+                .post_json(
+                    "/api/fuzzer/attacks",
+                    &FuzzerRunPayload {
+                        template,
+                        payloads,
+                        source_transaction_id: workspace.fuzzer.source_transaction_id,
+                    },
+                )
+                .await?;
+            workspace.fuzzer.attack_record = Some(record.clone());
+            workspace.fuzzer.notice.clear();
+            let _snapshot: WorkspaceStateSnapshot =
+                api.post_json("/api/workspace-state", &workspace).await?;
+
             if args.r#async {
-                // Async mode: fire the request with a short timeout, return job info immediately.
-                // The API processes the attack synchronously, so we use a spawned task approach:
-                // send the request in background and return a pending job reference.
-                let payload = FuzzerRunPayload {
-                    template: template.clone(),
-                    payloads: payloads.clone(),
-                    source_transaction_id: workspace.fuzzer.source_transaction_id,
-                };
-                let api_clone = api.clone();
-                tokio::spawn(async move {
-                    let _result: Result<FuzzerAttackRecord, _> =
-                        api_clone.post_json("/api/fuzzer/attacks", &payload).await;
-                });
                 print_json(&json!({
-                    "async": true,
-                    "message": "Fuzzer attack submitted asynchronously. Use 'fuzzer list' or 'fuzzer status --id <id>' to check results.",
-                    "hint": "The attack ID will appear in 'fuzzer list' once the server begins processing."
+                    "async_requested": true,
+                    "message": "Fuzzer attack completed. The current Sniper API creates attacks synchronously, so the CLI waits until the server returns the attack record.",
+                    "attack": record,
                 }))
             } else {
-                let record: FuzzerAttackRecord = api
-                    .post_json(
-                        "/api/fuzzer/attacks",
-                        &FuzzerRunPayload {
-                            template,
-                            payloads,
-                            source_transaction_id: workspace.fuzzer.source_transaction_id,
-                        },
-                    )
-                    .await?;
-                workspace.fuzzer.attack_record = Some(record.clone());
-                workspace.fuzzer.notice.clear();
-                let _snapshot: WorkspaceStateSnapshot =
-                    api.post_json("/api/workspace-state", &workspace).await?;
                 print_json(&record)
             }
         }
@@ -1664,7 +1652,10 @@ fn read_text_input(file: Option<PathBuf>, stdin: bool) -> Result<String> {
     bail!("expected --file or --stdin")
 }
 
-fn discover_api_base_url(cli_api: Option<String>) -> Result<String> {
+async fn discover_api_base_url(
+    cli_api: Option<String>,
+    client: &reqwest::Client,
+) -> Result<String> {
     if let Some(api) = cli_api {
         return Ok(normalize_api_base_url(&api));
     }
@@ -1678,14 +1669,13 @@ fn discover_api_base_url(cli_api: Option<String>) -> Result<String> {
     let data_dir = default_data_dir();
     if let Some(runtime_state) = load_runtime_state(&data_dir)? {
         let url = runtime_state.api_base_url();
-        // Probe the discovered address to verify it's live
-        if let Ok(probe) = reqwest::blocking::Client::builder()
+        let probe = client
+            .get(format!("{url}/api/runtime"))
             .timeout(std::time::Duration::from_secs(2))
-            .build()
-        {
-            if probe.get(format!("{url}/api/runtime")).send().is_ok() {
-                return Ok(url);
-            }
+            .send()
+            .await;
+        if probe.is_ok_and(|response| response.status().is_success()) {
+            return Ok(url);
         }
         // Probe failed — stale runtime-state
         bail!(

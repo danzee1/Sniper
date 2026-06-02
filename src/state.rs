@@ -395,19 +395,21 @@ impl AppState {
         let new_app_path = new_app_path.context("no .app found in DMG")?;
 
         // Copy new app over the current bundle
-        let cp_output = Command::new("cp")
-            .args(["-Rf"])
+        let copy_output = Command::new("ditto")
             .arg(&new_app_path)
-            .arg(app_bundle.parent().unwrap_or(std::path::Path::new("/")))
+            .arg(&app_bundle)
             .output()
             .context("failed to copy new app bundle")?;
 
-        if !cp_output.status.success() {
+        if !copy_output.status.success() {
             let _ = Command::new("hdiutil")
                 .args(["detach", "-quiet"])
                 .arg(&mount_point)
                 .output();
-            anyhow::bail!("cp failed: {}", String::from_utf8_lossy(&cp_output.stderr));
+            anyhow::bail!(
+                "ditto failed: {}",
+                String::from_utf8_lossy(&copy_output.stderr)
+            );
         }
 
         // Detach DMG & clean up
@@ -443,9 +445,10 @@ impl AppState {
         let _ = Command::new("sh")
             .args([
                 "-c",
-                &format!(
-                    "while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; sleep 0.5; open -a '{bundle}'"
-                ),
+                "pid=\"$1\"; bundle=\"$2\"; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done; sleep 0.5; open \"$bundle\"",
+                "sniper-restart",
+                &pid.to_string(),
+                &bundle,
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -470,6 +473,11 @@ impl AppState {
             .and_then(|p| p.parent()) // Contents/
             .and_then(|p| p.parent()) // Sniper.app/
             .context("executable is not inside a .app bundle")?;
+        if contents.extension().and_then(|value| value.to_str()) != Some("app")
+            || !contents.join("Contents/MacOS").is_dir()
+        {
+            anyhow::bail!("self-update is only supported when running from Sniper.app");
+        }
         Ok(contents.to_path_buf())
     }
 

@@ -750,8 +750,13 @@ async fn get_target_site_map(State(state): State<Arc<AppState>>) -> Json<Vec<Tar
 
 async fn list_transactions(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<TransactionQuery>,
+    Query(mut query): Query<TransactionQuery>,
 ) -> Json<Vec<crate::model::TransactionSummary>> {
+    const MAX_PAGE_LIMIT: usize = 10000;
+
+    if let Some(limit) = query.limit {
+        query.limit = Some(limit.clamp(1, MAX_PAGE_LIMIT));
+    }
     let session = state.session().await;
     let runtime = session.runtime.snapshot().await;
     let filters = transaction_list_filters(query, runtime.scope_patterns);

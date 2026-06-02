@@ -66,7 +66,9 @@ impl StartupSettingsSnapshot {
     }
 
     pub fn proxy_addr_string(&self) -> String {
-        format!("{}:{}", self.proxy_bind_host, self.proxy_port)
+        self.proxy_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| format!("{}:{}", self.proxy_bind_host, self.proxy_port))
     }
 }
 
@@ -272,5 +274,15 @@ mod tests {
         let saved = reloaded.snapshot().await;
         assert_eq!(saved.proxy_bind_host, "0.0.0.0");
         assert_eq!(saved.proxy_port, 8081);
+    }
+
+    #[test]
+    fn startup_settings_view_formats_ipv6_proxy_addr() {
+        let snapshot = super::StartupSettingsSnapshot {
+            proxy_bind_host: "::1".to_string(),
+            proxy_port: 8081,
+        };
+
+        assert_eq!(snapshot.proxy_addr_string(), "[::1]:8081");
     }
 }
