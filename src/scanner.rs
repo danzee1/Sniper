@@ -1,4 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
@@ -43,24 +46,35 @@ pub struct CustomRule {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScannerConfig {
+    #[serde(default = "default_scanner_enabled")]
     pub enabled: bool,
     /// Per-rule toggle. Key = rule id (e.g. "jwt", "header"), value = enabled.
-    pub rules: std::collections::HashMap<String, bool>,
+    #[serde(default = "default_rule_toggles")]
+    pub rules: HashMap<String, bool>,
+    #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
 }
 
 impl Default for ScannerConfig {
     fn default() -> Self {
-        let mut rules = std::collections::HashMap::new();
-        for &(id, _) in BUILTIN_RULES {
-            rules.insert(id.to_string(), true);
-        }
         Self {
             enabled: true,
-            rules,
+            rules: default_rule_toggles(),
             custom_rules: Vec::new(),
         }
     }
+}
+
+fn default_scanner_enabled() -> bool {
+    true
+}
+
+fn default_rule_toggles() -> HashMap<String, bool> {
+    let mut rules = HashMap::new();
+    for &(id, _) in BUILTIN_RULES {
+        rules.insert(id.to_string(), true);
+    }
+    rules
 }
 
 impl ScannerConfig {
@@ -129,8 +143,9 @@ pub struct ScannerStore {
     entries: RwLock<VecDeque<ScannerFinding>>,
     events: broadcast::Sender<FindingSummary>,
     config: RwLock<ScannerConfig>,
-    /// Dedup set: key = "host:path:category:title"
+    /// Dedup set: key = "record_id:host:path:category:title"
     seen: RwLock<HashSet<String>>,
+    clear_generation: AtomicU64,
 }
 
 impl ScannerStore {
@@ -142,25 +157,42 @@ impl ScannerStore {
             events,
             config: RwLock::new(ScannerConfig::default()),
             seen: RwLock::new(HashSet::new()),
+            clear_generation: AtomicU64::new(0),
         }
     }
 
-    /// Push a finding, deduplicating by host+category+title.
-    pub async fn push(&self, finding: ScannerFinding) {
-        let dedup_key = format!("{}:{}:{}", finding.host, finding.category, finding.title);
-        {
-            let mut seen = self.seen.write().await;
-            if !seen.insert(dedup_key) {
-                return; // duplicate — skip
-            }
-        }
+    /// Push a finding, deduplicating by transaction+host+path+category+title.
+    pub async fn push(&self, finding: ScannerFinding) -> bool {
+        self.push_inner(finding, None).await
+    }
+
+    pub fn clear_generation(&self) -> u64 {
+        self.clear_generation.load(Ordering::Acquire)
+    }
+
+    pub async fn push_if_generation(&self, finding: ScannerFinding, generation: u64) -> bool {
+        self.push_inner(finding, Some(generation)).await
+    }
+
+    async fn push_inner(&self, finding: ScannerFinding, generation: Option<u64>) -> bool {
+        let dedup_key = finding_dedup_key(&finding);
         let summary = finding.summary();
         let mut entries = self.entries.write().await;
+        let mut seen = self.seen.write().await;
+        if generation.is_some_and(|expected| self.clear_generation() != expected) {
+            return false;
+        }
+        if !seen.insert(dedup_key) {
+            return false; // duplicate — skip
+        }
         entries.push_front(finding);
         while entries.len() > self.max_entries {
-            entries.pop_back();
+            if let Some(evicted) = entries.pop_back() {
+                seen.remove(&finding_dedup_key(&evicted));
+            }
         }
         let _ = self.events.send(summary);
+        true
     }
 
     pub async fn list(&self, limit: Option<usize>) -> Vec<FindingSummary> {
@@ -178,8 +210,20 @@ impl ScannerStore {
     }
 
     pub async fn clear(&self) {
+        self.clear_generation.fetch_add(1, Ordering::AcqRel);
         self.entries.write().await.clear();
-        // Keep `seen` intact so cleared findings are not re-detected from new traffic.
+        self.seen.write().await.clear();
+    }
+
+    pub async fn replace_all(&self, findings: Vec<ScannerFinding>) {
+        let mut entries = self.entries.write().await;
+        let mut seen = self.seen.write().await;
+        entries.clear();
+        seen.clear();
+        for finding in findings.into_iter().take(self.max_entries) {
+            seen.insert(finding_dedup_key(&finding));
+            entries.push_back(finding);
+        }
     }
 
     pub async fn count(&self) -> usize {
@@ -200,17 +244,24 @@ impl ScannerStore {
 
     /// Create a store pre-populated with persisted findings.
     pub fn from_findings(max_entries: usize, findings: Vec<ScannerFinding>) -> Self {
+        Self::from_findings_with_config(max_entries, findings, ScannerConfig::default())
+    }
+
+    pub fn from_findings_with_config(
+        max_entries: usize,
+        findings: Vec<ScannerFinding>,
+        config: ScannerConfig,
+    ) -> Self {
         let (events, _) = broadcast::channel(max_entries.max(64));
-        let mut seen = HashSet::new();
-        for f in &findings {
-            seen.insert(format!("{}:{}:{}", f.host, f.category, f.title));
-        }
+        let findings: Vec<_> = findings.into_iter().take(max_entries).collect();
+        let seen = findings.iter().map(finding_dedup_key).collect();
         Self {
             max_entries,
             entries: RwLock::new(VecDeque::from(findings)),
             events,
-            config: RwLock::new(ScannerConfig::default()),
+            config: RwLock::new(config),
             seen: RwLock::new(seen),
+            clear_generation: AtomicU64::new(0),
         }
     }
 
@@ -223,6 +274,13 @@ impl ScannerStore {
             .cloned()
             .collect()
     }
+}
+
+fn finding_dedup_key(finding: &ScannerFinding) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        finding.record_id, finding.host, finding.path, finding.category, finding.title
+    )
 }
 
 // ── Scanner engine ──
@@ -412,10 +470,7 @@ fn check_jwt(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
 
     // Check Authorization header in request
     if let Some(auth) = record.request.header_value("authorization") {
-        let token = auth
-            .strip_prefix("Bearer ")
-            .or_else(|| auth.strip_prefix("bearer "));
-        if let Some(token) = token {
+        if let Some(token) = authorization_bearer_token(auth) {
             if looks_like_jwt(token) {
                 jwt_sources.push(("Authorization header", token.to_string()));
             }
@@ -472,17 +527,31 @@ fn looks_like_jwt(value: &str) -> bool {
         return false;
     }
     // Each part should be valid base64url
-    parts.iter().all(|part| {
-        !part.is_empty()
-            && part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=')
-    })
+    parts[0..2].iter().all(|part| is_non_empty_base64url(part))
+        && parts[2]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=')
+}
+
+fn authorization_bearer_token(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let (scheme, token) = trimmed.split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+        .filter(|token| !token.is_empty())
+}
+
+fn is_non_empty_base64url(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=')
 }
 
 fn extract_jwt_from_text(text: &str) -> Vec<String> {
     // Simple pattern: eyJ followed by base64url.base64url.base64url
-    let re = Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap();
+    let re = Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*").unwrap();
     re.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
 
@@ -516,9 +585,10 @@ fn analyze_jwt(
     };
     let payload_json = decode_jwt_part(parts[1]).unwrap_or_default();
 
+    let jwt_alg = jwt_alg_from_header(&header_json);
+
     // Check alg:none
-    let header_lower = header_json.to_ascii_lowercase();
-    if header_lower.contains("\"alg\"") && header_lower.contains("\"none\"") {
+    if jwt_alg.as_deref() == Some("none") {
         findings.push(make_finding(
             record,
             Severity::High,
@@ -531,7 +601,7 @@ fn analyze_jwt(
 
     // Check weak algorithms
     for weak_alg in &["hs256", "hs384", "hs512"] {
-        if header_lower.contains(&format!("\"{weak_alg}\"")) {
+        if jwt_alg.as_deref() == Some(*weak_alg) {
             findings.push(make_finding(
                 record,
                 Severity::Low,
@@ -581,6 +651,14 @@ fn analyze_jwt(
     ));
 }
 
+fn jwt_alg_from_header(header_json: &str) -> Option<String> {
+    let header = serde_json::from_str::<serde_json::Value>(header_json).ok()?;
+    header
+        .get("alg")?
+        .as_str()
+        .map(|alg| alg.to_ascii_lowercase())
+}
+
 // ── Rule 2: Security Headers ──
 
 fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -589,9 +667,8 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
         None => return,
     };
 
-    // Only check HTML responses
-    let ct = response.content_type.as_deref().unwrap_or("");
-    if !ct.contains("text/html") && !ct.is_empty() {
+    // Only check HTML page responses.
+    if !is_html_page_response(response) {
         return;
     }
 
@@ -654,6 +731,25 @@ fn has_csp_frame_ancestors(response: &crate::model::MessageRecord) -> bool {
     })
 }
 
+fn is_html_page_response(response: &crate::model::MessageRecord) -> bool {
+    if let Some(content_type) = response.content_type.as_deref() {
+        let ct = content_type.trim();
+        if !ct.is_empty() {
+            return ct.to_ascii_lowercase().contains("text/html");
+        }
+    }
+
+    if !matches!(response.body_encoding, BodyEncoding::Utf8) {
+        return false;
+    }
+
+    let body = response.body_preview.trim_start().to_ascii_lowercase();
+    body.starts_with("<!doctype html")
+        || body.starts_with("<html")
+        || body.contains("<head")
+        || body.contains("<body")
+}
+
 // ── Rule 3: Cookie Flags ──
 
 fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -668,9 +764,9 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
         }
 
         let cookie_name = header.value.split('=').next().unwrap_or("unknown").trim();
-        let lower = header.value.to_ascii_lowercase();
+        let attributes = cookie_attribute_names(&header.value);
 
-        if !lower.contains("httponly") {
+        if !attributes.contains("httponly") {
             findings.push(make_finding(
                 record,
                 Severity::Medium,
@@ -681,7 +777,7 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
             ));
         }
 
-        if !lower.contains("secure") && record.scheme == "https" {
+        if !attributes.contains("secure") && record.scheme == "https" {
             findings.push(make_finding(
                 record,
                 Severity::Medium,
@@ -692,7 +788,7 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
             ));
         }
 
-        if !lower.contains("samesite") {
+        if !attributes.contains("samesite") {
             findings.push(make_finding(
                 record,
                 Severity::Low,
@@ -703,6 +799,16 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
             ));
         }
     }
+}
+
+fn cookie_attribute_names(value: &str) -> HashSet<String> {
+    value
+        .split(';')
+        .skip(1)
+        .filter_map(|attribute| attribute.trim().split('=').next())
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 // ── Rule 4: Sensitive Data Exposure ──
@@ -1008,7 +1114,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         ),
         // ── Network / Infrastructure ──
         (
-            r"\b(?:10|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b",
+            r"\b(?:10\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)|172\.(?:1[6-9]|2\d|3[01])\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)|192\.168\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d))\b",
             "Internal IP address",
             Severity::Low,
         ),
@@ -1060,8 +1166,12 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
         None => return,
     };
 
-    let acao = response.header_value("access-control-allow-origin");
-    let acac = response.header_value("access-control-allow-credentials");
+    let acao = response
+        .header_value("access-control-allow-origin")
+        .map(str::trim);
+    let acac = response
+        .header_value("access-control-allow-credentials")
+        .map(str::trim);
 
     if let Some(origin) = acao {
         if origin == "*" {
@@ -1086,7 +1196,7 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
             }
         } else if origin != "null" && acac.is_some_and(|v| v.eq_ignore_ascii_case("true")) {
             // Reflect origin with credentials — potentially dangerous
-            let req_origin = record.request.header_value("origin").unwrap_or("");
+            let req_origin = record.request.header_value("origin").unwrap_or("").trim();
             if !req_origin.is_empty() && origin == req_origin {
                 findings.push(make_finding(
                     record,
@@ -1123,7 +1233,7 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
                 findings.push(make_finding(
                     record,
                     Severity::Info,
-                    "disclosure",
+                    "server",
                     format!("{label} version disclosure"),
                     format!("{label} header reveals server technology/version. This helps attackers fingerprint the stack."),
                     format!("{header_name}: {value}"),
@@ -1155,7 +1265,7 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
             findings.push(make_finding(
                 record,
                 severity.clone(),
-                "disclosure",
+                "server",
                 format!("{label} exposed"),
                 format!("{label} found in response. This debug/infrastructure header should not be present in production."),
                 format!("{header_name}: {}", truncate_evidence(value, 80)),
@@ -1333,9 +1443,7 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
     for &(pattern, label, ref severity) in ERROR_PATTERNS {
         if body_lower.contains(pattern) {
             let evidence_start = body_lower.find(pattern).unwrap_or(0);
-            let start = evidence_start.saturating_sub(20);
-            let end = (evidence_start + pattern.len() + 60).min(body.len());
-            let evidence = &body[start..end];
+            let evidence = evidence_window(body, evidence_start, pattern.len(), 20, 60);
             findings.push(make_finding(
                 record,
                 severity.clone(),
@@ -1357,8 +1465,6 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
         None => return,
     };
 
-    let ct = response.content_type.as_deref().unwrap_or("");
-
     let has_header = |name: &str| -> bool {
         response
             .headers
@@ -1375,7 +1481,7 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
     };
 
     // Referrer-Policy missing (HTML responses)
-    if (ct.contains("text/html") || ct.is_empty()) && !has_header("referrer-policy") {
+    if is_html_page_response(response) && !has_header("referrer-policy") {
         findings.push(make_finding(
             record,
             Severity::Info,
@@ -1387,7 +1493,7 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
     }
 
     // Permissions-Policy / Feature-Policy missing (HTML responses)
-    if (ct.contains("text/html") || ct.is_empty())
+    if is_html_page_response(response)
         && !has_header("permissions-policy")
         && !has_header("feature-policy")
     {
@@ -1522,10 +1628,7 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
             "info",
             "Directory listing enabled",
             "Server is exposing directory contents. This reveals file structure and may expose sensitive files.",
-            truncate_evidence(
-                &body[..body.len().min(120)],
-                120,
-            ),
+            truncate_evidence(evidence_prefix(body, 120), 120),
         ));
     }
 
@@ -1609,8 +1712,9 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     // Email addresses in response body
     if let Ok(email_re) = Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}") {
         let ct = response.content_type.as_deref().unwrap_or("");
+        let ct_lower = ct.to_ascii_lowercase();
         // Only flag in non-email contexts (HTML/JSON)
-        if ct.contains("html") || ct.contains("json") {
+        if ct_lower.contains("html") || ct_lower.contains("json") {
             if let Some(m) = email_re.find(body) {
                 // Skip obvious false positives
                 let email = m.as_str();
@@ -1675,31 +1779,15 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
 
 fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
     // Session token in URL
-    let path_lower = record.path.to_ascii_lowercase();
-    let session_params = [
-        "jsessionid",
-        "phpsessid",
-        "sessionid",
-        "session_id",
-        "sid=",
-        "aspsessionid",
-        "token=",
-        "access_token=",
-        "auth_token=",
-        "api_key=",
-    ];
-    for param in &session_params {
-        if path_lower.contains(param) {
-            findings.push(make_finding(
+    if let Some(param) = session_token_parameter_in_url(&record.path) {
+        findings.push(make_finding(
                 record,
                 Severity::Medium,
                 "auth",
-                format!("Session/token parameter in URL: {param}"),
+            format!("Session/token parameter in URL: {param}"),
                 "Session token or credentials found in URL. URLs are logged in browser history, server logs, and referer headers, exposing the token.",
                 truncate_evidence(&record.path, 120),
             ));
-            break;
-        }
     }
 
     // Basic authentication over HTTP (not HTTPS)
@@ -1757,7 +1845,7 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
                 // Check if Location contains user-controlled input (common open redirect patterns)
                 let path_params: Vec<&str> = record.path.split('?').collect();
                 if path_params.len() > 1 {
-                    let query = path_params[1].to_ascii_lowercase();
+                    let query = path_params[1];
                     let redirect_params = [
                         "redirect",
                         "url",
@@ -1771,20 +1859,25 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
                         "dest",
                         "destination",
                     ];
-                    for param in &redirect_params {
-                        if query.contains(param) {
-                            // Check if Location points to external domain
-                            if loc.starts_with("http") && !loc.contains(&record.host) {
-                                findings.push(make_finding(
-                                    record,
-                                    Severity::Medium,
-                                    "auth",
-                                    "Possible open redirect",
-                                    format!("Redirect to external URL based on user-controlled parameter. Query contains '{param}' and Location points to a different host."),
-                                    format!("Location: {}", truncate_evidence(loc, 80)),
-                                ));
-                                break;
-                            }
+                    let matched_param = query
+                        .split('&')
+                        .map(|pair| {
+                            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+                            let key = key.replace('+', " ");
+                            percent_decode(&key).to_ascii_lowercase()
+                        })
+                        .find(|key| redirect_params.contains(&key.as_str()));
+                    if let Some(param) = matched_param {
+                        // Check if Location points to an external origin.
+                        if is_external_redirect_location(loc, &record.scheme, &record.host) {
+                            findings.push(make_finding(
+                                record,
+                                Severity::Medium,
+                                "auth",
+                                "Possible open redirect",
+                                format!("Redirect to external URL based on user-controlled parameter. Query contains '{param}' and Location points to a different host."),
+                                format!("Location: {}", truncate_evidence(loc, 80)),
+                            ));
                         }
                     }
                 }
@@ -1810,6 +1903,28 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
     }
 }
 
+fn is_external_redirect_location(location: &str, request_scheme: &str, request_host: &str) -> bool {
+    let base = match url::Url::parse(&format!("{request_scheme}://{request_host}")) {
+        Ok(base) => base,
+        Err(_) => return false,
+    };
+    let redirect = match url::Url::parse(location).or_else(|_| base.join(location)) {
+        Ok(redirect) => redirect,
+        Err(_) => return false,
+    };
+    if !matches!(redirect.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(base_host) = base.host_str() else {
+        return false;
+    };
+    let Some(redirect_host) = redirect.host_str() else {
+        return false;
+    };
+    !base_host.eq_ignore_ascii_case(redirect_host)
+        || base.port_or_known_default() != redirect.port_or_known_default()
+}
+
 // ── Utilities ──
 
 fn extract_json_number(json: &str, key: &str) -> Option<i64> {
@@ -1827,18 +1942,117 @@ fn extract_json_number(json: &str, key: &str) -> Option<i64> {
     num_str.parse().ok()
 }
 
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn session_token_parameter_in_url(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains(";jsessionid=") || lower.contains(";phpsessid=") {
+        return lower.split(';').skip(1).find_map(|segment| {
+            let key = segment
+                .split_once('=')
+                .map(|(key, _)| key)
+                .unwrap_or(segment);
+            matches!(key, "jsessionid" | "phpsessid").then(|| key.to_string())
+        });
+    }
+
+    let query = path.split_once('?')?.1;
+    let session_param_names = [
+        "jsessionid",
+        "phpsessid",
+        "sessionid",
+        "session_id",
+        "sid",
+        "aspsessionid",
+        "token",
+        "access_token",
+        "auth_token",
+        "api_key",
+    ];
+    query.split('&').find_map(|pair| {
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let key = key.replace('+', " ");
+        let decoded = percent_decode(&key).to_ascii_lowercase();
+        session_param_names
+            .contains(&decoded.as_str())
+            .then_some(decoded)
+    })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn truncate_evidence(value: &str, max: usize) -> String {
     if value.len() <= max {
         value.to_string()
     } else {
-        format!("{}...", &value[..max])
+        let end = value
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx <= max)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &value[..end])
     }
+}
+
+fn evidence_window(
+    value: &str,
+    match_start: usize,
+    match_len: usize,
+    before: usize,
+    after: usize,
+) -> &str {
+    let start = previous_char_boundary(value, match_start.saturating_sub(before));
+    let end = next_char_boundary(value, (match_start + match_len + after).min(value.len()));
+    &value[start..end]
+}
+
+fn evidence_prefix(value: &str, max: usize) -> &str {
+    &value[..previous_char_boundary(value, value.len().min(max))]
+}
+
+fn previous_char_boundary(value: &str, mut index: usize) -> usize {
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(value: &str, mut index: usize) -> usize {
+    while index < value.len() && !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{BodyEncoding, HeaderRecord, MessageRecord, TransactionRecord};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono::Utc;
 
     fn make_record(
@@ -1866,6 +2080,7 @@ mod tests {
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_type: None,
                 content_decoded: false,
@@ -1881,6 +2096,7 @@ mod tests {
                 body_preview: res_body.into(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: res_body.len(),
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_decoded: false,
                 content_type: Some("text/html".into()),
@@ -1889,6 +2105,268 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn finding(title: &str) -> ScannerFinding {
+        ScannerFinding {
+            id: Uuid::new_v4(),
+            record_id: Uuid::new_v4(),
+            found_at: Utc::now(),
+            severity: Severity::Low,
+            category: "test".to_string(),
+            title: title.to_string(),
+            detail: String::new(),
+            evidence: String::new(),
+            host: "example.com".to_string(),
+            path: "/".to_string(),
+        }
+    }
+
+    fn jwt_token(header: serde_json::Value, payload: serde_json::Value) -> String {
+        format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
+    }
+
+    #[tokio::test]
+    async fn scanner_store_from_findings_trims_to_max_entries() {
+        let store = ScannerStore::from_findings(
+            2,
+            vec![finding("first"), finding("second"), finding("third")],
+        );
+
+        let findings = store.list(None).await;
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].title, "first");
+        assert_eq!(findings[1].title, "second");
+    }
+
+    #[tokio::test]
+    async fn scanner_store_deduplicates_by_path_too() {
+        let store = ScannerStore::new(10);
+        let mut first = finding("Missing CSP");
+        first.path = "/login".to_string();
+        let mut second = finding("Missing CSP");
+        second.path = "/admin".to_string();
+
+        store.push(first).await;
+        store.push(second).await;
+
+        let findings = store.list(None).await;
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().any(|finding| finding.path == "/login"));
+        assert!(findings.iter().any(|finding| finding.path == "/admin"));
+    }
+
+    #[tokio::test]
+    async fn scanner_store_keeps_same_path_findings_for_distinct_records() {
+        let store = ScannerStore::new(10);
+        let first = finding("Missing CSP");
+        let mut second = first.clone();
+        second.id = Uuid::new_v4();
+        second.record_id = Uuid::new_v4();
+
+        store.push(first).await;
+        store.push(second).await;
+
+        let findings = store.list(None).await;
+        assert_eq!(findings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scanner_store_removes_dedup_key_when_finding_is_evicted() {
+        let store = ScannerStore::new(1);
+        let first = finding("Missing CSP");
+        let second = finding("Missing HSTS");
+
+        store.push(first.clone()).await;
+        store.push(second).await;
+        store.push(first).await;
+
+        let findings = store.list(None).await;
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "Missing CSP");
+    }
+
+    #[tokio::test]
+    async fn scanner_store_clear_resets_dedup_state() {
+        let store = ScannerStore::new(10);
+        let finding = finding("Missing CSP");
+
+        store.push(finding.clone()).await;
+        store.clear().await;
+        store.push(finding).await;
+
+        let findings = store.list(None).await;
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_store_rejects_pre_clear_generation_findings() {
+        let store = ScannerStore::new(10);
+        let generation = store.clear_generation();
+        let finding = finding("Missing CSP");
+
+        store.clear().await;
+
+        assert!(!store.push_if_generation(finding, generation).await);
+        assert_eq!(store.count().await, 0);
+    }
+
+    #[test]
+    fn truncate_evidence_does_not_split_utf8_codepoints() {
+        assert_eq!(truncate_evidence("😀😀", 5), "😀...");
+    }
+
+    #[test]
+    fn scanner_config_accepts_legacy_empty_object() {
+        let config: ScannerConfig =
+            serde_json::from_value(serde_json::json!({})).expect("config should deserialize");
+
+        assert!(config.enabled);
+        assert!(config.custom_rules.is_empty());
+        assert_eq!(config.rules.get("jwt"), Some(&true));
+        assert_eq!(config.rules.get("header"), Some(&true));
+    }
+
+    #[test]
+    fn scanner_config_accepts_partial_legacy_object() {
+        let config: ScannerConfig = serde_json::from_value(serde_json::json!({
+            "enabled": false
+        }))
+        .expect("partial config should deserialize");
+
+        assert!(!config.enabled);
+        assert!(config.custom_rules.is_empty());
+        assert_eq!(config.rules.get("jwt"), Some(&true));
+    }
+
+    #[test]
+    fn open_redirect_detection_compares_location_host_not_substrings() {
+        let mut record = make_record(
+            vec![],
+            vec![("location", "HTTPS://example.com.evil/landing")],
+            "",
+            302,
+        );
+        record.path = "/login?next=https://example.com.evil/landing".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Possible open redirect"),
+            "external suffix host should be reported"
+        );
+    }
+
+    #[test]
+    fn open_redirect_detection_allows_same_host_default_port() {
+        let mut record = make_record(
+            vec![],
+            vec![("location", "https://example.com:443/landing")],
+            "",
+            302,
+        );
+        record.path = "/login?next=https://example.com/landing".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Possible open redirect"),
+            "same host with default port should not be reported"
+        );
+    }
+
+    #[test]
+    fn open_redirect_detection_requires_exact_query_parameter_name() {
+        let mut record = make_record(
+            vec![],
+            vec![("location", "https://evil.example/landing")],
+            "",
+            302,
+        );
+        record.path = "/login?curl=https://evil.example/landing".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Possible open redirect"),
+            "substring matches like curl should not be treated as url parameters"
+        );
+    }
+
+    #[test]
+    fn open_redirect_detection_decodes_query_parameter_names() {
+        let mut record = make_record(
+            vec![],
+            vec![("location", "https://evil.example/landing")],
+            "",
+            302,
+        );
+        record.path = "/login?redirect%5Furi=https://evil.example/landing".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Possible open redirect"),
+            "percent-encoded redirect parameter names should still be detected"
+        );
+    }
+
+    #[test]
+    fn jwt_algorithm_checks_only_use_alg_claim() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "RS256", "kid": "none", "hint": "HS256" }),
+            serde_json::json!({ "sub": "1234", "exp": 4_102_444_800_i64 }),
+        );
+        let record = make_record(
+            vec![("authorization", &format!("Bearer {token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "JWT with alg:none"),
+            "only the alg claim should trigger alg:none"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("symmetric algorithm")),
+            "non-alg header fields should not trigger symmetric algorithm findings"
+        );
+    }
+
+    #[test]
+    fn security_header_checks_treat_content_type_case_insensitively() {
+        let mut record = make_record(
+            vec![],
+            vec![("content-type", "TEXT/HTML; Charset=UTF-8")],
+            "<html></html>",
+            200,
+        );
+        if let Some(response) = &mut record.response {
+            response.content_type = Some("TEXT/HTML; Charset=UTF-8".to_string());
+        }
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Missing Content-Security-Policy"),
+            "HTML content-type checks should be case-insensitive"
+        );
     }
 
     #[test]
@@ -1912,6 +2390,29 @@ mod tests {
     }
 
     #[test]
+    fn jwt_detection_accepts_uppercase_bearer_scheme_and_empty_signature() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "none", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234", "exp": 4_102_444_800_i64 }),
+        );
+        let token = token.trim_end_matches("signature").to_string();
+        let record = make_record(
+            vec![("authorization", &format!("BEARER   {token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "JWT with alg:none"),
+            "case-insensitive bearer schemes and empty signatures should be analyzed"
+        );
+    }
+
+    #[test]
     fn test_missing_security_headers() {
         let record = make_record(
             vec![],
@@ -1926,6 +2427,98 @@ mod tests {
                 .iter()
                 .any(|f| f.title.contains("Content-Security-Policy")),
             "Should detect missing CSP"
+        );
+    }
+
+    #[test]
+    fn page_header_checks_skip_binary_response_without_content_type() {
+        let mut record = make_record(vec![], vec![], "", 200);
+        if let Some(response) = &mut record.response {
+            response.body_preview = STANDARD.encode([0x89, b'P', b'N', b'G']);
+            response.body_encoding = BodyEncoding::Base64;
+            response.body_size = 4;
+            response.content_type = None;
+        }
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Missing Content-Security-Policy"),
+            "binary responses without content-type should not be treated as HTML pages"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Missing Referrer-Policy header"),
+            "binary responses without content-type should not get page-only misconfig findings"
+        );
+    }
+
+    #[test]
+    fn session_token_detection_requires_exact_query_parameter_name() {
+        let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+        record.path = "/search?notoken=1&xapi_key=2".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.starts_with("Session/token parameter")),
+            "token-like substrings inside unrelated parameter names should not be reported"
+        );
+    }
+
+    #[test]
+    fn session_token_detection_decodes_exact_query_parameter_name() {
+        let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+        record.path = "/search?access%5Ftoken=secret".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Session/token parameter in URL: access_token"),
+            "percent-encoded token parameter names should be reported"
+        );
+    }
+
+    #[test]
+    fn session_token_detection_reports_actual_matrix_parameter_name() {
+        let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+        record.path = "/app;foo=bar;jsessionid=abc".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Session/token parameter in URL: jsessionid"),
+            "matrix path scanning should report the actual session parameter"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Session/token parameter in URL: foo"),
+            "unrelated matrix parameters should not be reported as session tokens"
+        );
+    }
+
+    #[test]
+    fn internal_ip_pattern_reports_full_private_ipv4_address() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"upstream":"10.1.2.3"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.title.contains("Internal IP address")
+                    && finding.evidence.contains("10.1.2.3")
+            }),
+            "10/8 addresses should include all four octets in evidence"
         );
     }
 
@@ -1946,6 +2539,31 @@ mod tests {
     }
 
     #[test]
+    fn cookie_flags_are_detected_from_attributes_not_cookie_name_or_value() {
+        let record = make_record(
+            vec![],
+            vec![("set-cookie", "insecure_samesite=httponly_value; Path=/")],
+            "",
+            200,
+        );
+        let config = ScannerConfig::default();
+        let findings = scan_transaction(&record, &config);
+
+        assert!(
+            findings.iter().any(|f| f.title.contains("HttpOnly")),
+            "Should detect missing HttpOnly when only the value contains httponly"
+        );
+        assert!(
+            findings.iter().any(|f| f.title.contains("Secure")),
+            "Should detect missing Secure when only the name contains secure"
+        );
+        assert!(
+            findings.iter().any(|f| f.title.contains("SameSite")),
+            "Should detect missing SameSite when only the name contains samesite"
+        );
+    }
+
+    #[test]
     fn test_cors_wildcard() {
         let record = make_record(vec![], vec![("access-control-allow-origin", "*")], "", 200);
         let config = ScannerConfig::default();
@@ -1957,12 +2575,35 @@ mod tests {
     }
 
     #[test]
+    fn cors_checks_trim_header_ows_before_comparison() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("access-control-allow-origin", " * "),
+                ("access-control-allow-credentials", " true "),
+            ],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "cors" && f.severity == Severity::High),
+            "OWS around CORS headers should not hide wildcard-with-credentials"
+        );
+    }
+
+    #[test]
     fn test_server_disclosure() {
         let record = make_record(vec![], vec![("server", "Apache/2.4.51")], "", 200);
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.title.contains("Server version")),
+            findings
+                .iter()
+                .any(|f| f.category == "server" && f.title.contains("Server version")),
             "Should detect server version disclosure"
         );
     }
@@ -1980,6 +2621,19 @@ mod tests {
         assert!(
             findings.iter().any(|f| f.category == "error"),
             "Should detect SQL error message"
+        );
+    }
+
+    #[test]
+    fn sql_error_evidence_window_does_not_split_utf8_padding() {
+        let body = format!("a{}sql syntax near select", "語".repeat(7));
+        let record = make_record(vec![], vec![], &body, 500);
+        let config = ScannerConfig::default();
+        let findings = scan_transaction(&record, &config);
+
+        assert!(
+            findings.iter().any(|f| f.category == "error"),
+            "Should detect SQL error without panicking on UTF-8 evidence window"
         );
     }
 
@@ -2026,6 +2680,24 @@ mod tests {
     }
 
     #[test]
+    fn directory_listing_evidence_prefix_does_not_split_utf8() {
+        let body = format!(
+            "a{}<html><body><h1>Index of /uploads</h1>Parent Directory Last modified</body></html>",
+            "語".repeat(40)
+        );
+        let record = make_record(vec![], vec![("content-type", "text/html")], &body, 200);
+        let config = ScannerConfig::default();
+        let findings = scan_transaction(&record, &config);
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "info" && f.title.contains("Directory listing")),
+            "Should detect directory listing without panicking on UTF-8 prefix"
+        );
+    }
+
+    #[test]
     fn test_graphql_introspection() {
         let record = make_record(
             vec![],
@@ -2058,6 +2730,7 @@ mod tests {
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_type: None,
                 content_decoded: false,
@@ -2067,6 +2740,7 @@ mod tests {
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_type: Some("text/html".into()),
                 content_decoded: false,
@@ -2103,6 +2777,7 @@ mod tests {
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_type: None,
                 content_decoded: false,
@@ -2112,6 +2787,7 @@ mod tests {
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_type: Some("text/html".into()),
                 content_decoded: false,

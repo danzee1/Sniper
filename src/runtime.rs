@@ -1,10 +1,18 @@
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+pub const OAST_TOKEN_REDACTION: &str = "********";
+pub const MIN_OAST_POLLING_INTERVAL_SECS: u64 = 1;
+pub const MAX_OAST_POLLING_INTERVAL_SECS: u64 = 300;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSettingsSnapshot {
+    #[serde(default)]
     pub intercept_enabled: bool,
+    #[serde(default = "default_true")]
     pub websocket_capture_enabled: bool,
+    #[serde(default)]
     pub scope_patterns: Vec<String>,
     #[serde(default)]
     pub passthrough_hosts: Vec<String>,
@@ -54,8 +62,18 @@ impl Default for RuntimeSettingsSnapshot {
     }
 }
 
+impl RuntimeSettingsSnapshot {
+    pub fn redacted_for_read(mut self) -> Self {
+        if !self.oast_token.is_empty() {
+            self.oast_token = OAST_TOKEN_REDACTION.to_string();
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct RuntimeSettingsUpdate {
+    pub session_id: Option<uuid::Uuid>,
     pub intercept_enabled: Option<bool>,
     pub websocket_capture_enabled: Option<bool>,
     pub scope_patterns: Option<Vec<String>>,
@@ -88,7 +106,18 @@ impl RuntimeSettings {
         self.inner.read().await.clone()
     }
 
-    pub async fn update(&self, update: RuntimeSettingsUpdate) -> RuntimeSettingsSnapshot {
+    pub async fn update(&self, update: RuntimeSettingsUpdate) -> Result<RuntimeSettingsSnapshot> {
+        if let Some(oast_polling_interval_secs) = update.oast_polling_interval_secs {
+            if !(MIN_OAST_POLLING_INTERVAL_SECS..=MAX_OAST_POLLING_INTERVAL_SECS)
+                .contains(&oast_polling_interval_secs)
+            {
+                bail!(
+                    "OAST polling interval must be between {} and {} seconds",
+                    MIN_OAST_POLLING_INTERVAL_SECS,
+                    MAX_OAST_POLLING_INTERVAL_SECS
+                );
+            }
+        }
         let mut current = self.inner.write().await;
 
         if let Some(intercept_enabled) = update.intercept_enabled {
@@ -122,7 +151,9 @@ impl RuntimeSettings {
             current.oast_server_url = oast_server_url;
         }
         if let Some(oast_token) = update.oast_token {
-            current.oast_token = oast_token;
+            if oast_token != OAST_TOKEN_REDACTION {
+                current.oast_token = oast_token;
+            }
         }
         if let Some(oast_polling_interval_secs) = update.oast_polling_interval_secs {
             current.oast_polling_interval_secs = oast_polling_interval_secs;
@@ -131,7 +162,7 @@ impl RuntimeSettings {
             current.oast_provider = oast_provider;
         }
 
-        current.clone()
+        Ok(current.clone())
     }
 
     pub async fn replace_snapshot(
@@ -231,4 +262,84 @@ fn host_without_port(host: &str) -> &str {
             .unwrap_or(trimmed);
     }
     trimmed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RuntimeSettings, RuntimeSettingsSnapshot, RuntimeSettingsUpdate, OAST_TOKEN_REDACTION,
+    };
+
+    #[test]
+    fn runtime_settings_accepts_legacy_partial_snapshot() {
+        let snapshot: RuntimeSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({ "intercept_enabled": true }))
+                .expect("legacy runtime settings should deserialize");
+
+        assert!(snapshot.intercept_enabled);
+        assert!(snapshot.websocket_capture_enabled);
+        assert!(snapshot.scope_patterns.is_empty());
+        assert!(snapshot.passthrough_hosts.is_empty());
+        assert!(snapshot.upstream_insecure);
+        assert!(snapshot.intercept_scope_only);
+    }
+
+    #[test]
+    fn runtime_settings_read_view_redacts_oast_token() {
+        let snapshot = RuntimeSettingsSnapshot {
+            oast_token: "secret-token".to_string(),
+            ..RuntimeSettingsSnapshot::default()
+        };
+
+        let redacted = snapshot.clone().redacted_for_read();
+
+        assert_eq!(snapshot.oast_token, "secret-token");
+        assert_eq!(redacted.oast_token, OAST_TOKEN_REDACTION);
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_rejects_out_of_range_oast_polling_interval() {
+        let settings = RuntimeSettings::new();
+        let error = settings
+            .update(RuntimeSettingsUpdate {
+                oast_polling_interval_secs: Some(0),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("OAST polling interval"));
+        assert_eq!(settings.snapshot().await.oast_polling_interval_secs, 5);
+
+        let error = settings
+            .update(RuntimeSettingsUpdate {
+                oast_polling_interval_secs: Some(u64::MAX),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("OAST polling interval"));
+        assert_eq!(settings.snapshot().await.oast_polling_interval_secs, 5);
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_keeps_oast_token_on_redaction_sentinel() {
+        let settings = RuntimeSettings::new();
+        settings
+            .update(RuntimeSettingsUpdate {
+                oast_token: Some("real-secret".to_string()),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        let snapshot = settings
+            .update(RuntimeSettingsUpdate {
+                oast_token: Some(OAST_TOKEN_REDACTION.to_string()),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.oast_token, "real-secret");
+    }
 }

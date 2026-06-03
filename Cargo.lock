@@ -2964,6 +2964,7 @@ dependencies = [
  "rsa",
  "rust-embed",
  "rustls 0.21.12",
+ "rustls 0.23.37",
  "semver",
  "serde",
  "serde_json",
@@ -2978,6 +2979,7 @@ dependencies = [
  "uuid",
  "webbrowser",
  "wry",
+ "x509-parser",
  "zstd",
 ]
 

@@ -1,14 +1,15 @@
-use std::{env, fs, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{Context, Result};
-use sniper::{
-    api,
-    config::AppConfig,
-    proxy,
-    runtime_state::{self, RuntimeStateSnapshot},
-    skills,
-    state::AppState,
-};
+use sniper::{api, config::AppConfig, proxy, runtime_state, skills, state::AppState};
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -16,7 +17,8 @@ use tao::{
     window::WindowBuilder,
 };
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use url::Url;
 use wry::WebViewBuilder;
 
 fn main() -> Result<()> {
@@ -49,16 +51,10 @@ fn main() -> Result<()> {
     let ui_listener = runtime
         .block_on(TcpListener::bind(config.ui_addr))
         .with_context(|| format!("failed to bind UI listener to {}", config.ui_addr))?;
-    config.ui_addr = ui_listener
+    let bound_ui_addr = ui_listener
         .local_addr()
         .context("failed to read bound UI address")?;
-
-    if let Err(error) = sniper::runtime_state::persist_runtime_state(
-        &config.data_dir,
-        &RuntimeStateSnapshot::new(config.proxy_addr, config.ui_addr),
-    ) {
-        error!(?error, "failed to persist runtime-state.json");
-    }
+    config.ui_addr = runtime_state::advertise_local_api_addr(bound_ui_addr);
 
     // Auto-install Claude & Codex skills on every launch so they stay in sync
     // with the current Sniper version. Errors are silently logged.
@@ -104,9 +100,17 @@ fn main() -> Result<()> {
 
     let proxy_task = if let Some(listener) = proxy_listener {
         let proxy_state = state.clone();
+        let offline_state = state.clone();
+        let proxy_addr = config.proxy_addr;
         let handle = runtime.spawn(async move {
             if let Err(error) = proxy::serve_proxy(listener, proxy_state).await {
                 error!(?error, "proxy task stopped");
+                proxy::mark_proxy_offline_after_task_exit(
+                    &offline_state,
+                    proxy_addr,
+                    "after initial proxy task stopped",
+                )
+                .await;
             }
         });
         // Store the handle so rebind_proxy can abort it later
@@ -116,32 +120,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let ui_task = runtime.spawn(async move {
-        if let Err(error) = api::serve_api(ui_listener, ui_state).await {
-            error!(?error, "ui task stopped");
-        }
-    });
-
-    // Start OAST polling background task
-    {
-        let oast_state = state.clone();
-        runtime.spawn(async move {
-            let session = oast_state.session().await;
-            // Sync OAST config from runtime settings
-            let runtime_snap = session.runtime.snapshot().await;
-            session
-                .oast
-                .update_config(sniper::oast::OastConfig {
-                    enabled: runtime_snap.oast_enabled,
-                    server_url: runtime_snap.oast_server_url.clone(),
-                    token: runtime_snap.oast_token.clone(),
-                    polling_interval_secs: runtime_snap.oast_polling_interval_secs,
-                    provider: runtime_snap.oast_provider.clone(),
-                })
-                .await;
-            let _ = sniper::oast::start_oast_poller(session.oast.clone()).await;
-        });
-    }
+    let oast_task = sniper::oast::start_oast_poller_for_state(state.clone());
 
     let event_loop = EventLoop::new();
     install_platform_app_menu();
@@ -153,24 +132,54 @@ fn main() -> Result<()> {
         .context("failed to create desktop window")?;
     let ui_url = format!("http://{}/", config.ui_addr);
     let ui_origin = format!("http://{}", config.ui_addr);
-    let webview = WebViewBuilder::new(&window)
+    let ui_task = runtime.spawn(async move {
+        if let Err(error) = api::serve_api(ui_listener, ui_state).await {
+            error!(?error, "ui task stopped");
+        }
+    });
+    let webview_builder = WebViewBuilder::new(&window)
         .with_incognito(true)
-        .with_devtools(true)
+        .with_devtools(desktop_devtools_enabled())
         .with_navigation_handler({
             let ui_origin = ui_origin.clone();
             move |url| handle_navigation_request(&url, &ui_origin)
         })
-        .with_new_window_req_handler(move |url| {
-            if let Err(error) = webbrowser::open(&url) {
-                error!(?error, url = %url, "failed to open external url");
-            }
-            false
+        .with_new_window_req_handler({
+            let ui_origin = ui_origin.clone();
+            move |url| handle_new_window_request(&url, &ui_origin)
         })
-        .with_url(&ui_url)
-        .build()
-        .context("failed to build desktop webview")?;
+        .with_url(&ui_url);
+    let webview = match webview_builder.build() {
+        Ok(webview) => webview,
+        Err(error) => {
+            ui_task.abort();
+            if let Err(join_error) = runtime.block_on(ui_task) {
+                if !join_error.is_cancelled() {
+                    warn!(
+                        ?join_error,
+                        "UI API task stopped with an error after webview build failure"
+                    );
+                }
+            }
+            oast_task.abort();
+            if let Err(join_error) = runtime.block_on(oast_task) {
+                if !join_error.is_cancelled() {
+                    warn!(
+                        ?join_error,
+                        "OAST poller stopped with an error after webview build failure"
+                    );
+                }
+            }
+            runtime.block_on(state.abort_proxy_task());
+            remove_runtime_state_file(&state.config.data_dir);
+            return Err(anyhow::anyhow!("failed to build desktop webview: {error}"));
+        }
+    };
 
     let close_state = state.clone();
+    let shutdown_done = Arc::new(AtomicBool::new(false));
+    let mut ui_task = Some(ui_task);
+    let mut oast_task = Some(oast_task);
     event_loop.run(move |event, _, control_flow| {
         let _keep_runtime = &runtime;
         let _keep_window = &window;
@@ -178,19 +187,82 @@ fn main() -> Result<()> {
         let _keep_proxy_task = &proxy_task;
         *control_flow = ControlFlow::Wait;
 
-        if let Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } = event
-        {
+        let mut shutdown_once = || {
+            if shutdown_done.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            if let Some(ui_task) = ui_task.take() {
+                ui_task.abort();
+                if let Err(error) = runtime.block_on(ui_task) {
+                    if !error.is_cancelled() {
+                        warn!(
+                            ?error,
+                            "UI API task stopped with an error during desktop shutdown"
+                        );
+                    }
+                }
+            }
+            if let Some(oast_task) = oast_task.take() {
+                oast_task.abort();
+                if let Err(error) = runtime.block_on(oast_task) {
+                    if !error.is_cancelled() {
+                        warn!(
+                            ?error,
+                            "OAST poller stopped with an error during desktop shutdown"
+                        );
+                    }
+                }
+            }
+            runtime.block_on(close_state.ws_replay.disconnect_all());
             runtime.block_on(close_state.abort_proxy_task());
-            ui_task.abort();
-            // Clean up runtime-state so CLI doesn't connect to a stale port
-            let state_path = runtime_state::runtime_state_path(&close_state.config.data_dir);
-            let _ = fs::remove_file(&state_path);
-            *control_flow = ControlFlow::Exit;
+            runtime.block_on(proxy::close_live_websocket_relays(
+                close_state.as_ref(),
+                "Sniper desktop shutdown closed the live WebSocket relay.",
+            ));
+            runtime.block_on(proxy::drain_proxy_connections(
+                std::time::Duration::from_secs(1),
+            ));
+            runtime.block_on(proxy::flush_pending_session_persists(close_state.as_ref()));
+            if let Err(error) = runtime.block_on(close_state.persist_active_session()) {
+                warn!(
+                    ?error,
+                    "failed to persist active session before desktop shutdown"
+                );
+            }
+            // Clean up runtime-state so CLI doesn't connect to a stale port.
+            remove_runtime_state_file(&close_state.config.data_dir);
+        };
+
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                shutdown_once();
+                *control_flow = ControlFlow::Exit;
+            }
+            Event::LoopDestroyed => {
+                shutdown_once();
+            }
+            _ => {}
         }
     })
+}
+
+fn desktop_devtools_enabled() -> bool {
+    cfg!(debug_assertions)
+        || env::var("SNIPER_ENABLE_DEVTOOLS")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+}
+
+fn remove_runtime_state_file(data_dir: &Path) {
+    if let Err(error) = runtime_state::remove_runtime_state(data_dir) {
+        warn!(
+            ?error,
+            "failed to remove runtime state before desktop shutdown"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -304,13 +376,20 @@ fn install_platform_app_menu() {}
 fn install_cli_path() {
     let Ok(exe) = env::current_exe() else { return };
     let macos_dir = exe.parent().unwrap_or(&exe);
+    if !should_install_cli_path(macos_dir) {
+        info!(dir = %macos_dir.display(), "skipping sniper-cli PATH install from transient app location");
+        return;
+    }
     let cli_bin = macos_dir.join("sniper-cli");
     if !cli_bin.exists() {
         return;
     }
 
-    let dir = macos_dir.to_string_lossy();
-    let export_line = format!("export PATH=\"{}:$PATH\" # Added by Sniper.app", dir);
+    let dir = macos_dir.to_string_lossy().to_string();
+    let export_line = format!(
+        "export PATH={}:$PATH # Added by Sniper.app",
+        shell_single_quote(&dir)
+    );
 
     let home = match env::var("HOME") {
         Ok(h) => PathBuf::from(h),
@@ -325,41 +404,355 @@ fn install_cli_path() {
     }
 
     for rc_path in &targets {
-        if let Ok(contents) = std::fs::read_to_string(rc_path) {
-            if contents.contains(&*dir) {
-                info!(file = %rc_path.display(), "sniper-cli PATH already configured");
+        let contents = match load_shell_rc_contents(rc_path) {
+            Ok(contents) => contents,
+            Err(e) => {
+                error!(?e, file = %rc_path.display(), "skipping unreadable shell rc");
                 continue;
             }
-        }
-        // Append the export line
-        let mut line = String::from("\n");
-        line.push_str(&export_line);
-        line.push('\n');
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(rc_path)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                if let Err(e) = f.write_all(line.as_bytes()) {
-                    error!(?e, file = %rc_path.display(), "failed to write PATH to shell rc");
-                } else {
-                    info!(file = %rc_path.display(), "added sniper-cli to PATH");
-                }
-            }
-            Err(e) => error!(?e, file = %rc_path.display(), "failed to open shell rc"),
+        };
+        let Some(updated) = upsert_managed_path_line(&contents, &export_line) else {
+            info!(file = %rc_path.display(), "sniper-cli PATH already configured");
+            continue;
+        };
+        if let Err(e) = write_shell_rc_atomically(rc_path, &updated) {
+            error!(?e, file = %rc_path.display(), "failed to write PATH to shell rc");
+        } else {
+            info!(file = %rc_path.display(), "updated sniper-cli PATH");
         }
     }
 }
 
+fn should_install_cli_path(macos_dir: &std::path::Path) -> bool {
+    let path = macos_dir.to_string_lossy();
+    if macos_dir.starts_with("/Volumes") || path.contains("/AppTranslocation/") {
+        return false;
+    }
+    let components: Vec<_> = macos_dir
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect();
+    !components
+        .windows(2)
+        .any(|window| window[0] == "target" && (window[1] == "release" || window[1] == "debug"))
+}
+
+fn load_shell_rc_contents(rc_path: &std::path::Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(rc_path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_shell_rc_atomically(rc_path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let write_path = resolve_shell_rc_write_path(rc_path)?;
+    let parent = write_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = write_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("shellrc");
+    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let existing_permissions = std::fs::metadata(&write_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        if let Some(permissions) = existing_permissions {
+            std::fs::set_permissions(&tmp_path, permissions)?;
+        }
+        std::fs::rename(&tmp_path, &write_path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn resolve_shell_rc_write_path(rc_path: &std::path::Path) -> std::io::Result<PathBuf> {
+    match std::fs::symlink_metadata(rc_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = std::fs::read_link(rc_path)?;
+            if target.is_absolute() {
+                Ok(target)
+            } else {
+                Ok(rc_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(target))
+            }
+        }
+        Ok(_) => Ok(rc_path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(rc_path.to_path_buf()),
+        Err(error) => Err(error),
+    }
+}
+
+fn upsert_managed_path_line(contents: &str, export_line: &str) -> Option<String> {
+    const MARKER: &str = "# Added by Sniper.app";
+    let mut changed = false;
+    let mut found_managed = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        if line.contains(MARKER) {
+            if found_managed {
+                changed = true;
+                continue;
+            }
+            found_managed = true;
+            changed |= line.trim() != export_line;
+            lines.push(export_line.to_string());
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !found_managed {
+        if !contents.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(export_line.to_string());
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    Some(updated)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn handle_navigation_request(url: &str, ui_origin: &str) -> bool {
-    if url == "about:blank" || url.starts_with(ui_origin) || url.starts_with("data:") {
+    if url == "about:blank" || is_same_origin(url, ui_origin) {
         return true;
+    }
+
+    if is_blocked_desktop_navigation_scheme(url) {
+        warn!(url = %url, "blocked unsafe desktop navigation");
+        return false;
     }
 
     if let Err(error) = webbrowser::open(url) {
         error!(?error, url = %url, "failed to open external url");
     }
     false
+}
+
+fn handle_new_window_request(url: &str, ui_origin: &str) -> bool {
+    if url == "about:blank" || is_same_origin(url, ui_origin) {
+        return false;
+    }
+
+    if is_blocked_desktop_navigation_scheme(url) {
+        warn!(url = %url, "blocked unsafe desktop new-window request");
+        return false;
+    }
+
+    if let Err(error) = webbrowser::open(url) {
+        error!(?error, url = %url, "failed to open external url");
+    }
+    false
+}
+
+fn is_blocked_desktop_navigation_scheme(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "data" | "javascript" | "file")
+}
+
+fn is_same_origin(url: &str, expected_origin: &str) -> bool {
+    let (Ok(url), Ok(expected)) = (Url::parse(url), Url::parse(expected_origin)) else {
+        return false;
+    };
+    url.scheme() == expected.scheme()
+        && url
+            .host_str()
+            .zip(expected.host_str())
+            .map(|(left, right)| left.eq_ignore_ascii_case(right))
+            .unwrap_or(false)
+        && url.port_or_known_default() == expected.port_or_known_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        handle_navigation_request, handle_new_window_request, is_blocked_desktop_navigation_scheme,
+        is_same_origin, load_shell_rc_contents, shell_single_quote, should_install_cli_path,
+        upsert_managed_path_line, write_shell_rc_atomically,
+    };
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(
+            shell_single_quote("/Applications/Sniper 'Beta'.app/Contents/MacOS"),
+            "'/Applications/Sniper '\\''Beta'\\''.app/Contents/MacOS'"
+        );
+    }
+
+    #[test]
+    fn upsert_managed_path_line_replaces_old_managed_line() {
+        let updated = upsert_managed_path_line(
+            "export PATH='/old/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app\n",
+            "export PATH='/new/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app",
+        )
+        .unwrap();
+        assert!(updated.contains("/new/Sniper.app"));
+        assert!(!updated.contains("/old/Sniper.app"));
+    }
+
+    #[test]
+    fn upsert_managed_path_line_collapses_duplicate_managed_lines() {
+        let updated = upsert_managed_path_line(
+            "before\nexport PATH='/old/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app\nmiddle\nexport PATH='/older/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app\nafter\n",
+            "export PATH='/new/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app",
+        )
+        .unwrap();
+
+        assert_eq!(updated.matches("# Added by Sniper.app").count(), 1);
+        assert!(updated.contains("before\n"));
+        assert!(updated.contains("middle\n"));
+        assert!(updated.contains("after\n"));
+        assert!(updated.contains("/new/Sniper.app"));
+        assert!(!updated.contains("/old/Sniper.app"));
+        assert!(!updated.contains("/older/Sniper.app"));
+    }
+
+    #[test]
+    fn shell_rc_loader_only_defaults_missing_files() {
+        let root = std::env::temp_dir().join(format!("sniper-rc-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(load_shell_rc_contents(&root.join(".zshrc")).unwrap(), "");
+
+        let invalid_utf8 = root.join(".bashrc");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        assert!(load_shell_rc_contents(&invalid_utf8).is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shell_rc_writer_replaces_file_atomically() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-rc-write-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let rc_path = root.join(".zshrc");
+        std::fs::write(&rc_path, "old\n").unwrap();
+
+        write_shell_rc_atomically(&rc_path, "new\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&rc_path).unwrap(), "new\n");
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shell_rc_writer_preserves_symlinked_rc_files() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-rc-symlink-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target_path = root.join("dotfiles").join("zshrc");
+        std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        std::fs::write(&target_path, "old\n").unwrap();
+        let rc_path = root.join(".zshrc");
+        std::os::unix::fs::symlink("dotfiles/zshrc", &rc_path).unwrap();
+
+        write_shell_rc_atomically(&rc_path, "new\n").unwrap();
+
+        assert!(std::fs::symlink_metadata(&rc_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "new\n");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_path_install_skips_transient_dmg_mounts() {
+        assert!(!should_install_cli_path(std::path::Path::new(
+            "/Volumes/Sniper/Sniper.app/Contents/MacOS",
+        )));
+        assert!(!should_install_cli_path(std::path::Path::new(
+            "/private/var/folders/xx/AppTranslocation/123/Sniper.app/Contents/MacOS",
+        )));
+        assert!(!should_install_cli_path(std::path::Path::new(
+            "/Users/kakao/Desktop/git/Sniper/target/release",
+        )));
+        assert!(should_install_cli_path(std::path::Path::new(
+            "/Applications/Sniper.app/Contents/MacOS",
+        )));
+    }
+
+    #[test]
+    fn navigation_origin_check_does_not_allow_prefix_collisions() {
+        assert!(is_same_origin(
+            "http://127.0.0.1:3000/dashboard",
+            "http://127.0.0.1:3000",
+        ));
+        assert!(!is_same_origin(
+            "http://127.0.0.1:30000/dashboard",
+            "http://127.0.0.1:3000",
+        ));
+        assert!(!is_same_origin(
+            "http://127.0.0.1.evil.test:3000/dashboard",
+            "http://127.0.0.1:3000",
+        ));
+        assert!(is_same_origin(
+            "http://[::1]:3000/dashboard",
+            "http://[::1]:3000",
+        ));
+    }
+
+    #[test]
+    fn navigation_handler_blocks_unsafe_internal_schemes() {
+        assert!(is_blocked_desktop_navigation_scheme("data:text/html,pwn"));
+        assert!(is_blocked_desktop_navigation_scheme("javascript:alert(1)"));
+        assert!(is_blocked_desktop_navigation_scheme("file:///etc/passwd"));
+
+        assert!(!handle_navigation_request(
+            "data:text/html,pwn",
+            "http://127.0.0.1:3000",
+        ));
+    }
+
+    #[test]
+    fn new_window_handler_blocks_unsafe_internal_schemes() {
+        assert!(!handle_new_window_request(
+            "file:///etc/passwd",
+            "http://127.0.0.1:3000",
+        ));
+        assert!(!handle_new_window_request(
+            "javascript:alert(1)",
+            "http://127.0.0.1:3000",
+        ));
+        assert!(!handle_new_window_request(
+            "http://127.0.0.1:3000/popup",
+            "http://127.0.0.1:3000",
+        ));
+    }
 }

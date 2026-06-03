@@ -3506,6 +3506,16 @@ body.pane-resizing-y {
   opacity: 1;
 }
 
+.replay-tab-pin-btn.idle {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.replay-tab:hover .replay-tab-pin-btn.idle {
+  opacity: 0.3;
+  pointer-events: auto;
+}
+
 .replay-tab-pin-icon {
   margin-right: 4px;
   font-size: 10px;
@@ -4650,6 +4660,21 @@ button.utility-button.replay-tab-add {
   color: var(--text);
 }
 
+.settings-inline-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-inline-control input {
+  min-width: 0;
+}
+
+.settings-inline-control .secondary-action {
+  min-height: 40px;
+  flex: 0 0 auto;
+}
+
 .settings-field small {
   color: var(--text-soft);
   line-height: 1.5;
@@ -5246,11 +5271,23 @@ button.utility-button.replay-tab-add {
   }
 
   .replay-workbench {
+    grid-template-columns: 1fr;
     grid-template-rows: minmax(260px, 0.9fr) minmax(260px, 1.1fr);
   }
 
   .websocket-filter-bar {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .ws-replay-panel {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(260px, 1fr) minmax(260px, 1fr);
+  }
+
+  #wsReplayPaneResizer {
+    display: none;
   }
 }
 

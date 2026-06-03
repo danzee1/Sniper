@@ -5,15 +5,15 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>Sniper</string>
+  <string>__APP_NAME__</string>
   <key>CFBundleExecutable</key>
-  <string>Sniper</string>
+  <string>__APP_NAME__</string>
   <key>CFBundleIdentifier</key>
   <string>com.sm1ee.sniper</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>Sniper</string>
+  <string>__APP_NAME__</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

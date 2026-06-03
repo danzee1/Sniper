@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
@@ -39,8 +40,8 @@ impl AppConfig {
 
         Ok(Self {
             proxy_addr: resolve_proxy_addr(&data_dir, &startup)?,
-            ui_addr: parse_socket_addr("SNIPER_UI_ADDR", ui_default)?,
-            max_entries: parse_usize("SNIPER_MAX_ENTRIES", 500_000)?,
+            ui_addr: parse_ui_socket_addr("SNIPER_UI_ADDR", ui_default)?,
+            max_entries: parse_usize_min("SNIPER_MAX_ENTRIES", 500_000, 1)?,
             body_preview_bytes: parse_usize("SNIPER_BODY_PREVIEW_BYTES", 10_485_760)?,
             data_dir,
         })
@@ -69,6 +70,34 @@ impl StartupSettingsSnapshot {
         self.proxy_addr()
             .map(|addr| addr.to_string())
             .unwrap_or_else(|_| format!("{}:{}", self.proxy_bind_host, self.proxy_port))
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StoredStartupSettingsSnapshot {
+    proxy_bind_host: Option<String>,
+    proxy_port: Option<u16>,
+    proxy_addr: Option<String>,
+}
+
+impl StoredStartupSettingsSnapshot {
+    fn into_snapshot(self, default_proxy_addr: SocketAddr) -> Result<StartupSettingsSnapshot> {
+        let fallback = if self.proxy_bind_host.is_some() && self.proxy_port.is_some() {
+            default_proxy_addr
+        } else {
+            self.proxy_addr
+                .as_deref()
+                .map(|value| parse_socket_addr_value("startup settings proxy_addr", value))
+                .transpose()?
+                .unwrap_or(default_proxy_addr)
+        };
+        let fallback = StartupSettingsSnapshot::from_proxy_addr(fallback);
+        let snapshot = StartupSettingsSnapshot {
+            proxy_bind_host: self.proxy_bind_host.unwrap_or(fallback.proxy_bind_host),
+            proxy_port: self.proxy_port.unwrap_or(fallback.proxy_port),
+        };
+        snapshot.proxy_addr()?;
+        Ok(snapshot)
     }
 }
 
@@ -150,6 +179,21 @@ fn parse_socket_addr(name: &str, default: &str) -> Result<SocketAddr> {
     parse_socket_addr_value(name, &value)
 }
 
+fn parse_ui_socket_addr(name: &str, default: &str) -> Result<SocketAddr> {
+    let addr = parse_socket_addr(name, default)?;
+    validate_ui_socket_addr(name, addr)?;
+    Ok(addr)
+}
+
+fn validate_ui_socket_addr(name: &str, addr: SocketAddr) -> Result<()> {
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "{name} must bind to a loopback address because Sniper's local UI API is unauthenticated"
+        );
+    }
+    Ok(())
+}
+
 fn parse_socket_addr_value(name: &str, value: &str) -> Result<SocketAddr> {
     value
         .parse()
@@ -161,6 +205,14 @@ fn parse_usize(name: &str, default: usize) -> Result<usize> {
     value
         .parse()
         .with_context(|| format!("failed to parse {name}={value} as usize"))
+}
+
+fn parse_usize_min(name: &str, default: usize, min: usize) -> Result<usize> {
+    let parsed = parse_usize(name, default)?;
+    if parsed < min {
+        anyhow::bail!("{name} must be at least {min}");
+    }
+    Ok(parsed)
 }
 
 fn resolve_proxy_addr(data_dir: &Path, startup: &StartupSettingsSnapshot) -> Result<SocketAddr> {
@@ -187,12 +239,9 @@ fn load_startup_settings_snapshot(
     })?;
     let path = startup_settings_path(data_dir);
     match fs::read(&path) {
-        Ok(bytes) => {
-            let snapshot = serde_json::from_slice::<StartupSettingsSnapshot>(&bytes)
-                .with_context(|| format!("failed to parse startup settings {}", path.display()))?;
-            snapshot.proxy_addr()?;
-            Ok(snapshot)
-        }
+        Ok(bytes) => serde_json::from_slice::<StoredStartupSettingsSnapshot>(&bytes)
+            .with_context(|| format!("failed to parse startup settings {}", path.display()))?
+            .into_snapshot(default_proxy_addr),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let snapshot = StartupSettingsSnapshot::from_proxy_addr(default_proxy_addr);
             persist_startup_settings(&path, &snapshot)?;
@@ -204,19 +253,36 @@ fn load_startup_settings_snapshot(
 }
 
 fn persist_startup_settings(path: &Path, snapshot: &StartupSettingsSnapshot) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create startup settings directory {}",
-                parent.display()
-            )
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create startup settings directory {}",
+            parent.display()
+        )
+    })?;
+    let tmp_path = parent.join(format!(".startup-settings.{}.tmp", uuid::Uuid::new_v4()));
+    let json =
+        serde_json::to_vec_pretty(snapshot).context("failed to serialize startup settings")?;
+    {
+        let mut file = fs::File::create(&tmp_path).with_context(|| {
+            format!("failed to write startup settings to {}", tmp_path.display())
         })?;
+        file.write_all(&json).with_context(|| {
+            format!("failed to write startup settings to {}", tmp_path.display())
+        })?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync startup settings {}", tmp_path.display()))?;
     }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(snapshot).context("failed to serialize startup settings")?,
-    )
-    .with_context(|| format!("failed to write startup settings {}", path.display()))
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("failed to replace startup settings {}", path.display()))?;
+    sync_directory(parent, "startup settings directory")?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path, label: &str) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync {label} {}", path.display()))
 }
 
 fn parse_bind_socket_addr(bind_host: &str, port: u16) -> Result<SocketAddr> {
@@ -249,6 +315,31 @@ fn validate_proxy_port(port: u16) -> Result<u16> {
 mod tests {
     use super::{StartupSettingsStore, StartupSettingsUpdate};
 
+    #[test]
+    fn max_entries_env_rejects_zero_retention() {
+        const VAR_NAME: &str = "SNIPER_TEST_MAX_ENTRIES_ZERO";
+        std::env::set_var(VAR_NAME, "0");
+        let result = super::parse_usize_min(VAR_NAME, 500_000, 1);
+        std::env::remove_var(VAR_NAME);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ui_addr_rejects_non_loopback_bind() {
+        let result =
+            super::validate_ui_socket_addr("SNIPER_UI_ADDR", "0.0.0.0:23001".parse().unwrap());
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("loopback address"));
+    }
+
+    #[test]
+    fn ui_addr_allows_loopback_ephemeral_bind() {
+        super::validate_ui_socket_addr("SNIPER_UI_ADDR", "127.0.0.1:0".parse().unwrap()).unwrap();
+        super::validate_ui_socket_addr("SNIPER_UI_ADDR", "[::1]:0".parse().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn startup_settings_store_persists_proxy_listener() {
         let data_dir =
@@ -274,6 +365,83 @@ mod tests {
         let saved = reloaded.snapshot().await;
         assert_eq!(saved.proxy_bind_host, "0.0.0.0");
         assert_eq!(saved.proxy_port, 8081);
+        let temp_files = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".startup-settings.")
+            })
+            .count();
+        assert_eq!(temp_files, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_store_accepts_partial_legacy_snapshot() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-startup-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("temp data dir should be created");
+        std::fs::write(
+            data_dir.join(super::STARTUP_SETTINGS_FILE),
+            br#"{"proxy_bind_host":"0.0.0.0"}"#,
+        )
+        .expect("legacy startup settings should be written");
+
+        let store =
+            StartupSettingsStore::load_or_create(&data_dir, "127.0.0.1:18080".parse().unwrap())
+                .expect("partial startup settings should load");
+        let saved = store.snapshot().await;
+
+        assert_eq!(saved.proxy_bind_host, "0.0.0.0");
+        assert_eq!(saved.proxy_port, 18080);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_store_accepts_legacy_proxy_addr_snapshot() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-startup-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("temp data dir should be created");
+        std::fs::write(
+            data_dir.join(super::STARTUP_SETTINGS_FILE),
+            br#"{"proxy_addr":"[::1]:19090"}"#,
+        )
+        .expect("legacy startup settings should be written");
+
+        let store =
+            StartupSettingsStore::load_or_create(&data_dir, "127.0.0.1:18080".parse().unwrap())
+                .expect("legacy proxy addr startup settings should load");
+        let saved = store.snapshot().await;
+
+        assert_eq!(saved.proxy_bind_host, "::1");
+        assert_eq!(saved.proxy_port, 19090);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_prefers_valid_split_fields_over_bad_legacy_proxy_addr() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-startup-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("temp data dir should be created");
+        std::fs::write(
+            data_dir.join(super::STARTUP_SETTINGS_FILE),
+            br#"{"proxy_bind_host":"127.0.0.1","proxy_port":8080,"proxy_addr":"127.0.0.1:not-a-port"}"#,
+        )
+        .expect("startup settings should be written");
+
+        let store =
+            StartupSettingsStore::load_or_create(&data_dir, "127.0.0.1:18080".parse().unwrap())
+                .expect("valid split startup settings should load");
+        let saved = store.snapshot().await;
+
+        assert_eq!(saved.proxy_bind_host, "127.0.0.1");
+        assert_eq!(saved.proxy_port, 8080);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

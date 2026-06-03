@@ -1,6 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,21 +10,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::body::Body;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    future::{AbortHandle, Abortable},
+    SinkExt, StreamExt,
+};
 use http::{
     header::{
         HeaderMap, HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST,
         SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL,
-        UPGRADE,
+        SEC_WEBSOCKET_VERSION, TRANSFER_ENCODING, UPGRADE,
     },
     request::Parts,
     uri::Authority,
-    Method, Request, Response, StatusCode, Uri,
+    Method, Request, Response, StatusCode, Uri, Version,
 };
 use http_body_util::BodyExt;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
@@ -35,7 +39,7 @@ use reqwest::{redirect::Policy, Client};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
-    connect_async,
+    connect_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest,
         handshake::derive_accept_key,
@@ -56,6 +60,7 @@ use crate::{
         RequestTargetOverride, TransactionRecord, WebSocketFrameDirection, WebSocketFrameKind,
         WebSocketFrameRecord, WebSocketSessionRecord,
     },
+    runtime_state::{self, RuntimeStateSnapshot},
     session::SessionContext,
     special_host,
     state::AppState,
@@ -63,6 +68,7 @@ use crate::{
 
 type ProxyClient = Client;
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+const MAX_PROXY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 struct UpstreamResponse {
     status: StatusCode,
@@ -73,6 +79,25 @@ struct UpstreamResponse {
 struct ExecutedExchange {
     record: TransactionRecord,
     response: std::result::Result<UpstreamResponse, UpstreamError>,
+}
+
+struct StreamedRecordContext {
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    _session_owner: ActiveProxySessionGuard,
+    started_at: chrono::DateTime<Utc>,
+    started: Instant,
+    method: String,
+    scheme: String,
+    host: String,
+    path: String,
+    status: StatusCode,
+    request_capture: MessageRecord,
+    response_headers: HeaderMap,
+    notes: Vec<String>,
+    original_request_capture: Option<MessageRecord>,
+    response_version: Version,
+    max_preview: usize,
 }
 
 struct UpstreamError {
@@ -119,6 +144,7 @@ pub async fn rebind_proxy(
     state: Arc<AppState>,
     new_addr: std::net::SocketAddr,
 ) -> std::result::Result<(), String> {
+    let _rebind_guard = state.proxy_rebind_lock.lock().await;
     let current = state.get_active_proxy_addr().await;
     if current == new_addr {
         return Ok(());
@@ -130,6 +156,7 @@ pub async fn rebind_proxy(
     // `abort_proxy_task` awaits the task so the TcpListener is fully dropped.
     state.abort_proxy_task().await;
     state.set_proxy_online(false);
+    persist_proxy_runtime_state(&state, current, false, "after stopping proxy for rebind").await;
 
     // Bind the new address with SO_REUSEADDR.
     // Retry a few times because macOS may not release the port instantly
@@ -166,10 +193,24 @@ pub async fn rebind_proxy(
                     let restored_addr = restored.local_addr().unwrap_or(current);
                     state.set_active_proxy_addr(restored_addr).await;
                     state.set_proxy_online(true);
+                    persist_proxy_runtime_state(
+                        &state,
+                        restored_addr,
+                        true,
+                        "after restoring proxy listener",
+                    )
+                    .await;
                     let proxy_state = state.clone();
+                    let offline_state = state.clone();
                     let handle = tokio::spawn(async move {
                         if let Err(error) = serve_proxy(restored, proxy_state).await {
                             tracing::error!(?error, "restored proxy task stopped");
+                            mark_proxy_offline_after_task_exit(
+                                &offline_state,
+                                restored_addr,
+                                "after restored proxy task stopped",
+                            )
+                            .await;
                         }
                     });
                     state.set_proxy_task(handle).await;
@@ -179,11 +220,25 @@ pub async fn rebind_proxy(
                         %restore_err,
                         "failed to restore old proxy listener — proxy is offline"
                     );
+                    persist_proxy_runtime_state(
+                        &state,
+                        current,
+                        false,
+                        "after failed proxy restore",
+                    )
+                    .await;
                 }
             }
             return Err(format!("Could not bind to {} ({})", new_addr, bind_err));
         }
     };
+
+    drain_proxy_connections(Duration::from_millis(200)).await;
+    close_live_websocket_relays(
+        state.as_ref(),
+        "Proxy listener rebind closed the live WebSocket relay.",
+    )
+    .await;
 
     let bound_addr = listener
         .local_addr()
@@ -192,19 +247,55 @@ pub async fn rebind_proxy(
     // Update active address
     state.set_active_proxy_addr(bound_addr).await;
     state.set_proxy_online(true);
+    persist_proxy_runtime_state(&state, bound_addr, true, "after proxy rebind").await;
 
     info!(old = %current, new = %bound_addr, "proxy listener rebound");
 
     // Spawn new proxy task
     let proxy_state = state.clone();
+    let offline_state = state.clone();
     let handle = tokio::spawn(async move {
         if let Err(error) = serve_proxy(listener, proxy_state).await {
             tracing::error!(?error, "rebound proxy task stopped");
+            mark_proxy_offline_after_task_exit(
+                &offline_state,
+                bound_addr,
+                "after rebound proxy task stopped",
+            )
+            .await;
         }
     });
     state.set_proxy_task(handle).await;
 
     Ok(())
+}
+
+async fn persist_proxy_runtime_state(
+    state: &Arc<AppState>,
+    proxy_addr: SocketAddr,
+    proxy_online: bool,
+    context: &'static str,
+) {
+    let ui_addr = state.get_active_ui_addr().await;
+    if let Err(error) = runtime_state::persist_runtime_state(
+        &state.config.data_dir,
+        &RuntimeStateSnapshot::with_proxy_status(proxy_addr, ui_addr, proxy_online),
+    ) {
+        warn!(?error, context, "failed to persist runtime state");
+    }
+}
+
+pub async fn mark_proxy_offline_after_task_exit(
+    state: &Arc<AppState>,
+    expected_addr: SocketAddr,
+    context: &'static str,
+) {
+    let proxy_addr = state.get_active_proxy_addr().await;
+    if proxy_addr != expected_addr {
+        return;
+    }
+    state.set_proxy_online(false);
+    persist_proxy_runtime_state(state, proxy_addr, false, context).await;
 }
 
 pub async fn serve_proxy(listener: TcpListener, state: Arc<AppState>) -> Result<()> {
@@ -213,19 +304,22 @@ pub async fn serve_proxy(listener: TcpListener, state: Arc<AppState>) -> Result<
         let io = TokioIo::new(stream);
         let state = state.clone();
 
+        let connection_id = Uuid::new_v4();
+        let (abort, registration) = AbortHandle::new_pair();
+        remember_proxy_connection(connection_id, abort);
         tokio::spawn(async move {
             let service =
                 service_fn(move |request| handle_request(request, state.clone(), peer_addr));
 
-            if let Err(error) = http1::Builder::new()
+            let connection = http1::Builder::new()
                 .preserve_header_case(true)
                 .title_case_headers(true)
                 .serve_connection(io, service)
-                .with_upgrades()
-                .await
-            {
+                .with_upgrades();
+            if let Ok(Err(error)) = Abortable::new(connection, registration).await {
                 warn!(%peer_addr, ?error, "proxy connection failed");
             }
+            forget_proxy_connection(connection_id);
         });
     }
 }
@@ -238,28 +332,117 @@ pub async fn send_replay_request(
     http_version: Option<String>,
 ) -> Result<TransactionRecord> {
     let session = state.session().await;
-    if is_websocket_upgrade_editable(&request) {
-        return Err(anyhow!(
-            "Replay currently supports HTTP/HTTPS requests only, not WebSocket upgrades"
-        ));
+    send_replay_request_for_session(
+        state,
+        session,
+        request,
+        target,
+        source_transaction_id,
+        http_version,
+    )
+    .await
+}
+
+pub async fn send_replay_request_for_session(
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    request: EditableRequest,
+    target: Option<RequestTargetOverride>,
+    source_transaction_id: Option<Uuid>,
+    http_version: Option<String>,
+) -> Result<TransactionRecord> {
+    try_send_replay_request_for_session(
+        state,
+        session,
+        request,
+        target,
+        source_transaction_id,
+        http_version,
+    )
+    .await
+    .map_err(ReplaySendError::into_error)
+}
+
+#[derive(Debug)]
+pub struct ReplaySendError {
+    message: String,
+    record: Option<TransactionRecord>,
+}
+
+impl ReplaySendError {
+    fn without_record(error: anyhow::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            record: None,
+        }
     }
 
-    validate_reusable_request_source(session.as_ref(), &request, source_transaction_id).await?;
+    fn with_record(message: String, record: TransactionRecord) -> Self {
+        Self {
+            message,
+            record: Some(record),
+        }
+    }
+
+    pub fn record(&self) -> Option<&TransactionRecord> {
+        self.record.as_ref()
+    }
+
+    pub fn into_error(self) -> anyhow::Error {
+        anyhow!(self.message)
+    }
+}
+
+impl std::fmt::Display for ReplaySendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReplaySendError {}
+
+pub async fn try_send_replay_request_for_session(
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    request: EditableRequest,
+    target: Option<RequestTargetOverride>,
+    source_transaction_id: Option<Uuid>,
+    http_version: Option<String>,
+) -> std::result::Result<TransactionRecord, ReplaySendError> {
+    request
+        .try_body_bytes()
+        .context("request body is not valid base64")
+        .map_err(ReplaySendError::without_record)?;
+    if is_websocket_upgrade_editable(&request) {
+        return Err(ReplaySendError::without_record(anyhow!(
+            "Replay currently supports HTTP/HTTPS requests only, not WebSocket upgrades",
+        )));
+    }
+
+    validate_reusable_request_source(session.as_ref(), &request, source_transaction_id)
+        .await
+        .map_err(ReplaySendError::without_record)?;
 
     let started_at = Utc::now();
     let started = Instant::now();
     let (request, mut notes, original_request_capture) =
         apply_request_match_replace(session.as_ref(), request, state.config.body_preview_bytes)
             .await;
-    let request = build_replay_exchange_request(&request, target.as_ref())?;
+    let request = build_replay_exchange_request(&request, target.as_ref())
+        .map_err(ReplaySendError::without_record)?;
     let upstream_insecure = session.runtime.upstream_insecure().await;
+    let requested_http_version = parse_replay_http_version(http_version.as_deref())
+        .map_err(ReplaySendError::without_record)?;
     let client = build_replay_client(
         upstream_insecure,
         &request,
         target.as_ref(),
-        http_version.as_deref(),
+        requested_http_version,
     )
-    .await?;
+    .await
+    .map_err(ReplaySendError::without_record)?;
+    let outbound_uri_authority = build_replay_outbound_uri_authority(&request, target.as_ref())
+        .map_err(ReplaySendError::without_record)?;
     notes.push("Sent from Replay.".to_string());
     let exchange = execute_http_exchange(
         state.clone(),
@@ -271,24 +454,35 @@ pub async fn send_replay_request(
         notes,
         true,
         original_request_capture,
+        requested_http_version,
+        outbound_uri_authority.as_deref(),
     )
     .await;
 
-    session.store.insert(exchange.record.clone()).await;
+    let mut record = exchange.record.clone();
+    if requested_http_version == Some(Version::HTTP_2)
+        && record.http_version.as_deref() != Some("HTTP/2")
+    {
+        let message = format!(
+            "requested HTTP/2 but upstream negotiated {}",
+            record.http_version.as_deref().unwrap_or("unknown")
+        );
+        record.notes.push(message.clone());
+        store_record_and_scan(&state, &session, record.clone()).await;
+        return Err(ReplaySendError::with_record(message, record));
+    }
+
     session
         .event_log
         .push(
             EventLevel::Info,
             "replay",
             "Request sent",
-            format!(
-                "{} {}{}",
-                exchange.record.method, exchange.record.host, exchange.record.path
-            ),
+            format!("{} {}{}", record.method, record.host, record.path),
         )
         .await;
-    persist_session_quiet(&state, &session).await;
-    Ok(exchange.record)
+    store_record_and_scan(&state, &session, record.clone()).await;
+    Ok(record)
 }
 
 fn build_client(upstream_insecure: bool) -> ProxyClient {
@@ -300,31 +494,37 @@ fn build_client(upstream_insecure: bool) -> ProxyClient {
         .expect("failed to build upstream HTTP client")
 }
 
+fn parse_replay_http_version(value: Option<&str>) -> Result<Option<Version>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value {
+        "HTTP/1.0" | "1.0" => Ok(Some(Version::HTTP_10)),
+        "HTTP/1.1" | "1.1" => Ok(Some(Version::HTTP_11)),
+        "HTTP/2" | "HTTP/2.0" | "2" | "2.0" => Ok(Some(Version::HTTP_2)),
+        other => Err(anyhow!("unsupported replay http_version: {other}")),
+    }
+}
+
 async fn build_replay_client(
     upstream_insecure: bool,
     request: &EditableRequest,
     target: Option<&RequestTargetOverride>,
-    http_version: Option<&str>,
+    http_version: Option<Version>,
 ) -> Result<ProxyClient> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .danger_accept_invalid_certs(upstream_insecure);
 
     // Force HTTP version if specified
-    match http_version.map(|v| v.trim()) {
-        Some("HTTP/1.1") | Some("HTTP/1.0") | Some("1.1") | Some("1.0") => {
+    match http_version {
+        Some(Version::HTTP_10 | Version::HTTP_11) => {
             builder = builder.http1_only();
         }
-        Some("HTTP/2") | Some("2") | Some("2.0") => {
-            if request.scheme.eq_ignore_ascii_case("https") {
-                // HTTPS: default ALPN includes h2, so don't force http1_only.
-                // If server supports h2, it will negotiate HTTP/2 automatically.
-            } else {
-                // Cleartext h2c (HTTP without TLS)
-                builder = builder.http2_prior_knowledge();
-            }
+        Some(Version::HTTP_2) => {
+            builder = builder.http2_prior_knowledge();
         }
-        _ => {
+        Some(_) | None => {
             // Auto-negotiate (default)
         }
     }
@@ -332,13 +532,40 @@ async fn build_replay_client(
     if let Some(target) = target {
         let request_authority = parse_request_authority(&request.host, &request.scheme)?;
         let target_host = target.host.trim();
-        if !target_host.is_empty()
-            && !request_authority.host.eq_ignore_ascii_case(target_host)
-            && request_authority.host.parse::<IpAddr>().is_err()
-        {
-            let target_port =
-                replay_target_port(target.port.trim(), &request.scheme, request_authority.port)?;
-            let resolved_addrs = resolve_target_host(target_host, target_port).await?;
+        let target_authority = if target_host.is_empty() {
+            None
+        } else {
+            Some(parse_replay_target_authority(target_host, &request.scheme)?)
+        };
+        if target_authority.is_some() || !target.port.trim().is_empty() {
+            let target_port = replay_target_port(
+                target.port.trim(),
+                &request.scheme,
+                target_authority
+                    .as_ref()
+                    .and_then(|authority| authority.port)
+                    .or(request_authority.port),
+            )?;
+            let request_port = request_authority
+                .port
+                .unwrap_or(default_port_for_scheme(&request.scheme)?);
+            let dial_host = target_authority
+                .as_ref()
+                .map(|authority| authority.host.as_str())
+                .unwrap_or(request_authority.host.as_str());
+            if dial_host.eq_ignore_ascii_case(&request_authority.host)
+                && target_port == request_port
+            {
+                return builder
+                    .build()
+                    .context("failed to build replay HTTP client");
+            }
+            if request_authority.host.parse::<IpAddr>().is_ok() {
+                bail!(
+                    "Replay target override is not supported when the request host is an IP address"
+                );
+            }
+            let resolved_addrs = resolve_target_host(dial_host, target_port).await?;
             builder = builder.resolve_to_addrs(&request_authority.host, &resolved_addrs);
         }
     }
@@ -369,10 +596,63 @@ fn build_replay_exchange_request(
     }
 
     let request_authority = parse_request_authority(&request.host, &rewritten.scheme)?;
-    let effective_port =
-        replay_target_port(target_port, &rewritten.scheme, request_authority.port)?;
-    rewritten.host = build_authority(&request_authority.host, effective_port);
+    let target_authority = if target_host.is_empty() {
+        None
+    } else {
+        Some(parse_replay_target_authority(
+            target_host,
+            &rewritten.scheme,
+        )?)
+    };
+    replay_target_port(
+        target_port,
+        &rewritten.scheme,
+        target_authority
+            .as_ref()
+            .and_then(|authority| authority.port)
+            .or(request_authority.port),
+    )?;
     Ok(rewritten)
+}
+
+fn build_replay_outbound_uri_authority(
+    request: &EditableRequest,
+    target: Option<&RequestTargetOverride>,
+) -> Result<Option<String>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    if target.host.trim().is_empty() && target.port.trim().is_empty() {
+        return Ok(None);
+    }
+    let request_authority = parse_request_authority(&request.host, &request.scheme)?;
+    let target_authority = if target.host.trim().is_empty() {
+        None
+    } else {
+        Some(parse_replay_target_authority(
+            target.host.trim(),
+            &request.scheme,
+        )?)
+    };
+    let target_port = replay_target_port(
+        target.port.trim(),
+        &request.scheme,
+        target_authority
+            .as_ref()
+            .and_then(|authority| authority.port)
+            .or(request_authority.port),
+    )?;
+    let request_port = request_authority
+        .port
+        .unwrap_or(default_port_for_scheme(&request.scheme)?);
+    let dial_host = target_authority
+        .as_ref()
+        .map(|authority| authority.host.as_str())
+        .unwrap_or(request_authority.host.as_str());
+    if dial_host.eq_ignore_ascii_case(&request_authority.host) && target_port == request_port {
+        return Ok(None);
+    }
+    Ok(Some(build_authority_without_port(&request_authority.host)))
 }
 
 fn parse_request_authority(authority: &str, scheme: &str) -> Result<ParsedAuthority> {
@@ -388,14 +668,31 @@ fn parse_request_authority(authority: &str, scheme: &str) -> Result<ParsedAuthor
     })
 }
 
+fn parse_replay_target_authority(authority: &str, scheme: &str) -> Result<ParsedAuthority> {
+    let authority = authority.trim();
+    let normalized = if authority.contains(':')
+        && !authority.starts_with('[')
+        && authority.parse::<IpAddr>().is_ok()
+    {
+        format!("[{authority}]")
+    } else {
+        authority.to_string()
+    };
+    parse_request_authority(&normalized, scheme)
+}
+
 fn replay_target_port(target_port: &str, scheme: &str, request_port: Option<u16>) -> Result<u16> {
     if target_port.is_empty() {
         return Ok(request_port.unwrap_or(default_port_for_scheme(scheme)?));
     }
 
-    target_port
+    let port = target_port
         .parse::<u16>()
-        .with_context(|| format!("invalid replay target port: {target_port}"))
+        .with_context(|| format!("invalid replay target port: {target_port}"))?;
+    if port == 0 {
+        anyhow::bail!("invalid replay target port: {target_port}");
+    }
+    Ok(port)
 }
 
 fn default_port_for_scheme(scheme: &str) -> Result<u16> {
@@ -406,11 +703,11 @@ fn default_port_for_scheme(scheme: &str) -> Result<u16> {
     }
 }
 
-fn build_authority(host: &str, port: u16) -> String {
+fn build_authority_without_port(host: &str) -> String {
     if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
-        format!("[{host}]:{port}")
+        format!("[{host}]")
     } else {
-        format!("{host}:{port}")
+        host.to_string()
     }
 }
 
@@ -443,7 +740,7 @@ async fn handle_request(
     state: Arc<AppState>,
     peer_addr: SocketAddr,
 ) -> Result<Response<Body>, Infallible> {
-    let session = state.session().await;
+    let (session, _session_owner) = state.session_with_proxy_owner().await;
     let response = if request.method() == Method::CONNECT {
         handle_connect(request, state, session, peer_addr).await
     } else {
@@ -465,7 +762,17 @@ async fn handle_connect(
         Ok(target) => target,
         Err(error) => {
             warn!(%peer_addr, ?error, "invalid CONNECT target");
-            return text_response(StatusCode::BAD_REQUEST, error.to_string());
+            return record_connect_rejection(
+                &state,
+                &session,
+                request.uri(),
+                request.headers(),
+                started_at,
+                started,
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+            )
+            .await;
         }
     };
     let request_capture = MessageRecord::from_headers_and_body(
@@ -478,7 +785,7 @@ async fn handle_connect(
     if special_host::is_special_host(&target) {
         let state = state.clone();
         let session = session.clone();
-        tokio::spawn(async move {
+        spawn_tracked_proxy_task(session.id(), async move {
             if let Err(error) = serve_special_host_tls(
                 upgrade,
                 state,
@@ -496,7 +803,7 @@ async fn handle_connect(
         let state = state.clone();
         let session = session.clone();
         let target = target.clone();
-        tokio::spawn(async move {
+        spawn_tracked_proxy_task(session.id(), async move {
             if let Err(error) = serve_passthrough_tunnel(
                 upgrade,
                 state.clone(),
@@ -519,7 +826,7 @@ async fn handle_connect(
         let failure_started_at = started_at;
         let failure_started = started;
 
-        tokio::spawn(async move {
+        spawn_tracked_proxy_task(session.id(), async move {
             if let Err(error) = serve_https_mitm(
                 upgrade,
                 state.clone(),
@@ -533,18 +840,22 @@ async fn handle_connect(
             .await
             {
                 warn!(%peer_addr, ?error, target = %failure_target, "HTTPS MITM handler failed");
-                failure_session
-                    .store
-                    .insert(TransactionRecord::tunnel(
+                if insert_transaction_quiet(
+                    &failure_session,
+                    TransactionRecord::tunnel(
                         failure_started_at,
                         failure_target,
                         Some(StatusCode::BAD_GATEWAY.as_u16()),
                         failure_started.elapsed().as_millis() as u64,
                         failure_capture,
                         vec![format!("HTTPS MITM failed: {error}")],
-                    ))
-                    .await;
-                persist_session_quiet(&failure_state, &failure_session).await;
+                    ),
+                    "https mitm failure",
+                )
+                .await
+                {
+                    persist_session_quiet(&failure_state, &failure_session).await;
+                }
             }
         });
     }
@@ -581,6 +892,31 @@ async fn handle_forwardable_request(
     let started_at = Utc::now();
     let started = Instant::now();
     let is_websocket = is_websocket_upgrade_headers(request.headers());
+    if is_websocket {
+        if let Some(message) =
+            websocket_upgrade_validation_error(request.method(), request.headers())
+        {
+            return record_http_rejection(
+                &state,
+                &session,
+                RejectedRequestIdentity::from_request(
+                    request.method(),
+                    request.uri(),
+                    request.headers(),
+                    default_scheme,
+                    authority_override.as_deref(),
+                ),
+                request.headers(),
+                &[],
+                started_at,
+                started,
+                StatusCode::BAD_REQUEST,
+                message.to_string(),
+                "invalid websocket upgrade",
+            )
+            .await;
+        }
+    }
     let on_upgrade = is_websocket.then(|| hyper::upgrade::on(&mut request));
     let (parts, body) = request.into_parts();
     let absolute_uri = match resolve_absolute_uri(
@@ -590,13 +926,46 @@ async fn handle_forwardable_request(
         authority_override.as_deref(),
     ) {
         Ok(uri) => uri,
-        Err(error) => return text_response(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => {
+            return record_http_rejection(
+                &state,
+                &session,
+                RejectedRequestIdentity::from_request(
+                    &parts.method,
+                    &parts.uri,
+                    &parts.headers,
+                    default_scheme,
+                    authority_override.as_deref(),
+                ),
+                &parts.headers,
+                &[],
+                started_at,
+                started,
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                "invalid proxy request uri",
+            )
+            .await
+        }
     };
     let request_bytes = match collect_body(body).await {
         Ok(bytes) => bytes,
         Err(error) => {
             warn!(%peer_addr, ?error, "failed to read request body");
-            return text_response(StatusCode::BAD_REQUEST, error);
+            let status = error.status();
+            return record_http_rejection(
+                &state,
+                &session,
+                RejectedRequestIdentity::from_absolute_uri(&parts.method, &absolute_uri),
+                &parts.headers,
+                &[],
+                started_at,
+                started,
+                status,
+                error.to_string(),
+                "proxy request body rejected",
+            )
+            .await;
         }
     };
 
@@ -630,11 +999,53 @@ async fn handle_forwardable_request(
     .await
 }
 
-async fn collect_body(body: Incoming) -> std::result::Result<Bytes, String> {
-    body.collect()
-        .await
-        .map(|collected| collected.to_bytes())
-        .map_err(|error| format!("body collection failed: {error}"))
+#[derive(Debug)]
+enum BodyCollectionError {
+    TooLarge { limit: usize },
+    Read(String),
+}
+
+impl BodyCollectionError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Read(_) => StatusCode::BAD_REQUEST,
+        }
+    }
+}
+
+impl std::fmt::Display for BodyCollectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { limit } => {
+                write!(f, "request body exceeds {} bytes", limit)
+            }
+            Self::Read(error) => write!(f, "body collection failed: {error}"),
+        }
+    }
+}
+
+async fn collect_body(mut body: Incoming) -> std::result::Result<Bytes, BodyCollectionError> {
+    let mut bytes = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| BodyCollectionError::Read(error.to_string()))?;
+        if let Ok(data) = frame.into_data() {
+            let new_len =
+                bytes
+                    .len()
+                    .checked_add(data.len())
+                    .ok_or(BodyCollectionError::TooLarge {
+                        limit: MAX_PROXY_REQUEST_BODY_BYTES,
+                    })?;
+            if new_len > MAX_PROXY_REQUEST_BODY_BYTES {
+                return Err(BodyCollectionError::TooLarge {
+                    limit: MAX_PROXY_REQUEST_BODY_BYTES,
+                });
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(bytes.freeze())
 }
 
 fn resolve_absolute_uri(
@@ -644,6 +1055,13 @@ fn resolve_absolute_uri(
     authority_override: Option<&str>,
 ) -> Result<Uri> {
     if uri.scheme().is_some() && uri.authority().is_some() {
+        if let Some(authority_override) = authority_override {
+            validate_absolute_uri_matches_authority_override(
+                uri,
+                default_scheme,
+                authority_override,
+            )?;
+        }
         return Ok(uri.clone());
     }
 
@@ -669,45 +1087,155 @@ fn resolve_absolute_uri(
         .map_err(|error| anyhow!("failed to build absolute URI: {error}"))
 }
 
-fn connect_target(uri: &Uri) -> Result<String> {
-    if let Some(authority) = uri.authority() {
-        return Ok(authority.to_string());
+fn validate_absolute_uri_matches_authority_override(
+    uri: &Uri,
+    default_scheme: &str,
+    authority_override: &str,
+) -> Result<()> {
+    let uri_authority = uri
+        .authority()
+        .context("absolute-form request URI is missing authority")?;
+    let override_authority: Authority = authority_override
+        .parse()
+        .with_context(|| format!("invalid CONNECT tunnel authority: {authority_override}"))?;
+    let scheme = uri.scheme_str().unwrap_or(default_scheme);
+    if !scheme.eq_ignore_ascii_case(default_scheme) {
+        bail!("absolute-form request scheme does not match CONNECT tunnel scheme: {scheme}");
     }
-
-    let target = uri.path().trim();
-    if target.is_empty() {
-        Err(anyhow!("CONNECT request is missing authority"))
-    } else {
-        Ok(target.to_string())
+    let uri_port = uri_authority
+        .port_u16()
+        .unwrap_or(default_port_for_scheme(scheme)?);
+    let override_port = override_authority
+        .port_u16()
+        .ok_or_else(|| anyhow!("CONNECT tunnel authority must include a port"))?;
+    if !authority_hosts_equivalent(uri_authority.host(), override_authority.host())
+        || uri_port != override_port
+    {
+        bail!(
+            "absolute-form request authority does not match CONNECT tunnel authority: {}",
+            uri_authority
+        );
     }
+    Ok(())
 }
 
-fn rebuild_response(headers: HeaderMap, status: StatusCode, body: Bytes) -> Response<Body> {
+fn authority_hosts_equivalent(left: &str, right: &str) -> bool {
+    let left = left
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(left);
+    let right = right
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(right);
+    left.eq_ignore_ascii_case(right)
+}
+
+fn connect_target(uri: &Uri) -> Result<String> {
+    if uri.scheme().is_some() {
+        return Err(anyhow!(
+            "CONNECT request target must be authority-form host:port"
+        ));
+    }
+    let target = uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .unwrap_or_else(|| uri.path().trim());
+    if target.is_empty() {
+        return Err(anyhow!("CONNECT request is missing authority"));
+    }
+    let authority: Authority = target
+        .parse()
+        .with_context(|| format!("invalid CONNECT target authority: {target}"))?;
+    authority
+        .port_u16()
+        .ok_or_else(|| anyhow!("CONNECT target authority must include a port: {target}"))?;
+    Ok(authority.to_string())
+}
+
+fn rebuild_response(
+    headers: HeaderMap,
+    status: StatusCode,
+    body: Bytes,
+    request_method: &str,
+) -> Response<Body> {
     let mut sanitized = headers;
+    let upstream_content_length = sanitized.get(CONTENT_LENGTH).cloned();
     strip_hop_by_hop_headers(&mut sanitized);
     sanitized.remove(CONTENT_LENGTH);
-    if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
+    if response_must_not_include_content_length(status) {
+        sanitized.remove(CONTENT_LENGTH);
+    } else if request_method.eq_ignore_ascii_case("HEAD") || status == StatusCode::NOT_MODIFIED {
+        if let Some(value) = upstream_content_length {
+            sanitized.insert(CONTENT_LENGTH, value);
+        }
+    } else if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
         sanitized.insert(CONTENT_LENGTH, value);
     }
 
-    let mut response = Response::new(Body::from(body));
+    let wire_body = if response_must_not_include_body(status, request_method) {
+        Bytes::new()
+    } else {
+        body
+    };
+
+    let mut response = Response::new(Body::from(wire_body));
     *response.status_mut() = status;
     *response.headers_mut() = sanitized;
     response
 }
 
+fn rebuild_streaming_response(
+    headers: HeaderMap,
+    status: StatusCode,
+    body: Body,
+    request_method: &str,
+) -> Response<Body> {
+    let mut sanitized = headers;
+    let upstream_content_length = sanitized.get(CONTENT_LENGTH).cloned();
+    strip_hop_by_hop_headers(&mut sanitized);
+    if response_must_not_include_content_length(status) {
+        sanitized.remove(CONTENT_LENGTH);
+    } else if request_method.eq_ignore_ascii_case("HEAD") || status == StatusCode::NOT_MODIFIED {
+        sanitized.remove(CONTENT_LENGTH);
+        if let Some(value) = upstream_content_length {
+            sanitized.insert(CONTENT_LENGTH, value);
+        }
+    }
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = sanitized;
+    response
+}
+
+fn response_must_not_include_content_length(status: StatusCode) -> bool {
+    status.is_informational() || status == StatusCode::NO_CONTENT
+}
+
+fn response_must_not_include_body(status: StatusCode, request_method: &str) -> bool {
+    request_method.eq_ignore_ascii_case("HEAD")
+        || status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+}
+
+fn response_allows_synthesized_content_length(status: StatusCode) -> bool {
+    !response_must_not_include_content_length(status) && status != StatusCode::NOT_MODIFIED
+}
+
 fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     let connection_tokens = headers
-        .get(CONNECTION)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| {
             value
                 .split(',')
                 .map(|token| token.trim().to_ascii_lowercase())
                 .filter(|token| !token.is_empty())
-                .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
 
     for header in [
         "connection",
@@ -745,13 +1273,156 @@ fn text_response(status: StatusCode, message: impl Into<String>) -> Response<Bod
     response
 }
 
+struct RejectedRequestIdentity {
+    method: String,
+    scheme: String,
+    host: String,
+    path: String,
+}
+
+impl RejectedRequestIdentity {
+    fn from_request(
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        default_scheme: &str,
+        authority_override: Option<&str>,
+    ) -> Self {
+        let scheme = uri.scheme_str().unwrap_or(default_scheme).to_string();
+        let host = authority_override
+            .map(str::to_string)
+            .or_else(|| uri.authority().map(|authority| authority.to_string()))
+            .or_else(|| {
+                headers
+                    .get(HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let path = uri
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        Self {
+            method: method.to_string(),
+            scheme,
+            host,
+            path,
+        }
+    }
+
+    fn from_absolute_uri(method: &Method, uri: &Uri) -> Self {
+        Self {
+            method: method.to_string(),
+            scheme: uri.scheme_str().unwrap_or("http").to_string(),
+            host: uri
+                .authority()
+                .map(|authority| authority.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            path: uri
+                .path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string()),
+        }
+    }
+}
+
+async fn record_http_rejection(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    identity: RejectedRequestIdentity,
+    request_headers: &HeaderMap,
+    request_body: &[u8],
+    started_at: chrono::DateTime<Utc>,
+    started: Instant,
+    status: StatusCode,
+    message: String,
+    context: &'static str,
+) -> Response<Body> {
+    let request_capture = MessageRecord::from_headers_and_body(
+        request_headers,
+        request_body,
+        state.config.body_preview_bytes,
+    );
+    let (response, response_capture) = synthetic_error_response(status, &message, state);
+    let record = TransactionRecord::http(
+        started_at,
+        identity.method,
+        identity.scheme,
+        identity.host,
+        normalize_request_path(&identity.path),
+        Some(status.as_u16()),
+        started.elapsed().as_millis() as u64,
+        request_capture,
+        Some(response_capture),
+        vec![format!("Proxy rejected request: {message}")],
+        None,
+        None,
+    );
+    if insert_transaction_quiet(session, record, context).await {
+        persist_session_quiet(state, session).await;
+    }
+    response
+}
+
+async fn record_connect_rejection(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    uri: &Uri,
+    request_headers: &HeaderMap,
+    started_at: chrono::DateTime<Utc>,
+    started: Instant,
+    status: StatusCode,
+    message: String,
+) -> Response<Body> {
+    let target = uri
+        .authority()
+        .map(|authority| authority.to_string())
+        .unwrap_or_else(|| uri.path().trim().to_string())
+        .if_empty_then("<unknown>");
+    let request_capture =
+        MessageRecord::from_headers_and_body(request_headers, &[], state.config.body_preview_bytes);
+    let (response, response_capture) = synthetic_error_response(status, &message, state);
+    let record = TransactionRecord::tunnel(
+        started_at,
+        target,
+        Some(status.as_u16()),
+        started.elapsed().as_millis() as u64,
+        request_capture,
+        vec![format!("Proxy rejected CONNECT: {message}")],
+    )
+    .with_response(response_capture);
+    if insert_transaction_quiet(session, record, "invalid connect target").await {
+        persist_session_quiet(state, session).await;
+    }
+    response
+}
+
+trait EmptyStringExt {
+    fn if_empty_then(self, fallback: &str) -> String;
+}
+
+impl EmptyStringExt for String {
+    fn if_empty_then(self, fallback: &str) -> String {
+        if self.is_empty() {
+            fallback.to_string()
+        } else {
+            self
+        }
+    }
+}
+
 fn build_local_response(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Response<Body> {
     let len = body.len();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
-    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
-        response.headers_mut().insert(CONTENT_LENGTH, value);
+    if response_allows_synthesized_content_length(status) {
+        if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+            response.headers_mut().insert(CONTENT_LENGTH, value);
+        }
+    } else if response_must_not_include_content_length(status) {
+        response.headers_mut().remove(CONTENT_LENGTH);
     }
     response
 }
@@ -768,15 +1439,18 @@ async fn serve_special_host_tls(
         .await
         .context("CONNECT upgrade failed for special host")?;
     let upgraded = TokioIo::new(upgraded);
-    let acceptor: TlsAcceptor = state.certificates.tls_acceptor();
+    let acceptor: TlsAcceptor = state
+        .certificates
+        .tls_acceptor()
+        .context("failed to build special host TLS certificate")?;
     let tls_stream = acceptor
         .accept(upgraded)
         .await
         .context("TLS handshake failed for special host")?;
 
-    session
-        .store
-        .insert(TransactionRecord::tunnel(
+    if insert_transaction_quiet(
+        &session,
+        TransactionRecord::tunnel(
             started_at,
             "sniper:443".to_string(),
             Some(StatusCode::OK.as_u16()),
@@ -785,9 +1459,13 @@ async fn serve_special_host_tls(
             vec![
                 "CONNECT tunnel terminated locally for the Sniper certificate portal.".to_string(),
             ],
-        ))
-        .await;
-    persist_session_quiet(&state, &session).await;
+        ),
+        "special-host tunnel",
+    )
+    .await
+    {
+        persist_session_quiet(&state, &session).await;
+    }
 
     let io = TokioIo::new(tls_stream);
     let service = service_fn(move |request| {
@@ -827,9 +1505,9 @@ async fn serve_passthrough_tunnel(
     let mut upstream_stream = match tokio::net::TcpStream::connect(&upstream_addr).await {
         Ok(stream) => stream,
         Err(error) => {
-            session
-                .store
-                .insert(TransactionRecord::tunnel(
+            if insert_transaction_quiet(
+                &session,
+                TransactionRecord::tunnel(
                     started_at,
                     target.clone(),
                     Some(StatusCode::BAD_GATEWAY.as_u16()),
@@ -838,9 +1516,13 @@ async fn serve_passthrough_tunnel(
                     vec![format!(
                         "Passthrough tunnel failed to connect to upstream: {error}"
                     )],
-                ))
-                .await;
-            persist_session_quiet(&state, &session).await;
+                ),
+                "passthrough tunnel connect failure",
+            )
+            .await
+            {
+                persist_session_quiet(&state, &session).await;
+            }
             return Err(error).context("passthrough tunnel upstream connect failed");
         }
     };
@@ -857,20 +1539,30 @@ async fn serve_passthrough_tunnel(
             vec![format!("SSL passthrough tunnel error: {error}")]
         }
     };
+    let tunnel_status = if result.is_ok() {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
 
-    session
-        .store
-        .insert(TransactionRecord::tunnel(
+    if insert_transaction_quiet(
+        &session,
+        TransactionRecord::tunnel(
             started_at,
             target,
-            Some(StatusCode::OK.as_u16()),
+            Some(tunnel_status.as_u16()),
             started.elapsed().as_millis() as u64,
             request_capture,
             notes,
-        ))
-        .await;
-    persist_session_quiet(&state, &session).await;
+        ),
+        "passthrough tunnel",
+    )
+    .await
+    {
+        persist_session_quiet(&state, &session).await;
+    }
 
+    result.context("passthrough tunnel relay failed")?;
     Ok(())
 }
 
@@ -900,9 +1592,9 @@ async fn serve_https_mitm(
         .await
         .with_context(|| format!("TLS handshake failed for {}", authority.host()))?;
 
-    session
-        .store
-        .insert(TransactionRecord::tunnel(
+    if insert_transaction_quiet(
+        &session,
+        TransactionRecord::tunnel(
             started_at,
             target,
             Some(StatusCode::OK.as_u16()),
@@ -912,12 +1604,17 @@ async fn serve_https_mitm(
                 "HTTPS MITM terminated locally and is forwarding upstream traffic for {}.",
                 authority.host()
             )],
-        ))
-        .await;
-    persist_session_quiet(&state, &session).await;
+        ),
+        "https mitm tunnel",
+    )
+    .await
+    {
+        persist_session_quiet(&state, &session).await;
+    }
 
     let io = TokioIo::new(tls_stream);
     let connect_authority = authority.to_string();
+    let log_authority = connect_authority.clone();
     let service = service_fn(move |request| {
         handle_https_mitm_request(
             request,
@@ -932,10 +1629,14 @@ async fn serve_https_mitm(
         .http1()
         .preserve_header_case(true)
         .title_case_headers(true);
-    builder
+    if let Err(error) = builder
         .serve_connection_with_upgrades(io, service)
         .await
         .map_err(|error| anyhow!("HTTPS MITM HTTP serving failed: {error}"))
+    {
+        warn!(%peer_addr, target = %log_authority, ?error, "HTTPS MITM HTTP serving failed after CONNECT was recorded");
+    }
+    Ok(())
 }
 
 async fn handle_special_host_request(
@@ -946,27 +1647,63 @@ async fn handle_special_host_request(
     let started_at = Utc::now();
     let started = Instant::now();
     let (parts, body) = request.into_parts();
-    let body_bytes = collect_body(body).await.unwrap_or_default();
     let path = parts
         .uri
         .path_and_query()
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
+    let body_bytes = match collect_body(body).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let message = error.to_string();
+            let request_capture = MessageRecord::from_headers_and_body(
+                &parts.headers,
+                &[],
+                state.config.body_preview_bytes,
+            );
+            let (response, response_capture) =
+                synthetic_error_response(error.status(), &message, &state);
+            if insert_transaction_quiet(
+                &session,
+                TransactionRecord::http(
+                    started_at,
+                    parts.method.to_string(),
+                    "https".to_string(),
+                    "sniper".to_string(),
+                    path,
+                    Some(error.status().as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    vec![message],
+                    None,
+                    None,
+                ),
+                "special host body collection failed",
+            )
+            .await
+            {
+                persist_session_quiet(&state, &session).await;
+            }
+            return Ok(response);
+        }
+    };
     let request_capture = MessageRecord::from_headers_and_body(
         &parts.headers,
         body_bytes.as_ref(),
         state.config.body_preview_bytes,
     );
-    let response = special_host::respond(&path, &parts.method, state.as_ref(), true);
+    let proxy_addr = state.get_active_proxy_addr().await;
+    let response = special_host::respond(&path, &parts.method, state.as_ref(), true, proxy_addr);
     let response_capture = MessageRecord::from_headers_and_body(
         &response.headers,
         response.body.as_ref(),
         state.config.body_preview_bytes,
     );
 
-    session
-        .store
-        .insert(TransactionRecord::http(
+    if insert_transaction_quiet(
+        &session,
+        TransactionRecord::http(
             started_at,
             parts.method.to_string(),
             "https".to_string(),
@@ -979,9 +1716,13 @@ async fn handle_special_host_request(
             response.notes.clone(),
             None,
             None,
-        ))
-        .await;
-    persist_session_quiet(&state, &session).await;
+        ),
+        "special-host request",
+    )
+    .await
+    {
+        persist_session_quiet(&state, &session).await;
+    }
 
     Ok(build_local_response(
         response.status,
@@ -1039,8 +1780,9 @@ async fn forward_http_request(
                 started,
                 "Request dropped in intercept.",
             );
-            session.store.insert(dropped.record).await;
-            persist_session_quiet(&state, &session).await;
+            if insert_transaction_quiet(&session, dropped.record, "dropped request").await {
+                persist_session_quiet(&state, &session).await;
+            }
             return dropped.response;
         }
     };
@@ -1052,6 +1794,24 @@ async fn forward_http_request(
     .await;
 
     let client = build_client(session.runtime.upstream_insecure().await);
+    if should_stream_upstream_response(session.as_ref(), &forwarded_request).await {
+        return execute_streaming_http_exchange(
+            state.clone(),
+            session.clone(),
+            &client,
+            forwarded_request,
+            started_at,
+            started,
+            notes,
+            secure_special_host,
+            original_request_capture,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    let response_method = forwarded_request.method.clone();
     let exchange = execute_http_exchange(
         state.clone(),
         session.clone(),
@@ -1062,6 +1822,8 @@ async fn forward_http_request(
         notes,
         secure_special_host,
         original_request_capture,
+        None,
+        None,
     )
     .await;
     let mut record = exchange.record.clone();
@@ -1080,7 +1842,12 @@ async fn forward_http_request(
                 ResponseInterceptResolution::PassThrough => {
                     // No intercept — use original raw bytes directly to avoid
                     // lossy UTF-8 conversion that corrupts gzip/br bodies.
-                    rebuild_response(response.headers, response.status, response.body)
+                    rebuild_response(
+                        response.headers,
+                        response.status,
+                        response.body,
+                        &response_method,
+                    )
                 }
                 ResponseInterceptResolution::Forward(edited) => {
                     let headers = header_map_from_records(&edited.headers);
@@ -1093,7 +1860,7 @@ async fn forward_http_request(
                         body.as_ref(),
                         state.config.body_preview_bytes,
                     ));
-                    rebuild_response(headers, status, body)
+                    rebuild_response(headers, status, body, &response_method)
                 }
                 ResponseInterceptResolution::Drop => {
                     let message = "Response dropped in intercept.";
@@ -1144,8 +1911,10 @@ async fn forward_websocket_request(
                 started,
                 "WebSocket upgrade dropped in intercept.",
             );
-            session.store.insert(dropped.record).await;
-            persist_session_quiet(&state, &session).await;
+            if insert_transaction_quiet(&session, dropped.record, "dropped websocket upgrade").await
+            {
+                persist_session_quiet(&state, &session).await;
+            }
             return dropped.response;
         }
     };
@@ -1157,6 +1926,7 @@ async fn forward_websocket_request(
     .await;
 
     if !is_websocket_upgrade_editable(&forwarded_request) {
+        let response_method = forwarded_request.method.clone();
         let client = build_client(session.runtime.upstream_insecure().await);
         let exchange = execute_http_exchange(
             state.clone(),
@@ -1171,18 +1941,59 @@ async fn forward_websocket_request(
             ),
             secure_special_host,
             original_request_capture,
+            None,
+            None,
         )
         .await;
         let record = exchange.record.clone();
-        session.store.insert(record).await;
-        persist_session_quiet(&state, &session).await;
+        store_record_and_scan(&state, &session, record).await;
         return match exchange.response {
-            Ok(response) => rebuild_response(response.headers, response.status, response.body),
+            Ok(response) => rebuild_response(
+                response.headers,
+                response.status,
+                response.body,
+                &response_method,
+            ),
             Err(error) => text_response(error.status, error.message),
         };
     }
 
+    let request_headers = header_map_from_records(&forwarded_request.headers);
+    let request_capture = MessageRecord::from_headers_and_body(
+        &request_headers,
+        &forwarded_request.body_bytes(),
+        state.config.body_preview_bytes,
+    );
+    if let Some(message) =
+        websocket_upgrade_validation_error_for_editable(&forwarded_request, &request_headers)
+    {
+        let (client_response, response_capture) =
+            synthetic_error_response(StatusCode::BAD_REQUEST, message, &state);
+        let record = TransactionRecord::http(
+            started_at,
+            forwarded_request.method.clone(),
+            forwarded_request.scheme.clone(),
+            forwarded_request.host.clone(),
+            normalize_request_path(&forwarded_request.path),
+            Some(StatusCode::BAD_REQUEST.as_u16()),
+            started.elapsed().as_millis() as u64,
+            request_capture,
+            Some(response_capture),
+            merge_notes(
+                request_notes,
+                vec![format!("Invalid WebSocket handshake: {message}")],
+            ),
+            None,
+            None,
+        );
+        if insert_transaction_quiet(&session, record, "invalid edited websocket upgrade").await {
+            persist_session_quiet(&state, &session).await;
+        }
+        return client_response;
+    }
+
     if special_host::is_special_host(&forwarded_request.host) {
+        let response_method = forwarded_request.method.clone();
         let exchange = execute_http_exchange(
             state.clone(),
             session.clone(),
@@ -1199,26 +2010,36 @@ async fn forward_websocket_request(
             ),
             secure_special_host,
             original_request_capture,
+            None,
+            None,
         )
         .await;
         let record = exchange.record.clone();
-        session.store.insert(record).await;
-        persist_session_quiet(&state, &session).await;
+        if insert_transaction_quiet(&session, record, "special-host websocket request").await {
+            persist_session_quiet(&state, &session).await;
+        }
         return match exchange.response {
-            Ok(response) => rebuild_response(response.headers, response.status, response.body),
+            Ok(response) => rebuild_response(
+                response.headers,
+                response.status,
+                response.body,
+                &response_method,
+            ),
             Err(error) => text_response(error.status, error.message),
         };
     }
 
-    let request_headers = header_map_from_records(&forwarded_request.headers);
-    let request_capture = MessageRecord::from_headers_and_body(
-        &request_headers,
-        &forwarded_request.body_bytes(),
-        state.config.body_preview_bytes,
-    );
-    let response = match connect_upstream_websocket(&forwarded_request).await {
+    let response = match connect_upstream_websocket(
+        &forwarded_request,
+        session.runtime.upstream_insecure().await,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => {
+            let message = format!("WebSocket connect failed: {error}");
+            let (client_response, response_capture) =
+                synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
             let record = TransactionRecord::http(
                 started_at,
                 forwarded_request.method.clone(),
@@ -1228,17 +2049,15 @@ async fn forward_websocket_request(
                 Some(StatusCode::BAD_GATEWAY.as_u16()),
                 started.elapsed().as_millis() as u64,
                 request_capture,
-                None,
-                vec![format!("WebSocket connect failed: {error}")],
+                Some(response_capture),
+                vec![message],
                 None,
                 None,
             );
-            session.store.insert(record).await;
-            persist_session_quiet(&state, &session).await;
-            return text_response(
-                StatusCode::BAD_GATEWAY,
-                format!("WebSocket connect failed: {error}"),
-            );
+            if insert_transaction_quiet(&session, record, "websocket connect failure").await {
+                persist_session_quiet(&state, &session).await;
+            }
+            return client_response;
         }
     };
 
@@ -1248,6 +2067,9 @@ async fn forward_websocket_request(
     ) {
         Ok(headers) => headers,
         Err(error) => {
+            let message = format!("Invalid WebSocket handshake: {error}");
+            let (client_response, response_capture) =
+                synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
             let record = TransactionRecord::http(
                 started_at,
                 forwarded_request.method.clone(),
@@ -1257,17 +2079,15 @@ async fn forward_websocket_request(
                 Some(StatusCode::BAD_REQUEST.as_u16()),
                 started.elapsed().as_millis() as u64,
                 request_capture,
-                None,
-                vec![format!("Invalid WebSocket handshake: {error}")],
+                Some(response_capture),
+                vec![message],
                 None,
                 None,
             );
-            session.store.insert(record).await;
-            persist_session_quiet(&state, &session).await;
-            return text_response(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid WebSocket handshake: {error}"),
-            );
+            if insert_transaction_quiet(&session, record, "invalid websocket handshake").await {
+                persist_session_quiet(&state, &session).await;
+            }
+            return client_response;
         }
     };
     let applied_response = session
@@ -1284,6 +2104,31 @@ async fn forward_websocket_request(
                 applied_response.notes.join(" | "),
             )
             .await;
+    }
+    if let Some(error) =
+        websocket_response_validation_error(&request_headers, &applied_response.headers)
+    {
+        let message = format!("Invalid WebSocket handshake response: {error}");
+        let (client_response, response_capture) =
+            synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
+        let record = TransactionRecord::http(
+            started_at,
+            forwarded_request.method.clone(),
+            forwarded_request.scheme.clone(),
+            forwarded_request.host.clone(),
+            normalize_request_path(&forwarded_request.path),
+            Some(StatusCode::BAD_REQUEST.as_u16()),
+            started.elapsed().as_millis() as u64,
+            request_capture,
+            Some(response_capture),
+            merge_notes(request_notes, vec![message]),
+            None,
+            None,
+        );
+        if insert_transaction_quiet(&session, record, "invalid websocket response").await {
+            persist_session_quiet(&state, &session).await;
+        }
+        return client_response;
     }
 
     let response_capture = MessageRecord::from_headers_and_body(
@@ -1309,7 +2154,7 @@ async fn forward_websocket_request(
         None,
         None,
     );
-    session.store.insert(http_record).await;
+    insert_transaction_quiet(&session, http_record, "websocket upgrade transaction").await;
     session
         .event_log
         .push(
@@ -1321,9 +2166,9 @@ async fn forward_websocket_request(
         .await;
 
     let capture_enabled = session.runtime.websocket_capture_enabled().await;
-    let session_id = capture_enabled.then(Uuid::new_v4);
+    let captured_websocket_id = capture_enabled.then(Uuid::new_v4);
 
-    if let Some(id) = session_id {
+    if let Some(id) = captured_websocket_id {
         session
             .websockets
             .open(WebSocketSessionRecord {
@@ -1344,17 +2189,27 @@ async fn forward_websocket_request(
     }
     persist_session_quiet(&state, &session).await;
 
-    tokio::spawn(async move {
-        if let Err(error) = relay_websocket_session(
+    let relay_id = Uuid::new_v4();
+    let (relay_abort, relay_registration) = AbortHandle::new_pair();
+    remember_live_websocket_relay(
+        relay_id,
+        captured_websocket_id,
+        &session,
+        started,
+        relay_abort,
+    );
+
+    spawn_tracked_proxy_task(session.id(), async move {
+        let relay = relay_websocket_session(
             on_upgrade,
             response.websocket,
             state.clone(),
             session.clone(),
-            session_id,
+            captured_websocket_id,
             started,
-        )
-        .await
-        {
+        );
+        let result = Abortable::new(relay, relay_registration).await.ok();
+        if let Some(Err(error)) = result {
             warn!(
                 %peer_addr,
                 host = %forwarded_request.host,
@@ -1362,7 +2217,7 @@ async fn forward_websocket_request(
                 ?error,
                 "websocket relay failed"
             );
-            if let Some(id) = session_id {
+            if let Some(id) = captured_websocket_id {
                 session
                     .websockets
                     .close(
@@ -1375,6 +2230,7 @@ async fn forward_websocket_request(
                 persist_session_quiet(&state, &session).await;
             }
         }
+        forget_live_websocket_relay(relay_id);
     });
 
     build_local_response(
@@ -1447,8 +2303,11 @@ async fn maybe_intercept_response(
         return ResponseInterceptResolution::PassThrough;
     }
 
-    if special_host::is_special_host(&record.host)
-        || !session.runtime.is_in_scope(&record.host).await
+    if special_host::is_special_host(&record.host) {
+        return ResponseInterceptResolution::PassThrough;
+    }
+    if session.runtime.intercept_scope_only().await
+        && !session.runtime.is_in_scope(&record.host).await
     {
         return ResponseInterceptResolution::PassThrough;
     }
@@ -1502,25 +2361,344 @@ async fn store_record_and_scan(
     session: &Arc<SessionContext>,
     record: TransactionRecord,
 ) {
-    session.store.insert(record.clone()).await;
+    if !insert_transaction_quiet(session, record.clone(), "captured transaction").await {
+        return;
+    }
     {
         let scanner = session.scanner.clone();
+        let scan_generation = scanner.clear_generation();
         let scan_record = record.clone();
         let scan_state = Arc::clone(state);
         let scan_session = Arc::clone(session);
-        tokio::spawn(async move {
+        spawn_tracked_proxy_task(session.id(), async move {
             let config = scanner.get_config().await;
             let findings = crate::scanner::scan_transaction(&scan_record, &config);
-            let has_findings = !findings.is_empty();
+            let mut accepted_findings = false;
             for finding in findings {
-                scanner.push(finding).await;
+                accepted_findings |= scanner.push_if_generation(finding, scan_generation).await;
             }
-            if has_findings {
+            if accepted_findings {
                 persist_session_quiet(&scan_state, &scan_session).await;
             }
         });
     }
     persist_session_quiet(state, session).await;
+}
+
+async fn insert_transaction_quiet(
+    session: &Arc<SessionContext>,
+    record: TransactionRecord,
+    _context: &'static str,
+) -> bool {
+    session.store.insert(record).await;
+    true
+}
+
+async fn should_stream_upstream_response(
+    session: &SessionContext,
+    request: &EditableRequest,
+) -> bool {
+    if special_host::is_special_host(&request.host) {
+        return false;
+    }
+    if session.match_replace.has_enabled_response_rules().await {
+        return false;
+    }
+    if should_buffer_for_response_intercept(session, request).await {
+        return false;
+    }
+    true
+}
+
+async fn should_buffer_for_response_intercept(
+    session: &SessionContext,
+    request: &EditableRequest,
+) -> bool {
+    if !session.runtime.intercept_enabled().await {
+        return false;
+    }
+    if session.runtime.intercept_scope_only().await
+        && !session.runtime.is_in_scope(&request.host).await
+    {
+        return false;
+    }
+    session.intercept_rules.matches_any_response(request).await
+}
+
+async fn execute_streaming_http_exchange(
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    client: &ProxyClient,
+    request: EditableRequest,
+    started_at: chrono::DateTime<Utc>,
+    started: Instant,
+    mut notes: Vec<String>,
+    _secure_special_host: bool,
+    original_request_capture: Option<MessageRecord>,
+    requested_http_version: Option<Version>,
+    outbound_uri_authority: Option<&str>,
+) -> Response<Body> {
+    let request_headers = header_map_from_records(&request.headers);
+    let request_body = request.body_bytes();
+    let request_capture = MessageRecord::from_headers_and_body(
+        &request_headers,
+        request_body.as_ref(),
+        state.config.body_preview_bytes,
+    );
+    let path = normalize_request_path(&request.path);
+    let method = match Method::from_bytes(request.method.as_bytes()) {
+        Ok(method) => method,
+        Err(error) => {
+            let message = format!("Invalid HTTP method: {error}");
+            notes.push(message.clone());
+            let (response, response_capture) =
+                synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
+            let record = TransactionRecord::http(
+                started_at,
+                request.method,
+                request.scheme,
+                request.host,
+                path,
+                Some(StatusCode::BAD_REQUEST.as_u16()),
+                started.elapsed().as_millis() as u64,
+                request_capture,
+                Some(response_capture),
+                notes,
+                None,
+                None,
+            );
+            store_record_and_scan(&state, &session, record).await;
+            return response;
+        }
+    };
+
+    let absolute_uri = match build_uri_from_request(&request, outbound_uri_authority) {
+        Ok(uri) => uri,
+        Err(error) => {
+            let message = error.to_string();
+            notes.push(message.clone());
+            let (response, response_capture) =
+                synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
+            let record = TransactionRecord::http(
+                started_at,
+                method.to_string(),
+                request.scheme,
+                request.host,
+                path,
+                Some(StatusCode::BAD_REQUEST.as_u16()),
+                started.elapsed().as_millis() as u64,
+                request_capture,
+                Some(response_capture),
+                notes,
+                None,
+                None,
+            );
+            store_record_and_scan(&state, &session, record).await;
+            return response;
+        }
+    };
+
+    let host_override = request_headers.get(HOST).cloned();
+    let mut outbound_headers = request_headers.clone();
+    strip_hop_by_hop_headers(&mut outbound_headers);
+    outbound_headers.remove(HOST);
+    outbound_headers.remove(CONTENT_LENGTH);
+
+    let mut request_builder = client
+        .request(method.clone(), absolute_uri.to_string())
+        .headers(outbound_headers)
+        .body(request_body.clone());
+    if let Some(version) = requested_http_version {
+        request_builder = request_builder.version(version);
+    }
+    if let Some(host_override) = host_override {
+        request_builder = request_builder.header(HOST, host_override);
+    }
+
+    match request_builder.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let response_version = response.version();
+            let response_headers = response.headers().clone();
+            let method_text = method.to_string();
+            remember_persist_context(&session);
+            let context = StreamedRecordContext {
+                state: state.clone(),
+                session: session.clone(),
+                _session_owner: remember_active_proxy_session_owner(session.id()),
+                started_at,
+                started,
+                method: method_text.clone(),
+                scheme: request.scheme,
+                host: request.host,
+                path,
+                status,
+                request_capture,
+                response_headers: response_headers.clone(),
+                notes,
+                original_request_capture,
+                response_version,
+                max_preview: state.config.body_preview_bytes,
+            };
+
+            if response_must_not_include_body(status, &method_text) {
+                context.store(Vec::new(), 0).await;
+                return rebuild_streaming_response(
+                    response_headers,
+                    status,
+                    Body::empty(),
+                    &method_text,
+                );
+            }
+
+            let body = stream_upstream_response_body(response, context);
+            rebuild_streaming_response(response_headers, status, body, &method_text)
+        }
+        Err(error) => {
+            let message = format!("Upstream request failed: {error}");
+            notes.push(message.clone());
+            session
+                .event_log
+                .push(
+                    EventLevel::Warn,
+                    "proxy",
+                    "Upstream request failed",
+                    message.clone(),
+                )
+                .await;
+            let (response, response_capture) =
+                synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+            let record = TransactionRecord::http(
+                started_at,
+                method.to_string(),
+                request.scheme,
+                request.host,
+                path,
+                Some(StatusCode::BAD_GATEWAY.as_u16()),
+                started.elapsed().as_millis() as u64,
+                request_capture,
+                Some(response_capture),
+                notes,
+                None,
+                None,
+            );
+            store_record_and_scan(&state, &session, record).await;
+            response
+        }
+    }
+}
+
+fn stream_upstream_response_body(
+    response: reqwest::Response,
+    context: StreamedRecordContext,
+) -> Body {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(8);
+    let pump_id = Uuid::new_v4();
+    let session_id = context.session.id();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    remember_streamed_response_pump(pump_id, session_id, shutdown_tx);
+    tokio::spawn(async move {
+        let mut upstream = response.bytes_stream();
+        let mut preview = Vec::new();
+        let mut body_size = 0usize;
+        let mut context = context;
+        let mut notes = std::mem::take(&mut context.notes);
+
+        loop {
+            tokio::select! {
+                _ = tx.closed() => {
+                    notes.push(
+                        "Client disconnected before streamed response completed.".to_string(),
+                    );
+                    break;
+                }
+                _ = &mut shutdown_rx => {
+                    notes.push(
+                        "Shutdown finalized streamed response capture before upstream EOF.".to_string(),
+                    );
+                    break;
+                }
+                chunk = upstream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => {
+                            body_size = body_size.saturating_add(bytes.len());
+                            append_body_preview(&mut preview, bytes.as_ref(), context.max_preview);
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                notes.push(
+                                    "Client disconnected before streamed response completed.".to_string(),
+                                );
+                                break;
+                            }
+                        }
+                        Some(Err(error)) => {
+                            let message = format!("Failed to read upstream response body: {error}");
+                            notes.push(message.clone());
+                            let _ = tx.send(Err(std::io::Error::other(message))).await;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        context.store_with_notes(preview, body_size, notes).await;
+        forget_streamed_response_pump(pump_id);
+    });
+
+    Body::from_stream(async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            yield chunk;
+        }
+    })
+}
+
+fn append_body_preview(preview: &mut Vec<u8>, chunk: &[u8], max_preview: usize) {
+    let remaining = max_preview.saturating_sub(preview.len());
+    if remaining == 0 {
+        return;
+    }
+    preview.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+}
+
+impl StreamedRecordContext {
+    async fn store(self, preview: Vec<u8>, body_size: usize) {
+        let notes = self.notes.clone();
+        self.store_with_notes(preview, body_size, notes).await;
+    }
+
+    async fn store_with_notes(mut self, preview: Vec<u8>, body_size: usize, notes: Vec<String>) {
+        let mut response_capture = MessageRecord::from_headers_and_body(
+            &self.response_headers,
+            preview.as_ref(),
+            self.max_preview,
+        );
+        response_capture.body_size = body_size;
+        if body_size > preview.len() {
+            response_capture.preview_truncated = true;
+            if response_capture.content_decoded {
+                response_capture.decoded_body_size = None;
+                response_capture.content_decoded = false;
+            }
+        }
+        self.notes = notes;
+        let record = TransactionRecord::http(
+            self.started_at,
+            self.method,
+            self.scheme,
+            self.host,
+            self.path,
+            Some(self.status.as_u16()),
+            self.started.elapsed().as_millis() as u64,
+            self.request_capture,
+            Some(response_capture),
+            self.notes,
+            self.original_request_capture,
+            None,
+        )
+        .with_http_version(self.response_version);
+        store_record_and_scan(&self.state, &self.session, record).await;
+    }
 }
 
 async fn execute_http_exchange(
@@ -1533,6 +2711,8 @@ async fn execute_http_exchange(
     mut notes: Vec<String>,
     secure_special_host: bool,
     original_request_capture: Option<MessageRecord>,
+    requested_http_version: Option<Version>,
+    outbound_uri_authority: Option<&str>,
 ) -> ExecutedExchange {
     let request_headers = header_map_from_records(&request.headers);
     let request_body = request.body_bytes();
@@ -1573,11 +2753,13 @@ async fn execute_http_exchange(
     };
 
     if special_host::is_special_host(&request.host) {
+        let proxy_addr = state.get_active_proxy_addr().await;
         let response = special_host::respond(
             &path,
             &method,
             state.as_ref(),
             secure_special_host || request.scheme.eq_ignore_ascii_case("https"),
+            proxy_addr,
         );
         let response_capture = MessageRecord::from_headers_and_body(
             &response.headers,
@@ -1608,7 +2790,7 @@ async fn execute_http_exchange(
         };
     }
 
-    let absolute_uri = match build_uri_from_request(&request) {
+    let absolute_uri = match build_uri_from_request(&request, outbound_uri_authority) {
         Ok(uri) => uri,
         Err(error) => {
             let message = error.to_string();
@@ -1648,6 +2830,9 @@ async fn execute_http_exchange(
         .request(method.clone(), absolute_uri.to_string())
         .headers(outbound_headers)
         .body(request_body.clone());
+    if let Some(version) = requested_http_version {
+        request_builder = request_builder.version(version);
+    }
     if let Some(host_override) = host_override {
         request_builder = request_builder.header(HOST, host_override);
     }
@@ -1839,14 +3024,31 @@ async fn validate_reusable_request_source(
         .get(source_transaction_id)
         .await
         .ok_or_else(|| anyhow!("The captured request is no longer available in HTTP history."))?;
-    if source_record.request.preview_truncated
-        && request.body_bytes() == source_record.request.body_bytes()
-    {
-        return Err(anyhow!(
-            "The captured request body was truncated at the preview cap. Increase the preview cap and capture it again, or paste the full body manually before sending."
-        ));
+    if source_record.request.preview_truncated {
+        let request_body = request.body_bytes();
+        let Some(source_body_size) = reusable_source_full_body_size(&source_record.request) else {
+            return Err(anyhow!(
+                "The captured request body was truncated at the preview cap. Increase the preview cap and capture it again, or paste the full body manually before sending."
+            ));
+        };
+        if request.preview_truncated
+            || request_body == source_record.request.body_bytes()
+            || request_body.len() < source_body_size
+        {
+            return Err(anyhow!(
+                "The captured request body was truncated at the preview cap. Increase the preview cap and capture it again, or paste the full body manually before sending."
+            ));
+        }
     }
     Ok(())
+}
+
+fn reusable_source_full_body_size(request: &MessageRecord) -> Option<usize> {
+    if request.content_decoded {
+        request.decoded_body_size
+    } else {
+        Some(request.body_size)
+    }
 }
 
 fn merge_notes(mut left: Vec<String>, mut right: Vec<String>) -> Vec<String> {
@@ -1869,14 +3071,52 @@ fn editable_request_from_parts(
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    EditableRequest::from_headers_and_body(
+    let mut headers: Vec<HeaderRecord> = parts
+        .headers
+        .iter()
+        .map(|(name, value)| HeaderRecord {
+            name: name.as_str().to_string(),
+            value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+        })
+        .collect();
+    if !headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("host"))
+        && !host.is_empty()
+    {
+        headers.insert(
+            0,
+            HeaderRecord {
+                name: "host".to_string(),
+                value: host.clone(),
+            },
+        );
+    }
+
+    let body_encoding = if is_raw_request_body_utf8(request_bytes.as_ref()) {
+        BodyEncoding::Utf8
+    } else {
+        BodyEncoding::Base64
+    };
+    let body = match &body_encoding {
+        BodyEncoding::Utf8 => String::from_utf8_lossy(request_bytes.as_ref()).into_owned(),
+        BodyEncoding::Base64 => STANDARD.encode(request_bytes.as_ref()),
+    };
+
+    EditableRequest {
         scheme,
         host,
-        parts.method.to_string(),
+        method: parts.method.to_string(),
         path,
-        &parts.headers,
-        request_bytes.as_ref(),
-    )
+        headers,
+        body,
+        body_encoding,
+        preview_truncated: false,
+    }
+}
+
+fn is_raw_request_body_utf8(body: &[u8]) -> bool {
+    std::str::from_utf8(body).is_ok() && !body.contains(&0)
 }
 
 fn header_map_from_records(headers: &[HeaderRecord]) -> HeaderMap {
@@ -1914,10 +3154,13 @@ fn header_map_from_records(headers: &[HeaderRecord]) -> HeaderMap {
     map
 }
 
-fn build_uri_from_request(request: &EditableRequest) -> Result<Uri> {
+fn build_uri_from_request(
+    request: &EditableRequest,
+    authority_override: Option<&str>,
+) -> Result<Uri> {
     Uri::builder()
         .scheme(request.scheme.as_str())
-        .authority(request.host.as_str())
+        .authority(authority_override.unwrap_or(request.host.as_str()))
         .path_and_query(normalize_request_path(&request.path))
         .build()
         .map_err(|error| anyhow!("failed to build upstream URI: {error}"))
@@ -1926,6 +3169,8 @@ fn build_uri_from_request(request: &EditableRequest) -> Result<Uri> {
 fn normalize_request_path(path: &str) -> String {
     if path.trim().is_empty() {
         "/".to_string()
+    } else if path == "*" {
+        "*".to_string()
     } else if path.starts_with('/') {
         path.to_string()
     } else {
@@ -1995,20 +3240,78 @@ fn build_dropped_transaction(
 }
 
 fn is_websocket_upgrade_headers(headers: &HeaderMap) -> bool {
-    headers
-        .get(UPGRADE)
+    header_values_contain_token(headers, UPGRADE, "websocket")
+        && header_values_contain_token(headers, CONNECTION, "upgrade")
+}
+
+fn websocket_upgrade_validation_error(
+    method: &Method,
+    headers: &HeaderMap,
+) -> Option<&'static str> {
+    if method != Method::GET {
+        return Some("WebSocket upgrade requests must use GET");
+    }
+    if headers.contains_key(TRANSFER_ENCODING) {
+        return Some("WebSocket upgrade requests must not include a request body");
+    }
+    if headers.get_all(CONTENT_LENGTH).iter().any(|value| {
+        value
+            .to_str()
+            .map(|value| value.trim() != "0")
+            .unwrap_or(true)
+    }) {
+        return Some("WebSocket upgrade requests must not include a request body");
+    }
+
+    let key = match headers
+        .get(SEC_WEBSOCKET_KEY)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false)
-        && headers
-            .get(CONNECTION)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| {
-                value
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
-            })
-            .unwrap_or(false)
+    {
+        Some(key) => key,
+        None => return Some("missing or invalid Sec-WebSocket-Key"),
+    };
+    let decoded_key = match STANDARD.decode(key.as_bytes()) {
+        Ok(decoded_key) => decoded_key,
+        Err(_) => return Some("invalid Sec-WebSocket-Key"),
+    };
+    if decoded_key.len() != 16 {
+        return Some("invalid Sec-WebSocket-Key");
+    }
+
+    let version = headers
+        .get(SEC_WEBSOCKET_VERSION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if version != Some("13") {
+        return Some("unsupported Sec-WebSocket-Version");
+    }
+
+    None
+}
+
+fn websocket_upgrade_validation_error_for_editable(
+    request: &EditableRequest,
+    headers: &HeaderMap,
+) -> Option<&'static str> {
+    if !request.method.eq_ignore_ascii_case("GET") {
+        return Some("WebSocket upgrade requests must use GET");
+    }
+    if !request.body_bytes().is_empty() {
+        return Some("WebSocket upgrade requests must not include a request body");
+    }
+    websocket_upgrade_validation_error(&Method::GET, headers)
+}
+
+fn header_values_contain_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
 }
 
 fn is_websocket_upgrade_editable(request: &EditableRequest) -> bool {
@@ -2021,27 +3324,31 @@ struct ConnectedWebSocket {
     upstream_headers: HeaderMap,
 }
 
-async fn connect_upstream_websocket(request: &EditableRequest) -> Result<ConnectedWebSocket> {
+async fn connect_upstream_websocket(
+    request: &EditableRequest,
+    upstream_insecure: bool,
+) -> Result<ConnectedWebSocket> {
     let mut upstream_request = websocket_url(request)?.into_client_request()?;
     {
+        let forwarded_headers = websocket_forward_headers_from_records(&request.headers);
         let headers = upstream_request.headers_mut();
-        for header in &request.headers {
-            if !should_forward_websocket_header(&header.name) {
-                continue;
-            }
-
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(header.name.as_bytes()),
-                HeaderValue::from_str(&header.value),
-            ) {
-                headers.append(name, value);
+        for (name, value) in forwarded_headers.iter() {
+            if name == HOST {
+                headers.insert(HOST, value.clone());
+            } else {
+                headers.append(name.clone(), value.clone());
             }
         }
     }
 
-    let (websocket, response) = connect_async(upstream_request)
-        .await
-        .context("upstream WebSocket handshake failed")?;
+    let (websocket, response) = connect_async_tls_with_config(
+        upstream_request,
+        None,
+        false,
+        crate::ws_tls::insecure_connector(upstream_insecure),
+    )
+    .await
+    .context("upstream WebSocket handshake failed")?;
 
     Ok(ConnectedWebSocket {
         websocket,
@@ -2049,16 +3356,30 @@ async fn connect_upstream_websocket(request: &EditableRequest) -> Result<Connect
     })
 }
 
+pub(crate) fn websocket_forward_headers_from_records(records: &[HeaderRecord]) -> HeaderMap {
+    let mut headers = header_map_from_records(records);
+    strip_hop_by_hop_headers(&mut headers);
+    let remove = headers
+        .keys()
+        .filter(|name| !should_forward_websocket_header(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in remove {
+        headers.remove(name);
+    }
+    headers
+}
+
 fn should_forward_websocket_header(name: &str) -> bool {
     !matches!(
         name.to_ascii_lowercase().as_str(),
-        "host"
-            | "connection"
+        "connection"
             | "upgrade"
             | "proxy-connection"
             | "content-length"
             | "sec-websocket-key"
             | "sec-websocket-version"
+            | "sec-websocket-extensions"
             | "sec-websocket-accept"
     )
 }
@@ -2091,6 +3412,7 @@ fn build_websocket_client_response_headers(
     let mut headers = upstream_headers;
     strip_hop_by_hop_headers(&mut headers);
     headers.remove(SEC_WEBSOCKET_ACCEPT);
+    headers.remove(SEC_WEBSOCKET_EXTENSIONS);
     headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
     headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
     headers.insert(
@@ -2102,11 +3424,34 @@ fn build_websocket_client_response_headers(
     if let Some(protocol) = headers.get(SEC_WEBSOCKET_PROTOCOL).cloned() {
         headers.insert(SEC_WEBSOCKET_PROTOCOL, protocol);
     }
-    if let Some(extensions) = headers.get(SEC_WEBSOCKET_EXTENSIONS).cloned() {
-        headers.insert(SEC_WEBSOCKET_EXTENSIONS, extensions);
+    Ok(headers)
+}
+
+fn websocket_response_validation_error(
+    request_headers: &HeaderMap,
+    response_headers: &HeaderMap,
+) -> Option<&'static str> {
+    if !is_websocket_upgrade_headers(response_headers) {
+        return Some("missing WebSocket upgrade response headers");
     }
 
-    Ok(headers)
+    let request_key = match request_headers
+        .get(SEC_WEBSOCKET_KEY)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) => value,
+        None => return Some("missing request Sec-WebSocket-Key"),
+    };
+    let expected_accept = derive_accept_key(request_key.as_bytes());
+    let response_accept = response_headers
+        .get(SEC_WEBSOCKET_ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if response_accept != Some(expected_accept.as_str()) {
+        return Some("invalid Sec-WebSocket-Accept");
+    }
+
+    None
 }
 
 static LAST_PERSIST: Mutex<Option<Instant>> = Mutex::new(None);
@@ -2115,9 +3460,45 @@ static PERSIST_DIRTY_SESSIONS: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static PERSIST_TRAILING_SESSIONS: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static PERSIST_PENDING_CONTEXTS: LazyLock<Mutex<HashMap<Uuid, Arc<SessionContext>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LIVE_WEBSOCKET_RELAYS: LazyLock<Mutex<HashMap<Uuid, LiveWebSocketRelay>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_STREAMED_RESPONSE_PUMPS: LazyLock<Mutex<HashMap<Uuid, StreamedResponsePump>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_PROXY_CONNECTIONS: LazyLock<Mutex<HashMap<Uuid, AbortHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_PROXY_SESSION_OWNERS: LazyLock<Mutex<HashMap<Uuid, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
+const PENDING_PERSIST_FLUSH_PROXY_WAIT: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct LiveWebSocketRelay {
+    session: Arc<SessionContext>,
+    captured_websocket_id: Option<Uuid>,
+    started: Instant,
+    abort: AbortHandle,
+}
+
+struct StreamedResponsePump {
+    session_id: Uuid,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+pub(crate) struct ActiveProxySessionGuard {
+    session_id: Uuid,
+}
+
+impl Drop for ActiveProxySessionGuard {
+    fn drop(&mut self) {
+        forget_active_proxy_session_owner(self.session_id);
+    }
+}
 
 async fn persist_session_quiet(state: &Arc<AppState>, session: &Arc<SessionContext>) {
+    remember_persist_context(session);
+
     if let Some(delay) = persist_debounce_remaining() {
         mark_persist_dirty(session);
         schedule_delayed_persist(state, session, delay);
@@ -2154,6 +3535,7 @@ fn schedule_delayed_persist(state: &Arc<AppState>, session: &Arc<SessionContext>
         tokio::time::sleep(delay).await;
         clear_trailing_persist(session_id);
         if !take_persist_dirty(session_id) {
+            forget_persist_context(session_id);
             return;
         }
         start_persist_or_reschedule(state, session);
@@ -2187,10 +3569,321 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>) {
             warn!(?error, session_id = %session.id(), "failed to persist session snapshot");
         }
         PERSIST_IN_FLIGHT.store(false, Ordering::Release);
-        if take_persist_dirty(session.id()) {
+        if has_persist_dirty(session.id()) {
             schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE);
+        } else {
+            forget_persist_context(session.id());
         }
     });
+}
+
+fn remember_persist_context(session: &Arc<SessionContext>) {
+    let mut pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending.insert(session.id(), Arc::clone(session));
+}
+
+fn forget_persist_context(session_id: Uuid) {
+    let mut pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending.remove(&session_id);
+}
+
+fn remember_live_websocket_relay(
+    relay_id: Uuid,
+    captured_websocket_id: Option<Uuid>,
+    session: &Arc<SessionContext>,
+    started: Instant,
+    abort: AbortHandle,
+) {
+    let mut relays = LIVE_WEBSOCKET_RELAYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    relays.insert(
+        relay_id,
+        LiveWebSocketRelay {
+            session: Arc::clone(session),
+            captured_websocket_id,
+            started,
+            abort,
+        },
+    );
+}
+
+fn forget_live_websocket_relay(relay_id: Uuid) {
+    let mut relays = LIVE_WEBSOCKET_RELAYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    relays.remove(&relay_id);
+}
+
+fn remember_streamed_response_pump(
+    pump_id: Uuid,
+    session_id: Uuid,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut pumps = ACTIVE_STREAMED_RESPONSE_PUMPS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pumps.insert(
+        pump_id,
+        StreamedResponsePump {
+            session_id,
+            shutdown,
+        },
+    );
+}
+
+fn forget_streamed_response_pump(pump_id: Uuid) {
+    let mut pumps = ACTIVE_STREAMED_RESPONSE_PUMPS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pumps.remove(&pump_id);
+}
+
+fn signal_streamed_response_pumps(session_id: Uuid) -> usize {
+    let pumps = {
+        let mut active = ACTIVE_STREAMED_RESPONSE_PUMPS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let pump_ids = active
+            .iter()
+            .filter_map(|(pump_id, pump)| (pump.session_id == session_id).then_some(*pump_id))
+            .collect::<Vec<_>>();
+        pump_ids
+            .into_iter()
+            .filter_map(|pump_id| active.remove(&pump_id))
+            .collect::<Vec<_>>()
+    };
+    let count = pumps.len();
+    for pump in pumps {
+        let _ = pump.shutdown.send(());
+    }
+    count
+}
+
+fn remember_proxy_connection(connection_id: Uuid, abort: AbortHandle) {
+    let mut connections = ACTIVE_PROXY_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    connections.insert(connection_id, abort);
+}
+
+fn forget_proxy_connection(connection_id: Uuid) {
+    let mut connections = ACTIVE_PROXY_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    connections.remove(&connection_id);
+}
+
+pub(crate) fn remember_active_proxy_session_owner(session_id: Uuid) -> ActiveProxySessionGuard {
+    let mut owners = ACTIVE_PROXY_SESSION_OWNERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *owners.entry(session_id).or_insert(0) += 1;
+    ActiveProxySessionGuard { session_id }
+}
+
+fn forget_active_proxy_session_owner(session_id: Uuid) {
+    let mut owners = ACTIVE_PROXY_SESSION_OWNERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(count) = owners.get_mut(&session_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            owners.remove(&session_id);
+        }
+    }
+}
+
+pub fn session_has_active_proxy_work(session_id: Uuid) -> bool {
+    let owners = ACTIVE_PROXY_SESSION_OWNERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    owners.get(&session_id).copied().unwrap_or(0) > 0
+}
+
+fn active_proxy_work_is_empty() -> bool {
+    let connections_empty = {
+        let connections = ACTIVE_PROXY_CONNECTIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        connections.is_empty()
+    };
+    if !connections_empty {
+        return false;
+    }
+    let owners = ACTIVE_PROXY_SESSION_OWNERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    owners.is_empty()
+}
+
+fn spawn_tracked_proxy_task<F>(session_id: Uuid, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let connection_id = Uuid::new_v4();
+    let (abort, registration) = AbortHandle::new_pair();
+    let session_owner = remember_active_proxy_session_owner(session_id);
+    remember_proxy_connection(connection_id, abort);
+    tokio::spawn(async move {
+        let _session_owner = session_owner;
+        let _ = Abortable::new(future, registration).await;
+        forget_proxy_connection(connection_id);
+    });
+}
+
+pub async fn drain_proxy_connections(timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if active_proxy_work_is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let connections = {
+        let connections = ACTIVE_PROXY_CONNECTIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        connections.values().cloned().collect::<Vec<_>>()
+    };
+    for connection in connections {
+        connection.abort();
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if active_proxy_work_is_empty() || Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) {
+    let relays = {
+        let relays = LIVE_WEBSOCKET_RELAYS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        relays
+            .iter()
+            .map(|(websocket_id, relay)| (*websocket_id, relay.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    for (relay_id, relay) in relays {
+        relay.abort.abort();
+        if let Some(websocket_id) = relay.captured_websocket_id {
+            relay
+                .session
+                .websockets
+                .close(
+                    websocket_id,
+                    Utc::now(),
+                    relay.started.elapsed().as_millis() as u64,
+                    Some(note.to_string()),
+                )
+                .await;
+            if let Err(error) = state.persist_session_context(&relay.session).await {
+                warn!(
+                    ?error,
+                    session_id = %relay.session.id(),
+                    websocket_id = %websocket_id,
+                    "failed to persist closed live websocket relay"
+                );
+            }
+        }
+        forget_live_websocket_relay(relay_id);
+    }
+}
+
+pub fn session_has_live_websocket_relays(session_id: Uuid) -> bool {
+    let relays = LIVE_WEBSOCKET_RELAYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    relays
+        .values()
+        .any(|relay| relay.session.id() == session_id)
+}
+
+pub fn live_websocket_session_context(session_id: Uuid) -> Option<Arc<SessionContext>> {
+    let relays = LIVE_WEBSOCKET_RELAYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    relays
+        .values()
+        .find(|relay| relay.session.id() == session_id)
+        .map(|relay| Arc::clone(&relay.session))
+}
+
+pub fn pending_session_context(session_id: Uuid) -> Option<Arc<SessionContext>> {
+    let pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending.get(&session_id).cloned()
+}
+
+pub fn session_has_pending_persist(session_id: Uuid) -> bool {
+    let pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending.contains_key(&session_id)
+}
+
+pub async fn flush_pending_session_persists(state: &AppState) {
+    let sessions = {
+        let pending = PERSIST_PENDING_CONTEXTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pending.values().cloned().collect::<Vec<_>>()
+    };
+
+    for session in sessions {
+        let session_id = session.id();
+        wait_for_session_proxy_work_to_finish(session_id, PENDING_PERSIST_FLUSH_PROXY_WAIT).await;
+        clear_trailing_persist(session_id);
+        take_persist_dirty(session_id);
+        if let Err(error) = state.persist_session_context(&session).await {
+            warn!(
+                ?error,
+                session_id = %session_id,
+                "failed to flush pending session snapshot"
+            );
+        }
+        forget_persist_context(session_id);
+    }
+}
+
+async fn wait_for_session_proxy_work_to_finish(session_id: Uuid, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while session_has_active_proxy_work(session_id) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let signaled_stream_pumps = if session_has_active_proxy_work(session_id) {
+        signal_streamed_response_pumps(session_id)
+    } else {
+        0
+    };
+    if signaled_stream_pumps > 0 {
+        let deadline = Instant::now() + timeout;
+        while session_has_active_proxy_work(session_id) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    if session_has_active_proxy_work(session_id) {
+        warn!(
+            session_id = %session_id,
+            signaled_stream_pumps,
+            "flushing pending session snapshot while proxy activity is still running"
+        );
+    }
 }
 
 fn mark_persist_dirty(session: &SessionContext) {
@@ -2205,6 +3898,13 @@ fn take_persist_dirty(session_id: Uuid) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     dirty.remove(&session_id)
+}
+
+fn has_persist_dirty(session_id: Uuid) -> bool {
+    let dirty = PERSIST_DIRTY_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dirty.contains(&session_id)
 }
 
 fn clear_trailing_persist(session_id: Uuid) {
@@ -2237,24 +3937,46 @@ async fn relay_websocket_session(
             message = client_stream.next() => {
                 match message {
                     Some(Ok(message)) => {
-                        if let Some(id) = session_id {
-                            if let Some(frame) = capture_websocket_frame(
-                                frame_index,
-                                WebSocketFrameDirection::ClientToServer,
-                                &message,
-                                max_preview,
-                            ) {
-                                session.websockets.append_frame(id, frame).await;
-                                frame_index += 1;
+                        if !should_relay_websocket_frame(&message) {
+                            if let Some(id) = session_id {
+                                if let Some(frame) = capture_websocket_frame(
+                                    frame_index,
+                                    WebSocketFrameDirection::ClientToServer,
+                                    &message,
+                                    max_preview,
+                                ) {
+                                    session.websockets.append_frame(id, frame).await;
+                                    frame_index += 1;
+                                    persist_session_quiet(&state, &session).await;
+                                }
                             }
+                            continue;
                         }
-
                         let should_close = message.is_close();
+                        let captured_message = message.clone();
                         upstream_sink
                             .send(message)
                             .await
                             .context("failed to relay client websocket frame upstream")?;
+                        if let Some(id) = session_id {
+                            if let Some(frame) = capture_websocket_frame(
+                                frame_index,
+                                WebSocketFrameDirection::ClientToServer,
+                                &captured_message,
+                                max_preview,
+                            ) {
+                                session.websockets.append_frame(id, frame).await;
+                                frame_index += 1;
+                                persist_session_quiet(&state, &session).await;
+                            }
+                        }
                         if should_close {
+                            if let Err(error) = client_sink.close().await {
+                                warn!(?error, "failed to flush client websocket close reply");
+                            }
+                            if let Err(error) = upstream_sink.close().await {
+                                warn!(?error, "failed to flush upstream websocket close");
+                            }
                             break Some("Client initiated websocket close.".to_string());
                         }
                     }
@@ -2269,24 +3991,46 @@ async fn relay_websocket_session(
             message = upstream_stream.next() => {
                 match message {
                     Some(Ok(message)) => {
-                        if let Some(id) = session_id {
-                            if let Some(frame) = capture_websocket_frame(
-                                frame_index,
-                                WebSocketFrameDirection::ServerToClient,
-                                &message,
-                                max_preview,
-                            ) {
-                                session.websockets.append_frame(id, frame).await;
-                                frame_index += 1;
+                        if !should_relay_websocket_frame(&message) {
+                            if let Some(id) = session_id {
+                                if let Some(frame) = capture_websocket_frame(
+                                    frame_index,
+                                    WebSocketFrameDirection::ServerToClient,
+                                    &message,
+                                    max_preview,
+                                ) {
+                                    session.websockets.append_frame(id, frame).await;
+                                    frame_index += 1;
+                                    persist_session_quiet(&state, &session).await;
+                                }
                             }
+                            continue;
                         }
-
                         let should_close = message.is_close();
+                        let captured_message = message.clone();
                         client_sink
                             .send(message)
                             .await
                             .context("failed to relay upstream websocket frame to client")?;
+                        if let Some(id) = session_id {
+                            if let Some(frame) = capture_websocket_frame(
+                                frame_index,
+                                WebSocketFrameDirection::ServerToClient,
+                                &captured_message,
+                                max_preview,
+                            ) {
+                                session.websockets.append_frame(id, frame).await;
+                                frame_index += 1;
+                                persist_session_quiet(&state, &session).await;
+                            }
+                        }
                         if should_close {
+                            if let Err(error) = upstream_sink.close().await {
+                                warn!(?error, "failed to flush upstream websocket close reply");
+                            }
+                            if let Err(error) = client_sink.close().await {
+                                warn!(?error, "failed to flush client websocket close");
+                            }
                             break Some("Upstream websocket closed the connection.".to_string());
                         }
                     }
@@ -2326,6 +4070,10 @@ async fn relay_websocket_session(
     Ok(())
 }
 
+fn should_relay_websocket_frame(message: &WebSocketMessage) -> bool {
+    !message.is_ping() && !message.is_pong()
+}
+
 fn capture_websocket_frame(
     index: usize,
     direction: WebSocketFrameDirection,
@@ -2336,17 +4084,16 @@ fn capture_websocket_frame(
 
     match message {
         WebSocketMessage::Text(text) => {
-            let bytes = text.as_bytes();
-            let preview_len = max_preview.min(bytes.len());
+            let (preview, truncated) = websocket_text_preview(text, max_preview);
             Some(WebSocketFrameRecord {
                 index,
                 captured_at,
                 direction,
                 kind: WebSocketFrameKind::Text,
-                body_preview: String::from_utf8_lossy(&bytes[..preview_len]).into_owned(),
+                body_preview: preview.to_string(),
                 body_encoding: BodyEncoding::Utf8,
-                body_size: bytes.len(),
-                preview_truncated: bytes.len() > max_preview,
+                body_size: text.len(),
+                preview_truncated: truncated,
             })
         }
         WebSocketMessage::Binary(bytes) => Some(binary_frame_record(
@@ -2393,6 +4140,20 @@ fn capture_websocket_frame(
     }
 }
 
+fn websocket_text_preview(text: &str, max_preview: usize) -> (&str, bool) {
+    if text.len() <= max_preview {
+        return (text, false);
+    }
+
+    let end = text
+        .char_indices()
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .take_while(|end| *end <= max_preview)
+        .last()
+        .unwrap_or(0);
+    (&text[..end], true)
+}
+
 fn binary_frame_record(
     index: usize,
     captured_at: chrono::DateTime<Utc>,
@@ -2424,6 +4185,668 @@ mod tests {
             name: name.to_string(),
             value: value.to_string(),
         }
+    }
+
+    fn editable_request(host: &str) -> EditableRequest {
+        EditableRequest {
+            scheme: "https".to_string(),
+            host: host.to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: vec![record("Host", host)],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        }
+    }
+
+    fn message_record_with_sizes(
+        body_size: usize,
+        decoded_body_size: Option<usize>,
+        content_decoded: bool,
+    ) -> MessageRecord {
+        MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size,
+            decoded_body_size,
+            preview_truncated: true,
+            content_type: None,
+            content_decoded,
+        }
+    }
+
+    #[test]
+    fn reusable_source_size_uses_decoded_size_for_compressed_capture() {
+        let record = message_record_with_sizes(20, Some(200), true);
+
+        assert_eq!(reusable_source_full_body_size(&record), Some(200));
+    }
+
+    #[test]
+    fn reusable_source_size_fails_closed_for_legacy_decoded_capture() {
+        let record = message_record_with_sizes(20, None, true);
+
+        assert_eq!(reusable_source_full_body_size(&record), None);
+    }
+
+    #[test]
+    fn in_flight_persist_completion_does_not_consume_dirty_marker() {
+        let session_id = Uuid::new_v4();
+        assert!(!has_persist_dirty(session_id));
+
+        {
+            let mut dirty = PERSIST_DIRTY_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            dirty.insert(session_id);
+        }
+
+        assert!(has_persist_dirty(session_id));
+        assert!(has_persist_dirty(session_id));
+        assert!(take_persist_dirty(session_id));
+        assert!(!has_persist_dirty(session_id));
+    }
+
+    #[tokio::test]
+    async fn shutdown_close_live_websocket_relays_persists_closed_session() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-test-live-ws-shutdown-{}", Uuid::new_v4()));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let websocket_id = Uuid::new_v4();
+        session
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now(),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                path: "/ws".to_string(),
+                status: Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(
+            websocket_id,
+            Some(websocket_id),
+            &session,
+            Instant::now(),
+            abort,
+        );
+
+        close_live_websocket_relays(
+            state.as_ref(),
+            "test shutdown closed the live WebSocket relay.",
+        )
+        .await;
+
+        let live = session.websockets.get(websocket_id).await.unwrap();
+        assert!(live.closed_at.is_some());
+        assert!(live.notes.iter().any(|note| note.contains("test shutdown")));
+
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        let durable = reloaded.websockets.get(websocket_id).await.unwrap();
+        assert!(durable.closed_at.is_some());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_live_websocket_relay_until_closed() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-test-live-ws-delete-{}", Uuid::new_v4()));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("active".to_string()))
+            .await
+            .unwrap();
+
+        let websocket_id = Uuid::new_v4();
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(
+            websocket_id,
+            Some(websocket_id),
+            &original,
+            Instant::now(),
+            abort,
+        );
+
+        let error = state.delete_session(original_id).await.unwrap_err();
+        assert!(error.to_string().contains("live captures are active"));
+
+        close_live_websocket_relays(
+            state.as_ref(),
+            "test shutdown closed the live WebSocket relay.",
+        )
+        .await;
+        state.delete_session(original_id).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_uncaptured_live_websocket_relay_until_closed() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-uncaptured-ws-delete-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("active".to_string()))
+            .await
+            .unwrap();
+
+        let relay_id = Uuid::new_v4();
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(relay_id, None, &original, Instant::now(), abort);
+
+        let error = state.delete_session(original_id).await.unwrap_err();
+        assert!(error.to_string().contains("live captures are active"));
+
+        close_live_websocket_relays(
+            state.as_ref(),
+            "test shutdown closed the live WebSocket relay.",
+        )
+        .await;
+        state.delete_session(original_id).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_active_proxy_work_until_owner_dropped() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-active-proxy-delete-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("active".to_string()))
+            .await
+            .unwrap();
+
+        let owner = remember_active_proxy_session_owner(original_id);
+        let error = state.delete_session(original_id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("proxy activity is still running"));
+
+        drop(owner);
+        state.delete_session(original_id).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn proxy_editable_request_preserves_raw_compressed_body_and_headers() {
+        let compressed = Bytes::from_static(&[0x1f, 0x8b, 0x08, 0x00, 0x00]);
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/upload")
+            .header(HOST, "example.com")
+            .header(http::header::CONTENT_ENCODING, "gzip")
+            .header(CONTENT_LENGTH, compressed.len().to_string())
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let absolute_uri: Uri = "http://example.com/upload".parse().unwrap();
+
+        let editable = editable_request_from_parts(&parts, &compressed, &absolute_uri);
+
+        assert_eq!(editable.body_encoding, BodyEncoding::Base64);
+        assert_eq!(editable.body_bytes(), compressed.as_ref());
+        assert!(editable.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("content-encoding") && header.value == "gzip"
+        }));
+        assert!(editable
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length")));
+    }
+
+    #[test]
+    fn connect_target_rejects_non_authority_path_before_upgrade() {
+        let uri: Uri = "/".parse().unwrap();
+        let error = connect_target(&uri).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("invalid CONNECT target authority"));
+    }
+
+    #[test]
+    fn normalize_request_path_preserves_asterisk_form() {
+        assert_eq!(normalize_request_path("*"), "*");
+    }
+
+    #[test]
+    fn connect_target_requires_explicit_port() {
+        let uri: Uri = "http://example.com".parse().unwrap();
+        let error = connect_target(&uri).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("must be authority-form host:port"));
+    }
+
+    #[test]
+    fn connect_target_rejects_absolute_form_with_path() {
+        let uri: Uri = "http://example.com:443/ignored".parse().unwrap();
+        let error = connect_target(&uri).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("must be authority-form host:port"));
+    }
+
+    #[test]
+    fn absolute_form_inside_connect_must_match_tunnel_authority() {
+        let uri: Uri = "https://other.example/private".parse().unwrap();
+        let headers = HeaderMap::new();
+        let error =
+            resolve_absolute_uri(&uri, &headers, "https", Some("origin.example:443")).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match CONNECT tunnel authority"));
+    }
+
+    #[test]
+    fn absolute_form_inside_connect_accepts_default_port_match() {
+        let uri: Uri = "https://origin.example/private".parse().unwrap();
+        let headers = HeaderMap::new();
+        let resolved =
+            resolve_absolute_uri(&uri, &headers, "https", Some("origin.example:443")).unwrap();
+
+        assert_eq!(resolved, uri);
+    }
+
+    #[test]
+    fn absolute_form_inside_connect_accepts_ipv6_authority_match() {
+        let uri: Uri = "https://[::1]/private".parse().unwrap();
+        let headers = HeaderMap::new();
+        let resolved = resolve_absolute_uri(&uri, &headers, "https", Some("[::1]:443")).unwrap();
+
+        assert_eq!(resolved, uri);
+    }
+
+    #[test]
+    fn absolute_form_inside_connect_rejects_scheme_mismatch() {
+        let uri: Uri = "http://origin.example:443/private".parse().unwrap();
+        let headers = HeaderMap::new();
+        let error =
+            resolve_absolute_uri(&uri, &headers, "https", Some("origin.example:443")).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("scheme does not match CONNECT tunnel scheme"));
+    }
+
+    #[test]
+    fn websocket_upgrade_accepts_split_connection_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.append(CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.append(CONNECTION, HeaderValue::from_static("Upgrade"));
+
+        assert!(is_websocket_upgrade_headers(&headers));
+    }
+
+    #[test]
+    fn websocket_upgrade_accepts_upgrade_token_lists() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("h2c, websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
+
+        assert!(is_websocket_upgrade_headers(&headers));
+    }
+
+    #[test]
+    fn websocket_upgrade_validation_accepts_valid_handshake() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+
+        assert_eq!(
+            websocket_upgrade_validation_error(&Method::GET, &headers),
+            None
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_validation_rejects_non_get_before_upstream_dial() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+
+        assert_eq!(
+            websocket_upgrade_validation_error(&Method::POST, &headers),
+            Some("WebSocket upgrade requests must use GET")
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_validation_rejects_missing_client_key_before_upstream_dial() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+
+        assert_eq!(
+            websocket_upgrade_validation_error(&Method::GET, &headers),
+            Some("missing or invalid Sec-WebSocket-Key")
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_validation_rejects_body_framing_before_collecting_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+
+        assert_eq!(
+            websocket_upgrade_validation_error(&Method::GET, &headers),
+            Some("WebSocket upgrade requests must not include a request body")
+        );
+
+        headers.remove(CONTENT_LENGTH);
+        headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        assert_eq!(
+            websocket_upgrade_validation_error(&Method::GET, &headers),
+            Some("WebSocket upgrade requests must not include a request body")
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_validation_rejects_edited_non_get_request() {
+        let mut request = editable_request("upstream.example");
+        request.method = "POST".to_string();
+        request.headers.extend([
+            record("Connection", "Upgrade"),
+            record("Upgrade", "websocket"),
+            record("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            record("Sec-WebSocket-Version", "13"),
+        ]);
+        let headers = header_map_from_records(&request.headers);
+
+        assert_eq!(
+            websocket_upgrade_validation_error_for_editable(&request, &headers),
+            Some("WebSocket upgrade requests must use GET")
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_validation_rejects_edited_body_without_framing_headers() {
+        let mut request = editable_request("upstream.example");
+        request.headers.extend([
+            record("Connection", "Upgrade"),
+            record("Upgrade", "websocket"),
+            record("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            record("Sec-WebSocket-Version", "13"),
+        ]);
+        request.body = "SHOULD_NOT_FORWARD".to_string();
+        let headers = header_map_from_records(&request.headers);
+
+        assert_eq!(
+            websocket_upgrade_validation_error_for_editable(&request, &headers),
+            Some("WebSocket upgrade requests must not include a request body")
+        );
+    }
+
+    #[test]
+    fn websocket_forwarding_preserves_host_header_override() {
+        assert!(should_forward_websocket_header("Host"));
+    }
+
+    #[test]
+    fn websocket_forwarding_strips_hop_by_hop_and_proxy_headers() {
+        let records = vec![
+            record("Host", "upstream.example"),
+            record("Connection", "Upgrade, X-Hop"),
+            record("Upgrade", "websocket"),
+            record("X-Hop", "secret"),
+            record("Proxy-Authorization", "Basic abc"),
+            record("Sec-WebSocket-Key", "client-key"),
+            record("X-End-To-End", "keep"),
+        ];
+
+        let headers = websocket_forward_headers_from_records(&records);
+
+        assert_eq!(headers.get(HOST).unwrap(), "upstream.example");
+        assert_eq!(headers.get("x-end-to-end").unwrap(), "keep");
+        assert!(!headers.contains_key(CONNECTION));
+        assert!(!headers.contains_key(UPGRADE));
+        assert!(!headers.contains_key("x-hop"));
+        assert!(!headers.contains_key("proxy-authorization"));
+        assert!(!headers.contains_key(SEC_WEBSOCKET_KEY));
+    }
+
+    #[test]
+    fn websocket_relay_does_not_forward_auto_handled_control_frames() {
+        assert!(!should_relay_websocket_frame(&WebSocketMessage::Ping(
+            b"ping".to_vec().into()
+        )));
+        assert!(!should_relay_websocket_frame(&WebSocketMessage::Pong(
+            b"pong".to_vec().into()
+        )));
+        assert!(should_relay_websocket_frame(&WebSocketMessage::Text(
+            "hello".into()
+        )));
+        assert!(should_relay_websocket_frame(&WebSocketMessage::Close(None)));
+    }
+
+    #[test]
+    fn websocket_text_preview_does_not_split_utf8_codepoint() {
+        let frame = capture_websocket_frame(
+            0,
+            WebSocketFrameDirection::ClientToServer,
+            &WebSocketMessage::Text("éx".into()),
+            1,
+        )
+        .expect("text frame should capture");
+
+        assert_eq!(frame.body_preview, "");
+        assert!(frame.preview_truncated);
+
+        let frame = capture_websocket_frame(
+            0,
+            WebSocketFrameDirection::ClientToServer,
+            &WebSocketMessage::Text("éx".into()),
+            2,
+        )
+        .expect("text frame should capture");
+
+        assert_eq!(frame.body_preview, "é");
+        assert!(frame.preview_truncated);
+    }
+
+    #[test]
+    fn replay_target_override_preserves_request_authority() {
+        let request = editable_request("origin.example:443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "target.example".to_string(),
+            port: "9443".to_string(),
+        };
+
+        let rewritten = build_replay_exchange_request(&request, Some(&target)).unwrap();
+
+        assert_eq!(rewritten.host, "origin.example:443");
+        assert_eq!(rewritten.headers[0].value, "origin.example:443");
+    }
+
+    #[test]
+    fn replay_target_override_accepts_ipv6_target_host() {
+        let request = editable_request("origin.example:443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "::1".to_string(),
+            port: "9443".to_string(),
+        };
+
+        let rewritten = build_replay_exchange_request(&request, Some(&target)).unwrap();
+
+        assert_eq!(rewritten.host, "origin.example:443");
+        assert_eq!(rewritten.headers[0].value, "origin.example:443");
+    }
+
+    #[tokio::test]
+    async fn replay_target_override_rejects_ip_literal_request_host() {
+        let request = editable_request("127.0.0.1:443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "127.0.0.2".to_string(),
+            port: "9443".to_string(),
+        };
+
+        let error = build_replay_client(false, &request, Some(&target), None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("request host is an IP address"));
+    }
+
+    #[tokio::test]
+    async fn replay_target_override_allows_equivalent_ip_literal_request_host() {
+        let request = editable_request("127.0.0.1:443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "443".to_string(),
+        };
+
+        build_replay_client(false, &request, Some(&target), None)
+            .await
+            .expect("equivalent target override should be treated as a no-op");
+    }
+
+    #[tokio::test]
+    async fn replay_target_override_rejects_bracketed_ipv6_request_host() {
+        let request = editable_request("[::1]:443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "::2".to_string(),
+            port: "9443".to_string(),
+        };
+
+        let _error = build_replay_client(false, &request, Some(&target), None)
+            .await
+            .unwrap_err();
+    }
+
+    #[test]
+    fn replay_target_override_uses_port_embedded_in_target_host() {
+        let request = editable_request("origin.example:443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "target.example:9443".to_string(),
+            port: String::new(),
+        };
+
+        let rewritten = build_replay_exchange_request(&request, Some(&target)).unwrap();
+
+        assert_eq!(rewritten.host, "origin.example:443");
+        assert_eq!(rewritten.headers[0].value, "origin.example:443");
+    }
+
+    #[test]
+    fn replay_outbound_uri_authority_omits_logical_port_for_target_override() {
+        let request = editable_request("origin.example:8443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "9443".to_string(),
+        };
+
+        let authority = build_replay_outbound_uri_authority(&request, Some(&target)).unwrap();
+
+        assert_eq!(authority.as_deref(), Some("origin.example"));
+    }
+
+    #[test]
+    fn replay_outbound_uri_authority_ignores_equivalent_target_override() {
+        let request = editable_request("origin.example:8443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "origin.example".to_string(),
+            port: "8443".to_string(),
+        };
+
+        let authority = build_replay_outbound_uri_authority(&request, Some(&target)).unwrap();
+
+        assert_eq!(authority, None);
+    }
+
+    #[test]
+    fn replay_outbound_uri_authority_brackets_ipv6_without_port() {
+        let request = editable_request("[2001:db8::1]:8443");
+        let target = RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "9443".to_string(),
+        };
+
+        let authority = build_replay_outbound_uri_authority(&request, Some(&target)).unwrap();
+
+        assert_eq!(authority.as_deref(), Some("[2001:db8::1]"));
     }
 
     #[test]
@@ -2473,6 +4896,107 @@ mod tests {
         let map = header_map_from_records(&records);
         assert!(map.get(COOKIE).is_none());
         assert_eq!(map.get("user-agent").unwrap(), "test");
+    }
+
+    #[test]
+    fn strip_hop_by_hop_headers_reads_all_connection_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.append(CONNECTION, HeaderValue::from_static("X-Hop"));
+        headers.insert("x-hop", HeaderValue::from_static("leaks"));
+
+        strip_hop_by_hop_headers(&mut headers);
+
+        assert!(!headers.contains_key("x-hop"));
+        assert!(!headers.contains_key(CONNECTION));
+    }
+
+    #[tokio::test]
+    async fn rebuild_response_preserves_head_content_length_and_removes_wire_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("1234"));
+
+        let response = rebuild_response(
+            headers,
+            StatusCode::OK,
+            Bytes::from_static(b"hidden"),
+            "HEAD",
+        );
+
+        assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "1234");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebuild_response_preserves_not_modified_content_length_and_removes_wire_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("55"));
+
+        let response = rebuild_response(
+            headers,
+            StatusCode::NOT_MODIFIED,
+            Bytes::from_static(b"not-on-the-wire"),
+            "GET",
+        );
+
+        assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "55");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn rebuild_response_removes_content_length_from_switching_protocols() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+
+        let response = rebuild_response(
+            headers,
+            StatusCode::SWITCHING_PROTOCOLS,
+            Bytes::new(),
+            "GET",
+        );
+
+        assert!(!response.headers().contains_key(CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn websocket_extension_header_is_not_forwarded_or_reflected() {
+        assert!(!should_forward_websocket_header("Sec-WebSocket-Extensions"));
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(
+            SEC_WEBSOCKET_EXTENSIONS,
+            HeaderValue::from_static("permessage-deflate"),
+        );
+
+        let response_headers =
+            build_websocket_client_response_headers(&request_headers, upstream_headers).unwrap();
+
+        assert!(!response_headers.contains_key(SEC_WEBSOCKET_EXTENSIONS));
+        assert!(response_headers.contains_key(SEC_WEBSOCKET_ACCEPT));
+    }
+
+    #[test]
+    fn websocket_response_validation_rejects_mutated_accept_header() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        let mut response_headers =
+            build_websocket_client_response_headers(&request_headers, HeaderMap::new()).unwrap();
+        response_headers.insert(SEC_WEBSOCKET_ACCEPT, HeaderValue::from_static("bad"));
+
+        assert_eq!(
+            websocket_response_validation_error(&request_headers, &response_headers),
+            Some("invalid Sec-WebSocket-Accept")
+        );
     }
 
     #[test]

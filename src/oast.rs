@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,13 +9,16 @@ use base64::Engine;
 use cfb_mode::Decryptor as CfbDecryptor;
 use chrono::{DateTime, Utc};
 use rand::Rng;
-use rsa::pkcs1::EncodeRsaPublicKey;
+use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use rsa::sha2::Sha256;
 use rsa::Oaep;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
+use url::{form_urlencoded, Url};
 use uuid::Uuid;
+
+use crate::state::AppState;
 
 // ── Provider enum ──
 
@@ -92,6 +95,14 @@ pub struct OastCallbackSummary {
     pub correlation_id: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct OastCallbackDedupKey {
+    protocol: String,
+    remote_addr: String,
+    correlation_id: String,
+    raw_data: String,
+}
+
 impl OastCallback {
     pub fn summary(&self) -> OastCallbackSummary {
         OastCallbackSummary {
@@ -110,10 +121,23 @@ impl OastCallback {
 enum RegistrationState {
     None,
     Interactsh {
+        server_url: String,
+        token: String,
         correlation_id: String,
         secret_key: String,
         private_key: rsa::RsaPrivateKey,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredOastRegistration {
+    #[serde(default)]
+    pub server_url: String,
+    #[serde(default)]
+    pub token: String,
+    pub correlation_id: String,
+    pub secret_key: String,
+    pub private_key_pkcs1_pem: String,
 }
 
 // ── Interactsh registration result ──
@@ -133,28 +157,46 @@ pub struct OastStore {
     events: broadcast::Sender<OastCallbackSummary>,
     config: RwLock<OastConfig>,
     registration: RwLock<RegistrationState>,
+    cleared_keys: RwLock<VecDeque<OastCallbackDedupKey>>,
 }
 
 impl OastStore {
     pub fn new(max_entries: usize) -> Self {
+        Self::new_with_config(max_entries, OastConfig::default())
+    }
+
+    pub fn new_with_config(max_entries: usize, config: OastConfig) -> Self {
         let (events, _) = broadcast::channel(max_entries.max(64));
         Self {
             max_entries,
             entries: RwLock::new(VecDeque::new()),
             events,
-            config: RwLock::new(OastConfig::default()),
+            config: RwLock::new(config),
             registration: RwLock::new(RegistrationState::None),
+            cleared_keys: RwLock::new(VecDeque::new()),
         }
     }
 
-    pub async fn push(&self, callback: OastCallback) {
+    pub async fn push(&self, callback: OastCallback) -> bool {
+        let dedup_key = callback_dedup_key(&callback);
         let summary = callback.summary();
+        let cleared_keys = self.cleared_keys.read().await;
+        if cleared_keys.iter().any(|cleared| cleared == &dedup_key) {
+            return false;
+        }
         let mut entries = self.entries.write().await;
+        if entries
+            .iter()
+            .any(|existing| callback_dedup_key(existing) == dedup_key)
+        {
+            return false;
+        }
         entries.push_front(callback);
         while entries.len() > self.max_entries {
             entries.pop_back();
         }
         let _ = self.events.send(summary);
+        true
     }
 
     pub async fn list(&self, limit: Option<usize>) -> Vec<OastCallbackSummary> {
@@ -172,7 +214,16 @@ impl OastStore {
     }
 
     pub async fn clear(&self) {
-        self.entries.write().await.clear();
+        let mut cleared_keys = self.cleared_keys.write().await;
+        let mut entries = self.entries.write().await;
+        for callback in entries.iter() {
+            push_cleared_key(
+                &mut cleared_keys,
+                callback_dedup_key(callback),
+                self.max_entries,
+            );
+        }
+        entries.clear();
     }
 
     pub async fn count(&self) -> usize {
@@ -195,9 +246,65 @@ impl OastStore {
         self.entries.read().await.iter().cloned().collect()
     }
 
+    pub async fn snapshot_cleared_keys(&self) -> Vec<OastCallbackDedupKey> {
+        self.cleared_keys.read().await.iter().cloned().collect()
+    }
+
+    pub async fn snapshot_registration(&self) -> Option<StoredOastRegistration> {
+        let registration = self.registration.read().await;
+        match &*registration {
+            RegistrationState::Interactsh {
+                server_url,
+                token,
+                correlation_id,
+                secret_key,
+                private_key,
+            } => private_key
+                .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+                .ok()
+                .map(|pem| StoredOastRegistration {
+                    server_url: server_url.clone(),
+                    token: token.clone(),
+                    correlation_id: correlation_id.clone(),
+                    secret_key: secret_key.clone(),
+                    private_key_pkcs1_pem: pem.to_string(),
+                }),
+            RegistrationState::None => None,
+        }
+    }
+
+    pub fn restore_registration_blocking(&self, registration: Option<StoredOastRegistration>) {
+        let restored = registration
+            .and_then(|stored| {
+                let private_key =
+                    rsa::RsaPrivateKey::from_pkcs1_pem(&stored.private_key_pkcs1_pem).ok()?;
+                Some(RegistrationState::Interactsh {
+                    server_url: stored.server_url,
+                    token: stored.token,
+                    correlation_id: stored.correlation_id,
+                    secret_key: stored.secret_key,
+                    private_key,
+                })
+            })
+            .unwrap_or(RegistrationState::None);
+        *self.registration_mut_blocking() = restored;
+    }
+
     pub async fn restore(&self, callbacks: Vec<OastCallback>) {
         let mut entries = self.entries.write().await;
-        *entries = VecDeque::from(callbacks);
+        *entries = callbacks_to_entries(callbacks, self.max_entries);
+    }
+
+    pub fn restore_blocking(&self, callbacks: Vec<OastCallback>) {
+        *self.entries_mut_blocking() = callbacks_to_entries(callbacks, self.max_entries);
+    }
+
+    pub async fn restore_cleared_keys(&self, keys: Vec<OastCallbackDedupKey>) {
+        *self.cleared_keys.write().await = cleared_keys_to_entries(keys, self.max_entries);
+    }
+
+    pub fn restore_cleared_keys_blocking(&self, keys: Vec<OastCallbackDedupKey>) {
+        *self.cleared_keys_mut_blocking() = cleared_keys_to_entries(keys, self.max_entries);
     }
 
     /// Blocking mutable access to entries — for use outside async context (e.g. session restore).
@@ -214,20 +321,57 @@ impl OastStore {
         }
     }
 
+    fn registration_mut_blocking(&self) -> tokio::sync::RwLockWriteGuard<'_, RegistrationState> {
+        loop {
+            if let Ok(guard) = self.registration.try_write() {
+                return guard;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn cleared_keys_mut_blocking(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, VecDeque<OastCallbackDedupKey>> {
+        loop {
+            if let Ok(guard) = self.cleared_keys.try_write() {
+                return guard;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// Returns (correlation_id, payload_suffix) if an Interactsh session is registered.
     pub async fn get_registration_info(&self) -> Option<(String, String)> {
+        let config = self.config.read().await;
+        if !config.enabled {
+            return None;
+        }
         let reg = self.registration.read().await;
         match &*reg {
             RegistrationState::Interactsh {
+                server_url,
+                token,
                 correlation_id,
-                secret_key: _,
-                private_key: _,
+                ..
             } => {
-                let config = self.config.read().await;
+                if server_url != &config.server_url || token != &config.token {
+                    return None;
+                }
                 let domain = extract_domain(&config.server_url);
                 Some((correlation_id.clone(), domain))
             }
             RegistrationState::None => None,
+        }
+    }
+
+    pub async fn registration_matches_config(&self, config: &OastConfig) -> bool {
+        let reg = self.registration.read().await;
+        match &*reg {
+            RegistrationState::Interactsh {
+                server_url, token, ..
+            } => server_url == &config.server_url && token == &config.token,
+            RegistrationState::None => false,
         }
     }
 
@@ -237,6 +381,52 @@ impl OastStore {
 
     async fn clear_registration(&self) {
         *self.registration.write().await = RegistrationState::None;
+    }
+}
+
+fn callbacks_to_entries(
+    callbacks: Vec<OastCallback>,
+    max_entries: usize,
+) -> VecDeque<OastCallback> {
+    let mut seen = HashSet::new();
+    callbacks
+        .into_iter()
+        .filter(|callback| seen.insert(callback_dedup_key(callback)))
+        .take(max_entries)
+        .collect()
+}
+
+fn cleared_keys_to_entries(
+    keys: Vec<OastCallbackDedupKey>,
+    max_entries: usize,
+) -> VecDeque<OastCallbackDedupKey> {
+    let mut seen = HashSet::new();
+    keys.into_iter()
+        .filter(|key| seen.insert(key.clone()))
+        .take(max_entries)
+        .collect()
+}
+
+fn push_cleared_key(
+    cleared_keys: &mut VecDeque<OastCallbackDedupKey>,
+    key: OastCallbackDedupKey,
+    max_entries: usize,
+) {
+    if cleared_keys.iter().any(|cleared| cleared == &key) {
+        return;
+    }
+    cleared_keys.push_front(key);
+    while cleared_keys.len() > max_entries {
+        cleared_keys.pop_back();
+    }
+}
+
+fn callback_dedup_key(callback: &OastCallback) -> OastCallbackDedupKey {
+    OastCallbackDedupKey {
+        protocol: callback.protocol.trim().to_ascii_lowercase(),
+        remote_addr: callback.remote_addr.trim().to_string(),
+        correlation_id: callback.correlation_id.trim().to_string(),
+        raw_data: callback.raw_data.clone(),
     }
 }
 
@@ -281,6 +471,31 @@ pub fn build_oast_payload(server_url: &str, correlation_id: &str) -> String {
     }
 }
 
+fn oast_endpoint_url(base_url: &str, path: &str, query: &[(&str, &str)]) -> String {
+    let base = base_url.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    let endpoint = format!("{base}/{path}");
+    if query.is_empty() {
+        return endpoint;
+    }
+
+    if let Ok(mut url) = Url::parse(&endpoint) {
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
+        }
+        return url.to_string();
+    }
+
+    let mut encoded = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in query {
+        encoded.append_pair(key, value);
+    }
+    format!("{endpoint}?{}", encoded.finish())
+}
+
 // ── Generate payload (multi-backend aware) ──
 
 /// Generate an OAST payload. Returns (correlation_id, full_payload).
@@ -289,7 +504,7 @@ pub fn build_oast_payload(server_url: &str, correlation_id: &str) -> String {
 /// - BOAST / Custom: uses a fresh UUID-based correlation_id + server URL
 pub async fn generate_payload(store: &OastStore) -> Option<(String, String)> {
     let config = store.get_config().await;
-    if config.server_url.is_empty() {
+    if !config.enabled || config.server_url.is_empty() {
         return None;
     }
 
@@ -298,18 +513,21 @@ pub async fn generate_payload(store: &OastStore) -> Option<(String, String)> {
             let reg = store.registration.read().await;
             match &*reg {
                 RegistrationState::Interactsh {
+                    server_url,
+                    token,
                     correlation_id,
-                    secret_key: _,
-                    private_key: _,
+                    ..
                 } => {
+                    if server_url != &config.server_url || token != &config.token {
+                        debug!("Interactsh registration does not match current config");
+                        return None;
+                    }
                     let payload = build_interactsh_payload(correlation_id, &config.server_url);
                     Some((correlation_id.clone(), payload))
                 }
                 RegistrationState::None => {
-                    debug!("Interactsh not registered, falling back to generic payload");
-                    let cid = generate_correlation_id();
-                    let payload = build_oast_payload(&config.server_url, &cid);
-                    Some((cid, payload))
+                    debug!("Interactsh not registered, refusing unrecoverable payload generation");
+                    None
                 }
             }
         }
@@ -351,12 +569,7 @@ async fn register_interactsh(
     };
 
     // 4. Build registration URL
-    let base = base_url.trim_end_matches('/');
-    let url = if token.is_empty() {
-        format!("{base}/register")
-    } else {
-        format!("{base}/register?token={token}")
-    };
+    let url = oast_endpoint_url(base_url, "register", &[]);
 
     // 5. POST registration
     let body = serde_json::json!({
@@ -400,12 +613,7 @@ async fn deregister_interactsh(
     token: &str,
     client: &reqwest::Client,
 ) {
-    let base = base_url.trim_end_matches('/');
-    let url = if token.is_empty() {
-        format!("{base}/deregister")
-    } else {
-        format!("{base}/deregister?token={token}")
-    };
+    let url = oast_endpoint_url(base_url, "deregister", &[]);
 
     let body = serde_json::json!({
         "correlation-id": correlation_id,
@@ -442,11 +650,11 @@ async fn poll_interactsh(
     token: &str,
     client: &reqwest::Client,
 ) -> Vec<OastCallback> {
-    let base = base_url.trim_end_matches('/');
-    let mut url = format!("{base}/poll?id={correlation_id}&secret={secret_key}");
-    if !token.is_empty() {
-        url.push_str(&format!("&token={token}"));
-    }
+    let url = oast_endpoint_url(
+        base_url,
+        "poll",
+        &[("id", correlation_id), ("secret", secret_key)],
+    );
 
     let mut req = client.get(&url).timeout(Duration::from_secs(15));
     if !token.is_empty() {
@@ -720,11 +928,10 @@ async fn poll_custom(config: &OastConfig, client: &reqwest::Client) -> Vec<OastC
         return vec![];
     }
 
-    let base = config.server_url.trim_end_matches('/');
     let poll_url = if config.token.is_empty() {
-        format!("{base}/poll")
+        oast_endpoint_url(&config.server_url, "poll", &[])
     } else {
-        format!("{base}/poll?token={}", config.token)
+        oast_endpoint_url(&config.server_url, "poll", &[("token", &config.token)])
     };
 
     let response = match client
@@ -837,6 +1044,7 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
 
         let mut prev_provider: Option<OastProvider> = None;
         let mut prev_url: Option<String> = None;
+        let mut prev_token: Option<String> = None;
 
         loop {
             let config = store.get_config().await;
@@ -847,6 +1055,7 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
                     deregister_current_interactsh(&store, &prev_url, &client).await;
                     prev_provider = None;
                     prev_url = None;
+                    prev_token = None;
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -856,7 +1065,8 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
 
             // Detect config change (provider or URL changed)
             let config_changed = prev_provider.as_ref() != Some(&config.provider)
-                || prev_url.as_deref() != Some(&config.server_url);
+                || prev_url.as_deref() != Some(&config.server_url)
+                || prev_token.as_deref() != Some(&config.token);
 
             if config_changed {
                 // Deregister old Interactsh session if switching away
@@ -874,6 +1084,8 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
                             );
                             store
                                 .set_registration(RegistrationState::Interactsh {
+                                    server_url: config.server_url.clone(),
+                                    token: config.token.clone(),
                                     correlation_id: reg.correlation_id,
                                     secret_key: reg.secret_key,
                                     private_key: reg.private_key,
@@ -891,6 +1103,7 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
 
                 prev_provider = Some(config.provider.clone());
                 prev_url = Some(config.server_url.clone());
+                prev_token = Some(config.token.clone());
             }
 
             // Dispatch poll to correct backend
@@ -904,8 +1117,182 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
 
             if !callbacks.is_empty() {
                 info!(count = callbacks.len(), provider = %config.provider, "OAST callbacks received");
+                let mut inserted = 0usize;
                 for cb in callbacks {
-                    store.push(cb).await;
+                    if store.push(cb).await {
+                        inserted += 1;
+                    }
+                }
+                if inserted == 0 {
+                    debug!(provider = %config.provider, "OAST poll returned only duplicate callbacks");
+                }
+            }
+
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+/// Start an OAST poller that follows the active session.
+///
+/// Desktop and headless modes can switch sessions while the app keeps running.
+/// This poller reads the active session on each tick, syncs OAST runtime config
+/// into that session's store, and persists callbacks into the same session that
+/// received them.
+pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
+
+        let mut prev_session_id: Option<Uuid> = None;
+        let mut prev_provider: Option<OastProvider> = None;
+        let mut prev_url: Option<String> = None;
+        let mut prev_token: Option<String> = None;
+        let mut prev_store: Option<Arc<OastStore>> = None;
+
+        loop {
+            let session = state.session().await;
+            let runtime = session.runtime.snapshot().await;
+            let config = OastConfig {
+                enabled: runtime.oast_enabled,
+                server_url: runtime.oast_server_url.clone(),
+                token: runtime.oast_token.clone(),
+                polling_interval_secs: runtime.oast_polling_interval_secs,
+                provider: runtime.oast_provider.clone(),
+            };
+            session.oast.update_config(config.clone()).await;
+
+            let session_changed = prev_session_id != Some(session.id());
+            let same_session_as_previous = !session_changed;
+
+            if !config.enabled || config.server_url.is_empty() {
+                if same_session_as_previous
+                    && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
+                {
+                    if let Some(store) = prev_store.as_deref() {
+                        deregister_current_interactsh(store, &prev_url, &client).await;
+                    }
+                    if let Err(error) = state.persist_session_context(&session).await {
+                        warn!(?error, session_id = %session.id(), "failed to persist OAST registration clear");
+                    }
+                }
+                prev_session_id = None;
+                prev_provider = None;
+                prev_url = None;
+                prev_token = None;
+                prev_store = None;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            let interval = Duration::from_secs(config.polling_interval_secs.max(1));
+            let config_changed = session_changed
+                || prev_provider.as_ref() != Some(&config.provider)
+                || prev_url.as_deref() != Some(&config.server_url)
+                || prev_token.as_deref() != Some(&config.token);
+
+            if config_changed {
+                let registration_config_changed = prev_provider.as_ref() != Some(&config.provider)
+                    || prev_url.as_deref() != Some(&config.server_url)
+                    || prev_token.as_deref() != Some(&config.token);
+                if same_session_as_previous
+                    && registration_config_changed
+                    && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
+                {
+                    if let Some(store) = prev_store.as_deref() {
+                        deregister_current_interactsh(store, &prev_url, &client).await;
+                    }
+                }
+
+                let mut registration_changed = false;
+                if config.provider == OastProvider::Interactsh {
+                    let has_existing_registration =
+                        session.oast.registration_matches_config(&config).await;
+                    if has_existing_registration && session_changed {
+                        debug!(
+                            session_id = %session.id(),
+                            "Reusing persisted Interactsh registration"
+                        );
+                    } else {
+                        match register_interactsh(&config.server_url, &config.token, &client).await
+                        {
+                            Ok(reg) => {
+                                info!(
+                                    session_id = %session.id(),
+                                    correlation_id = %reg.correlation_id,
+                                    "Interactsh auto-registration complete"
+                                );
+                                session
+                                    .oast
+                                    .set_registration(RegistrationState::Interactsh {
+                                        server_url: config.server_url.clone(),
+                                        token: config.token.clone(),
+                                        correlation_id: reg.correlation_id,
+                                        secret_key: reg.secret_key,
+                                        private_key: reg.private_key,
+                                    })
+                                    .await;
+                                registration_changed = true;
+                            }
+                            Err(error) => {
+                                warn!(%error, "Interactsh auto-registration failed");
+                                session.oast.clear_registration().await;
+                                registration_changed = true;
+                            }
+                        }
+                    }
+                } else {
+                    session.oast.clear_registration().await;
+                    registration_changed = true;
+                }
+
+                prev_session_id = Some(session.id());
+                prev_provider = Some(config.provider.clone());
+                prev_url = Some(config.server_url.clone());
+                prev_token = Some(config.token.clone());
+                prev_store = Some(session.oast.clone());
+
+                if registration_changed {
+                    if let Err(error) = state.persist_session_context(&session).await {
+                        warn!(?error, session_id = %session.id(), "failed to persist OAST registration");
+                    }
+                }
+            }
+
+            let callbacks = match config.provider {
+                OastProvider::Interactsh => {
+                    poll_interactsh_from_store(&session.oast, &config, &client).await
+                }
+                OastProvider::Boast => poll_boast(&config.server_url, &client).await,
+                OastProvider::Custom => poll_custom(&config, &client).await,
+            };
+
+            if !callbacks.is_empty() {
+                info!(
+                    count = callbacks.len(),
+                    provider = %config.provider,
+                    session_id = %session.id(),
+                    "OAST callbacks received"
+                );
+                let mut inserted = 0usize;
+                for callback in callbacks {
+                    if session.oast.push(callback).await {
+                        inserted += 1;
+                    }
+                }
+                if inserted == 0 {
+                    debug!(
+                        provider = %config.provider,
+                        session_id = %session.id(),
+                        "OAST poll returned only duplicate callbacks"
+                    );
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+                if let Err(error) = state.persist_session_context(&session).await {
+                    warn!(?error, session_id = %session.id(), "failed to persist OAST callbacks");
                 }
             }
 
@@ -926,6 +1313,7 @@ async fn poll_interactsh_from_store(
             correlation_id,
             secret_key,
             private_key,
+            ..
         } => {
             poll_interactsh(
                 &config.server_url,
@@ -950,18 +1338,258 @@ async fn deregister_current_interactsh(
     prev_url: &Option<String>,
     client: &reqwest::Client,
 ) {
-    let reg = store.registration.read().await;
-    if let RegistrationState::Interactsh {
-        correlation_id,
-        secret_key,
-        private_key: _,
-    } = &*reg
+    let registration = {
+        let reg = store.registration.read().await;
+        match &*reg {
+            RegistrationState::Interactsh {
+                correlation_id,
+                secret_key,
+                token,
+                ..
+            } => Some((correlation_id.clone(), secret_key.clone(), token.clone())),
+            RegistrationState::None => None,
+        }
+    };
+
+    if let (Some(url), Some((correlation_id, secret_key, stored_token))) =
+        (prev_url.as_ref(), registration)
     {
-        if let Some(url) = prev_url {
-            let config = store.get_config().await;
-            deregister_interactsh(url, correlation_id, secret_key, &config.token, client).await;
+        let token = if stored_token.is_empty() {
+            store.get_config().await.token
+        } else {
+            stored_token
+        };
+        deregister_interactsh(url, &correlation_id, &secret_key, &token, client).await;
+    }
+    store.clear_registration().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interactsh_config(token: &str) -> OastConfig {
+        OastConfig {
+            enabled: true,
+            server_url: "https://interact.example.test".to_string(),
+            token: token.to_string(),
+            polling_interval_secs: 1,
+            provider: OastProvider::Interactsh,
         }
     }
-    drop(reg);
-    store.clear_registration().await;
+
+    fn callback(protocol: &str) -> OastCallback {
+        OastCallback {
+            id: Uuid::new_v4(),
+            received_at: Utc::now(),
+            protocol: protocol.to_string(),
+            remote_addr: "127.0.0.1:1".to_string(),
+            raw_data: String::new(),
+            correlation_id: protocol.to_string(),
+        }
+    }
+
+    #[test]
+    fn oast_endpoint_url_encodes_query_values() {
+        let url = oast_endpoint_url(
+            "https://oast.example.test/",
+            "/poll",
+            &[("token", "a b&c=d")],
+        );
+
+        assert_eq!(url, "https://oast.example.test/poll?token=a+b%26c%3Dd");
+    }
+
+    #[test]
+    fn interactsh_endpoint_urls_do_not_include_token_query() {
+        assert_eq!(
+            oast_endpoint_url("https://interact.example.test", "register", &[]),
+            "https://interact.example.test/register"
+        );
+        assert!(
+            !oast_endpoint_url("https://interact.example.test", "deregister", &[])
+                .contains("token=")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_trims_callbacks_to_max_entries() {
+        let store = OastStore::new(2);
+        store
+            .restore(vec![
+                callback("first"),
+                callback("second"),
+                callback("third"),
+            ])
+            .await;
+
+        let callbacks = store.list(None).await;
+
+        assert_eq!(callbacks.len(), 2);
+        assert_eq!(callbacks[0].protocol, "first");
+        assert_eq!(callbacks[1].protocol, "second");
+    }
+
+    #[tokio::test]
+    async fn push_skips_duplicate_callbacks_without_broadcasting() {
+        let store = OastStore::new(16);
+        let mut receiver = store.subscribe();
+        let first = callback("dns");
+        let duplicate = OastCallback {
+            id: Uuid::new_v4(),
+            received_at: Utc::now(),
+            ..first.clone()
+        };
+
+        assert!(store.push(first).await);
+        assert!(!store.push(duplicate).await);
+
+        let first_event = receiver.recv().await.unwrap();
+        assert_eq!(first_event.protocol, "dns");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn clear_suppresses_previously_seen_callbacks() {
+        let store = OastStore::new(16);
+        let first = callback("dns");
+        let duplicate = OastCallback {
+            id: Uuid::new_v4(),
+            received_at: Utc::now(),
+            ..first.clone()
+        };
+
+        assert!(store.push(first).await);
+        store.clear().await;
+
+        assert!(!store.push(duplicate).await);
+        assert_eq!(store.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn restored_cleared_keys_suppress_old_callbacks() {
+        let store = OastStore::new(16);
+        let first = callback("dns");
+        let duplicate = OastCallback {
+            id: Uuid::new_v4(),
+            received_at: Utc::now(),
+            ..first.clone()
+        };
+
+        assert!(store.push(first).await);
+        store.clear().await;
+        let cleared_keys = store.snapshot_cleared_keys().await;
+
+        let restored = OastStore::new(16);
+        restored.restore_cleared_keys(cleared_keys).await;
+
+        assert!(!restored.push(duplicate).await);
+        assert_eq!(restored.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn restore_deduplicates_callbacks_with_fresh_local_ids() {
+        let first = callback("http");
+        let duplicate = OastCallback {
+            id: Uuid::new_v4(),
+            received_at: Utc::now(),
+            ..first.clone()
+        };
+        let store = OastStore::new(16);
+
+        store.restore(vec![first, duplicate]).await;
+
+        let callbacks = store.list(None).await;
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].protocol, "http");
+    }
+
+    #[tokio::test]
+    async fn registration_config_match_checks_token_and_url() {
+        let store = OastStore::new(16);
+        let config = interactsh_config("token-a");
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+
+        store
+            .set_registration(RegistrationState::Interactsh {
+                server_url: config.server_url.clone(),
+                token: config.token.clone(),
+                correlation_id: "cid".to_string(),
+                secret_key: "secret".to_string(),
+                private_key,
+            })
+            .await;
+
+        assert!(store.registration_matches_config(&config).await);
+
+        let mut changed_token = config.clone();
+        changed_token.token = "token-b".to_string();
+        assert!(!store.registration_matches_config(&changed_token).await);
+
+        let mut changed_url = config;
+        changed_url.server_url = "https://other.example.test".to_string();
+        assert!(!store.registration_matches_config(&changed_url).await);
+    }
+
+    #[tokio::test]
+    async fn registration_snapshot_round_trips_config_fingerprint() {
+        let store = OastStore::new(16);
+        let config = interactsh_config("round-trip-token");
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+
+        store
+            .set_registration(RegistrationState::Interactsh {
+                server_url: config.server_url.clone(),
+                token: config.token.clone(),
+                correlation_id: "cid".to_string(),
+                secret_key: "secret".to_string(),
+                private_key,
+            })
+            .await;
+
+        let snapshot = store.snapshot_registration().await;
+        let restored = OastStore::new(16);
+        restored.restore_registration_blocking(snapshot);
+
+        assert!(restored.registration_matches_config(&config).await);
+    }
+
+    #[tokio::test]
+    async fn stale_interactsh_registration_is_not_reported_or_used_for_payloads() {
+        let store = OastStore::new(16);
+        let config = interactsh_config("token-a");
+        store.update_config(config.clone()).await;
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+
+        store
+            .set_registration(RegistrationState::Interactsh {
+                server_url: config.server_url.clone(),
+                token: config.token.clone(),
+                correlation_id: "cid".to_string(),
+                secret_key: "secret".to_string(),
+                private_key,
+            })
+            .await;
+
+        assert!(store.get_registration_info().await.is_some());
+        assert!(generate_payload(&store).await.is_some());
+
+        let mut disabled = config.clone();
+        disabled.enabled = false;
+        store.update_config(disabled).await;
+        assert!(store.get_registration_info().await.is_none());
+        assert!(generate_payload(&store).await.is_none());
+
+        let mut changed = config;
+        changed.token = "token-b".to_string();
+        store.update_config(changed).await;
+
+        assert!(store.get_registration_info().await.is_none());
+        assert!(generate_payload(&store).await.is_none());
+    }
 }

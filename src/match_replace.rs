@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::model::{BodyEncoding, EditableRequest, HeaderRecord};
+use crate::model::{decode_content_encoding, BodyEncoding, EditableRequest, HeaderRecord};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,6 +90,14 @@ impl MatchReplaceStore {
         let rules = self.rules.read().await.clone();
         apply_response_rules(headers, body, rules)
     }
+
+    pub async fn has_enabled_response_rules(&self) -> bool {
+        self.rules
+            .read()
+            .await
+            .iter()
+            .any(|rule| rule.enabled && matches!(rule.scope, MatchReplaceScope::Response))
+    }
 }
 
 impl Default for MatchReplaceStore {
@@ -101,6 +109,7 @@ impl Default for MatchReplaceStore {
 fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -> AppliedRequest {
     let mut request = request;
     let mut notes = Vec::new();
+    let mut body_changed = false;
 
     for rule in rules
         .into_iter()
@@ -167,6 +176,7 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
                 if changed {
                     request.body = value;
                     matched = true;
+                    body_changed = true;
                 }
             }
         }
@@ -179,6 +189,10 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
         }
     }
 
+    if body_changed {
+        normalize_content_length_records(&mut request.headers, request.body.len());
+    }
+
     AppliedRequest { request, notes }
 }
 
@@ -189,7 +203,23 @@ fn apply_response_rules(
 ) -> AppliedResponse {
     let mut headers = header_records(headers);
     let mut body = body;
+    let needs_response_body = rules.iter().any(|rule| {
+        rule.enabled
+            && matches!(rule.scope, MatchReplaceScope::Response)
+            && matches!(
+                rule.target,
+                MatchReplaceTarget::Any | MatchReplaceTarget::Body
+            )
+    });
+    let decoded_body_for_rules = needs_response_body
+        .then(|| decode_content_encoding_records(&headers, body.as_ref()))
+        .flatten();
+    let mut body_for_rules = decoded_body_for_rules
+        .as_ref()
+        .map(|decoded| Bytes::from(decoded.clone()))
+        .unwrap_or_else(|| body.clone());
     let mut notes = Vec::new();
+    let mut body_changed = false;
 
     for rule in rules
         .into_iter()
@@ -229,11 +259,12 @@ fn apply_response_rules(
             rule.target,
             MatchReplaceTarget::Any | MatchReplaceTarget::Body
         ) {
-            if let Ok(text) = std::str::from_utf8(body.as_ref()) {
+            if let Ok(text) = std::str::from_utf8(body_for_rules.as_ref()) {
                 if let Ok((value, changed)) = replace_text(text, &rule) {
                     if changed {
-                        body = Bytes::from(value);
+                        body_for_rules = Bytes::from(value);
                         matched = true;
+                        body_changed = true;
                     }
                 }
             }
@@ -247,10 +278,44 @@ fn apply_response_rules(
         }
     }
 
+    if body_changed {
+        body = body_for_rules;
+        if decoded_body_for_rules.is_some() {
+            strip_content_encoding_records(&mut headers);
+        }
+        normalize_content_length_records(&mut headers, body.len());
+    }
+
     AppliedResponse {
         headers: header_map(headers),
         body,
         notes,
+    }
+}
+
+fn decode_content_encoding_records(headers: &[HeaderRecord], body: &[u8]) -> Option<Vec<u8>> {
+    decode_content_encoding(&header_map(headers.to_vec()), body)
+}
+
+fn strip_content_encoding_records(headers: &mut Vec<HeaderRecord>) {
+    headers.retain(|header| !header.name.eq_ignore_ascii_case("content-encoding"));
+}
+
+fn normalize_content_length_records(headers: &mut Vec<HeaderRecord>, body_len: usize) {
+    let mut had_content_length = false;
+    headers.retain(|header| {
+        if header.name.eq_ignore_ascii_case("content-length") {
+            had_content_length = true;
+            false
+        } else {
+            true
+        }
+    });
+    if had_content_length {
+        headers.push(HeaderRecord {
+            name: "Content-Length".to_string(),
+            value: body_len.to_string(),
+        });
     }
 }
 
@@ -315,6 +380,23 @@ fn header_map(headers: Vec<HeaderRecord>) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{
+        write::{GzEncoder, ZlibEncoder},
+        Compression,
+    };
+    use std::io::Write;
+
+    fn gzip(body: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zlib_deflate(body: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
 
     #[tokio::test]
     async fn applies_request_rule_to_path_and_header_values() {
@@ -353,5 +435,178 @@ mod tests {
         assert_eq!(applied.request.path, "/api/internal.local");
         assert!(applied.request.body.contains("internal.local"));
         assert_eq!(applied.notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_body_rule_refreshes_existing_content_length() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "grow body".to_string(),
+                scope: MatchReplaceScope::Request,
+                target: MatchReplaceTarget::Body,
+                search: "tiny".to_string(),
+                replace: "larger-body".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let applied = store
+            .apply_request(EditableRequest {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                headers: vec![HeaderRecord {
+                    name: "Content-Length".to_string(),
+                    value: "4".to_string(),
+                }],
+                body: "tiny".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+                preview_truncated: false,
+            })
+            .await;
+
+        assert_eq!(applied.request.body, "larger-body");
+        assert_eq!(
+            applied
+                .request
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                .map(|header| header.value.as_str()),
+            Some("11")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_body_rule_refreshes_existing_content_length() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "grow response".to_string(),
+                scope: MatchReplaceScope::Response,
+                target: MatchReplaceTarget::Body,
+                search: "tiny".to_string(),
+                replace: "larger-body".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "4".parse().unwrap());
+        let applied = store
+            .apply_response(headers, Bytes::from_static(b"tiny"))
+            .await;
+
+        assert_eq!(applied.body.as_ref(), b"larger-body");
+        assert_eq!(applied.headers.get("content-length").unwrap(), "11");
+    }
+
+    #[tokio::test]
+    async fn response_body_rule_applies_to_gzip_body_and_strips_encoding() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "rewrite compressed response".to_string(),
+                scope: MatchReplaceScope::Response,
+                target: MatchReplaceTarget::Body,
+                search: "tiny".to_string(),
+                replace: "larger-body".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let compressed = gzip(b"tiny");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert(
+            "content-length",
+            compressed.len().to_string().parse().unwrap(),
+        );
+        let applied = store.apply_response(headers, Bytes::from(compressed)).await;
+
+        assert_eq!(applied.body.as_ref(), b"larger-body");
+        assert!(applied.headers.get("content-encoding").is_none());
+        assert_eq!(applied.headers.get("content-length").unwrap(), "11");
+        assert_eq!(applied.notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_body_rule_applies_to_zlib_deflate_body_and_strips_encoding() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "rewrite deflate response".to_string(),
+                scope: MatchReplaceScope::Response,
+                target: MatchReplaceTarget::Body,
+                search: "tiny".to_string(),
+                replace: "larger-body".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let compressed = zlib_deflate(b"tiny");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "deflate".parse().unwrap());
+        headers.insert(
+            "content-length",
+            compressed.len().to_string().parse().unwrap(),
+        );
+        let applied = store.apply_response(headers, Bytes::from(compressed)).await;
+
+        assert_eq!(applied.body.as_ref(), b"larger-body");
+        assert!(applied.headers.get("content-encoding").is_none());
+        assert_eq!(applied.headers.get("content-length").unwrap(), "11");
+        assert_eq!(applied.notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_body_rule_leaves_unmatched_gzip_body_untouched() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "no match".to_string(),
+                scope: MatchReplaceScope::Response,
+                target: MatchReplaceTarget::Body,
+                search: "absent".to_string(),
+                replace: "larger-body".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let compressed = gzip(b"tiny");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert(
+            "content-length",
+            compressed.len().to_string().parse().unwrap(),
+        );
+        let applied = store
+            .apply_response(headers, Bytes::from(compressed.clone()))
+            .await;
+
+        assert_eq!(applied.body.as_ref(), compressed.as_slice());
+        assert_eq!(applied.headers.get("content-encoding").unwrap(), "gzip");
+        assert_eq!(
+            applied.headers.get("content-length").unwrap(),
+            compressed.len().to_string().as_str()
+        );
+        assert!(applied.notes.is_empty());
     }
 }

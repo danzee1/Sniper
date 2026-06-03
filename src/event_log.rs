@@ -52,6 +52,18 @@ impl EventLogStore {
         title: impl Into<String>,
         message: impl Into<String>,
     ) -> EventLogEntry {
+        self.push_with_evicted(level, source, title, message)
+            .await
+            .0
+    }
+
+    pub async fn push_with_evicted(
+        &self,
+        level: EventLevel,
+        source: impl Into<String>,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> (EventLogEntry, Vec<EventLogEntry>) {
         let entry = EventLogEntry {
             id: Uuid::new_v4(),
             captured_at: Utc::now(),
@@ -63,11 +75,30 @@ impl EventLogStore {
 
         let mut entries = self.entries.write().await;
         entries.push_front(entry.clone());
+        let mut evicted = Vec::new();
         while entries.len() > self.max_entries {
-            entries.pop_back();
+            if let Some(record) = entries.pop_back() {
+                evicted.push(record);
+            }
         }
         let _ = self.events.send(entry.clone());
-        entry
+        (entry, evicted)
+    }
+
+    pub async fn remove_and_restore(&self, id: Uuid, restore: Vec<EventLogEntry>) -> bool {
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|entry| entry.id != id);
+        let removed = entries.len() < before;
+        if removed {
+            for record in restore {
+                if entries.len() >= self.max_entries {
+                    break;
+                }
+                entries.push_back(record);
+            }
+        }
+        removed
     }
 
     pub async fn list(&self, limit: Option<usize>) -> Vec<EventLogEntry> {
@@ -95,5 +126,31 @@ impl EventLogStore {
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventLogEntry> {
         self.events.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remove_and_restore_recovers_evicted_entry_after_failed_insert() {
+        let store = EventLogStore::new(1);
+        let old = store.push(EventLevel::Info, "test", "old", "old").await;
+        let (new, evicted) = store
+            .push_with_evicted(EventLevel::Info, "test", "new", "new")
+            .await;
+
+        assert_eq!(
+            evicted.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![old.id]
+        );
+
+        assert!(store.remove_and_restore(new.id, evicted).await);
+        let entries = store.snapshot(None).await;
+        assert_eq!(
+            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![old.id]
+        );
     }
 }

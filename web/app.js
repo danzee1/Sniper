@@ -60,6 +60,9 @@ const DISPLAY_THEME_OPTIONS = new Set([
   "dusk",
   "white",
   "paper",
+  "snow",
+  "ivory",
+  "frost",
 ]);
 const DISPLAY_UI_FONT_OPTIONS = new Set(["plex", "system", "pretendard", "notokr", "applekr", "nanumgothic"]);
 const DISPLAY_MONO_FONT_OPTIONS = new Set([
@@ -70,6 +73,7 @@ const DISPLAY_MONO_FONT_OPTIONS = new Set([
   "nanumgothiccoding",
   "notomonokr",
 ]);
+const OAST_TOKEN_REDACTION = "********";
 const HISTORY_COLUMN_RULES = {
   index: { default: 48, min: 40, max: 88 },
   host: { default: 320, min: 160, max: 720 },
@@ -109,6 +113,20 @@ const HTTP_HISTORY_MAX_LOADED_ITEMS = 12000;
 const HTTP_HISTORY_BACKFILL_DELAY_MS = 80;
 const HTTP_HISTORY_SCROLL_PREFETCH_ROWS = 120;
 const HTTP_HISTORY_POLL_FALLBACK_MS = 30000;
+const WS_REPLAY_MAX_LOADED_FRAMES = 10000;
+const WS_REPLAY_MAX_RENDERED_FRAMES = 1000;
+const WS_REPLAY_MAX_PERSISTED_FRAMES = 1000;
+const WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES = 16 * 1024;
+const WS_REPLAY_MAX_PERSISTED_TOTAL_FRAMES = 2000;
+const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 24 * 1024 * 1024;
+const WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS = 2000;
+const WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS = 5000;
+const WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES = 60 * 1024;
+const WORKSPACE_UNLOAD_WS_FRAME_BUDGET = 32;
+const WORKSPACE_UNLOAD_WS_BODY_BUDGET = 32 * 1024;
+const WS_REPLAY_FINAL_POLL_INTERVAL_MS = 100;
+const WS_REPLAY_FINAL_POLL_TIMEOUT_MS = 2200;
+const HTTP_METHOD_TOKEN_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 const WS_COLUMN_RULES = {
   index:       { default: 48,  min: 36,  max: 80 },
   host:        { default: 260, min: 120, max: 600 },
@@ -136,6 +154,7 @@ const WORKBENCH_STACK_MIN_HEIGHTS = {
 };
 const REPEATER_HISTORY_LIMIT = 30;
 const HISTORY_ROW_HEIGHT = 27;
+let measuredHistoryRowHeight = HISTORY_ROW_HEIGHT;
 const HISTORY_BUFFER_ROWS = 30;
 const FINDINGS_ROW_HEIGHT = 27;
 const FINDINGS_BUFFER_ROWS = 20;
@@ -189,6 +208,91 @@ function showToast(message, type = "success", durationMs = 2000) {
   }, durationMs);
 }
 
+function safeDecodeBase64(value, fallback = "") {
+  if (!value) return "";
+  try {
+    return atob(value);
+  } catch (_error) {
+    return fallback || value;
+  }
+}
+
+function safeEncodeBase64(value) {
+  try {
+    return btoa(value);
+  } catch (_error) {
+    const bytes = new TextEncoder().encode(value || "");
+    let binary = "";
+    for (const byte of bytes) {
+      binary += String.fromCharCode(byte);
+    }
+    return btoa(binary);
+  }
+}
+
+function decodedBase64Length(value) {
+  return atob(value || "").length;
+}
+
+function editableRequestBodyLength(body, bodyEncoding) {
+  if (bodyEncoding === "base64") {
+    return decodedBase64Length(body);
+  }
+  return new TextEncoder().encode(body || "").length;
+}
+
+function editableResponseBodyLength(bodyText, bodyEncoding) {
+  if (bodyEncoding === "base64") {
+    return decodedBase64Length(safeEncodeBase64(bodyText || ""));
+  }
+  return new TextEncoder().encode(bodyText || "").length;
+}
+
+function isBase64Text(value) {
+  const normalized = String(value || "").replace(/\s+/g, "");
+  if (!normalized || normalized.length % 4 !== 0) return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(normalized)) return false;
+  try {
+    atob(normalized);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function wsReplayBodyForSend(body, kind, bodyIsEncoded = false) {
+  const messageKind = normalizeWsMessageType(kind);
+  if (messageKind === "text") return body;
+  return bodyIsEncoded ? String(body || "").replace(/\s+/g, "") : safeEncodeBase64(body);
+}
+
+function defaultWsPortForScheme(scheme) {
+  return scheme === "ws" ? 80 : 443;
+}
+
+function jsonArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function websocketPagePayload(value) {
+  if (Array.isArray(value)) {
+    return {
+      items: value,
+      total: value.length,
+      limit: value.length,
+      has_more: false,
+    };
+  }
+  const payload = value && typeof value === "object" ? value : {};
+  const items = jsonArray(payload.items);
+  return {
+    items,
+    total: Number.isFinite(Number(payload.total)) ? Number(payload.total) : items.length,
+    limit: Number.isFinite(Number(payload.limit)) ? Number(payload.limit) : items.length,
+    has_more: Boolean(payload.has_more),
+  };
+}
+
 function createHistoryPagingState() {
   return {
     generation: 0,
@@ -203,6 +307,15 @@ function createHistoryPagingState() {
     backfillScheduled: false,
     trimmedHeadCount: 0,
     trimmedTailCount: 0,
+    hiddenConnectTotal: null,
+  };
+}
+
+function createWebsocketPagingState() {
+  return {
+    total: 0,
+    limit: 5000,
+    hasMore: false,
   };
 }
 
@@ -211,6 +324,8 @@ const state = {
   selectedId: null,
   selectedRecord: null,
   historyPaging: createHistoryPagingState(),
+  historyDirty: false,
+  historyResetScrollOnNextLoad: false,
   sessions: [],
   activeSession: null,
   selectedSessionId: null,
@@ -263,6 +378,7 @@ const state = {
   selectedResponseInterceptRecord: null,
   responseInterceptEditorSeedId: null,
   websocketSessions: [],
+  websocketPaging: createWebsocketPagingState(),
   websocketQuery: "",
   websocketSortKey: "started_at",
   websocketSortDirection: "desc",
@@ -271,6 +387,7 @@ const state = {
   selectedFrameIdx: null,
   wsKeyboardFocus: "sessions",
   replayTabs: [],
+  workspaceRevision: 0,
   activeReplayTabId: null,
   replayTabSequence: 0,
   replayRenamingTabId: null,
@@ -286,14 +403,24 @@ const state = {
   sequenceDefinitions: [],
   selectedSequenceId: null,
   editingSequence: null,
+  sequenceSelectionGeneration: 0,
+  sequenceRunGeneration: 0,
+  sequenceDirty: false,
+  sequenceDraftVersion: 0,
   sequenceRunResult: null,
   sequencePastRuns: [],
   fuzzerBaseRequest: null,
   fuzzerSourceTransactionId: null,
+  fuzzerTarget: null,
+  fuzzerTargetRequestText: null,
   fuzzerNotice: "",
   fuzzerRequestText: "",
   fuzzerPayloadsText: "",
   fuzzerAttackRecord: null,
+  fuzzerRunning: false,
+  fuzzerDraftVersion: 0,
+  fuzzerRunToken: 0,
+  oastTokenClearPending: false,
   _cachedVisibleEntries: null,
   _cachedVisibleEntriesKey: "",
   _visibleEntriesSearchCache: null,
@@ -306,7 +433,12 @@ const state = {
 };
 
 let _historyPagingGeneration = 0;
+let _websocketLoadGeneration = 0;
+let _websocketDetailGeneration = 0;
+let _websocketDetailPendingId = null;
+let _websocketDetailPendingPromise = null;
 let _lastHttpHistoryFallbackPoll = Date.now();
+let _interceptToggleRequestSeq = 0;
 
 const els = {
   dashboardShell: document.getElementById("dashboardShell"),
@@ -530,6 +662,8 @@ const els = {
   proxySettingUpstreamInsecure: document.getElementById("proxySettingUpstreamInsecure"),
   proxySettingScopePatterns: document.getElementById("proxySettingScopePatterns"),
   proxySettingPassthroughHosts: document.getElementById("proxySettingPassthroughHosts"),
+  proxySettingOastClearToken: document.getElementById("proxySettingOastClearToken"),
+  proxySettingOastTokenHint: document.getElementById("proxySettingOastTokenHint"),
   proxySettingBindHost: document.getElementById("proxySettingBindHost"),
   proxySettingPort: document.getElementById("proxySettingPort"),
   proxySettingListenerHelp: document.getElementById("proxySettingListenerHelp"),
@@ -555,6 +689,7 @@ const els = {
   replayResponseView: document.getElementById("replayResponseView"), // legacy, may be null
   replayResponseCM: document.getElementById("replayResponseCM"),
   replayResponseSearchInput: document.getElementById("replayResponseSearchInput"),
+  curlImportModal: document.getElementById("curlImportModal"),
   replayResponseSearchMeta: document.getElementById("replayResponseSearchMeta"),
   sendReplayButton: document.getElementById("sendReplayButton"),
   cancelReplayButton: document.getElementById("cancelReplayButton"),
@@ -642,10 +777,15 @@ let refreshTimer = null;
 let auxTimer = null;
 let eventSource = null;
 let workspaceSaveTimer = null;
+let wsTranscriptSaveTimer = null;
+let wsTranscriptFirstDirtyAt = 0;
 let workspaceSaveInFlight = false;
 let workspaceSaveDirty = false;
 let workspaceSaveVersion = 0;
+let workspaceSaveLastSnapshot = null;
+const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
+let workspaceSaveConflictPending = false;
 let uiSettingsSaveTimer = null;
 let toolsBootPromise = null;
 let displaySettingsPreviewActive = false;
@@ -697,9 +837,9 @@ async function init() {
   if (aclInit) aclInit.checked = localStorage.getItem("sniper_auto_content_length") !== "false";
   await loadUiSettings();
   hydrateDisplaySettingsForm();
+  await loadSessions();
+  await loadSettings();
   const loads = [
-    loadSessions(),
-    loadSettings(),
     loadWorkspaceState(),
     loadTransactions(false),
     loadIntercepts(false),
@@ -722,7 +862,7 @@ async function init() {
     pollAuxiliaryData().catch((error) => console.error(error));
   }, 1200);
   // Sync active tabs from DOM in case WKWebView restored a cached page state
-  const domActiveTool = document.querySelector(".tool-tab.active");
+  const domActiveTool = document.querySelector(".main-tab.active");
   if (domActiveTool?.dataset?.tool && domActiveTool.dataset.tool !== state.activeTool) {
     state.activeTool = domActiveTool.dataset.tool;
   }
@@ -771,6 +911,8 @@ function resetLayoutTextareas() {
 
 function bindEvents() {
   window.addEventListener("resize", resetLayoutTextareas);
+  window.addEventListener("pagehide", flushWorkspaceStateOnUnload);
+  window.addEventListener("beforeunload", flushWorkspaceStateOnUnload);
 
   mainTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -784,6 +926,9 @@ function bindEvents() {
       }
       if (state.activeTool === "logger") {
         loadEventLog().catch((error) => console.error(error));
+      }
+      if (state.activeTool === "proxy" && state.activeProxyTab === "http-history") {
+        if (state.historyDirty) loadTransactions(true, consumeHistoryLoadOptions()).catch((error) => console.error(error));
       }
     });
   });
@@ -801,7 +946,7 @@ function bindEvents() {
         loadWebsockets(true).catch((error) => console.error(error));
       }
       if (state.activeProxyTab === "http-history") {
-        scheduleIncrementalRefresh();
+        if (state.historyDirty) loadTransactions(true, consumeHistoryLoadOptions()).catch((error) => console.error(error));
       }
       if (state.activeProxyTab === "proxy-settings") {
         loadRuntimeSettings().catch((error) => console.error(error));
@@ -862,7 +1007,9 @@ function bindEvents() {
     const row = event.target.closest(".history-row");
     if (!row) return;
     state.selectedId = row.dataset.id;
+    state.selectedRecord = null;
     updateHistorySelection(state.selectedId);
+    renderEmptyDetail();
     scrollSelectedHistoryRowIntoView();
     loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
     // Keep focus on the table so arrow keys navigate rows, not code-view lines
@@ -873,7 +1020,10 @@ function bindEvents() {
     if (!row) return;
     event.preventDefault();
     state.selectedId = row.dataset.id;
+    state.selectedRecord = null;
     updateHistorySelection(state.selectedId);
+    renderEmptyDetail();
+    loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
     openContextMenu(event.clientX, event.clientY, row.dataset.id);
   });
 
@@ -884,21 +1034,21 @@ function bindEvents() {
     clearTimeout(_searchDebounce);
     _searchDebounce = setTimeout(() => {
       state.query = els.searchInput.value.trim();
-      scheduleRefresh();
+      scheduleRefresh({ resetScroll: true });
     }, 60);
   });
   els.searchInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       clearTimeout(_searchDebounce);
       state.query = els.searchInput.value.trim();
-      scheduleRefresh();
+      scheduleRefresh({ resetScroll: true });
     }
   });
   els.searchInput.addEventListener("search", () => {
     // Triggered when user clears the search field via the X button
     clearTimeout(_searchDebounce);
     state.query = els.searchInput.value.trim();
-    scheduleRefresh();
+    scheduleRefresh({ resetScroll: true });
   });
 
   els.requestSearchInput.addEventListener("input", () => {
@@ -915,7 +1065,7 @@ function bindEvents() {
     state.replayMessageSearch.request = els.replayRequestSearchInput.value;
     const cv = getCMView("replayReq");
     const reqText = cv ? cv.getContent() : (els.replayRequestEditor ? els.replayRequestEditor.value : "") || "";
-    updateReplaySearchPane("request", reqText);
+      updateReplaySearchPane("request", reqText);
   });
 
   els.replayResponseSearchInput.addEventListener("input", () => {
@@ -935,6 +1085,7 @@ function bindEvents() {
   initSearchHitNavigation(els.replayRequestSearchMeta, () => els.replayRequestHighlight);
   initSearchHitNavigation(els.replayResponseSearchMeta, () => els.replayResponseView);
   initCMSearchNavigation(els.replayRequestSearchMeta, "replayReq");
+  initReplayResponseCMSearchNavigation();
 
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
@@ -953,16 +1104,43 @@ function bindEvents() {
     state.filterSettings.inScopeOnly = e.currentTarget.classList.contains("active");
     scheduleRefresh();
   });
-  document.getElementById("interceptInScopeToggle")?.addEventListener("click", (e) => {
-    e.currentTarget.classList.toggle("active");
-    const scopeOnly = e.currentTarget.classList.contains("active");
-    state.interceptInScopeOnly = scopeOnly;
-    // Sync to server so intercept engine respects scope setting
-    fetch("/api/runtime", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ intercept_scope_only: scopeOnly }),
-    }).catch((err) => console.error("Failed to update intercept scope:", err));
+  document.getElementById("interceptInScopeToggle")?.addEventListener("click", async (e) => {
+    const toggle = e.currentTarget;
+    const sessionId = currentSessionId();
+    const previousScopeOnly = Boolean(state.interceptInScopeOnly);
+    const nextScopeOnly = !toggle.classList.contains("active");
+    toggle.classList.toggle("active", nextScopeOnly);
+    toggle.disabled = true;
+    state.interceptInScopeOnly = nextScopeOnly;
+    try {
+      await applyInterceptScopeFilterLocally();
+      const response = await fetch("/api/runtime", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, intercept_scope_only: nextScopeOnly }),
+      });
+      await requireOkResponse(response, "Failed to update intercept scope.");
+      const runtime = await response.json();
+      if (sessionId !== currentSessionId()) {
+        return;
+      }
+      state.runtime = runtime;
+      const savedScopeOnly = state.runtime?.intercept_scope_only ?? nextScopeOnly;
+      state.interceptInScopeOnly = savedScopeOnly;
+      toggle.classList.toggle("active", savedScopeOnly);
+      await applyInterceptScopeFilterLocally();
+    } catch (err) {
+      if (sessionId !== currentSessionId()) {
+        return;
+      }
+      console.error("Failed to update intercept scope:", err);
+      showToast(err?.message || "Failed to update intercept scope.", "error");
+      state.interceptInScopeOnly = previousScopeOnly;
+      toggle.classList.toggle("active", previousScopeOnly);
+      await applyInterceptScopeFilterLocally();
+    } finally {
+      toggle.disabled = false;
+    }
   });
 
   els.methodFilter.addEventListener("change", () => {
@@ -1006,6 +1184,7 @@ function bindEvents() {
   els.resetFilterSettingsButton.addEventListener("click", () => {
     state.filterSettings = createDefaultFilterSettings();
     hydrateFilterForm();
+    syncHttpInScopePill();
     scheduleRefresh();
   });
   document.getElementById("closeCompareButton").addEventListener("click", closeCompareModal);
@@ -1050,7 +1229,7 @@ function bindEvents() {
     loadSessions().catch((error) => console.error(error));
   });
   els.dashboardCreateSessionButton?.addEventListener("click", () => {
-    createSession().catch((error) => console.error(error));
+    createSession().catch(handleWorkspaceActionError);
   });
   els.dashboardOpenStorageBtn?.addEventListener("click", () => {
     const sessionId = state.selectedSessionId || state.activeSession?.id || state.sessions.find((s) => s.active)?.id;
@@ -1074,7 +1253,10 @@ function bindEvents() {
   });
 
   els.clearEventLogButton.addEventListener("click", () => {
-    clearEventLog().catch((error) => console.error(error));
+    clearEventLog().catch((error) => {
+      console.error(error);
+      showToast(error?.message || "Failed to clear event log.", "error");
+    });
   });
 
   els.closeInspectorButton?.addEventListener("click", () => {
@@ -1083,24 +1265,24 @@ function bindEvents() {
   });
 
   document.getElementById("addInterceptRuleButton")?.addEventListener("click", () => {
-    addInterceptRule().catch((error) => console.error(error));
+    addInterceptRule().catch(handleInterceptRuleError);
   });
   document.getElementById("interceptRulesList").addEventListener("click", (event) => {
     const deleteBtn = event.target.closest("[data-rule-delete]");
-    if (deleteBtn) { deleteInterceptRule(deleteBtn.dataset.ruleDelete).catch((e) => console.error(e)); return; }
+    if (deleteBtn) { deleteInterceptRule(deleteBtn.dataset.ruleDelete).catch(handleInterceptRuleError); return; }
     const saveBtn = event.target.closest("[data-rule-save]");
-    if (saveBtn) { saveInterceptRuleFromRow(saveBtn.dataset.ruleSave).catch((e) => console.error(e)); return; }
+    if (saveBtn) { saveInterceptRuleFromRow(saveBtn.dataset.ruleSave).catch(handleInterceptRuleError); return; }
     const row = event.target.closest("[data-rule-id]");
     if (row && !event.target.closest("input") && !event.target.closest("button")) { editInterceptRule(row.dataset.ruleId); }
   });
   document.getElementById("interceptRulesList").addEventListener("change", (event) => {
     const toggle = event.target.closest("[data-rule-toggle]");
-    if (toggle) { toggleInterceptRuleEnabled(toggle.dataset.ruleToggle, toggle.checked).catch((e) => console.error(e)); }
+    if (toggle) { toggleInterceptRuleEnabled(toggle.dataset.ruleToggle, toggle.checked).catch(handleInterceptRuleError); }
   });
   document.getElementById("interceptRulesList").addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       const row = event.target.closest("[data-rule-id]");
-      if (row) { saveInterceptRuleFromRow(row.dataset.ruleId).catch((e) => console.error(e)); }
+      if (row) { saveInterceptRuleFromRow(row.dataset.ruleId).catch(handleInterceptRuleError); }
     }
   });
   if (els.refreshWebsocketsButton) {
@@ -1114,16 +1296,28 @@ function bindEvents() {
     btn.addEventListener("click", () => toggleWebsocketSort(btn.dataset.wsSortKey));
   });
   els.forwardInterceptButton.addEventListener("click", () => {
-    forwardSelectedIntercept().catch((error) => console.error(error));
+    forwardSelectedIntercept().catch((error) => {
+      console.error(error);
+      showToast(error?.message || "Failed to forward request.", "error");
+    });
   });
   els.dropInterceptButton.addEventListener("click", () => {
-    dropSelectedIntercept().catch((error) => console.error(error));
+    dropSelectedIntercept().catch((error) => {
+      console.error(error);
+      showToast(error?.message || "Failed to drop request.", "error");
+    });
   });
   els.forwardResponseInterceptButton.addEventListener("click", () => {
-    forwardSelectedResponseIntercept().catch((error) => console.error(error));
+    forwardSelectedResponseIntercept().catch((error) => {
+      console.error(error);
+      showToast(error?.message || "Failed to forward response.", "error");
+    });
   });
   els.dropResponseInterceptButton.addEventListener("click", () => {
-    dropSelectedResponseIntercept().catch((error) => console.error(error));
+    dropSelectedResponseIntercept().catch((error) => {
+      console.error(error);
+      showToast(error?.message || "Failed to drop response.", "error");
+    });
   });
   els.interceptQueueTabRequest.addEventListener("click", () => switchInterceptQueueTab("request"));
   els.interceptQueueTabResponse.addEventListener("click", () => switchInterceptQueueTab("response"));
@@ -1172,19 +1366,23 @@ function bindEvents() {
       const action = btn.dataset.paneAction;
       paneCtx.classList.add("hidden");
       if (action === "copy-url") copySelectedTransactionUrl();
-      else if (action === "send-to-replay") openReplayFromSelection().catch(console.error);
-      else if (action === "send-to-fuzzer") openFuzzerFromSelection().catch(console.error);
+      else if (action === "send-to-replay") openReplayFromSelection().catch(handleSendActionError);
+      else if (action === "send-to-fuzzer") openFuzzerFromSelection().catch(handleSendActionError);
       else if (action.startsWith("copy-response-")) copyResponseContent(action.replace("copy-", ""));
       else if (action.startsWith("copy-as-")) {
         const fmt = action.replace("copy-as-", "");
         const text = selectedRecordToFormat(fmt);
-        if (text) { copyTextToClipboard(text); showToast(`Copied as ${fmt}`); }
+        if (text) {
+          copyTextToClipboard(text)
+            .then(() => showToast(`Copied as ${fmt}`))
+            .catch(() => showToast("Failed to copy", "error"));
+        }
       }
     });
   }
 
   els.sendReplayButton.addEventListener("click", () => {
-    sendReplay().catch((error) => console.error(error));
+    sendReplay().catch(handleReplayActionError);
   });
   els.newReplayTabButton.addEventListener("click", () => {
     openBlankReplayTab();
@@ -1197,7 +1395,7 @@ function bindEvents() {
     navigateReplayHistory(1);
   });
   els.replayFollowRedirectButton.addEventListener("click", () => {
-    followRedirect().catch((error) => console.error(error));
+    followRedirect().catch(handleReplayActionError);
   });
   els.saveMatchReplaceRuleButton.addEventListener("click", () => {
     if (!state.selectedMatchReplaceRuleId) {
@@ -1214,7 +1412,13 @@ function bindEvents() {
     // Don't save immediately — let user fill in fields first
     renderMatchReplaceRules();
   });
-  els.deleteMatchReplaceRuleButton.addEventListener("click", deleteSelectedMatchReplaceRule);
+  els.deleteMatchReplaceRuleButton.addEventListener("click", () => {
+    deleteSelectedMatchReplaceRule().catch((error) => {
+      console.error(error);
+      showToast(error?.message || "Failed to delete rule", "error");
+      loadMatchReplaceRules().catch(console.error);
+    });
+  });
   [
     els.matchReplaceScope,
     els.matchReplaceTarget,
@@ -1241,9 +1445,6 @@ function bindEvents() {
   els.startFuzzerButton.addEventListener("click", () => {
     runFuzzerAttack().catch((error) => {
       console.error("Fuzzer start error:", error);
-      state.fuzzerAttackRecord = null;
-      state.fuzzerNotice = error.message || "An unexpected error occurred while starting the fuzzer.";
-      renderFuzzer();
     });
   });
   els.resetFuzzerButton.addEventListener("click", resetFuzzer);
@@ -1258,15 +1459,22 @@ function bindEvents() {
     row.classList.add("fuzzer-result-selected");
     row.scrollIntoView({ block: "nearest" });
     const txId = row.dataset.transactionId;
+    const rowIndex = Number.isFinite(Number(row.dataset.rowIndex))
+      ? Number(row.dataset.rowIndex)
+      : Number(row.dataset.resultIndex);
+    const selectionKey = txId ? `tx:${txId}` : `row:${rowIndex}`;
+    state._selectedFuzzerResultKey = selectionKey;
     if (txId) {
-      showFuzzerResultDetail(txId).catch((err) => console.error(err));
+      showFuzzerResultDetail(txId, selectionKey).catch((err) => console.error(err));
     } else {
-      const result = state.fuzzerAttackRecord?.results?.[Number(row.dataset.resultIndex)];
+      const result = state.fuzzerAttackRecord?.results?.[rowIndex];
+      state._fuzzerDetailRecord = null;
       if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.remove("hidden");
       const _dr = document.getElementById("fuzzerDetailResizer");
       if (_dr) _dr.classList.remove("hidden");
       if (els.fuzzerDetailReqCM) updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, result?.note || "No transaction was captured for this payload.", { mode: "http" });
       if (els.fuzzerDetailResCM) updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
+      if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
     }
   }
 
@@ -1316,14 +1524,14 @@ function bindEvents() {
   });
 
   document.getElementById("newSequenceButton").addEventListener("click", () => {
-    createNewSequence().catch((e) => console.error(e));
+    createNewSequence().catch(handleSequenceActionError);
   });
   document.getElementById("addSequenceStepButton").addEventListener("click", addSequenceStep);
   document.getElementById("saveSequenceButton").addEventListener("click", () => {
-    saveCurrentSequence().catch((e) => console.error(e));
+    saveCurrentSequence().catch(handleSequenceActionError);
   });
   document.getElementById("runSequenceButton").addEventListener("click", () => {
-    runCurrentSequence().catch((e) => console.error(e));
+    runCurrentSequence().catch(handleSequenceActionError);
   });
 
   // The replay request editor uses a contenteditable <pre> for editing so that
@@ -1415,14 +1623,36 @@ function bindEvents() {
   if (oastProviderSelect) {
     oastProviderSelect.addEventListener("change", () => renderProxySettings());
   }
+  if (els.proxySettingOastClearToken) {
+    els.proxySettingOastClearToken.addEventListener("click", () => {
+      state.oastTokenClearPending = true;
+      const oastToken = document.getElementById("proxySettingOastToken");
+      if (oastToken) {
+        oastToken.value = "";
+      }
+      renderProxySettings();
+    });
+  }
+  const oastTokenInput = document.getElementById("proxySettingOastToken");
+  if (oastTokenInput) {
+    oastTokenInput.addEventListener("input", () => {
+      if (oastTokenInput.value.trim()) {
+        state.oastTokenClearPending = false;
+        renderProxySettings();
+      }
+    });
+  }
   if (els.oastGenerateButton) {
     els.oastGenerateButton.addEventListener("click", () => {
-      generateOastPayload().catch(console.error);
+      generateOastPayload().catch(handleOastActionError);
     });
   }
   if (els.oastClearButton) {
     els.oastClearButton.addEventListener("click", () => {
-      clearOastCallbacks().catch(console.error);
+      clearOastCallbacks().catch((error) => {
+        console.error(error);
+        showToast(error?.message || "Failed to clear OAST callbacks.", "error");
+      });
     });
   }
   if (els.oastCopyPayloadButton) {
@@ -1436,7 +1666,7 @@ function bindEvents() {
       const row = event.target.closest("tr[data-oast-id]");
       if (!row) return;
       state.selectedOastId = row.dataset.oastId;
-      loadOastDetail(row.dataset.oastId).catch(console.error);
+      loadOastDetail(row.dataset.oastId).catch(handleOastActionError);
       renderOastCallbacks();
     });
   }
@@ -1445,32 +1675,55 @@ function bindEvents() {
   });
   document.getElementById("replayHttpVersionSelect")?.addEventListener("change", (e) => {
     const ver = e.target.value;
-    if (!ver) return; // "Auto" selected — don't modify request text
+    const tab = getActiveReplayTab();
+    if (!tab || tab.type === "websocket") return;
+    tab.httpVersionMode = ver || "";
     const cv = getCMView("replayReq");
-    if (cv) {
-      const text = cv.getContent();
-      const lines = text.split("\n");
-      if (lines.length > 0) {
-        lines[0] = lines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, ` ${ver}`);
-        if (!lines[0].match(/HTTP\//i)) lines[0] += ` ${ver}`;
-        const newText = lines.join("\n");
+    const text = tab.requestBytes
+      ? new TextDecoder().decode(tab.requestBytes)
+      : (tab.requestText || "");
+    const lines = text.split("\n");
+    if (lines.length > 0) {
+      lines[0] = ver
+        ? lines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, ` ${ver}`)
+        : lines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, "");
+      if (ver && !lines[0].match(/HTTP\//i)) lines[0] += ` ${ver}`;
+      const newText = lines.join("\n");
+      tab.requestText = newText;
+      tab.requestBytes = null;
+      tab.requestOriginalBytes = null;
+      syncReplayToolbar(tab);
+      renderReplayTabs();
+      scheduleWorkspaceStateSave();
+      if (cv && state.replayMessageViews.request !== "hex") {
         cv.setContent(newText);
-        const tab = getActiveReplayTab();
-        if (tab) tab.requestText = newText;
+        updateReplaySearchPane("request", newText);
+        return;
       }
+      renderReplayViewContent("request");
+      return;
+    }
+    if (cv) {
       return;
     }
     // Legacy path
     const hl = els.replayRequestHighlight;
     if (!hl) return;
-    const text = hl.innerText || "";
-    const lines = text.split("\n");
-    if (lines.length > 0) {
-      lines[0] = lines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, ` ${ver}`);
-      if (!lines[0].match(/HTTP\//i)) lines[0] += ` ${ver}`;
-      const newText = lines.join("\n");
+    const legacyText = hl.innerText || "";
+    const legacyLines = legacyText.split("\n");
+    if (legacyLines.length > 0) {
+      legacyLines[0] = ver
+        ? legacyLines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, ` ${ver}`)
+        : legacyLines[0].replace(/\s+HTTP\/[0-9.]+\s*$/i, "");
+      if (ver && !legacyLines[0].match(/HTTP\//i)) legacyLines[0] += ` ${ver}`;
+      const newText = legacyLines.join("\n");
       hl.innerText = newText;
       hl.dispatchEvent(new Event("input"));
+      tab.requestText = newText;
+      updateReplaySearchPane("request", newText);
+      syncReplayToolbar(tab);
+      renderReplayTabs();
+      scheduleWorkspaceStateSave();
     }
   });
   els.replayHostInput.addEventListener("input", () => {
@@ -1482,14 +1735,14 @@ function bindEvents() {
   if (els.fuzzerRequestEditor) {
     els.fuzzerRequestEditor.addEventListener("input", () => {
       if (els.fuzzerRequestCM) return; // CM handles it
-      state.fuzzerRequestText = els.fuzzerRequestEditor.value;
+      updateFuzzerRequestText(els.fuzzerRequestEditor.value, { userEdit: true });
       renderFuzzerRequestHighlight(state.fuzzerRequestText);
       scheduleWorkspaceStateSave();
     });
     els.fuzzerRequestEditor.addEventListener("scroll", syncFuzzerRequestHighlightScroll);
   }
   els.fuzzerPayloadsEditor.addEventListener("input", () => {
-    state.fuzzerPayloadsText = els.fuzzerPayloadsEditor.value;
+    updateFuzzerPayloadsText(els.fuzzerPayloadsEditor.value, { userEdit: true });
     scheduleWorkspaceStateSave();
   });
   if (els.interceptRequestEditor) {
@@ -1529,6 +1782,7 @@ function bindEvents() {
 
       if (
         event.key === "Enter" &&
+        typeof activeModalAction.apply === "function" &&
         !event.metaKey &&
         !event.ctrlKey &&
         !event.altKey &&
@@ -1547,11 +1801,13 @@ function bindEvents() {
     }
 
     if (
+      !event.defaultPrevented &&
       (event.metaKey || event.ctrlKey) &&
       !event.shiftKey &&
       !event.altKey &&
       event.key.toLowerCase() === "a" &&
-      isSelectableTextTarget(event.target)
+      isSelectableTextTarget(event.target) &&
+      !event.target.closest?.(".cm-editor")
     ) {
       event.preventDefault();
       selectEditableTargetContents(event.target);
@@ -1710,17 +1966,20 @@ function bindEvents() {
       !isEditableTarget(event.target)
     ) {
       const tab = state.replayTabs.find(t => t.id === state.activeReplayTabId);
-      if (tab && tab.type === "websocket" && tab.wsFrames.length > 0) {
+      const frames = getWsReplayFrames(tab);
+      if (tab && tab.type === "websocket" && frames.length > 0) {
         event.preventDefault();
-        const cur = tab.wsSelectedFrameIndex ?? -1;
-        const next = event.key === "ArrowDown"
-          ? Math.min(cur + 1, tab.wsFrames.length - 1)
-          : Math.max(cur - 1, 0);
-        tab.wsSelectedFrameIndex = next;
-        els.wsFrameList.querySelectorAll(".ws-frame-bubble").forEach(b => b.classList.remove("selected"));
-        const target = els.wsFrameList.querySelector(`[data-frame-index="${next}"]`);
-        if (target) { target.classList.add("selected"); target.scrollIntoView({ block: "nearest" }); }
-        renderWsFrameDetail();
+        const currentPosition = frames.findIndex((frame) => frame.index === tab.wsSelectedFrameIndex);
+        const nextPosition = currentPosition === -1
+          ? (event.key === "ArrowDown" ? 0 : frames.length - 1)
+          : event.key === "ArrowDown"
+            ? Math.min(currentPosition + 1, frames.length - 1)
+            : Math.max(currentPosition - 1, 0);
+        const nextFrameIndex = frames[nextPosition].index;
+        tab.wsSelectedFrameIndex = nextFrameIndex;
+        renderWsFrameList();
+        const target = els.wsFrameList.querySelector(`[data-frame-index="${nextFrameIndex}"]`);
+        if (target) { target.scrollIntoView({ block: "nearest" }); }
         return;
       }
     }
@@ -1732,7 +1991,8 @@ function bindEvents() {
       !event.altKey &&
       event.key === "Tab" &&
       state.activeTool === "replay" &&
-      state.replayTabs.length > 1
+      state.replayTabs.length > 1 &&
+      !(event.target instanceof Element && event.target.closest(".replay-tab-name-input"))
     ) {
       event.preventDefault();
       const visualOrder = getReplayTabVisualOrder();
@@ -1767,7 +2027,7 @@ function bindEvents() {
       state.selectedId
     ) {
       event.preventDefault();
-      openReplayFromSelection().catch((error) => console.error(error));
+      openReplayFromSelection().catch(handleSendActionError);
     }
 
     // Cmd+R on WebSocket tab — send selected frame to WS Replay
@@ -1778,10 +2038,11 @@ function bindEvents() {
       event.key.toLowerCase() === "r" &&
       state.activeTool === "proxy" &&
       state.activeProxyTab === "websockets-history" &&
-      state.selectedWebsocketRecord
+      state.selectedWebsocketRecord &&
+      state.selectedFrameIdx != null
     ) {
       event.preventDefault();
-      sendWsFrameToReplay(state.selectedFrameIdx ?? 0);
+      sendWsFrameToReplay(state.selectedFrameIdx);
     }
 
     // Cmd+R on Findings tab — send selected finding to Replay
@@ -1796,7 +2057,7 @@ function bindEvents() {
       const recordId = els.findingsDetailJump?.dataset.recordId;
       if (recordId) {
         event.preventDefault();
-        sendFindingToReplay(recordId).catch((error) => console.error(error));
+        sendFindingToReplay(recordId).catch(handleFindingActionError);
       }
     }
 
@@ -1808,10 +2069,10 @@ function bindEvents() {
     ) {
       if (state.activeTool === "proxy" && state.activeProxyTab === "http-history" && state.selectedId) {
         event.preventDefault();
-        openFuzzerFromSelection().catch(console.error);
+        openFuzzerFromSelection().catch(handleSendActionError);
       } else if (state.activeTool === "replay" && state.activeReplayTabId) {
         event.preventDefault();
-        openFuzzerFromReplay().catch(console.error);
+        openFuzzerFromReplay().catch(handleSendActionError);
       }
     }
 
@@ -1824,9 +2085,9 @@ function bindEvents() {
     ) {
       event.preventDefault();
       if (state.activeTool === "proxy" && state.activeProxyTab === "http-history" && state.selectedId) {
-        openFuzzerFromSelection().catch(console.error);
+        openFuzzerFromSelection().catch(handleSendActionError);
       } else if (state.activeTool === "replay" && state.activeReplayTabId) {
-        openFuzzerFromReplay().catch(console.error);
+        openFuzzerFromReplay().catch(handleSendActionError);
       } else {
         state.activeTool = "fuzzer";
         renderToolPanels();
@@ -2020,47 +2281,87 @@ async function performSelfUpdate() {
   const fill = els.openUpdateButton.querySelector(".update-bar-fill");
   const label = els.openUpdateButton.querySelector(".update-label");
 
-  const es = new EventSource("/api/self-update");
-  es.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      if (data.step.startsWith("error:")) {
-        es.close();
-        label.textContent = "Update failed";
-        fill.style.width = "0%";
-        els.openUpdateButton.disabled = false;
-        setTimeout(() => {
-          els.openUpdateButton.textContent = "Update";
-        }, 3000);
-        console.error("Self-update failed:", data.step);
-        return;
-      }
-      if (data.percent != null) {
-        fill.style.width = data.percent + "%";
-        const mb = (data.downloaded / 1048576).toFixed(1);
-        const totalMb = (data.total / 1048576).toFixed(1);
-        label.textContent = `${mb} / ${totalMb} MB`;
-      } else {
-        label.textContent = data.step;
-        if (data.step === "Installing update...") fill.style.width = "90%";
-        if (data.step === "Restarting...") fill.style.width = "100%";
-      }
-    } catch (_) {}
+  const handleProgress = (data) => {
+    if (data.step?.startsWith("error:")) {
+      label.textContent = "Update failed";
+      fill.style.width = "0%";
+      els.openUpdateButton.disabled = false;
+      setTimeout(() => {
+        els.openUpdateButton.textContent = "Update";
+      }, 3000);
+      console.error("Self-update failed:", data.step);
+      return false;
+    }
+    if (data.percent != null) {
+      fill.style.width = data.percent + "%";
+      const mb = (data.downloaded / 1048576).toFixed(1);
+      const totalMb = (data.total / 1048576).toFixed(1);
+      label.textContent = `${mb} / ${totalMb} MB`;
+    } else {
+      label.textContent = data.step;
+      if (data.step === "Installing update...") fill.style.width = "90%";
+      if (data.step === "Restarting...") fill.style.width = "100%";
+    }
+    return true;
   };
-  es.onerror = () => {
-    es.close();
-    // Connection lost probably means the app is restarting — that's OK
+
+  const markRestarting = () => {
     label.textContent = "Restarting...";
     fill.style.width = "100%";
   };
+
+  try {
+    const response = await fetch("/api/self-update", { method: "POST" });
+    await requireOkResponse(response, "Failed to start update.");
+    if (!response.body) {
+      markRestarting();
+      return;
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+      for (const eventText of events) {
+        const dataText = eventText
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (!dataText) continue;
+        try {
+          if (!handleProgress(JSON.parse(dataText))) return;
+        } catch (_error) {
+          // Ignore malformed progress frames.
+        }
+      }
+    }
+    markRestarting();
+  } catch (error) {
+    // Connection loss usually means the app is restarting after replacement.
+    if (label.textContent === "Restarting..." || fill.style.width === "100%") {
+      markRestarting();
+      return;
+    }
+    label.textContent = "Update failed";
+    fill.style.width = "0%";
+    els.openUpdateButton.disabled = false;
+    setTimeout(() => {
+      els.openUpdateButton.textContent = "Update";
+    }, 3000);
+    console.error("Self-update failed:", error);
+  }
 }
 
 async function loadSessions() {
   const response = await fetch("/api/sessions");
-  state.sessions = await response.json();
-  if (!state.activeSession || !state.sessions.some((session) => session.id === state.activeSession.id)) {
-    state.activeSession = state.sessions.find((session) => session.active) || state.sessions[0] || null;
-  }
+  await requireOkResponse(response, "Failed to load sessions.");
+  state.sessions = jsonArray(await response.json());
+  state.activeSession = state.sessions.find((session) => session.active) || state.sessions[0] || null;
   renderDashboard();
 }
 
@@ -2069,10 +2370,35 @@ async function loadWorkspaceState() {
   if (!response.ok) {
     throw new Error(await response.text());
   }
-  applyWorkspaceState(await response.json());
+  const snapshot = await response.json();
+  if (!workspaceSnapshotMatchesActiveSession(snapshot)) {
+    await loadSessions();
+    if (!workspaceSnapshotMatchesActiveSession(snapshot)) {
+      throw new WorkspaceSessionMismatchError(snapshot?.session_id || null);
+    }
+  }
+  applyWorkspaceState(snapshot);
+}
+
+class WorkspaceSessionMismatchError extends Error {
+  constructor(sessionId) {
+    super("Workspace state belongs to a different active session.");
+    this.name = "WorkspaceSessionMismatchError";
+    this.sessionId = sessionId;
+  }
 }
 
 function applyWorkspaceState(snapshot) {
+  if (!workspaceSnapshotMatchesActiveSession(snapshot)) {
+    console.warn("Ignoring workspace state for a non-active session", snapshot?.session_id);
+    return;
+  }
+  for (const tab of state.replayTabs || []) {
+    if (tab?.type === "websocket") {
+      cleanupWsReplayTab(tab).catch((error) => console.error(error));
+    }
+  }
+  state.workspaceRevision = Number.isFinite(snapshot?.revision) ? snapshot.revision : 0;
   const replayWS = snapshot?.replay || {};
   const tabs = Array.isArray(replayWS.tabs)
     ? replayWS.tabs.map((tab) => hydrateReplayTab(tab)).filter(Boolean)
@@ -2092,10 +2418,23 @@ function applyWorkspaceState(snapshot) {
   const fuzzerWS = snapshot?.fuzzer || {};
   state.fuzzerBaseRequest = fuzzerWS.base_request ? cloneEditableRequest(fuzzerWS.base_request) : null;
   state.fuzzerSourceTransactionId = fuzzerWS.source_transaction_id || null;
+  state.fuzzerTarget = normalizeFuzzerTargetOverride(fuzzerWS.target);
+  state.fuzzerTargetRequestText = state.fuzzerTarget ? normalizeFuzzerTargetAuthority(fuzzerWS.target_request_authority) : null;
+  if (state.fuzzerTarget && !state.fuzzerTargetRequestText) {
+    state.fuzzerTarget = null;
+  }
   state.fuzzerNotice = fuzzerWS.notice || "";
-  state.fuzzerRequestText = (fuzzerWS.request_text || "").trimEnd();
+  state.fuzzerRequestText = fuzzerWS.request_text || "";
   state.fuzzerPayloadsText = fuzzerWS.payloads_text || "";
-  state.fuzzerAttackRecord = fuzzerWS.attack_record || null;
+  state.fuzzerAttackRecord = normalizeFuzzerAttackRecord(fuzzerWS.attack_record);
+}
+
+function workspaceSnapshotMatchesActiveSession(snapshot) {
+  const snapshotSessionId = snapshot?.session_id || null;
+  const activeSessionId = state.activeSession?.id || null;
+  if (!snapshotSessionId) return true;
+  if (!activeSessionId) return false;
+  return snapshotSessionId === activeSessionId;
 }
 
 function hydrateReplayTab(tab) {
@@ -2104,32 +2443,36 @@ function hydrateReplayTab(tab) {
   }
 
   if (tab.type === "websocket") {
+    const wsScheme = tab.ws_scheme || "wss";
     return {
       id: typeof tab.id === "string" && tab.id ? tab.id : crypto.randomUUID(),
       type: "websocket",
       sequence: Number.isFinite(tab.sequence) ? tab.sequence : state.replayTabSequence + 1,
-      customLabel: normalizeReplayTabCustomLabel(tab.custom_label || tab.label || ""),
+      customLabel: normalizeReplayTabCustomLabel(tab.custom_label || ""),
       pinned: !!tab.pinned,
       label: `WS ${tab.ws_host || "draft"}`,
-      wsScheme: tab.ws_scheme || "wss",
+      wsScheme,
       wsHost: tab.ws_host || "",
-      wsPort: tab.ws_port || 443,
+      wsPort: tab.ws_port || defaultWsPortForScheme(wsScheme),
       wsPath: tab.ws_path || "/",
-      wsHeaders: tab.ws_headers || [],
+      wsHeaders: normalizedHeaders(tab.ws_headers),
       wsHandshakeText: tab.ws_handshake_text || "",
+      wsHandshakeEdited: !!tab.ws_handshake_edited,
+      wsEditorText: tab.ws_editor_text || "",
+      wsMessageType: normalizeWsMessageType(tab.ws_message_type),
+      wsEditorBodyEncoded: !!tab.ws_editor_body_encoded,
       wsSetupQueue: Array.isArray(tab.ws_setup_queue)
-        ? tab.ws_setup_queue.map((item) => ({
-            label: item.label || "",
-            body: item.body || "",
-            autoSend: !!item.autoSend,
-          }))
+        ? tab.ws_setup_queue.map((item) => normalizeWsSetupItem(item))
         : [],
       wsStatus: "disconnected",
-      wsFrames: [],
+      wsFrames: normalizeWebsocketFrames(tab.ws_frames),
       wsSelectedFrameIndex: -1,
-      wsEditorText: "",
       wsError: null,
+      wsSessionId: null,
       wsPollTimer: null,
+      wsLifecycleToken: 0,
+      wsSetupPending: false,
+      wsSetupRunning: false,
     };
   }
 
@@ -2152,11 +2495,13 @@ function hydrateReplayTab(tab) {
     baseRequest: fallbackRequest,
     sourceTransactionId: tab.source_transaction_id || null,
     notice: tab.notice || "",
-    requestText: (tab.request_text || buildEditableRawRequest(fallbackRequest)).trimEnd(),
+    requestText: tab.request_text ?? buildEditableRawRequest(fallbackRequest),
+    httpVersionMode: normalizeReplayHttpVersion(tab.http_version_mode || ""),
     responseRecord: tab.response_record || null,
     targetScheme: normalizedTarget.scheme,
     targetHost: normalizedTarget.host,
     targetPort: normalizedTarget.port,
+    targetManuallyEdited: !!tab.target_manually_edited,
     historyEntries,
     historyIndex,
   };
@@ -2176,7 +2521,9 @@ function hydrateRepeaterHistoryEntry(entry, fallbackRequest) {
   );
   return {
     request,
-    requestText: (entry.request_text || buildEditableRawRequest(request)).trimEnd(),
+    requestText: entry.request_text ?? buildEditableRawRequest(request),
+    httpVersionMode: normalizeReplayHttpVersion(entry.http_version_mode || "")
+      || replayHttpVersionFromText(entry.request_text || ""),
     responseRecord: entry.response_record || null,
     notice: entry.notice || "",
     targetScheme: normalizedTarget.scheme,
@@ -2185,8 +2532,38 @@ function hydrateRepeaterHistoryEntry(entry, fallbackRequest) {
   };
 }
 
-function snapshotWorkspaceState() {
+function normalizeFuzzerTargetOverride(target) {
+  if (!target || typeof target !== "object") return null;
+  const normalized = normalizeRepeaterTargetInput(target.host, target.port, target.scheme || "https");
+  if (!normalized.host) return null;
   return {
+    scheme: normalized.scheme || "https",
+    host: normalized.host,
+    port: normalizePortValue(normalized.port) || (normalized.scheme === "http" ? "80" : "443"),
+  };
+}
+
+function createWorkspaceClientId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function snapshotWorkspaceState(options = {}) {
+  const wsFrameBudget = {
+    frames: Number.isFinite(options.wsFrameLimit)
+      ? Math.max(0, options.wsFrameLimit)
+      : WS_REPLAY_MAX_PERSISTED_TOTAL_FRAMES,
+    bytes: Number.isFinite(options.wsBodyByteLimit)
+      ? Math.max(0, options.wsBodyByteLimit)
+      : WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES,
+  };
+  return {
+    revision: state.workspaceRevision || 0,
+    session_id: state.activeSession?.id || null,
+    client_id: workspaceClientId,
+    client_version: workspaceSaveVersion,
     replay: {
       tabs: state.replayTabs.map((tab) => {
         if (tab.type === "websocket") {
@@ -2198,17 +2575,28 @@ function snapshotWorkspaceState() {
             pinned: !!tab.pinned,
             ws_scheme: tab.wsScheme || "wss",
             ws_host: tab.wsHost || "",
-            ws_port: tab.wsPort || 443,
+            ws_port: tab.wsPort || defaultWsPortForScheme(tab.wsScheme),
             ws_path: tab.wsPath || "/",
-            ws_headers: tab.wsHeaders || [],
+            ws_headers: normalizedHeaders(tab.wsHeaders),
             ws_handshake_text: tab.wsHandshakeText || "",
-            ws_setup_queue: (tab.wsSetupQueue || []).map((item) => ({
+            ws_handshake_edited: !!tab.wsHandshakeEdited,
+            ws_editor_text: tab.wsEditorText || "",
+            ws_message_type: normalizeWsMessageType(tab.wsMessageType),
+            ws_editor_body_encoded: !!tab.wsEditorBodyEncoded,
+            ws_setup_queue: (Array.isArray(tab.wsSetupQueue) ? tab.wsSetupQueue : []).map((item) => ({
               label: item.label || "",
               body: item.body || "",
+              kind: normalizeWsMessageType(item.kind),
+              body_encoded: !!item.bodyEncoded,
               autoSend: !!item.autoSend,
+              sent: !!item.sent,
             })),
+            ws_frames: snapshotWsReplayFrames(tab, wsFrameBudget),
           };
         }
+        const historyEntries = Array.isArray(tab.historyEntries)
+          ? tab.historyEntries.filter((entry) => entry && typeof entry === "object")
+          : [];
         return {
           id: tab.id,
           sequence: tab.sequence,
@@ -2218,20 +2606,24 @@ function snapshotWorkspaceState() {
           source_transaction_id: tab.sourceTransactionId || null,
           notice: tab.notice || "",
           request_text: tab.requestText || "",
+          http_version_mode: normalizeReplayHttpVersion(tab.httpVersionMode || ""),
           response_record: tab.responseRecord || null,
           target_scheme: tab.targetScheme || "https",
           target_host: tab.targetHost || "",
           target_port: normalizePortValue(tab.targetPort),
-          history_entries: (tab.historyEntries || []).map((entry) => ({
+          target_manually_edited: !!tab.targetManuallyEdited,
+          history_entries: historyEntries.map((entry) => ({
             request: cloneEditableRequest(entry.request),
             request_text: entry.requestText || "",
+            http_version_mode: normalizeReplayHttpVersion(entry.httpVersionMode || "")
+              || replayHttpVersionFromText(entry.requestText || ""),
             response_record: entry.responseRecord || null,
             notice: entry.notice || "",
             target_scheme: entry.targetScheme || "https",
             target_host: entry.targetHost || "",
             target_port: normalizePortValue(entry.targetPort),
           })),
-          history_index: normalizeRepeaterHistoryIndex(tab.historyIndex, (tab.historyEntries || []).length),
+          history_index: normalizeRepeaterHistoryIndex(tab.historyIndex, historyEntries.length),
         };
       }),
       active_tab_id: state.activeReplayTabId,
@@ -2240,10 +2632,12 @@ function snapshotWorkspaceState() {
     fuzzer: {
       base_request: state.fuzzerBaseRequest ? cloneEditableRequest(state.fuzzerBaseRequest) : null,
       source_transaction_id: state.fuzzerSourceTransactionId || null,
+      target: normalizeFuzzerTargetOverride(state.fuzzerTarget),
+      target_request_authority: state.fuzzerTarget ? normalizeFuzzerTargetAuthority(state.fuzzerTargetRequestText) : null,
       notice: state.fuzzerNotice || "",
       request_text: state.fuzzerRequestText || "",
       payloads_text: state.fuzzerPayloadsText || "",
-      attack_record: state.fuzzerAttackRecord || null,
+      attack_record: normalizeFuzzerAttackRecord(state.fuzzerAttackRecord),
     },
   };
 }
@@ -2253,6 +2647,9 @@ function scheduleWorkspaceStateSave() {
     return;
   }
 
+  window.clearTimeout(wsTranscriptSaveTimer);
+  wsTranscriptSaveTimer = null;
+  wsTranscriptFirstDirtyAt = 0;
   workspaceSaveDirty = true;
   workspaceSaveVersion += 1;
   window.clearTimeout(workspaceSaveTimer);
@@ -2260,6 +2657,35 @@ function scheduleWorkspaceStateSave() {
     workspaceSaveTimer = null;
     flushQueuedWorkspaceStateSave().catch((error) => console.error(error));
   }, 250);
+}
+
+function scheduleWsTranscriptWorkspaceSave() {
+  if (!state.activeSession) {
+    return;
+  }
+  workspaceSaveDirty = true;
+  workspaceSaveVersion += 1;
+  const now = Date.now();
+  if (!wsTranscriptFirstDirtyAt) {
+    wsTranscriptFirstDirtyAt = now;
+  }
+  const elapsed = now - wsTranscriptFirstDirtyAt;
+  const delay = elapsed >= WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS
+    ? 0
+    : Math.min(
+        WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS,
+        WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS - elapsed,
+      );
+  window.clearTimeout(wsTranscriptSaveTimer);
+  wsTranscriptSaveTimer = window.setTimeout(() => {
+    wsTranscriptSaveTimer = null;
+    wsTranscriptFirstDirtyAt = 0;
+    window.clearTimeout(workspaceSaveTimer);
+    workspaceSaveTimer = window.setTimeout(() => {
+      workspaceSaveTimer = null;
+      flushQueuedWorkspaceStateSave().catch((error) => console.error(error));
+    }, 0);
+  }, delay);
 }
 
 async function flushQueuedWorkspaceStateSave() {
@@ -2282,15 +2708,35 @@ async function runQueuedWorkspaceStateSaves() {
     workspaceSaveDirty = false;
     const version = workspaceSaveVersion;
     const snapshot = snapshotWorkspaceState();
+    workspaceSaveLastSnapshot = snapshot;
     workspaceSaveInFlight = true;
     try {
       await saveWorkspaceState(snapshot);
+    } catch (error) {
+      if (!(error instanceof WorkspaceStateConflictError)) {
+        workspaceSaveDirty = true;
+        window.clearTimeout(workspaceSaveTimer);
+        workspaceSaveTimer = window.setTimeout(() => {
+          workspaceSaveTimer = null;
+          flushQueuedWorkspaceStateSave().catch((error) => console.error(error));
+        }, 1000);
+        throw error;
+      }
+      workspaceSaveConflictPending = true;
+      workspaceSaveDirty = false;
+      showToast(
+        "Workspace changed elsewhere; local workspace edits were not saved. Reload the workspace to reconcile.",
+        "error",
+        6000,
+      );
+      return;
     } finally {
       workspaceSaveInFlight = false;
     }
     if (workspaceSaveVersion !== version) {
       workspaceSaveDirty = true;
     }
+    workspaceSaveConflictPending = false;
   }
 }
 
@@ -2308,24 +2754,146 @@ async function saveWorkspaceState(snapshot = snapshotWorkspaceState()) {
   });
 
   if (!response.ok) {
+    if (response.status === 409) {
+      const latest = await response.json().catch(() => null);
+      throw new WorkspaceStateConflictError(latest);
+    }
     throw new Error(await response.text());
+  }
+  const saved = await response.json();
+  const currentSessionId = state.activeSession?.id || null;
+  if (
+    (snapshot?.session_id && snapshot.session_id !== currentSessionId)
+    || (saved?.session_id && saved.session_id !== currentSessionId)
+  ) {
+    return;
+  }
+  state.workspaceRevision = Number.isFinite(saved?.revision) ? saved.revision : state.workspaceRevision;
+  workspaceSaveConflictPending = false;
+}
+
+class WorkspaceStateConflictError extends Error {
+  constructor(latest) {
+    super("Workspace state revision conflict");
+    this.name = "WorkspaceStateConflictError";
+    this.latest = latest;
   }
 }
 
+function handleWorkspaceActionError(error) {
+  console.error(error);
+  if (error instanceof WorkspaceStateConflictError) {
+    showToast(
+      "Workspace changed elsewhere. Reload the workspace before switching sessions.",
+      "error",
+      7000,
+    );
+    return;
+  }
+  showToast(error?.message || "Workspace action failed.", "error", 6000);
+}
+
 async function flushWorkspaceState() {
+  window.clearTimeout(wsTranscriptSaveTimer);
+  wsTranscriptSaveTimer = null;
+  wsTranscriptFirstDirtyAt = 0;
   window.clearTimeout(workspaceSaveTimer);
   workspaceSaveTimer = null;
   workspaceSaveDirty = true;
   workspaceSaveVersion += 1;
   await flushQueuedWorkspaceStateSave();
+  if (workspaceSaveConflictPending) {
+    throw new WorkspaceStateConflictError(null);
+  }
+}
+
+function flushWorkspaceStateOnUnload() {
+  const hadTranscriptSaveTimer = !!wsTranscriptSaveTimer;
+  window.clearTimeout(wsTranscriptSaveTimer);
+  wsTranscriptSaveTimer = null;
+  wsTranscriptFirstDirtyAt = 0;
+  disconnectWsReplayTabsOnUnload();
+  if (!state.activeSession || (!workspaceSaveDirty && !workspaceSaveTimer && !workspaceSaveInFlight && !hadTranscriptSaveTimer)) {
+    return;
+  }
+  window.clearTimeout(workspaceSaveTimer);
+  workspaceSaveTimer = null;
+  const snapshot = workspaceSaveDirty || hadTranscriptSaveTimer
+    ? snapshotWorkspaceState()
+    : (workspaceSaveInFlight && workspaceSaveLastSnapshot
+      ? workspaceSaveLastSnapshot
+      : snapshotWorkspaceState());
+  const payload = workspaceUnloadPayload(snapshot);
+  if (!payload) {
+    workspaceSaveDirty = true;
+    console.warn("Skipping unload workspace keepalive save because even the bounded snapshot is too large.");
+    return;
+  }
+  const blob = new Blob([payload], { type: "application/json" });
+  if (navigator.sendBeacon && navigator.sendBeacon("/api/workspace-state", blob)) {
+    return;
+  }
+  fetch("/api/workspace-state", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: payload,
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function workspaceUnloadPayload(primarySnapshot) {
+  const candidates = [
+    primarySnapshot,
+    snapshotWorkspaceState({
+      wsFrameLimit: WORKSPACE_UNLOAD_WS_FRAME_BUDGET,
+      wsBodyByteLimit: WORKSPACE_UNLOAD_WS_BODY_BUDGET,
+    }),
+    snapshotWorkspaceState({ wsFrameLimit: 0, wsBodyByteLimit: 0 }),
+  ];
+  for (const candidate of candidates) {
+    const payload = JSON.stringify(candidate);
+    if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+      return payload;
+    }
+  }
+  return null;
+}
+
+function disconnectWsReplayTabsOnUnload() {
+  const activeSessionId = state.activeSession?.id || null;
+  if (!activeSessionId) return;
+  for (const tab of state.replayTabs || []) {
+    if (!tab || tab.type !== "websocket") continue;
+    if (tab.wsStatus !== "connected" && tab.wsStatus !== "connecting") continue;
+    const sessionId = tab.wsSessionId || activeSessionId;
+    const payload = JSON.stringify({ session_id: sessionId, id: tab.id, remove: false });
+    if (utf8ByteLength(payload) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
+    fetch("/api/replay/ws-disconnect", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {});
+    tab.wsStatus = "disconnected";
+    tab.wsError = null;
+  }
+}
+
+function hasPendingWorkspaceStateSave() {
+  return !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer || workspaceSaveInFlight || workspaceSaveLoopPromise);
 }
 
 function resetSessionScopedUiState() {
+  clearReplaySendInFlight();
   window.clearTimeout(refreshTimer);
   refreshTimer = null;
   window.clearTimeout(workspaceSaveTimer);
   workspaceSaveTimer = null;
+  window.clearTimeout(wsTranscriptSaveTimer);
+  wsTranscriptSaveTimer = null;
+  wsTranscriptFirstDirtyAt = 0;
   workspaceSaveDirty = false;
+  workspaceSaveConflictPending = false;
   clearHistoryBackfill();
   window.clearTimeout(_incrementalTimer);
   _incrementalTimer = 0;
@@ -2349,8 +2917,11 @@ function resetSessionScopedUiState() {
   state.selectedResponseInterceptRecord = null;
   state.responseInterceptEditorSeedId = null;
   state.websocketSessions = [];
+  state.websocketPaging = createWebsocketPagingState();
   state.selectedWebsocketId = null;
   state.selectedWebsocketRecord = null;
+  _websocketLoadGeneration += 1;
+  _websocketDetailGeneration += 1;
   state.eventLog = [];
   state.matchReplaceRules = [];
   state.selectedMatchReplaceRuleId = null;
@@ -2359,25 +2930,48 @@ function resetSessionScopedUiState() {
   state.targetScopeDirty = false;
   state.targetExpandedHosts = new Set();
   state.replayTabs.forEach((tab) => {
-    if (tab.type === "websocket") stopWsPoll(tab);
+    if (tab.type === "websocket") cleanupWsReplayTab(tab);
   });
   state.replayTabs = [];
   state.activeReplayTabId = null;
   state.replayTabSequence = 0;
   state.replayRenamingTabId = null;
+  state.fuzzerRunToken = (state.fuzzerRunToken || 0) + 1;
+  state.fuzzerRunning = false;
   state.fuzzerBaseRequest = null;
   state.fuzzerSourceTransactionId = null;
+  state.fuzzerTarget = null;
+  state.fuzzerTargetRequestText = null;
   state.fuzzerNotice = "";
   state.fuzzerRequestText = "";
   state.fuzzerPayloadsText = "";
   state.fuzzerAttackRecord = null;
+  state._selectedFuzzerResultKey = null;
+  state._fuzzerDetailRecord = null;
+  state.sequenceDefinitions = [];
+  state.selectedSequenceId = null;
+  state.editingSequence = null;
+  state.sequenceDirty = false;
+  state.sequenceRunResult = null;
+  state.sequencePastRuns = [];
+  clearCompareState();
 }
 
 async function reloadSessionWorkspace() {
   resetSessionScopedUiState();
-  await loadSessions();
-  await loadSettings();
-  await loadWorkspaceState();
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await loadSessions();
+    await loadSettings();
+    try {
+      await loadWorkspaceState();
+      break;
+    } catch (error) {
+      if (error instanceof WorkspaceSessionMismatchError && attempt === 0) {
+        continue;
+      }
+      throw error;
+    }
+  }
   await loadTransactions(false);
   await loadIntercepts(false);
   await loadResponseIntercepts(false);
@@ -2390,7 +2984,29 @@ async function reloadSessionWorkspace() {
   renderToolPanels();
 }
 
+async function handleExternalSessionChanged() {
+  try {
+    if (!(await flushSequenceDraft())) {
+      return;
+    }
+  } catch (error) {
+    handleSequenceActionError(error);
+    return;
+  }
+  if (hasPendingWorkspaceStateSave()) {
+    try {
+      await flushWorkspaceState();
+    } catch (error) {
+      handleWorkspaceActionError(error);
+    }
+  }
+  await reloadSessionWorkspace();
+}
+
 async function createSession() {
+  if (!(await flushSequenceDraft())) {
+    return;
+  }
   await flushWorkspaceState();
   const name = els.dashboardCreateSessionName.value.trim();
   const response = await fetch("/api/sessions", {
@@ -2408,6 +3024,9 @@ async function createSession() {
 }
 
 async function activateSessionById(id) {
+  if (!(await flushSequenceDraft())) {
+    return;
+  }
   await flushWorkspaceState();
   const response = await fetch(`/api/sessions/${id}/activate`, {
     method: "POST",
@@ -2419,15 +3038,38 @@ async function activateSessionById(id) {
 }
 
 async function loadRuntimeSettings() {
-  const response = await fetch("/api/runtime");
-  state.runtime = await response.json();
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/runtime", sessionId));
+  await requireOkResponse(response, "Failed to load runtime settings.");
+  const runtime = await response.json();
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.runtime = runtime;
   renderInterceptStatus();
   renderProxySettings();
 }
 
+function currentSessionId() {
+  return state.activeSession?.id || null;
+}
+
+function sessionQueryPath(path, sessionId = currentSessionId()) {
+  if (!sessionId) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}session_id=${encodeURIComponent(sessionId)}`;
+}
+
+function transactionPath(id, sessionId = currentSessionId()) {
+  return sessionQueryPath(`/api/transactions/${encodeURIComponent(id)}`, sessionId);
+}
+
 function buildTransactionsPageUrl({ limit, offset = 0, beforeSequence = null } = {}) {
   const params = new URLSearchParams();
+  const sessionId = currentSessionId();
   const filters = state.filterSettings;
+  const statusClasses = selectedStatusClasses(filters);
+  const mimeTypes = selectedMimeTypes(filters);
   params.set("limit", String(limit ?? HTTP_HISTORY_PAGE_SIZE));
   if (beforeSequence != null) {
     params.set("before_sequence", String(beforeSequence));
@@ -2436,6 +3078,7 @@ function buildTransactionsPageUrl({ limit, offset = 0, beforeSequence = null } =
   }
   params.set("sort_key", state.sortKey || "index");
   params.set("sort_direction", state.sortDirection || "desc");
+  if (sessionId) params.set("session_id", sessionId);
   params.set("hide_connect", "true");
   if (state.query) params.set("q", state.query);
   if (state.method) params.set("method", state.method);
@@ -2443,8 +3086,8 @@ function buildTransactionsPageUrl({ limit, offset = 0, beforeSequence = null } =
   if (filters.hideWithoutResponses) params.set("hide_without_responses", "true");
   if (filters.onlyParameterized) params.set("only_parameterized", "true");
   if (filters.onlyNotes) params.set("only_notes", "true");
-  params.set("status_classes", selectedStatusClasses(filters).join(","));
-  params.set("mime_types", selectedMimeTypes(filters).join(","));
+  params.set("status_classes", statusClasses.join(","));
+  params.set("mime_types", mimeTypes.join(","));
   if (filters.hiddenExtensions) params.set("hidden_extensions", filters.hiddenExtensions);
   if (filters.port) params.set("port", filters.port);
   if (filters.colorTags?.size) params.set("color_tags", [...filters.colorTags].join(","));
@@ -2481,6 +3124,7 @@ function selectedMimeTypes(filters) {
 }
 
 async function fetchTransactionPage(offsetOrOptions = 0) {
+  const sessionId = currentSessionId();
   const options = typeof offsetOrOptions === "object"
     ? offsetOrOptions
     : { offset: offsetOrOptions };
@@ -2490,17 +3134,29 @@ async function fetchTransactionPage(offsetOrOptions = 0) {
     beforeSequence: options.beforeSequence ?? null,
   }));
   if (!response.ok) {
-    throw new Error(await response.text());
+    const message = await response.text();
+    if (els.historyMeta) els.historyMeta.textContent = `HTTP History filter error: ${message}`;
+    if (els.liveStatus) {
+      els.liveStatus.textContent = "Filter error";
+      els.liveStatus.classList.remove("online");
+    }
+    throw new Error(message);
   }
-  return response.json();
+  const page = await response.json();
+  if (sessionId !== currentSessionId()) {
+    return null;
+  }
+  return page;
 }
 
 function applyPendingAnnotationsToItems(items) {
   if (!state._pendingAnnotations) return;
+  const sessionId = currentSessionId();
   const freshById = new Map(items.map((item) => [item.id, item]));
-  for (const [id, patch] of state._pendingAnnotations) {
+  for (const [id, entry] of state._pendingAnnotations) {
+    if (entry?.sessionId !== sessionId) continue;
     const item = freshById.get(id);
-    if (item) Object.assign(item, patch);
+    if (item) Object.assign(item, entry.payload || {});
   }
 }
 
@@ -2536,49 +3192,69 @@ function isKnownCount(value) {
   return Number.isFinite(value);
 }
 
-async function loadTransactions(preserveSelection = true) {
-  clearHistoryBackfill();
-  state.historyPaging = createHistoryPagingState();
-  state.historyPaging.generation = ++_historyPagingGeneration;
-  const generation = state.historyPaging.generation;
-  const page = await fetchTransactionPage(0);
-  if (state.historyPaging.generation !== generation) {
-    return;
-  }
-  const freshItems = page.items || [];
-
-  // Preserve in-flight annotation changes (optimistic updates)
-  applyPendingAnnotationsToItems(freshItems);
-  state.items = freshItems;
-  state._itemsVersion += 1;
-  // Pre-compute search haystacks and CONNECT count to avoid first-search latency
-  precomputeItemIndexes();
-  updateHistoryPagingCursor(freshItems);
-  state.historyPaging.offset = freshItems.length;
-  state.historyPaging.total = page.total ?? freshItems.length;
-  state.historyPaging.filteredTotal = page.filtered_total ?? null;
-  state.historyPaging.hasMore = Boolean(page.has_more);
-  state.historyPaging.fullyLoaded = !state.historyPaging.hasMore;
-  invalidateVisibleEntriesCache();
-
-  const visibleEntries = getVisibleEntries();
-  if (!preserveSelection || !visibleEntries.some((entry) => entry.item.id === state.selectedId)) {
-    state.selectedId = visibleEntries[0]?.item.id ?? null;
-  }
-
-  renderHistory();
-  if (state.selectedId) {
-    if (preserveSelection && state.selectedRecord && state.selectedRecord.id === state.selectedId) {
+async function loadTransactions(preserveSelection = true, options = {}) {
+  _historyFullLoadInFlight += 1;
+  try {
+    clearHistoryBackfill();
+    state.historyPaging = createHistoryPagingState();
+    state.historyPaging.generation = ++_historyPagingGeneration;
+    const generation = state.historyPaging.generation;
+    const page = await fetchTransactionPage(0);
+    if (!page) {
       return;
     }
-    await loadTransactionDetail(state.selectedId);
-  } else {
-    renderEmptyDetail();
+    if (state.historyPaging.generation !== generation) {
+      return;
+    }
+    const freshItems = jsonArray(page.items);
+
+    // Preserve in-flight annotation changes (optimistic updates)
+    applyPendingAnnotationsToItems(freshItems);
+    state.items = freshItems;
+    state._itemsVersion += 1;
+    // Pre-compute search haystacks and CONNECT count to avoid first-search latency
+    precomputeItemIndexes();
+    updateHistoryPagingCursor(freshItems);
+    state.historyPaging.offset = freshItems.length;
+    state.historyPaging.total = page.total ?? freshItems.length;
+    state.historyPaging.filteredTotal = page.filtered_total ?? null;
+    state.historyPaging.hiddenConnectTotal = page.hidden_connect_total ?? null;
+    state.historyPaging.hasMore = Boolean(page.has_more);
+    state.historyPaging.fullyLoaded = !state.historyPaging.hasMore;
+    state.historyDirty = false;
+    invalidateVisibleEntriesCache();
+    if (options.resetScroll) {
+      resetHistoryScrollPosition();
+    }
+
+    const visibleEntries = getVisibleEntries();
+    if (!preserveSelection || !visibleEntries.some((entry) => entry.item.id === state.selectedId)) {
+      state.selectedId = visibleEntries[0]?.item.id ?? null;
+    }
+
+    renderHistory();
+    if (state.selectedId) {
+      if (preserveSelection && state.selectedRecord && state.selectedRecord.id === state.selectedId) {
+        return;
+      }
+      await loadTransactionDetail(state.selectedId);
+    } else {
+      renderEmptyDetail();
+    }
+  } finally {
+    _historyFullLoadInFlight = Math.max(0, _historyFullLoadInFlight - 1);
+    if (!_historyFullLoadInFlight && _pendingTransactionSummaries.length) {
+      scheduleTransactionDeltaFlush();
+    }
   }
 }
 
 async function loadTransactionDetail(id) {
-  const response = await fetch(`/api/transactions/${id}`);
+  const sessionId = currentSessionId();
+  const response = await fetch(transactionPath(id, sessionId));
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   if (!response.ok) {
     if (state.selectedId === id) {
       renderEmptyDetail();
@@ -2587,25 +3263,64 @@ async function loadTransactionDetail(id) {
   }
 
   const record = await response.json();
-  if (state.selectedId !== id) {
+  if (state.selectedId !== id || sessionId !== currentSessionId()) {
     return;
   }
   state.selectedRecord = record;
   renderDetail(state.selectedRecord);
 }
 
-async function loadIntercepts(preserveSelection = true) {
-  const response = await fetch("/api/intercepts");
-  state.intercepts = await response.json();
+async function loadSelectedTransactionRecord() {
+  const id = state.selectedId;
+  if (!id) {
+    return null;
+  }
+  if (state.selectedRecord?.id === id) {
+    return state.selectedRecord;
+  }
 
-  if (!preserveSelection || !state.intercepts.some((item) => item.id === state.selectedInterceptId)) {
-    state.selectedInterceptId = state.intercepts[0]?.id ?? null;
+  const sessionId = currentSessionId();
+  const response = await fetch(transactionPath(id, sessionId));
+  if (sessionId !== currentSessionId()) {
+    return null;
+  }
+  if (!response.ok) {
+    if (state.selectedId === id) {
+      renderEmptyDetail();
+    }
+    return null;
+  }
+
+  const record = await response.json();
+  if (state.selectedId === id && sessionId === currentSessionId()) {
+    state.selectedRecord = record;
+    renderDetail(record);
+    return record;
+  }
+  return null;
+}
+
+async function loadIntercepts(preserveSelection = true) {
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/intercepts", sessionId));
+  await requireOkResponse(response, "Failed to load intercepted requests.");
+  const intercepts = jsonArray(await response.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.intercepts = intercepts;
+
+  const visibleIntercepts = getVisibleRequestInterceptSummaries();
+  if (!preserveSelection || !visibleIntercepts.some((item) => item.id === state.selectedInterceptId)) {
+    state.selectedInterceptId = visibleIntercepts[0]?.id ?? null;
+    state.selectedInterceptRecord = null;
+    state.interceptEditorSeedId = null;
   }
 
   renderIntercepts();
   updateInterceptQueueBadges();
   // Auto-switch to Request Queue when requests arrive and Response Queue is empty
-  if (state.intercepts.length > 0 && state.responseIntercepts.length === 0 && state.interceptQueueTab === "response") {
+  if (visibleIntercepts.length > 0 && getVisibleResponseInterceptSummaries().length === 0 && state.interceptQueueTab === "response") {
     switchInterceptQueueTab("request");
   }
   if (state.selectedInterceptId) {
@@ -2617,23 +3332,43 @@ async function loadIntercepts(preserveSelection = true) {
 }
 
 async function loadInterceptDetail(id) {
-  const response = await fetch(`/api/intercepts/${id}`);
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath(`/api/intercepts/${id}`, sessionId));
+  if (sessionId !== currentSessionId() || state.selectedInterceptId !== id) {
+    return;
+  }
   if (!response.ok) {
     state.selectedInterceptRecord = null;
     renderIntercepts();
     return;
   }
 
-  state.selectedInterceptRecord = await response.json();
+  const record = await response.json();
+  if (sessionId !== currentSessionId() || state.selectedInterceptId !== id) {
+    return;
+  }
+  state.selectedInterceptRecord = record;
   renderIntercepts();
 }
 
 /* ─── Intercept Rules ─── */
 
 async function loadInterceptRules() {
-  const response = await fetch("/api/intercept-rules");
-  state.interceptRules = await response.json();
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/intercept-rules", sessionId));
+  await requireOkResponse(response, "Failed to load intercept rules.");
+  const rules = jsonArray(await response.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.interceptRules = rules;
   renderInterceptRules();
+}
+
+function handleInterceptRuleError(error) {
+  console.error(error);
+  showToast(error?.message || "Intercept rule action failed.", "error", 6000);
+  loadInterceptRules().catch(console.error);
 }
 
 function renderInterceptRules() {
@@ -2664,6 +3399,7 @@ function renderInterceptRules() {
 }
 
 async function addInterceptRule() {
+  const sessionId = currentSessionId();
   const rule = {
     id: crypto.randomUUID(),
     enabled: true,
@@ -2672,11 +3408,15 @@ async function addInterceptRule() {
     path_pattern: "",
     method_filter: [],
   };
-  await fetch("/api/intercept-rules", {
+  const response = await fetch(sessionQueryPath("/api/intercept-rules", sessionId), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(rule),
   });
+  await requireOkResponse(response, "Failed to add intercept rule.");
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   await loadInterceptRules();
   editInterceptRule(rule.id);
 }
@@ -2704,6 +3444,7 @@ function editInterceptRule(ruleId) {
 }
 
 async function saveInterceptRuleFromRow(ruleId) {
+  const sessionId = currentSessionId();
   const container = document.getElementById("interceptRulesList");
   const row = container.querySelector(`[data-rule-id="${ruleId}"]`);
   if (!row) return;
@@ -2722,74 +3463,138 @@ async function saveInterceptRuleFromRow(ruleId) {
     path_pattern: pathInput?.value?.trim() || "",
     method_filter: (methodInput?.value || "").split(",").map((m) => m.trim().toUpperCase()).filter(Boolean),
   };
-  await fetch("/api/intercept-rules", {
+  const response = await fetch(sessionQueryPath("/api/intercept-rules", sessionId), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(updated),
   });
+  await requireOkResponse(response, "Failed to save intercept rule.");
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   await loadInterceptRules();
 }
 
 async function deleteInterceptRule(ruleId) {
-  await fetch(`/api/intercept-rules/${ruleId}`, { method: "DELETE" });
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath(`/api/intercept-rules/${ruleId}`, sessionId), { method: "DELETE" });
+  await requireOkResponse(response, "Failed to delete intercept rule.");
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   await loadInterceptRules();
 }
 
 async function toggleInterceptRuleEnabled(ruleId, enabled) {
+  const sessionId = currentSessionId();
   const rule = (state.interceptRules || []).find((r) => r.id === ruleId);
   if (!rule) return;
   rule.enabled = enabled;
-  await fetch("/api/intercept-rules", {
+  const response = await fetch(sessionQueryPath("/api/intercept-rules", sessionId), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(rule),
   });
+  await requireOkResponse(response, "Failed to update intercept rule.");
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   await loadInterceptRules();
 }
 
 async function loadWebsockets(preserveSelection = true) {
-  const response = await fetch("/api/websockets?limit=5000");
-  state.websocketSessions = await response.json();
+  const generation = ++_websocketLoadGeneration;
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/websockets?limit=5000", sessionId));
+  await requireOkResponse(response, "Failed to load WebSocket history.");
+  const page = websocketPagePayload(await response.json());
+  if (generation !== _websocketLoadGeneration || sessionId !== currentSessionId()) {
+    return;
+  }
+  state.websocketSessions = page.items;
+  state.websocketPaging = {
+    total: page.total,
+    limit: page.limit,
+    hasMore: page.has_more,
+  };
   await syncVisibleWebsocketSelection(preserveSelection);
 }
 
 async function loadWebsocketDetail(id) {
+  if (_websocketDetailPendingId === id && _websocketDetailPendingPromise) {
+    return _websocketDetailPendingPromise;
+  }
+  const generation = ++_websocketDetailGeneration;
   if (state.selectedWebsocketId !== id) {
     hideFrameDetail();
   }
-  const response = await fetch(`/api/websockets/${id}`);
-  if (!response.ok) {
-    if (state.selectedWebsocketId !== id) {
+
+  const pending = (async () => {
+    const sessionId = currentSessionId();
+    const response = await fetch(sessionQueryPath(`/api/websockets/${encodeURIComponent(id)}`, sessionId));
+    if (generation !== _websocketDetailGeneration || sessionId !== currentSessionId()) {
       return;
     }
-    state.selectedWebsocketRecord = null;
-    renderWebsocketSessions();
-    return;
-  }
+    if (!response.ok) {
+      if (state.selectedWebsocketId !== id) {
+        return;
+      }
+      state.selectedWebsocketRecord = null;
+      renderWebsocketSessions();
+      return;
+    }
 
-  const detail = await response.json();
-  if (state.selectedWebsocketId !== id) {
-    return;
+    const detail = await response.json();
+    if (generation !== _websocketDetailGeneration || sessionId !== currentSessionId() || state.selectedWebsocketId !== id) {
+      return;
+    }
+    state.selectedWebsocketRecord = detail;
+    renderWebsocketSessions();
+  })();
+  _websocketDetailPendingId = id;
+  _websocketDetailPendingPromise = pending;
+  try {
+    return await pending;
+  } finally {
+    if (_websocketDetailPendingId === id && _websocketDetailPendingPromise === pending) {
+      _websocketDetailPendingId = null;
+      _websocketDetailPendingPromise = null;
+    }
   }
-  state.selectedWebsocketRecord = detail;
-  renderWebsocketSessions();
 }
 
 async function loadEventLog() {
-  const response = await fetch("/api/event-log?limit=200");
-  state.eventLog = await response.json();
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/event-log?limit=200", sessionId));
+  await requireOkResponse(response, "Failed to load event log.");
+  const entries = jsonArray(await response.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.eventLog = entries;
   renderEventLog();
 }
 
 async function clearEventLog() {
-  await fetch("/api/event-log", { method: "DELETE" });
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/event-log", sessionId), { method: "DELETE" });
+  await requireOkResponse(response, "Failed to clear event log.");
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   state.eventLog = [];
   renderEventLog();
 }
 
 async function loadMatchReplaceRules() {
-  const response = await fetch("/api/match-replace");
-  state.matchReplaceRules = await response.json();
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/match-replace", sessionId));
+  await requireOkResponse(response, "Failed to load match-replace rules.");
+  const rules = jsonArray(await response.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.matchReplaceRules = rules;
   if (!state.matchReplaceRules.some((rule) => rule.id === state.selectedMatchReplaceRuleId)) {
     state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
   }
@@ -2797,14 +3602,20 @@ async function loadMatchReplaceRules() {
 }
 
 async function saveMatchReplaceRules() {
-  const response = await fetch("/api/match-replace", {
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/match-replace", sessionId), {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
     body: JSON.stringify({ rules: state.matchReplaceRules }),
   });
-  state.matchReplaceRules = await response.json();
+  await requireOkResponse(response, "Failed to save match-replace rules.");
+  const rules = jsonArray(await response.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.matchReplaceRules = rules;
   if (!state.matchReplaceRules.some((rule) => rule.id === state.selectedMatchReplaceRuleId)) {
     state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
   }
@@ -2824,12 +3635,20 @@ function syncTargetScopeDraft(force = false) {
 }
 
 async function loadTargetSiteMap(forceScopeSync = false) {
+  const sessionId = currentSessionId();
   const [runtimeResponse, siteMapResponse] = await Promise.all([
-    fetch("/api/runtime"),
-    fetch("/api/target/site-map"),
+    fetch(sessionQueryPath("/api/runtime", sessionId)),
+    fetch(sessionQueryPath("/api/target/site-map", sessionId)),
   ]);
-  state.runtime = await runtimeResponse.json();
-  state.targetSiteMap = await siteMapResponse.json();
+  await requireOkResponse(runtimeResponse, "Failed to load runtime settings.");
+  await requireOkResponse(siteMapResponse, "Failed to load target site map.");
+  const runtime = await runtimeResponse.json();
+  const siteMap = jsonArray(await siteMapResponse.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.runtime = runtime;
+  state.targetSiteMap = siteMap;
   syncTargetScopeDraft(forceScopeSync);
   renderInterceptStatus();
   renderProxySettings();
@@ -2908,20 +3727,47 @@ function connectEvents() {
     }
   });
 
+  eventSource.addEventListener("session_changed", () => {
+    handleExternalSessionChanged().catch((error) => console.error(error));
+  });
+
   eventSource.onerror = () => {
     els.liveStatus.textContent = "Retrying";
     els.liveStatus.classList.remove("online");
   };
 }
 
-function scheduleRefresh() {
+function resetHistoryScrollPosition() {
+  const shell = els.historyTable?.closest(".history-table-shell");
+  if (shell) {
+    shell.scrollTop = 0;
+  }
+}
+
+function consumeHistoryLoadOptions() {
+  const resetScroll = !!state.historyResetScrollOnNextLoad;
+  state.historyResetScrollOnNextLoad = false;
+  return { resetScroll };
+}
+
+function scheduleRefresh(options = {}) {
   invalidateVisibleEntriesCache();
+  if (!isHttpHistoryVisible()) {
+    state.historyDirty = true;
+    if (options.resetScroll) {
+      state.historyResetScrollOnNextLoad = true;
+    }
+    return;
+  }
+  if (options.resetScroll) {
+    state.historyResetScrollOnNextLoad = true;
+  }
   if (refreshTimer) {
     return;
   }
   refreshTimer = window.setTimeout(() => {
     refreshTimer = null;
-    loadTransactions(true).catch((error) => console.error(error));
+    loadTransactions(true, consumeHistoryLoadOptions()).catch((error) => console.error(error));
   }, 160);
 }
 
@@ -2951,6 +3797,33 @@ function mergeHistoryItems(items, { prepend = false } = {}) {
   state._itemsVersion += 1;
   invalidateVisibleEntriesCache();
   return newItems.length;
+}
+
+function replaceHistoryItemsForGap(items) {
+  applyPendingAnnotationsToItems(items);
+  const seen = new Set();
+  const freshItems = [];
+  let connectCount = 0;
+  for (const item of items) {
+    if (!item?.id || seen.has(item.id)) continue;
+    seen.add(item.id);
+    prepareHistoryItem(item);
+    if (item.method === "CONNECT") connectCount++;
+    freshItems.push(item);
+  }
+
+  state.items = freshItems;
+  state._connectCount = connectCount;
+  rebuildHistoryItemIndex();
+  state._itemsVersion += 1;
+  invalidateVisibleEntriesCache();
+  if (state.selectedId && !getHistoryItem(state.selectedId)) {
+    state.selectedId = null;
+    state.selectedRecord = null;
+    renderEmptyDetail();
+  }
+  refreshHistoryPagingCursorFromItems();
+  return freshItems.length;
 }
 
 function trimHistoryCache(prefer = "recent") {
@@ -2987,7 +3860,7 @@ function trimHistoryCache(prefer = "recent") {
 function adjustHistoryScrollAfterHeadTrim(removedCount) {
   const shell = els.historyTable?.closest(".history-table-shell");
   if (!shell || removedCount <= 0) return;
-  shell.scrollTop = Math.max(0, shell.scrollTop - removedCount * HISTORY_ROW_HEIGHT);
+  shell.scrollTop = Math.max(0, shell.scrollTop - removedCount * (measuredHistoryRowHeight || HISTORY_ROW_HEIGHT));
 }
 
 async function loadMoreTransactions({ background = false } = {}) {
@@ -3005,10 +3878,13 @@ async function loadMoreTransactions({ background = false } = {}) {
     const page = paging.beforeSequence == null
       ? await fetchTransactionPage(offset)
       : await fetchTransactionPage({ beforeSequence: paging.beforeSequence });
+    if (!page) {
+      return 0;
+    }
     if (state.historyPaging !== paging || state.historyPaging.generation !== generation) {
       return 0;
     }
-    const pageItems = page.items || [];
+    const pageItems = jsonArray(page.items);
     updateHistoryPagingCursor(pageItems);
     const added = mergeHistoryItems(pageItems);
     const hadMore = paging.hasMore;
@@ -3017,6 +3893,7 @@ async function loadMoreTransactions({ background = false } = {}) {
       : offset + pageItems.length;
     paging.total = page.total ?? paging.total;
     paging.filteredTotal = page.filtered_total ?? paging.filteredTotal;
+    if (page.hidden_connect_total != null) paging.hiddenConnectTotal = page.hidden_connect_total;
     paging.hasMore = Boolean(page.has_more);
     paging.fullyLoaded = !paging.hasMore;
     if (added || hadMore !== paging.hasMore || !background) {
@@ -3082,10 +3959,12 @@ function isHttpHistoryVisible() {
 /** Incremental refresh: fetch only recent transactions and merge into cache. */
 let _incrementalTimer = 0;
 let _transactionDeltaTimer = 0;
+let _historyFullLoadInFlight = 0;
 const _pendingTransactionSummaries = [];
 
 function applyTransactionDeltaEvent(event) {
   if (!isHttpHistoryVisible()) {
+    state.historyDirty = true;
     return true;
   }
   if (!canMergeRecentTransactions() || _searchActiveUntil > Date.now()) {
@@ -3114,8 +3993,15 @@ function scheduleTransactionDeltaFlush() {
 
 function flushTransactionDeltas() {
   if (!_pendingTransactionSummaries.length) return;
+  if (_historyFullLoadInFlight) {
+    scheduleTransactionDeltaFlush();
+    return;
+  }
   const pending = _pendingTransactionSummaries.splice(0);
-  if (!isHttpHistoryVisible()) return;
+  if (!isHttpHistoryVisible()) {
+    state.historyDirty = true;
+    return;
+  }
   if (!canMergeRecentTransactions() || _searchActiveUntil > Date.now()) {
     scheduleIncrementalRefresh();
     return;
@@ -3123,11 +4009,21 @@ function flushTransactionDeltas() {
 
   const fresh = [];
   let totalAdded = 0;
+  let hiddenConnectAdded = 0;
   for (const summary of pending) {
     if (!summary?.id || getHistoryItem(summary.id)) continue;
     totalAdded += 1;
+    if (String(summary.method || "").toUpperCase() === "CONNECT") {
+      if (summaryMatchesActiveHistoryFilters(summary, { includeConnect: true })) hiddenConnectAdded += 1;
+      continue;
+    }
     if (!summaryMatchesActiveHistoryFilters(summary)) continue;
     fresh.push(summary);
+  }
+
+  if (fresh.length && state.historyPaging?.trimmedHeadCount > 0 && canUseSequenceCursorForHistoryPaging()) {
+    scheduleIncrementalRefresh();
+    return;
   }
 
   fresh.sort((a, b) => Number(b.sequence ?? 0) - Number(a.sequence ?? 0));
@@ -3137,22 +4033,27 @@ function flushTransactionDeltas() {
     if (isKnownCount(state.historyPaging.filteredTotal)) {
       state.historyPaging.filteredTotal += added;
     }
+    if (isKnownCount(state.historyPaging.hiddenConnectTotal)) {
+      state.historyPaging.hiddenConnectTotal += hiddenConnectAdded;
+    }
     state.historyPaging.offset = state.items.length;
   }
   if (totalAdded || added) {
+    state.historyDirty = false;
     renderHistory();
   }
 }
 
-function summaryMatchesActiveHistoryFilters(item) {
-  if (item.method === "CONNECT") return false;
+function summaryMatchesActiveHistoryFilters(item, options = {}) {
+  const method = String(item.method || "").toUpperCase();
+  if (!options.includeConnect && method === "CONNECT") return false;
   if (state.method && String(item.method || "").toLowerCase() !== state.method.toLowerCase()) return false;
 
   const filters = state.filterSettings;
   if (filters.inScopeOnly && !isInScopeHost(item.host || "")) return false;
   if (filters.hideWithoutResponses && !item.has_response) return false;
   if (filters.onlyParameterized && !String(item.path || "").includes("?")) return false;
-  if (filters.onlyNotes && !item.note_count) return false;
+  if (filters.onlyNotes && !item.note_count && !item.has_user_note) return false;
   if (!summaryMatchesStatusFilter(item, filters)) return false;
   if (!summaryMatchesMimeFilter(item, filters)) return false;
   if (!summaryMatchesHiddenExtensions(item, filters)) return false;
@@ -3273,26 +4174,57 @@ function scheduleIncrementalRefresh() {
         scheduleRefresh();
         return;
       }
+      const refreshSessionId = state.activeSession?.id || null;
+      const refreshItemsVersion = state._itemsVersion;
       const resp = await fetch(buildTransactionsPageUrl({ limit: 50, offset: 0 }));
+      if (refreshSessionId !== (state.activeSession?.id || null) || refreshItemsVersion !== state._itemsVersion) {
+        return;
+      }
+      if (!resp.ok) {
+        const message = await resp.text().catch(() => "");
+        if (els.historyMeta) els.historyMeta.textContent = `HTTP History refresh error: ${message || resp.status}`;
+        if (els.liveStatus) {
+          els.liveStatus.textContent = "Refresh error";
+          els.liveStatus.classList.remove("online");
+        }
+        throw new Error(message || `HTTP History refresh failed: ${resp.status}`);
+      }
       const page = await resp.json();
-      const recent = page.items || [];
+      if (refreshSessionId !== (state.activeSession?.id || null) || refreshItemsVersion !== state._itemsVersion) {
+        return;
+      }
+      const recent = jsonArray(page.items);
       const previousTotal = state.historyPaging?.total;
       const previousFilteredTotal = state.historyPaging?.filteredTotal;
       const previousHasMore = state.historyPaging?.hasMore;
       const wasFullyLoaded = state.historyPaging?.fullyLoaded === true;
+      const hasOverlap = recent.some((item) => item?.id && getHistoryItem(item.id));
+      const hasGapBeforeLoadedWindow = Boolean(page.has_more)
+        && state.items.length > 0
+        && recent.length > 0
+        && !hasOverlap
+        && canUseSequenceCursorForHistoryPaging();
       if (state.historyPaging) {
         state.historyPaging._trimmedTailOnLastMerge = false;
       }
-      const added = mergeHistoryItems(recent, { prepend: true });
+      const added = hasGapBeforeLoadedWindow
+        ? replaceHistoryItemsForGap(recent)
+        : mergeHistoryItems(recent, { prepend: true });
       if (state.historyPaging) {
         if (page.total != null) state.historyPaging.total = page.total;
         if (page.filtered_total != null) state.historyPaging.filteredTotal = page.filtered_total;
-        state.historyPaging.hasMore = wasFullyLoaded && !state.historyPaging._trimmedTailOnLastMerge
+        if (page.hidden_connect_total != null) state.historyPaging.hiddenConnectTotal = page.hidden_connect_total;
+        state.historyPaging.hasMore = wasFullyLoaded
+          && !hasGapBeforeLoadedWindow
+          && !state.historyPaging._trimmedTailOnLastMerge
           ? false
-          : Boolean(page.has_more);
+          : Boolean(page.has_more) || state.historyPaging._trimmedTailOnLastMerge;
         state.historyPaging.fullyLoaded = !state.historyPaging.hasMore;
       }
       if (added > 0 && state.historyPaging) state.historyPaging.offset = state.items.length;
+      if (hasGapBeforeLoadedWindow) {
+        scheduleHistoryBackfill(0);
+      }
       if (
         added > 0
         || previousTotal !== state.historyPaging?.total
@@ -3605,7 +4537,7 @@ function renderDashboard() {
       if (!row) return;
       const { id } = row.dataset;
       if (!id) return;
-      activateSessionById(id).catch((error) => console.error(error));
+      activateSessionById(id).catch(handleWorkspaceActionError);
     });
   });
 
@@ -3718,6 +4650,7 @@ async function deleteSessionById(id) {
       renderDashboard();
     } catch (error) {
       console.error("Failed to delete session:", error);
+      showToast(error?.message || "Failed to delete session.", "error");
     }
   });
 }
@@ -3782,10 +4715,13 @@ const BUILTIN_RULE_LABELS = {
 let selectedFindingId = null;
 
 async function loadFindings() {
+  const sessionId = currentSessionId();
   try {
-    const response = await fetch("/api/findings?limit=5000");
+    const response = await fetch(sessionQueryPath("/api/findings?limit=5000", sessionId));
     if (!response.ok) return;
-    findingsData = await response.json();
+    const findings = jsonArray(await response.json());
+    if (sessionId !== currentSessionId()) return;
+    findingsData = findings;
     renderFindings();
     updateFindingsBadge();
   } catch (error) {
@@ -3794,10 +4730,13 @@ async function loadFindings() {
 }
 
 async function updateFindingsBadgeOnly() {
+  const sessionId = currentSessionId();
   try {
-    const response = await fetch("/api/findings?limit=5000");
+    const response = await fetch(sessionQueryPath("/api/findings?limit=5000", sessionId));
     if (!response.ok) return;
-    findingsData = await response.json();
+    const findings = jsonArray(await response.json());
+    if (sessionId !== currentSessionId()) return;
+    findingsData = findings;
     updateFindingsBadge();
   } catch (e) { /* silent */ }
 }
@@ -3939,9 +4878,13 @@ function renderFindingsVirtual() {
   const shell = els.findingsBody.closest(".history-table-shell");
   if (!shell) return;
 
-  const scrollTop = shell.scrollTop;
   const viewportHeight = shell.clientHeight;
   const totalCount = entries.length;
+  const maxScrollTop = Math.max(0, totalCount * FINDINGS_ROW_HEIGHT - viewportHeight);
+  const scrollTop = Math.min(shell.scrollTop, maxScrollTop);
+  if (shell.scrollTop !== scrollTop) {
+    shell.scrollTop = scrollTop;
+  }
 
   const startIdx = Math.max(0, Math.floor(scrollTop / FINDINGS_ROW_HEIGHT) - FINDINGS_BUFFER_ROWS);
   const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / FINDINGS_ROW_HEIGHT) + FINDINGS_BUFFER_ROWS);
@@ -3970,16 +4913,22 @@ function renderFindingsVirtual() {
 }
 
 async function loadFindingDetail(id) {
+  const sessionId = currentSessionId();
   try {
-    const res = await fetch(`/api/findings/${encodeURIComponent(id)}`);
+    const res = await fetch(sessionQueryPath(`/api/findings/${encodeURIComponent(id)}`, sessionId));
+    if (selectedFindingId !== id) return;
     if (!res.ok) return;
     const finding = await res.json();
+    if (currentSessionId() !== sessionId) return;
+    if (selectedFindingId !== id) return;
     // Also fetch the transaction record for request/response
     let record = null;
     try {
-      const tRes = await fetch(`/api/transactions/${encodeURIComponent(finding.record_id)}`);
+      const tRes = await fetch(transactionPath(finding.record_id, sessionId));
       if (tRes.ok) record = await tRes.json();
     } catch (_) { /* silent */ }
+    if (currentSessionId() !== sessionId) return;
+    if (selectedFindingId !== id) return;
     showFindingDetail(finding, record);
   } catch (error) {
     console.error("Failed to load finding detail:", error);
@@ -4014,14 +4963,12 @@ function showFindingDetail(finding, record) {
       const reqSearchMeta = els.findingsReqSearchMeta;
       if (reqSearchMeta) reqSearchMeta.innerHTML = buildSearchMeta(countLines(reqText), "raw", 0);
       if (els.findingsReqSearchInput) els.findingsReqSearchInput.value = "";
-      initCMSearchNavigation(els.findingsReqSearchMeta, "findingsReq");
     }
     if (els.findingsResCM) {
       updateCodePaneCM("findingsRes", els.findingsResCM, resText, { mode: "http" });
       const resSearchMeta = els.findingsResSearchMeta;
       if (resSearchMeta) resSearchMeta.innerHTML = buildSearchMeta(countLines(resText), "raw", 0);
       if (els.findingsResSearchInput) els.findingsResSearchInput.value = "";
-      initCMSearchNavigation(els.findingsResSearchMeta, "findingsRes");
     }
     // Legacy fallback
     if (!els.findingsReqCM) {
@@ -4171,15 +5118,39 @@ function jumpToTransaction(recordId) {
 }
 
 async function sendFindingToReplay(recordId) {
-  const response = await fetch(`/api/transactions/${recordId}`);
-  if (!response.ok) return;
+  const sessionId = currentSessionId();
+  const response = await fetch(transactionPath(recordId, sessionId));
+  if (currentSessionId() !== sessionId) return;
+  await requireOkResponse(response, "Failed to load finding transaction.");
   const record = await response.json();
-  if (!record || record.kind === "tunnel") return;
+  if (currentSessionId() !== sessionId) return;
+  openTransactionRecordInReplay(record);
+}
+
+function openTransactionRecordInReplay(record) {
+  if (!record || record.kind === "tunnel") {
+    throw new Error("Tunnel records cannot be sent to Replay.");
+  }
+  if (isWebSocketUpgradeRecord(record)) {
+    const scheme = record.scheme === "https" ? "wss" : record.scheme === "http" ? "ws" : record.scheme || "wss";
+    const target = authorityToTargetState(record.host || "", record.scheme || "https");
+    createWsReplayTab({
+      scheme,
+      host: target.host,
+      port: normalizePortValue(target.port) || (scheme === "wss" ? 443 : 80),
+      path: record.path || "/",
+      headers: normalizedHeaders(record.request?.headers),
+    });
+    state.activeTool = "replay";
+    scheduleWorkspaceStateSave();
+    renderToolPanels();
+    return;
+  }
   const request = editableRequestFromRecord(record);
   const tab = createReplayTab({
     baseRequest: request,
     sourceTransactionId: record.id,
-    notice: record.request.preview_truncated ? buildTruncatedBodyNotice(record, "Replay") : "",
+    notice: isRequestPreviewTruncated(record) ? buildTruncatedBodyNotice(record, "Replay") : "",
     requestText: buildEditableRawRequest(request),
   });
   state.replayTabs.push(tab);
@@ -4189,46 +5160,77 @@ async function sendFindingToReplay(recordId) {
   renderToolPanels();
 }
 
+function isWebSocketUpgradeRecord(record) {
+  return Number(record?.status) === 101 || normalizedHeaders(record?.request?.headers).some(
+    (h) => headerNameEquals(h, "upgrade") && String(h.value || "").toLowerCase() === "websocket"
+  );
+}
+
 async function sendFindingToFuzzer(recordId) {
-  const response = await fetch(`/api/transactions/${recordId}`);
-  if (!response.ok) return;
+  const sessionId = currentSessionId();
+  const response = await fetch(transactionPath(recordId, sessionId));
+  if (currentSessionId() !== sessionId) return;
+  await requireOkResponse(response, "Failed to load finding transaction.");
   const record = await response.json();
-  if (!record || record.kind === "tunnel") return;
+  if (currentSessionId() !== sessionId) return;
+  if (!record || record.kind === "tunnel") {
+    throw new Error("Tunnel records cannot be sent to Fuzzer.");
+  }
   const request = editableRequestFromRecord(record);
+  invalidateFuzzerRun();
   state.fuzzerBaseRequest = request;
   state.fuzzerSourceTransactionId = record.id;
-  state.fuzzerRequestText = buildEditableRawRequest(request);
-  state.fuzzerNotice = record.request.preview_truncated ? buildTruncatedBodyNotice(record, "Fuzzer") : "";
+  state.fuzzerTarget = null;
+  state.fuzzerTargetRequestText = null;
+  updateFuzzerRequestText(buildEditableRawRequest(request), { userEdit: true });
+  state.fuzzerNotice = isRequestPreviewTruncated(record) ? buildTruncatedBodyNotice(record, "Fuzzer") : "";
+  updateFuzzerPayloadsText("", { userEdit: true });
+  state.fuzzerAttackRecord = null;
+  state._selectedFuzzerResultKey = null;
+  hideFuzzerDetailPanel();
   state.activeTool = "fuzzer";
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
 
+function handleFindingActionError(error) {
+  console.error(error);
+  showToast(error?.message || "Finding action failed.", "error");
+}
+
 // ── Scanner Settings Modal ──
 
 async function loadScannerConfig() {
+  const sessionId = currentSessionId();
   try {
-    const res = await fetch("/api/scanner-config");
-    if (!res.ok) return null;
-    scannerConfigCache = await res.json();
+    const res = await fetch(sessionQueryPath("/api/scanner-config", sessionId));
+    await requireOkResponse(res, "Failed to load scanner settings.");
+    const config = await res.json();
+    if (sessionId !== currentSessionId()) {
+      return null;
+    }
+    scannerConfigCache = config;
     return scannerConfigCache;
   } catch (e) {
     console.error("Failed to load scanner config:", e);
+    showToast(e?.message || "Failed to load scanner settings.", "error");
     return null;
   }
 }
 
 async function saveScannerConfig(config) {
-  try {
-    await fetch("/api/scanner-config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(config),
-    });
-    scannerConfigCache = config;
-  } catch (e) {
-    console.error("Failed to save scanner config:", e);
+  const sessionId = currentSessionId();
+  const res = await fetch(sessionQueryPath("/api/scanner-config", sessionId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  await requireOkResponse(res, "Failed to save scanner settings.");
+  if (sessionId !== currentSessionId()) {
+    return false;
   }
+  scannerConfigCache = config;
+  return true;
 }
 
 async function openScannerSettings() {
@@ -4328,6 +5330,7 @@ async function saveScannerSettingsFromModal() {
   await saveScannerConfig(config);
   syncQuickToggle(config.enabled);
   closeScannerSettings();
+  showToast("Scanner settings saved");
 }
 
 function syncQuickToggle(enabled) {
@@ -4392,16 +5395,30 @@ function findingsArrowNav(direction) {
 }
 
 async function loadOastCallbacks() {
+  const sessionId = currentSessionId();
   const [cbRes, statusRes] = await Promise.all([
-    fetch("/api/oast/callbacks"),
-    fetch("/api/oast/status"),
+    fetch(sessionQueryPath("/api/oast/callbacks", sessionId)),
+    fetch(sessionQueryPath("/api/oast/status", sessionId)),
   ]);
-  state.oastCallbacks = await cbRes.json();
+  await requireOkResponse(cbRes, "Failed to load OAST callbacks.");
+  const callbacks = jsonArray(await cbRes.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.oastCallbacks = callbacks;
+  if (state.selectedOastId && !state.oastCallbacks.some((cb) => cb.id === state.selectedOastId)) {
+    state.selectedOastId = null;
+    clearOastDetail();
+  }
   renderOastCallbacks();
   updateOastBadge();
   // Update registration status display
   try {
-    const status = await statusRes.json();
+    await requireOkResponse(statusRes, "Failed to load OAST status.");
+    const status = await statusRes.json() || {};
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
     const el = document.getElementById("oastStatusText");
     if (el) {
       if (status.registered) {
@@ -4440,10 +5457,32 @@ function updateOastBadge() {
   els.oastBadge.classList.toggle("hidden", count === 0);
 }
 
+function clearOastDetail() {
+  if (els.oastDetailView) els.oastDetailView.textContent = "Select an OAST callback to view details.";
+  if (els.oastDetailTitle) els.oastDetailTitle.textContent = "Select a callback";
+}
+
+function handleOastActionError(error) {
+  console.error(error);
+  showToast(error?.message || "OAST action failed.", "error");
+}
+
 async function loadOastDetail(id) {
-  const response = await fetch(`/api/oast/callbacks/${id}`);
-  if (!response.ok) return;
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath(`/api/oast/callbacks/${id}`, sessionId));
+  if (sessionId !== currentSessionId() || state.selectedOastId !== id) {
+    return;
+  }
+  if (!response.ok) {
+    state.selectedOastId = null;
+    clearOastDetail();
+    renderOastCallbacks();
+    return;
+  }
   const cb = await response.json();
+  if (sessionId !== currentSessionId() || state.selectedOastId !== id) {
+    return;
+  }
   if (els.oastDetailTitle) els.oastDetailTitle.textContent = `${cb.protocol} from ${cb.remote_addr}`;
   if (els.oastDetailView) {
     els.oastDetailView.textContent = [
@@ -4460,24 +5499,40 @@ async function loadOastDetail(id) {
 
 async function generateOastPayload() {
   const serverUrl = (state.runtime.oast_server_url || "").trim();
+  if (!state.runtime.oast_enabled) {
+    showToast("Enable OAST in Settings before generating a payload", "error");
+    return;
+  }
   if (!serverUrl) {
     showToast("Set an OAST server URL in Settings first", "error");
     return;
   }
-  const response = await fetch("/api/oast/generate", { method: "POST" });
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/oast/generate", sessionId), { method: "POST" });
+  if (!response.ok) {
+    showToast(await response.text(), "error");
+    return;
+  }
   const data = await response.json();
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   if (els.oastPayloadText) els.oastPayloadText.value = data.payload;
   showToast(`OAST payload: ${data.payload}`);
 }
 
 async function clearOastCallbacks() {
-  await fetch("/api/oast/callbacks/clear", { method: "POST" });
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/oast/callbacks/clear", sessionId), { method: "POST" });
+  await requireOkResponse(response, "Failed to clear OAST callbacks.");
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
   state.oastCallbacks = [];
   state.selectedOastId = null;
   renderOastCallbacks();
   updateOastBadge();
-  if (els.oastDetailView) els.oastDetailView.textContent = "Select an OAST callback to view details.";
-  if (els.oastDetailTitle) els.oastDetailTitle.textContent = "Select a callback";
+  clearOastDetail();
 }
 
 function bindFindingsEvents() {
@@ -4534,25 +5589,33 @@ function bindFindingsEvents() {
   if (findingsReplayBtn) {
     findingsReplayBtn.addEventListener("click", () => {
       const recordId = els.findingsDetailJump?.dataset.recordId;
-      if (recordId) sendFindingToReplay(recordId);
+      if (recordId) sendFindingToReplay(recordId).catch(handleFindingActionError);
     });
   }
   const findingsFuzzerBtn = document.getElementById("findingsDetailSendFuzzer");
   if (findingsFuzzerBtn) {
     findingsFuzzerBtn.addEventListener("click", () => {
       const recordId = els.findingsDetailJump?.dataset.recordId;
-      if (recordId) sendFindingToFuzzer(recordId);
+      if (recordId) sendFindingToFuzzer(recordId).catch(handleFindingActionError);
     });
   }
   if (els.findingsClearButton) {
     els.findingsClearButton.addEventListener("click", async () => {
-      await fetch("/api/findings/clear", { method: "POST" });
-      findingsData = [];
-      selectedFindingId = null;
-      renderFindings();
-      updateFindingsBadge();
-      if (els.findingsDetailContent) els.findingsDetailContent.classList.add("hidden");
-      if (els.findingsDetailPlaceholder) els.findingsDetailPlaceholder.classList.remove("hidden");
+      const sessionId = currentSessionId();
+      try {
+        const response = await fetch(sessionQueryPath("/api/findings/clear", sessionId), { method: "POST" });
+        await requireOkResponse(response, "Failed to clear findings.");
+        if (sessionId !== currentSessionId()) return;
+        findingsData = [];
+        selectedFindingId = null;
+        renderFindings();
+        updateFindingsBadge();
+        if (els.findingsDetailContent) els.findingsDetailContent.classList.add("hidden");
+        if (els.findingsDetailPlaceholder) els.findingsDetailPlaceholder.classList.remove("hidden");
+      } catch (error) {
+        console.error(error);
+        showToast(error?.message || "Failed to clear findings.", "error");
+      }
     });
   }
 
@@ -4635,10 +5698,24 @@ function bindFindingsEvents() {
   if (els.scannerQuickToggle) {
     els.scannerQuickToggle.addEventListener("change", async () => {
       const enabled = els.scannerQuickToggle.checked;
-      const config = await loadScannerConfig();
-      if (config) {
+      els.scannerQuickToggle.disabled = true;
+      try {
+        const config = await loadScannerConfig();
+        if (!config) {
+          syncQuickToggle(!enabled);
+          return;
+        }
         config.enabled = enabled;
-        await saveScannerConfig(config);
+        if (!(await saveScannerConfig(config))) {
+          return;
+        }
+        syncQuickToggle(enabled);
+      } catch (error) {
+        console.error(error);
+        showToast(error?.message || "Failed to save scanner settings.", "error");
+        syncQuickToggle(!enabled);
+      } finally {
+        els.scannerQuickToggle.disabled = false;
       }
     });
     // Sync initial state from server
@@ -4658,7 +5735,12 @@ function bindFindingsEvents() {
     els.scannerSettingsCancel.addEventListener("click", () => closeScannerSettings());
   }
   if (els.scannerSettingsSave) {
-    els.scannerSettingsSave.addEventListener("click", () => saveScannerSettingsFromModal());
+    els.scannerSettingsSave.addEventListener("click", () => {
+      saveScannerSettingsFromModal().catch((error) => {
+        console.error(error);
+        showToast(error?.message || "Failed to save scanner settings.", "error");
+      });
+    });
   }
   if (els.scannerAddCustomRule) {
     els.scannerAddCustomRule.addEventListener("click", () => {
@@ -4867,10 +5949,11 @@ function renderHistory() {
   const visibleEntries = getVisibleEntries();
   const hiddenConnectCount = countHiddenConnectItems();
   const paging = state.historyPaging || createHistoryPagingState();
+  const hiddenConnectExact = isKnownCount(paging.hiddenConnectTotal);
   const summary = [];
   const totalCount = visibleEntries.length;
   summary.push(`${totalCount} loaded item(s) visible`);
-  if (hiddenConnectCount) summary.push(`${hiddenConnectCount}${paging.fullyLoaded ? "" : " loaded"} CONNECT tunnel(s) hidden`);
+  if (hiddenConnectCount) summary.push(`${hiddenConnectCount}${hiddenConnectExact || paging.fullyLoaded ? "" : " loaded"} CONNECT tunnel(s) hidden`);
   if (isKnownCount(paging.filteredTotal)) {
     summary.push(`${state.items.length}/${paging.filteredTotal} server-matched summaries loaded`);
   }
@@ -4914,23 +5997,24 @@ function renderHistoryVirtual() {
   const shell = els.historyTable.closest(".history-table-shell");
   if (!shell) return;
 
+  const rowHeight = measuredHistoryRowHeight || HISTORY_ROW_HEIGHT;
   const viewportHeight = shell.clientHeight;
   const totalCount = entries.length;
   const colCount = state.historyColumnOrder.length;
-  const maxScrollTop = Math.max(0, totalCount * HISTORY_ROW_HEIGHT - viewportHeight);
+  const maxScrollTop = Math.max(0, totalCount * rowHeight - viewportHeight);
   const scrollTop = Math.min(shell.scrollTop, maxScrollTop);
   if (shell.scrollTop !== scrollTop) {
     shell.scrollTop = scrollTop;
   }
 
-  const startIdx = Math.max(0, Math.floor(scrollTop / HISTORY_ROW_HEIGHT) - HISTORY_BUFFER_ROWS);
-  const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / HISTORY_ROW_HEIGHT) + HISTORY_BUFFER_ROWS);
+  const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - HISTORY_BUFFER_ROWS);
+  const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / rowHeight) + HISTORY_BUFFER_ROWS);
   if (totalCount - endIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS) {
     scheduleHistoryBackfill(0);
   }
 
-  const topPadding = startIdx * HISTORY_ROW_HEIGHT;
-  const bottomPadding = Math.max(0, (totalCount - endIdx) * HISTORY_ROW_HEIGHT);
+  const topPadding = startIdx * rowHeight;
+  const bottomPadding = Math.max(0, (totalCount - endIdx) * rowHeight);
 
   const rows = [];
   for (let i = startIdx; i < endIdx; i++) {
@@ -4946,6 +6030,13 @@ function renderHistoryVirtual() {
     (topPadding > 0 ? `<tr class="virtual-spacer"><td colspan="${colCount}" style="height:${topPadding}px;padding:0;border:none"></td></tr>` : "") +
     rows.join("") +
     (bottomPadding > 0 ? `<tr class="virtual-spacer"><td colspan="${colCount}" style="height:${bottomPadding}px;padding:0;border:none"></td></tr>` : "");
+
+  const measuredRow = els.historyTableBody.querySelector(".history-row");
+  const measured = measuredRow?.getBoundingClientRect().height || 0;
+  if (measured > 0 && Math.abs(measured - rowHeight) >= 1) {
+    measuredHistoryRowHeight = measured;
+    renderHistoryVirtual();
+  }
 }
 
 function historyEmptyMessage(hiddenConnectCount, paging) {
@@ -4984,7 +6075,7 @@ function scrollHistoryToId(targetId) {
   if (!shell) return;
 
   // Scroll so that target row is near center of viewport
-  const targetTop = idx * HISTORY_ROW_HEIGHT;
+  const targetTop = idx * (measuredHistoryRowHeight || HISTORY_ROW_HEIGHT);
   shell.scrollTop = Math.max(0, targetTop - shell.clientHeight / 2);
   // renderHistoryVirtual will be called by scroll event
 }
@@ -5025,8 +6116,9 @@ function scrollSelectedHistoryRowIntoView() {
   if (idx === -1) return;
   const shell = els.historyTable.closest(".history-table-shell");
   if (!shell) return;
-  const rowTop = idx * HISTORY_ROW_HEIGHT;
-  const rowBottom = rowTop + HISTORY_ROW_HEIGHT;
+  const rowHeight = measuredHistoryRowHeight || HISTORY_ROW_HEIGHT;
+  const rowTop = idx * rowHeight;
+  const rowBottom = rowTop + rowHeight;
   const viewTop = shell.scrollTop;
   const viewBottom = viewTop + shell.clientHeight;
   if (rowTop < viewTop) {
@@ -5050,6 +6142,10 @@ async function moveWebsocketSelection(offset) {
   const nextId = sortedEntries[nextIndex]?.session?.id;
   if (!nextId) return;
 
+  if (state.selectedWebsocketId !== nextId) {
+    state.selectedFrameIdx = null;
+    hideFrameDetail();
+  }
   state.selectedWebsocketId = nextId;
   renderWebsocketSessions();
   scrollSelectedWebsocketRowIntoView();
@@ -5063,23 +6159,27 @@ function scrollSelectedWebsocketRowIntoView() {
 
 function moveFrameSelection(offset) {
   const session = state.selectedWebsocketRecord;
-  if (!session || !session.frames || !session.frames.length) return;
+  const frames = getWebsocketFrames(session);
+  if (!frames.length) return;
 
   const current = state.selectedFrameIdx;
-  const fallback = offset > 0 ? 0 : session.frames.length - 1;
-  const nextIdx = clamp(
-    current == null ? fallback : current + offset,
+  const currentPosition = current == null
+    ? -1
+    : frames.findIndex((frame) => frame.index === current);
+  const fallback = offset > 0 ? 0 : frames.length - 1;
+  const nextPosition = clamp(
+    currentPosition === -1 ? fallback : currentPosition + offset,
     0,
-    session.frames.length - 1,
+    frames.length - 1,
   );
 
-  state.selectedFrameIdx = nextIdx;
-  const frame = session.frames[nextIdx];
+  const frame = frames[nextPosition];
   if (!frame) return;
+  state.selectedFrameIdx = frame.index;
 
   // Update selection highlight — find by data attribute, not DOM index
   els.websocketFramesBody.querySelectorAll(".frame-selected").forEach((r) => r.classList.remove("frame-selected"));
-  const target = els.websocketFramesBody.querySelector(`.history-row[data-frame-idx="${nextIdx}"]`);
+  const target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
   if (target) {
     target.classList.add("frame-selected");
     target.scrollIntoView({ block: "nearest" });
@@ -5270,14 +6370,15 @@ function getSelectedCMText(targetPane) {
 }
 
 async function copyTextToClipboard(text) {
-  if (!text) {
+  if (text == null) {
     return;
   }
+  const clipboardText = String(text);
 
   // Try modern Clipboard API first, fall back to textarea+execCommand
   if (navigator.clipboard?.writeText) {
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(clipboardText);
       return;
     } catch (_) {
       // Clipboard API rejected (common in WKWebView) — fall through to fallback
@@ -5285,15 +6386,18 @@ async function copyTextToClipboard(text) {
   }
 
   const textarea = document.createElement("textarea");
-  textarea.value = text;
+  textarea.value = clipboardText;
   textarea.setAttribute("readonly", "true");
   textarea.style.position = "fixed";
   textarea.style.opacity = "0";
   textarea.style.pointerEvents = "none";
   document.body.appendChild(textarea);
   textarea.select();
-  document.execCommand("copy");
+  const copied = document.execCommand("copy");
   textarea.remove();
+  if (!copied) {
+    throw new Error("Clipboard copy failed");
+  }
 }
 
 function selectCodePaneContents(targetPane) {
@@ -5322,14 +6426,21 @@ function selectCodePaneContents(targetPane) {
   selection?.addRange(range);
 }
 
-function renderDetail(record) {
+function renderDetail(record, options = {}) {
   if (!els.detailTitle) return;
-  state.showOriginal.request = false;
-  state.showOriginal.response = false;
+  if (!options.preserveOriginalToggles) {
+    state.showOriginal.request = false;
+    state.showOriginal.response = false;
+  }
   els.detailTitle.textContent = "Inspector";
   els.detailTags.innerHTML = "";
 
   const protocolState = inferProtocolState(record);
+  const request = record.request || {};
+  const response = record.response || null;
+  const requestHeaders = normalizedHeaders(request.headers);
+  const responseHeaders = normalizedHeaders(response?.headers);
+  const notes = Array.isArray(record.notes) ? record.notes : [];
 
   const attributes = [
     { label: "Method", value: record.method },
@@ -5337,10 +6448,10 @@ function renderDetail(record) {
     ["Started", formatTimestamp(record.started_at)],
     ["Duration", `${record.duration_ms} ms`],
     ["Host", record.host],
-    ["Request size", formatSize(record.request.body_size)],
-    ["Response size", formatSize(record.response?.body_size ?? 0)],
-    ["MIME type", record.response?.content_type || record.request.content_type || "n/a"],
-    ["Notes", `${record.notes.length}`],
+    ["Request size", formatSize(request.body_size)],
+    ["Response size", formatSize(response?.body_size ?? 0)],
+    ["MIME type", response?.content_type || request.content_type || "n/a"],
+    ["Notes", `${notes.length}`],
     ...(record.color_tag ? [["Color tag", record.color_tag]] : []),
     ...(record.user_note ? [["User note", record.user_note]] : []),
   ];
@@ -5349,19 +6460,19 @@ function renderDetail(record) {
   els.protocolStrip.innerHTML = renderProtocolStrip(protocolState);
   els.summaryList.innerHTML = renderSummaryRows(attributes);
 
-  els.requestHeaderCount.textContent = String(record.request.headers.length);
-  els.responseHeaderCount.textContent = String(record.response?.headers?.length ?? 0);
-  els.requestHeadersBody.innerHTML = renderHeaderList(record.request.headers);
-  els.responseHeadersBody.innerHTML = record.response
-    ? renderHeaderList(record.response.headers)
+  els.requestHeaderCount.textContent = String(requestHeaders.length);
+  els.responseHeaderCount.textContent = String(responseHeaders.length);
+  els.requestHeadersBody.innerHTML = renderHeaderList(requestHeaders);
+  els.responseHeadersBody.innerHTML = response
+    ? renderHeaderList(responseHeaders)
     : "<p class=\"empty-copy\">No response headers were captured.</p>";
 
   const noteParts = [];
   if (record.user_note) {
     noteParts.push(`<p class="user-note-display"><strong>Note:</strong> ${escapeHtml(record.user_note)}</p>`);
   }
-  if (record.notes.length) {
-    noteParts.push(...record.notes.map((note) => `<p>${escapeHtml(note)}</p>`));
+  if (notes.length) {
+    noteParts.push(...notes.map((note) => `<p>${escapeHtml(note)}</p>`));
   }
   els.notesCard.innerHTML = noteParts.length
     ? noteParts.join("")
@@ -5474,10 +6585,71 @@ function renderViewTabs() {
   if (!hasResponseDiff && state.showOriginal) state.showOriginal.response = false;
 }
 
-function renderIntercepts() {
-  const filteredIntercepts = state.interceptInScopeOnly
+function getVisibleRequestInterceptSummaries() {
+  return state.interceptInScopeOnly
     ? state.intercepts.filter((item) => isInScopeHost(item.host))
     : state.intercepts;
+}
+
+function getVisibleResponseInterceptSummaries() {
+  return state.interceptInScopeOnly
+    ? state.responseIntercepts.filter((item) => isInScopeHost(item.host))
+    : state.responseIntercepts;
+}
+
+function reconcileRequestInterceptSelection(visibleIntercepts = getVisibleRequestInterceptSummaries()) {
+  const selectedIsVisible = visibleIntercepts.some((item) => item.id === state.selectedInterceptId);
+  if (!selectedIsVisible) {
+    state.selectedInterceptId = visibleIntercepts[0]?.id ?? null;
+    state.selectedInterceptRecord = null;
+    state.interceptEditorSeedId = null;
+    return;
+  }
+  if (state.selectedInterceptRecord && state.selectedInterceptRecord.id !== state.selectedInterceptId) {
+    state.selectedInterceptRecord = null;
+    state.interceptEditorSeedId = null;
+  }
+}
+
+function reconcileResponseInterceptSelection(visibleIntercepts = getVisibleResponseInterceptSummaries()) {
+  const selectedIsVisible = visibleIntercepts.some((item) => item.id === state.selectedResponseInterceptId);
+  if (!selectedIsVisible) {
+    state.selectedResponseInterceptId = visibleIntercepts[0]?.id ?? null;
+    state.selectedResponseInterceptRecord = null;
+    state.responseInterceptEditorSeedId = null;
+    return;
+  }
+  if (state.selectedResponseInterceptRecord && state.selectedResponseInterceptRecord.id !== state.selectedResponseInterceptId) {
+    state.selectedResponseInterceptRecord = null;
+    state.responseInterceptEditorSeedId = null;
+  }
+}
+
+async function refreshInterceptDetailsForCurrentSelection() {
+  const tasks = [];
+  if (state.selectedInterceptId && (!state.selectedInterceptRecord || state.selectedInterceptRecord.id !== state.selectedInterceptId)) {
+    tasks.push(loadInterceptDetail(state.selectedInterceptId));
+  }
+  if (state.selectedResponseInterceptId && (!state.selectedResponseInterceptRecord || state.selectedResponseInterceptRecord.id !== state.selectedResponseInterceptId)) {
+    tasks.push(loadResponseInterceptDetail(state.selectedResponseInterceptId));
+  }
+  if (tasks.length) {
+    await Promise.all(tasks);
+  }
+}
+
+async function applyInterceptScopeFilterLocally() {
+  reconcileRequestInterceptSelection();
+  reconcileResponseInterceptSelection();
+  renderIntercepts();
+  renderResponseIntercepts();
+  updateInterceptQueueBadges();
+  await refreshInterceptDetailsForCurrentSelection();
+}
+
+function renderIntercepts() {
+  const filteredIntercepts = getVisibleRequestInterceptSummaries();
+  reconcileRequestInterceptSelection(filteredIntercepts);
   els.interceptTableBody.innerHTML = filteredIntercepts.length
     ? filteredIntercepts
         .map((item) => {
@@ -5562,13 +6734,15 @@ function renderWebsocketSessions() {
   els.websocketMeta.textContent = buildWebsocketFilterSummary(
     sortedEntries.length,
     state.websocketSessions.length,
+    state.websocketPaging?.total ?? state.websocketSessions.length,
+    Boolean(state.websocketPaging?.hasMore),
     state.websocketQuery,
   );
 
   updateWebsocketSortIndicators();
 
   els.websocketTableBody.innerHTML = sortedEntries.length
-    ? sortedEntries.slice(0, 500)
+    ? sortedEntries
         .map(({ session, index }) => {
           const selected = session.id === state.selectedWebsocketId ? "selected" : "";
           return `
@@ -5594,13 +6768,19 @@ function renderWebsocketSessions() {
         </tr>
       `;
 
-  Array.from(els.websocketTableBody.querySelectorAll(".history-row")).forEach((row) => {
-    row.addEventListener("click", () => {
-      state.wsKeyboardFocus = "sessions";
-      state.selectedWebsocketId = row.dataset.id;
-      loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
-    });
-  });
+	  Array.from(els.websocketTableBody.querySelectorAll(".history-row")).forEach((row) => {
+	    row.addEventListener("click", () => {
+	      state.wsKeyboardFocus = "sessions";
+	      if (state.selectedWebsocketId !== row.dataset.id) {
+	        state.selectedFrameIdx = null;
+	        state.selectedWebsocketRecord = null;
+	        hideFrameDetail();
+	      }
+	      state.selectedWebsocketId = row.dataset.id;
+	      renderWebsocketSessions();
+	      loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
+	    });
+	  });
 
   if (!state.selectedWebsocketRecord) {
     const noSessionMsg = state.websocketSessions.length && !sortedEntries.length
@@ -5613,11 +6793,13 @@ function renderWebsocketSessions() {
       if (els.websocketResponseView) els.websocketResponseView.textContent = "No response selected.";
     }
     els.websocketFramesBody.innerHTML = `
-      <div class="ws-frame-empty">${
+      <tr class="empty-row">
+        <td colspan="5">${
         state.websocketSessions.length && !sortedEntries.length
           ? "Clear or adjust the filter to inspect captured frames."
           : "Frame capture will appear here after a WebSocket handshake completes."
-      }</div>
+        }</td>
+      </tr>
     `;
     return;
   }
@@ -5659,13 +6841,20 @@ function renderWebsocketSessions() {
   if (els.wsHandshakeLines) {
     els.wsHandshakeLines.textContent = buildLineNumbers(hsLineCount);
   }
-  els.websocketFramesBody.innerHTML = session.frames.length
-    ? session.frames
+  const frames = getWebsocketFrames(session);
+  if (
+    state.selectedFrameIdx != null
+    && !frames.some((frame) => frame.index === state.selectedFrameIdx)
+  ) {
+    state.selectedFrameIdx = null;
+  }
+  els.websocketFramesBody.innerHTML = frames.length
+    ? frames
         .map((frame, idx) => {
           const dir = frame.direction === "client_to_server" ? "\u2192" : "\u2190";
           const dirClass = frame.direction === "client_to_server" ? "dir-client" : "dir-server";
           return `
-          <tr class="history-row${idx === state.selectedFrameIdx ? ' frame-selected' : ''}" data-frame-idx="${idx}">
+          <tr class="history-row${frame.index === state.selectedFrameIdx ? ' frame-selected' : ''}" data-frame-index="${frame.index}">
             <td class="cell-narrow">${idx + 1}</td>
             <td class="cell-narrow ${dirClass}">${dir}</td>
             <td class="cell-narrow">${frame.kind}</td>
@@ -5680,48 +6869,54 @@ function renderWebsocketSessions() {
         </tr>
       `;
 
-  // Frame click + context menu handlers
-  Array.from(els.websocketFramesBody.querySelectorAll(".history-row[data-frame-idx]")).forEach((row) => {
-    row.addEventListener("click", () => {
-      const idx = parseInt(row.dataset.frameIdx, 10);
-      const frame = session.frames[idx];
-      if (!frame) return;
+	  // Frame click + context menu handlers
+	  Array.from(els.websocketFramesBody.querySelectorAll(".history-row[data-frame-index]")).forEach((row) => {
+	    const selectFrameRow = () => {
+	      const frameIndex = parseInt(row.dataset.frameIndex, 10);
+	      const frame = frames.find((candidate) => candidate.index === frameIndex);
+	      if (!frame) return false;
 
-      state.selectedFrameIdx = idx;
-      state.wsKeyboardFocus = "frames";
+	      state.selectedFrameIdx = frame.index;
+	      state.wsKeyboardFocus = "frames";
 
       // Highlight selected row
       els.websocketFramesBody.querySelectorAll(".frame-selected").forEach((r) => r.classList.remove("frame-selected"));
       row.classList.add("frame-selected");
 
-      // Show detail panel
-      showFrameDetail(frame);
-    });
+	      // Show detail panel
+	      showFrameDetail(frame);
+	      return true;
+	    };
+	    row.addEventListener("click", () => {
+	      selectFrameRow();
+	    });
 
-    // Right-click on frame → show context menu
-    row.addEventListener("contextmenu", (e) => {
-      const idx = parseInt(row.dataset.frameIdx, 10);
-      if (isNaN(idx)) return;
-      e.preventDefault();
-      state.selectedFrameIdx = idx;
-      openWsFrameContextMenu(e.clientX, e.clientY);
-    });
-  });
+	    // Right-click on frame → show context menu
+	    row.addEventListener("contextmenu", (e) => {
+	      e.preventDefault();
+	      if (!selectFrameRow()) return;
+	      openWsFrameContextMenu(e.clientX, e.clientY);
+	    });
+	  });
 }
 
-function buildWebsocketFilterSummary(visibleCount, totalCount, query) {
+function buildWebsocketFilterSummary(visibleCount, loadedCount, totalCount, hasMore, query) {
   const parts = [`${visibleCount} session(s) visible`];
   const filters = [];
   if (document.getElementById("wsInScopeOnly")?.classList.contains("active")) filters.push("in scope");
   if (document.getElementById("wsHideClosed")?.classList.contains("active")) filters.push("live only");
   if (query) filters.push(query);
   if (filters.length) parts.push(`filter: ${filters.join(", ")}`);
-  parts.push(totalCount ? `${totalCount} total captured` : "No sessions captured yet");
+  if (totalCount) {
+    parts.push(hasMore ? `${loadedCount}/${totalCount} sessions loaded` : `${totalCount} total captured`);
+  } else {
+    parts.push("No sessions captured yet");
+  }
   return parts.join(" · ");
 }
 
 function getVisibleWebsocketSessions() {
-  const normalizedQuery = state.websocketQuery.trim().toLowerCase();
+  const normalizedQuery = String(state.websocketQuery || "").trim().toLowerCase();
   const inScopeOnly = document.getElementById("wsInScopeOnly")?.classList.contains("active") ?? false;
   const liveOnly = document.getElementById("wsHideClosed")?.classList.contains("active") ?? false;
 
@@ -5766,12 +6961,12 @@ function getSortedWebsocketEntries() {
 
 function getWebsocketSortValue(session, key) {
   switch (key) {
-    case "host": return session.host.toLowerCase();
-    case "path": return (session.path || "").toLowerCase();
-    case "status": return session.status ?? -1;
-    case "frame_count": return session.frame_count ?? 0;
-    case "duration_ms": return session.duration_ms ?? Infinity;
-    case "started_at": return Date.parse(session.started_at) || 0;
+    case "host": return String(session?.host || "").toLowerCase();
+    case "path": return String(session?.path || "").toLowerCase();
+    case "status": return Number.isFinite(Number(session?.status)) ? Number(session.status) : -1;
+    case "frame_count": return Number.isFinite(Number(session?.frame_count)) ? Number(session.frame_count) : 0;
+    case "duration_ms": return Number.isFinite(Number(session?.duration_ms)) ? Number(session.duration_ms) : Infinity;
+    case "started_at": return Date.parse(session?.started_at) || 0;
     default: return "";
   }
 }
@@ -5799,9 +6994,14 @@ function updateWebsocketSortIndicators() {
 }
 
 async function syncVisibleWebsocketSelection(preserveSelection = true) {
+  const previousSelectedId = state.selectedWebsocketId;
   const visibleSessions = getVisibleWebsocketSessions();
   if (!preserveSelection || !visibleSessions.some((item) => item.id === state.selectedWebsocketId)) {
     state.selectedWebsocketId = visibleSessions[0]?.id ?? null;
+  }
+  if (previousSelectedId !== state.selectedWebsocketId) {
+    state.selectedFrameIdx = null;
+    hideFrameDetail();
   }
 
   if (!state.selectedWebsocketId) {
@@ -5813,8 +7013,21 @@ async function syncVisibleWebsocketSelection(preserveSelection = true) {
   if (state.selectedWebsocketRecord?.id !== state.selectedWebsocketId) {
     state.selectedWebsocketRecord = null;
   }
+  const selectedSummary = visibleSessions.find((item) => item.id === state.selectedWebsocketId);
+  const selectedDetailIsStale = Boolean(
+    selectedSummary
+    && state.selectedWebsocketRecord
+    && (
+      Number(state.selectedWebsocketRecord.frame_count || 0) !== Number(selectedSummary.frame_count || 0)
+      || state.selectedWebsocketRecord.status !== selectedSummary.status
+      || (state.selectedWebsocketRecord.closed_at || null) !== (selectedSummary.closed_at || null)
+      || (state.selectedWebsocketRecord.duration_ms ?? null) !== (selectedSummary.duration_ms ?? null)
+    )
+  );
   renderWebsocketSessions();
-  await loadWebsocketDetail(state.selectedWebsocketId);
+  if (!state.selectedWebsocketRecord || selectedDetailIsStale) {
+    await loadWebsocketDetail(state.selectedWebsocketId);
+  }
 }
 
 function renderProxySettings() {
@@ -5857,10 +7070,27 @@ function renderProxySettings() {
   const oastInterval = document.getElementById("proxySettingOastInterval");
   const oastUrlHint = document.getElementById("oastServerUrlHint");
   const oastTokenField = document.getElementById("oastTokenField");
+  const tokenConfigured = state.runtime.oast_token === OAST_TOKEN_REDACTION;
   if (oastEnabled) oastEnabled.checked = Boolean(state.runtime.oast_enabled);
   if (oastProvider && document.activeElement !== oastProvider) oastProvider.value = state.runtime.oast_provider || "custom";
   if (oastUrl && document.activeElement !== oastUrl) oastUrl.value = state.runtime.oast_server_url || "";
-  if (oastToken && document.activeElement !== oastToken) oastToken.value = state.runtime.oast_token || "";
+  if (oastToken && document.activeElement !== oastToken) {
+    oastToken.value = "";
+    oastToken.placeholder = tokenConfigured
+      ? "Token configured; leave blank to keep it"
+      : "Optional token";
+  }
+  if (els.proxySettingOastClearToken) {
+    els.proxySettingOastClearToken.disabled = !tokenConfigured || state.oastTokenClearPending;
+    els.proxySettingOastClearToken.textContent = state.oastTokenClearPending ? "Clearing" : "Clear";
+  }
+  if (els.proxySettingOastTokenHint) {
+    els.proxySettingOastTokenHint.textContent = state.oastTokenClearPending
+      ? "Token will be cleared when settings are saved."
+      : tokenConfigured
+        ? "Leave blank to keep the saved token, or clear it explicitly."
+        : "Enter a token only if your OAST server requires one.";
+  }
   if (oastInterval && document.activeElement !== oastInterval) oastInterval.value = state.runtime.oast_polling_interval_secs || 5;
   // Update UI based on provider
   const prov = oastProvider?.value || "custom";
@@ -5956,18 +7186,11 @@ function renderReplay() {
         tab.requestBytes = null;
         tab.requestOriginalBytes = null;
       }
-      let displayText = tab.requestText;
-      if (reqMode === "pretty") {
-        const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
-        displayText = prettyFormat(tab.requestText, fakeMsg);
-      } else if (reqMode === "raw") {
-        displayText = compactFormat(tab.requestText);
-      }
-      updateCodePaneCM("replayReq", els.replayRequestCM, displayText, {
+      updateCodePaneCM("replayReq", els.replayRequestCM, tab.requestText, {
         mode: "http", readOnly: false,
         onChange: syncReplayRequestTextFromEditor,
       });
-      updateReplaySearchPane("request", displayText);
+      updateReplaySearchPane("request", tab.requestText);
     }
   } else if (reqMode === "hex") {
     if (els.replayRequestHighlight) els.replayRequestHighlight.removeAttribute("contenteditable");
@@ -5991,30 +7214,19 @@ function renderReplay() {
     if (els.replayRequestHighlight && !els.replayRequestHighlight.isContentEditable) {
       els.replayRequestHighlight.setAttribute("contenteditable", "plaintext-only");
     }
-    let displayText = tab.requestText;
-    if (reqMode === "pretty") {
-      const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
-      displayText = prettyFormat(tab.requestText, fakeMsg);
-    } else if (reqMode === "raw") {
-      displayText = compactFormat(tab.requestText);
-    }
     if (els.replayRequestEditor) els.replayRequestEditor.value = tab.requestText;
-    renderReplayRequestHighlight(displayText);
-    updateReplaySearchPane("request", displayText);
+    renderReplayRequestHighlight(tab.requestText);
+    updateReplaySearchPane("request", tab.requestText);
   }
 
   if (!tab.responseRecord) {
-    const notice = tab.notice || "Send a request from Replay to capture the response here.";
-    els.replayResponseMeta.textContent = tab.notice || "No response yet.";
-    renderReplayResponseView(notice);
-    updateReplaySearchPane("response", notice);
-    els.replayFollowRedirectButton.classList.add("hidden");
+    renderReplayEmptyResponse(tab);
     return;
   }
 
   // Show/hide Follow button for redirect responses
   const isRedirect = [301, 302, 303, 307, 308].includes(tab.responseRecord.status);
-  const hasLocation = tab.responseRecord.response?.headers?.some((h) => h.name.toLowerCase() === "location");
+  const hasLocation = normalizedHeaders(tab.responseRecord.response?.headers).some((h) => headerNameEquals(h, "location"));
   els.replayFollowRedirectButton.classList.toggle("hidden", !(isRedirect && hasLocation));
 
   els.replayResponseMeta.textContent = [
@@ -6031,7 +7243,7 @@ function renderReplay() {
   } else if (respMode === "pretty") {
     responseText = prettyFormat(rawResponseText, tab.responseRecord.response);
   } else {
-    responseText = compactFormat(rawResponseText);
+    responseText = rawResponseText;
   }
   renderReplayResponseView(responseText);
   updateReplaySearchPane("response", responseText);
@@ -6108,7 +7320,7 @@ function syncReplayRequestTextFromEditor(newText) {
   activeTab.requestOriginalBytes = null;
   syncReplayToolbar(activeTab);
   renderReplayTabs();
-  updateReplaySearchPane("request", newText);
+  updateReplaySearchPane("request", newText, { scrollToFirst: false });
   scheduleWorkspaceStateSave();
 }
 
@@ -6193,18 +7405,23 @@ function renderReplayResponseView(text) {
   if (els.replayResponseView) els.replayResponseView.innerHTML = renderCodeHtml(text, mode, "response");
 }
 
+function renderReplayEmptyResponse(tab) {
+  const notice = tab?.notice || "Send a request from Replay to capture the response here.";
+  els.replayResponseMeta.textContent = tab?.notice || "No response yet.";
+  renderReplayResponseView(notice);
+  updateReplaySearchPane("response", notice);
+  els.replayFollowRedirectButton.classList.add("hidden");
+  renderReplayViewTabs();
+}
+
 /** Update only the response pane + meta after a send — preserves request cursor/scroll. */
 function renderReplayResponseOnly(tab) {
   if (!tab.responseRecord) {
-    const notice = tab.notice || "Send a request from Replay to capture the response here.";
-    els.replayResponseMeta.textContent = tab.notice || "No response yet.";
-    renderReplayResponseView(notice);
-    updateReplaySearchPane("response", notice);
-    els.replayFollowRedirectButton.classList.add("hidden");
+    renderReplayEmptyResponse(tab);
     return;
   }
   const isRedirect = [301, 302, 303, 307, 308].includes(tab.responseRecord.status);
-  const hasLocation = tab.responseRecord.response?.headers?.some((h) => h.name.toLowerCase() === "location");
+  const hasLocation = normalizedHeaders(tab.responseRecord.response?.headers).some((h) => headerNameEquals(h, "location"));
   els.replayFollowRedirectButton.classList.toggle("hidden", !(isRedirect && hasLocation));
   els.replayResponseMeta.textContent = [
     `${formatStatus(tab.responseRecord.status)}`,
@@ -6219,7 +7436,7 @@ function renderReplayResponseOnly(tab) {
   } else if (respMode === "pretty") {
     responseText = prettyFormat(rawResponseText, tab.responseRecord.response);
   } else {
-    responseText = compactFormat(rawResponseText);
+    responseText = rawResponseText;
   }
   renderReplayResponseView(responseText);
   updateReplaySearchPane("response", responseText);
@@ -6255,19 +7472,12 @@ function renderReplayViewContent(target) {
           tab.requestBytes = null;
           tab.requestOriginalBytes = null;
         }
-        let displayText = tab.requestText;
-        if (mode === "pretty") {
-          const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
-          displayText = prettyFormat(tab.requestText, fakeMsg);
-        } else if (mode === "raw") {
-          displayText = compactFormat(tab.requestText);
-        }
-        updateCodePaneCM("replayReq", els.replayRequestCM, displayText, {
+        updateCodePaneCM("replayReq", els.replayRequestCM, tab.requestText, {
           mode: "http",
           readOnly: false,
           onChange: syncReplayRequestTextFromEditor,
         });
-        updateReplaySearchPane("request", displayText);
+        updateReplaySearchPane("request", tab.requestText);
       }
     } else {
       // Legacy non-CM path
@@ -6292,21 +7502,17 @@ function renderReplayViewContent(target) {
         if (els.replayRequestHighlight && !els.replayRequestHighlight.isContentEditable) {
           els.replayRequestHighlight.setAttribute("contenteditable", "plaintext-only");
         }
-        let displayText = tab.requestText;
-        if (mode === "pretty") {
-          const fakeMsg = { content_type: headerValue(tab.baseRequest?.headers || [], "content-type") };
-          displayText = prettyFormat(tab.requestText, fakeMsg);
-        } else if (mode === "raw") {
-          displayText = compactFormat(tab.requestText);
-        }
-        renderReplayRequestHighlight(displayText);
-        updateReplaySearchPane("request", displayText);
+        renderReplayRequestHighlight(tab.requestText);
+        updateReplaySearchPane("request", tab.requestText);
       }
     }
   }
 
   if (target === "response") {
-    if (!tab.responseRecord) return;
+    if (!tab.responseRecord) {
+      renderReplayEmptyResponse(tab);
+      return;
+    }
     const mode = state.replayMessageViews.response;
     const rawText = buildRawResponse(tab.responseRecord);
     let displayText;
@@ -6322,8 +7528,9 @@ function renderReplayViewContent(target) {
   }
 }
 
-function updateReplaySearchPane(target, text) {
+function updateReplaySearchPane(target, text, options = {}) {
   const isRequest = target === "request";
+  const scrollToFirst = options.scrollToFirst !== false;
   const query = state.replayMessageSearch[target];
   const input = isRequest ? els.replayRequestSearchInput : els.replayResponseSearchInput;
   const meta = isRequest ? els.replayRequestSearchMeta : els.replayResponseSearchMeta;
@@ -6338,7 +7545,7 @@ function updateReplaySearchPane(target, text) {
   if (isRequest) {
     const cv = getCMView("replayReq");
     if (cv) {
-      const result = cv.applySearch(query || "");
+      const result = cv.applySearch(query || "", { scrollToFirst });
       const mode = state.replayMessageViews[target] || "pretty";
       meta.innerHTML = buildSearchMeta(cv.view.state.doc.lines, mode, result.matchCount);
       return;
@@ -6346,7 +7553,7 @@ function updateReplaySearchPane(target, text) {
   }
   // CM path for response (via existing _replayResponseCMView)
   if (!isRequest && _replayResponseCMView) {
-    const result = _replayResponseCMView.applySearch(query || "");
+    const result = _replayResponseCMView.applySearch(query || "", { scrollToFirst });
     const mode = state.replayMessageViews[target] || "pretty";
     meta.innerHTML = buildSearchMeta(_replayResponseCMView.view.state.doc.lines, mode, result.matchCount);
     return;
@@ -6372,9 +7579,40 @@ function syncReplayToolbar(tab) {
   if (document.activeElement !== els.replaySchemeSelect && els.replaySchemeSelect.value !== target.scheme) {
     els.replaySchemeSelect.value = target.scheme;
   }
+  setReplayTargetInputValidity(validateManualRepeaterTargetInput(
+    els.replayHostInput.value,
+    els.replayPortInput.value,
+  ));
+  const versionSelect = document.getElementById("replayHttpVersionSelect");
+  if (versionSelect && document.activeElement !== versionSelect) {
+    versionSelect.value = normalizeReplayHttpVersion(tab.httpVersionMode || "");
+  }
   els.replayBackButton.disabled = !canNavigateReplayHistory(tab, -1);
   els.replayForwardButton.disabled = !canNavigateReplayHistory(tab, 1);
   return target;
+}
+
+function normalizeReplayHttpVersion(value) {
+  const normalized = String(value || "").trim().toUpperCase();
+  if (normalized === "HTTP/1.0" || normalized === "1.0") return "HTTP/1.0";
+  if (normalized === "HTTP/1.1" || normalized === "1.1") return "HTTP/1.1";
+  if (normalized === "HTTP/2" || normalized === "HTTP/2.0" || normalized === "2" || normalized === "2.0") return "HTTP/2";
+  return "";
+}
+
+function replayHttpVersionFromText(text) {
+  const firstLine = (text || "").split(/\r?\n/)[0] || "";
+  const match = firstLine.match(/^[A-Z]+\s+\S+\s+(HTTP\/[0-9.]+)$/i);
+  return normalizeReplayHttpVersion(match ? match[1] : "");
+}
+
+function parseReplayHttpVersionToken(token) {
+  if (!token) return undefined;
+  const normalized = normalizeReplayHttpVersion(token);
+  if (!normalized) {
+    throw new Error(`Unsupported HTTP version: ${token}`);
+  }
+  return normalized;
 }
 
 function renderEventLog() {
@@ -6437,7 +7675,11 @@ function renderMatchReplaceRules() {
       const rule = state.matchReplaceRules.find((r) => r.id === toggle.dataset.ruleToggle);
       if (rule) {
         rule.enabled = toggle.checked;
-        saveMatchReplaceRules().catch(console.error);
+        saveMatchReplaceRules().catch((error) => {
+          console.error(error);
+          showToast(error?.message || "Failed to save rule", "error");
+          loadMatchReplaceRules().catch(console.error);
+        });
       }
     });
   });
@@ -6480,42 +7722,54 @@ function renderTarget() {
     els.targetScopeEditor.value = state.targetScopeDraft;
   }
 
-  const liveHosts = new Set(state.targetSiteMap.map((host) => host.host));
+  const siteMap = Array.isArray(state.targetSiteMap) ? state.targetSiteMap : [];
+  const liveHosts = new Set(siteMap.map((host) => String(host.host || "")));
   state.targetExpandedHosts = new Set(
     Array.from(state.targetExpandedHosts).filter((host) => liveHosts.has(host)),
   );
 
-  els.targetTree.innerHTML = state.targetSiteMap.length
-    ? state.targetSiteMap
-        .map((host) => `
-          <section class="target-host-card">
-            <button
-              class="target-host-toggle ${state.targetExpandedHosts.has(host.host) ? "expanded" : ""}"
-              type="button"
-              data-target-host="${escapeHtml(host.host)}"
-              aria-expanded="${state.targetExpandedHosts.has(host.host) ? "true" : "false"}"
-            >
-              <div class="target-host-copy">
-                <div class="target-host-title">${escapeHtml(host.host)}</div>
-                <div class="target-path-meta">${host.request_count} request(s) · ${host.paths.length} path(s) · ${host.schemes.join(", ") || "http"}</div>
-              </div>
-              <div class="target-host-actions">
-                <span class="detail-chip ${host.in_scope ? "ok" : "none"}">${host.in_scope ? "In scope" : "Out of scope"}</span>
-                <span class="target-host-chevron" aria-hidden="true">▾</span>
-              </div>
-            </button>
-            <div class="target-path-list" ${state.targetExpandedHosts.has(host.host) ? "" : "hidden"}>
-              ${host.paths.map((path) => `
-                <div class="target-path-item">
-                  <div class="target-path-title">${escapeHtml(path.path || "/")}</div>
-                  <div class="target-path-meta">
-                    ${escapeHtml(path.methods.join(", "))} · ${escapeHtml(formatStatus(path.status))} · ${escapeHtml(formatTimestamp(path.last_seen))}${path.is_websocket ? " · websocket" : ""}${path.note_count ? ` · ${path.note_count} note(s)` : ""}
-                  </div>
+  els.targetTree.innerHTML = siteMap.length
+    ? siteMap
+        .map((host) => {
+          const hostName = String(host.host || "");
+          const paths = Array.isArray(host.paths) ? host.paths : [];
+          const schemes = Array.isArray(host.schemes) ? host.schemes.map(String).filter(Boolean) : [];
+          const requestCount = Number.isFinite(Number(host.request_count)) ? Number(host.request_count) : 0;
+          const expanded = state.targetExpandedHosts.has(hostName);
+          return `
+            <section class="target-host-card">
+              <button
+                class="target-host-toggle ${expanded ? "expanded" : ""}"
+                type="button"
+                data-target-host="${escapeHtml(hostName)}"
+                aria-expanded="${expanded ? "true" : "false"}"
+              >
+                <div class="target-host-copy">
+                  <div class="target-host-title">${escapeHtml(hostName)}</div>
+                  <div class="target-path-meta">${requestCount} request(s) · ${paths.length} path(s) · ${escapeHtml(schemes.join(", ") || "http")}</div>
                 </div>
-              `).join("")}
-            </div>
-          </section>
-        `)
+                <div class="target-host-actions">
+                  <span class="detail-chip ${host.in_scope ? "ok" : "none"}">${host.in_scope ? "In scope" : "Out of scope"}</span>
+                  <span class="target-host-chevron" aria-hidden="true">▾</span>
+                </div>
+              </button>
+              <div class="target-path-list" ${expanded ? "" : "hidden"}>
+                ${paths.map((path) => {
+                  const methods = Array.isArray(path.methods) ? path.methods.map(String) : [];
+                  const noteCount = Number.isFinite(Number(path.note_count)) ? Number(path.note_count) : 0;
+                  return `
+                    <div class="target-path-item">
+                      <div class="target-path-title">${escapeHtml(path.path || "/")}</div>
+                      <div class="target-path-meta">
+                        ${escapeHtml(methods.join(", "))} · ${escapeHtml(formatStatus(path.status))} · ${escapeHtml(formatTimestamp(path.last_seen))}${path.is_websocket ? " · websocket" : ""}${noteCount ? ` · ${noteCount} note(s)` : ""}
+                      </div>
+                    </div>
+                  `;
+                }).join("")}
+              </div>
+            </section>
+          `;
+        })
         .join("")
     : "<p class=\"empty-copy\">No captured targets yet. Send traffic through the proxy to build a site map.</p>";
 
@@ -6552,7 +7806,7 @@ function renderFuzzer() {
       if (newCv && !newCv._fuzzerOnChangeWired) {
         newCv._fuzzerOnChangeWired = true;
         addCMUpdateListener(newCv.view, (newText) => {
-          state.fuzzerRequestText = newText;
+          updateFuzzerRequestText(newText, { userEdit: true });
           scheduleWorkspaceStateSave();
         });
       }
@@ -6566,8 +7820,16 @@ function renderFuzzer() {
   if (els.fuzzerPayloadsEditor.value !== state.fuzzerPayloadsText) {
     els.fuzzerPayloadsEditor.value = state.fuzzerPayloadsText;
   }
+  if (els.startFuzzerButton) {
+    els.startFuzzerButton.disabled = !!state.fuzzerRunning;
+  }
+  if (els.resetFuzzerButton) {
+    els.resetFuzzerButton.disabled = !!state.fuzzerRunning;
+  }
 
-  if (!state.fuzzerAttackRecord) {
+  const attackRecord = normalizeFuzzerAttackRecord(state.fuzzerAttackRecord);
+  state.fuzzerAttackRecord = attackRecord;
+  if (!attackRecord) {
     els.fuzzerMeta.textContent = state.fuzzerNotice || "No fuzz run has been started yet.";
     els.fuzzerResultsBody.innerHTML = `
       <tr class="empty-row">
@@ -6583,22 +7845,37 @@ function renderFuzzer() {
   }
 
   els.fuzzerMeta.textContent = [
-    `${state.fuzzerAttackRecord.payload_count} payload(s)`,
-    `${state.fuzzerAttackRecord.marker_count} marker(s)`,
-    state.fuzzerAttackRecord.status,
+    `${attackRecord.payload_count ?? attackRecord.results.length} payload(s)`,
+    `${attackRecord.marker_count ?? 0} marker(s)`,
+    attackRecord.status || "completed",
   ].join(" · ");
-  els.fuzzerResultsBody.innerHTML = state.fuzzerAttackRecord.results
-    .map((result) => `
-      <tr class="fuzzer-result-row" data-transaction-id="${result.transaction_id || ""}" data-result-index="${result.index}">
-        <td>${result.index + 1}</td>
+  els.fuzzerResultsBody.innerHTML = attackRecord.results
+    .map((result, rowIndex) => {
+      const resultIndex = Number.isFinite(Number(result.index)) ? Number(result.index) : rowIndex;
+      const selectionKey = result.transaction_id ? `tx:${result.transaction_id}` : `row:${rowIndex}`;
+      const selectedClass = state._selectedFuzzerResultKey === selectionKey ? " fuzzer-result-selected" : "";
+      return `
+      <tr class="fuzzer-result-row${selectedClass}" data-transaction-id="${result.transaction_id || ""}" data-result-index="${resultIndex}" data-row-index="${rowIndex}">
+        <td>${resultIndex + 1}</td>
         <td class="cell-url">${escapeHtml(result.payload)}</td>
         <td>${escapeHtml(formatStatus(result.status))}</td>
         <td>${result.duration_ms == null ? "-" : `${result.duration_ms} ms`}</td>
         <td>${escapeHtml(formatSize(result.response_bytes))}</td>
         <td>${result.transaction_id ? escapeHtml(String(result.transaction_id).slice(0, 8)) : escapeHtml(result.note || "-")}</td>
       </tr>
-    `)
+    `;
+    })
     .join("");
+}
+
+function normalizeFuzzerAttackRecord(record) {
+  if (!record || typeof record !== "object") return null;
+  return {
+    ...record,
+    payload_count: Number.isFinite(Number(record.payload_count)) ? Number(record.payload_count) : jsonArray(record.results).length,
+    marker_count: Number.isFinite(Number(record.marker_count)) ? Number(record.marker_count) : 0,
+    results: jsonArray(record.results),
+  };
 }
 
 // ─── Fuzzer result detail panel ────────────────────────────────────────────
@@ -6606,28 +7883,40 @@ function renderFuzzer() {
 let _fuzzerDetailViewModes = { request: "pretty", response: "pretty" };
 
 /** Show request/response detail for a fuzzer result. */
-async function showFuzzerResultDetail(transactionId) {
+async function showFuzzerResultDetail(transactionId, selectionKey = `tx:${transactionId}`) {
   if (!transactionId || !els.fuzzerDetailPanel) return;
 
   els.fuzzerDetailPanel.classList.remove("hidden");
   const detailResizer = document.getElementById("fuzzerDetailResizer");
   if (detailResizer) detailResizer.classList.remove("hidden");
+  state._fuzzerDetailRecord = null;
+  if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
+  updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, "Loading transaction...", { mode: "http" });
+  updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
 
   try {
-    const resp = await fetch(`/api/transactions/${transactionId}`);
+    const sessionId = currentSessionId();
+    const resp = await fetch(transactionPath(transactionId, sessionId));
+    if (sessionId !== currentSessionId()) return;
     if (!resp.ok) {
+      if (state._selectedFuzzerResultKey !== selectionKey) return;
       updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, `Failed to load transaction: ${resp.status}`, { mode: "http" });
       updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
+      if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
       return;
     }
     const record = await resp.json();
+    if (state._selectedFuzzerResultKey !== selectionKey || sessionId !== currentSessionId()) return;
 
     // Store for mode switching
     state._fuzzerDetailRecord = record;
 
     renderFuzzerDetailPanes(record);
   } catch (err) {
+    if (state._selectedFuzzerResultKey !== selectionKey) return;
     updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, `Error: ${err.message}`, { mode: "http" });
+    updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
+    if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
   }
 }
 
@@ -6730,7 +8019,7 @@ function syncMatchReplaceEditor() {
   rule.case_sensitive = els.matchReplaceCaseSensitive.checked;
 }
 
-function deleteSelectedMatchReplaceRule() {
+async function deleteSelectedMatchReplaceRule() {
   if (!state.selectedMatchReplaceRuleId) {
     return;
   }
@@ -6738,9 +8027,12 @@ function deleteSelectedMatchReplaceRule() {
   state.matchReplaceRules = state.matchReplaceRules.filter((rule) => rule.id !== state.selectedMatchReplaceRuleId);
   state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
   renderMatchReplaceRules();
+  await saveMatchReplaceRules();
+  showToast("Rule deleted");
 }
 
 async function saveTargetScope() {
+  const sessionId = currentSessionId();
   const scopePatterns = els.targetScopeEditor.value
     .split("\n")
     .map((line) => line.trim())
@@ -6751,6 +8043,7 @@ async function saveTargetScope() {
       "content-type": "application/json",
     },
     body: JSON.stringify({
+      session_id: sessionId,
       scope_patterns: scopePatterns,
       intercept_enabled: state.runtime?.intercept_enabled,
       websocket_capture_enabled: state.runtime?.websocket_capture_enabled,
@@ -6759,7 +8052,11 @@ async function saveTargetScope() {
   if (!response.ok) {
     throw new Error(`saveTargetScope failed: ${response.status}`);
   }
-  state.runtime = await response.json();
+  const runtime = await response.json();
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.runtime = runtime;
   state.targetScopeDraft = formatScopePatternsText(state.runtime?.scope_patterns);
   state.targetScopeDirty = false;
   if (els.targetScopeEditor.value !== state.targetScopeDraft) {
@@ -6769,72 +8066,104 @@ async function saveTargetScope() {
   renderProxySettings();
   await loadTargetSiteMap();
   invalidateVisibleEntriesCache();
-  renderHistory();
+  scheduleRefresh();
 }
 
 async function openFuzzerFromReplay() {
   const tab = getActiveReplayTab();
-  if (!tab) return;
+  if (!tab || tab.type === "websocket") {
+    throw new Error("Select an HTTP Replay tab before sending to Fuzzer.");
+  }
   const request = parseEditableRawRequest(tab.requestText, tab.baseRequest);
+  const target = getRepeaterTargetConfig(tab, request);
+  invalidateFuzzerRun();
   state.fuzzerBaseRequest = request;
   state.fuzzerSourceTransactionId = tab.sourceTransactionId || null;
+  state.fuzzerTarget = normalizeFuzzerTargetOverride(replayTargetOverridePayload(tab, request, target));
+  state.fuzzerTargetRequestText = state.fuzzerTarget ? fuzzerTargetAuthorityFromRequestText(tab.requestText) : null;
   state.fuzzerNotice = "";
   state.fuzzerRequestText = tab.requestText;
   state.fuzzerPayloadsText = "";
   state.fuzzerAttackRecord = null;
+  state._selectedFuzzerResultKey = null;
+  hideFuzzerDetailPanel();
   state.activeTool = "fuzzer";
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
 
 async function openFuzzerFromSelection() {
-  let record = state.selectedRecord;
-  if (!record && state.selectedId) {
-    const response = await fetch(`/api/transactions/${state.selectedId}`);
-    if (response.ok) {
-      record = await response.json();
-    }
-  }
+  const record = await loadSelectedTransactionRecord();
 
-  if (!record || record.kind === "tunnel") {
-    return;
+  if (!record) {
+    throw new Error("Selected transaction could not be loaded.");
+  }
+  if (record.kind === "tunnel") {
+    throw new Error("Tunnel records cannot be sent to Fuzzer.");
   }
 
   const request = editableRequestFromRecord(record);
+  invalidateFuzzerRun();
   state.fuzzerBaseRequest = request;
   state.fuzzerSourceTransactionId = record.id;
-  state.fuzzerNotice = record.request.preview_truncated
+  state.fuzzerTarget = null;
+  state.fuzzerTargetRequestText = null;
+  state.fuzzerNotice = isRequestPreviewTruncated(record)
     ? buildTruncatedBodyNotice(record, "Fuzzer")
     : "";
   state.fuzzerRequestText = buildEditableRawRequest(request);
   state.fuzzerPayloadsText = "";
   state.fuzzerAttackRecord = null;
+  state._selectedFuzzerResultKey = null;
+  hideFuzzerDetailPanel();
   state.activeTool = "fuzzer";
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
 
 async function sendToSequenceFromSelection() {
-  let record = state.selectedRecord;
-  if (!record && state.selectedId) {
-    const response = await fetch(`/api/transactions/${state.selectedId}`);
-    if (response.ok) record = await response.json();
+  const record = await loadSelectedTransactionRecord();
+  if (!record) {
+    throw new Error("Selected transaction could not be loaded.");
   }
-  if (!record || record.kind === "tunnel") return;
+  if (record.kind === "tunnel") {
+    throw new Error("Tunnel records cannot be sent to Sequence.");
+  }
 
   const request = editableRequestFromRecord(record);
   if (!state.editingSequence) {
-    await createNewSequence();
+    if (!(await createNewSequence())) {
+      return;
+    }
+  }
+  if (!state.editingSequence) {
+    return;
   }
   state.editingSequence.steps.push({
     id: crypto.randomUUID(),
     label: `${request.method} ${request.path}`,
     request,
+    source_transaction_id: record.id,
+    http_version: normalizeReplayHttpVersion(request.http_version || ""),
     target: null,
     extractions: [],
   });
   state.activeTool = "sequence";
+  if (!(await saveCurrentSequence())) {
+    return;
+  }
+  scheduleWorkspaceStateSave();
   renderToolPanels();
+}
+
+function handleSendActionError(error) {
+  console.error(error);
+  showToast(error?.message || "Failed to send selected item.", "error");
+}
+
+function handleReplayActionError(error) {
+  console.error(error);
+  showToast(error?.message || "Replay action failed.", "error");
 }
 
 function initFuzzerResizers() {
@@ -6937,117 +8266,379 @@ function initFuzzerResizers() {
 }
 
 function resetFuzzer() {
-  state.fuzzerRequestText = state.fuzzerBaseRequest
-    ? buildEditableRawRequest(state.fuzzerBaseRequest)
-    : "";
+  invalidateFuzzerRun();
+  updateFuzzerRequestText(
+    state.fuzzerBaseRequest ? buildEditableRawRequest(state.fuzzerBaseRequest) : "",
+    { userEdit: true },
+  );
   state.fuzzerPayloadsText = "";
   state.fuzzerAttackRecord = null;
+  state.fuzzerNotice = "";
+  state._selectedFuzzerResultKey = null;
+  hideFuzzerDetailPanel();
   scheduleWorkspaceStateSave();
   renderFuzzer();
 }
 
-async function runFuzzerAttack() {
-  const fallback = state.fuzzerBaseRequest || {
-    scheme: "https",
-    host: "",
-    method: "GET",
-    path: "/",
-    headers: [],
-    body: "",
-    body_encoding: "utf8",
-    preview_truncated: false,
-  };
-  const fuzzerReqText = getCMView("fuzzerReq")
-    ? getCMView("fuzzerReq").getContent()
-    : (els.fuzzerRequestEditor ? els.fuzzerRequestEditor.value : "");
-
-  if (!fuzzerReqText.trim()) {
-    state.fuzzerAttackRecord = null;
-    state.fuzzerNotice = "Request template is empty. Paste a raw HTTP request with $payload$ markers, or send one from HTTP History (Command+I).";
-    renderFuzzer();
-    return;
+function updateFuzzerRequestText(text, { userEdit = false } = {}) {
+  const normalized = text || "";
+  if (state.fuzzerRequestText !== normalized) {
+    state.fuzzerRequestText = normalized;
+    if (userEdit) markFuzzerDraftChanged();
   }
+}
 
-  let template;
+function updateFuzzerPayloadsText(text, { userEdit = false } = {}) {
+  const normalized = text || "";
+  if (state.fuzzerPayloadsText !== normalized) {
+    state.fuzzerPayloadsText = normalized;
+    if (userEdit) markFuzzerDraftChanged();
+  }
+}
+
+function markFuzzerDraftChanged() {
+  state.fuzzerDraftVersion = (state.fuzzerDraftVersion || 0) + 1;
+  if (state.fuzzerAttackRecord) {
+    state.fuzzerAttackRecord = null;
+    state._selectedFuzzerResultKey = null;
+    state.fuzzerNotice = "Fuzzer draft changed. Start a new run to see results for the current template.";
+    hideFuzzerDetailPanel();
+  }
+}
+
+function invalidateFuzzerRun() {
+  state.fuzzerRunToken = (state.fuzzerRunToken || 0) + 1;
+  state.fuzzerRunning = false;
+}
+
+function fuzzerRequestAuthorityFromText(requestText) {
   try {
-    template = parseEditableRawRequest(fuzzerReqText, fallback);
-  } catch (parseErr) {
-    state.fuzzerAttackRecord = null;
-    state.fuzzerNotice = parseErr.message || "Failed to parse the request template.";
-    renderFuzzer();
+    const request = parseEditableRawRequest(
+      requestText,
+      state.fuzzerBaseRequest || createDefaultEditableRequest(),
+    );
+    return { scheme: request.scheme || "https", host: request.host || "" };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function fuzzerAuthorityFromSavedValue(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(text)) {
+    try {
+      const parsed = new URL(text);
+      const scheme = parsed.protocol.replace(":", "").toLowerCase();
+      if ((scheme !== "http" && scheme !== "https") || !parsed.host) {
+        return null;
+      }
+      return { scheme, host: parsed.host };
+    } catch (_error) {
+      return null;
+    }
+  }
+  return fuzzerRequestAuthorityFromText(text);
+}
+
+function activeFuzzerTargetForRequest(requestText) {
+  if (!state.fuzzerTarget) return null;
+  if (!state.fuzzerTargetRequestText) return null;
+  const original = fuzzerAuthorityFromSavedValue(state.fuzzerTargetRequestText);
+  const current = fuzzerRequestAuthorityFromText(requestText);
+  if (
+    !original
+    || !current
+    || original.scheme !== current.scheme
+    || !httpRequestAuthoritiesEquivalent(original.host, current.host, current.scheme)
+  ) {
+    return null;
+  }
+  return normalizeFuzzerTargetOverride(state.fuzzerTarget);
+}
+
+function fuzzerTargetAuthorityFromRequestText(requestText) {
+  const authority = fuzzerRequestAuthorityFromText(requestText || "");
+  if (!authority || !authority.host) {
+    return null;
+  }
+  return `${authority.scheme}://${authority.host}`;
+}
+
+function normalizeFuzzerTargetAuthority(value) {
+  const authority = fuzzerAuthorityFromSavedValue(value);
+  if (!authority || !authority.host) {
+    return null;
+  }
+  return `${authority.scheme}://${authority.host}`;
+}
+
+function isCurrentFuzzerRun(runToken, sessionId) {
+  return state.fuzzerRunToken === runToken && state.activeSession?.id === sessionId;
+}
+
+async function runFuzzerAttack() {
+  if (state.fuzzerRunning) {
     return;
   }
+  const runToken = (state.fuzzerRunToken || 0) + 1;
+  const sessionId = state.activeSession?.id || null;
+  state.fuzzerRunToken = runToken;
+  state.fuzzerRunning = true;
+  state._selectedFuzzerResultKey = null;
+  hideFuzzerDetailPanel();
+  renderFuzzer();
+  const draftVersion = state.fuzzerDraftVersion || 0;
+  try {
+    const fallback = state.fuzzerBaseRequest || {
+      scheme: "https",
+      host: "",
+      method: "GET",
+      path: "/",
+      headers: [],
+      body: "",
+      body_encoding: "utf8",
+      preview_truncated: false,
+    };
+    const fuzzerReqText = getCMView("fuzzerReq")
+      ? getCMView("fuzzerReq").getContent()
+      : (els.fuzzerRequestEditor ? els.fuzzerRequestEditor.value : "");
+    if (!fuzzerReqText.trim()) {
+      state.fuzzerAttackRecord = null;
+      state.fuzzerNotice = "Request template is empty. Paste a raw HTTP request with $payload$ markers, or send one from HTTP History (Command+I).";
+      scheduleWorkspaceStateSave();
+      renderFuzzer();
+      return;
+    }
 
-  const payloads = els.fuzzerPayloadsEditor.value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+    let template;
+    try {
+      template = parseEditableRawRequest(fuzzerReqText, fallback);
+    } catch (parseErr) {
+      state.fuzzerAttackRecord = null;
+      state.fuzzerNotice = parseErr.message || "Failed to parse the request template.";
+      scheduleWorkspaceStateSave();
+      renderFuzzer();
+      return;
+    }
 
-  if (payloads.length === 0) {
-    state.fuzzerAttackRecord = null;
-    state.fuzzerNotice = "No payloads provided. Enter one payload per line in the Payloads panel.";
-    renderFuzzer();
-    return;
-  }
+    const payloadsText = els.fuzzerPayloadsEditor.value;
+    const payloads = splitFuzzerPayloadLines(payloadsText);
 
-  const response = await fetch("/api/fuzzer/attacks", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ template, payloads, source_transaction_id: state.fuzzerSourceTransactionId }),
-  });
-  if (!response.ok) {
-    state.fuzzerAttackRecord = null;
-    state.fuzzerNotice = await response.text();
+    if (payloads.length === 0) {
+      state.fuzzerAttackRecord = null;
+      state.fuzzerNotice = "No payloads provided. Enter one payload per line in the Payloads panel.";
+      scheduleWorkspaceStateSave();
+      renderFuzzer();
+      return;
+    }
+
+    const target = activeFuzzerTargetForRequest(fuzzerReqText);
+    const httpVersion = replayHttpVersionFromText(fuzzerReqText) || undefined;
+    const response = await fetch("/api/fuzzer/attacks", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        session_id: sessionId,
+        template,
+        payloads,
+        source_transaction_id: state.fuzzerSourceTransactionId,
+        http_version: httpVersion,
+        target,
+      }),
+    });
+    if (!isCurrentFuzzerRun(runToken, sessionId)) {
+      return;
+    }
+    if (!response.ok) {
+      const notice = await response.text();
+      if (!isCurrentFuzzerRun(runToken, sessionId)) {
+        return;
+      }
+      const draftUnchanged = (state.fuzzerDraftVersion || 0) === draftVersion;
+      if (!draftUnchanged) {
+        showToast(notice || "Fuzzer run failed after the draft changed.", "error", 4000);
+        return;
+      }
+      state.fuzzerAttackRecord = null;
+      state.fuzzerNotice = notice;
+      scheduleWorkspaceStateSave();
+      renderFuzzer();
+      return;
+    }
+    const attackRecord = normalizeFuzzerAttackRecord(await response.json());
+    if (!isCurrentFuzzerRun(runToken, sessionId)) {
+      return;
+    }
+    const draftUnchanged = (state.fuzzerDraftVersion || 0) === draftVersion;
+    if (!draftUnchanged) {
+      state.fuzzerAttackRecord = null;
+      state.fuzzerNotice = "Fuzzer run completed, but the draft changed while it was running. Start again to see current results.";
+      state._selectedFuzzerResultKey = null;
+      hideFuzzerDetailPanel();
+      scheduleWorkspaceStateSave();
+      renderFuzzer();
+      scheduleRefresh();
+      return;
+    }
+    state.fuzzerBaseRequest = template;
+    state.fuzzerTarget = target;
+    state.fuzzerTargetRequestText = target ? fuzzerTargetAuthorityFromRequestText(fuzzerReqText) : null;
+    state.fuzzerRequestText = fuzzerReqText;
+    state.fuzzerPayloadsText = payloadsText;
+    state.fuzzerNotice = "";
+    state._selectedFuzzerResultKey = null;
+    hideFuzzerDetailPanel();
+    state.fuzzerAttackRecord = attackRecord;
     scheduleWorkspaceStateSave();
     renderFuzzer();
-    return;
+    scheduleRefresh();
+  } catch (error) {
+    if (!isCurrentFuzzerRun(runToken, sessionId)) {
+      return;
+    }
+    console.error("Fuzzer run error:", error);
+    const draftUnchanged = (state.fuzzerDraftVersion || 0) === draftVersion;
+    if (!draftUnchanged) {
+      showToast(error?.message || "Fuzzer run failed after the draft changed.", "error", 4000);
+      return;
+    }
+    state.fuzzerAttackRecord = null;
+    state.fuzzerNotice = error?.message || "An unexpected error occurred while starting the fuzzer.";
+    scheduleWorkspaceStateSave();
+    renderFuzzer();
+  } finally {
+    if (isCurrentFuzzerRun(runToken, sessionId)) {
+      state.fuzzerRunning = false;
+      renderFuzzer();
+    }
   }
-  state.fuzzerBaseRequest = template;
-  state.fuzzerNotice = "";
-  state.fuzzerRequestText = fuzzerReqText;
-  state.fuzzerPayloadsText = els.fuzzerPayloadsEditor.value;
-  state.fuzzerAttackRecord = await response.json();
-  scheduleWorkspaceStateSave();
-  renderFuzzer();
-  scheduleRefresh();
+}
+
+function splitFuzzerPayloadLines(text) {
+  const normalized = String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (normalized.length === 0) return [];
+  const lines = normalized.split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines;
 }
 
 /* ─── Sequence/Macro ─── */
 
-async function loadSequences() {
+function currentSequenceSessionId() {
+  return state.activeSession?.id || null;
+}
+
+function isCurrentSequenceSession(sessionId) {
+  return (state.activeSession?.id || null) === sessionId;
+}
+
+function isCurrentSequenceRun(runGeneration, sequenceId, sessionId, draftVersion) {
+  return Boolean(
+    state.sequenceRunGeneration === runGeneration
+    && state.selectedSequenceId === sequenceId
+    && isCurrentSequenceSession(sessionId)
+    && (state.sequenceDraftVersion || 0) === draftVersion
+  );
+}
+
+function sequenceSessionPath(path, sessionId) {
+  if (!sessionId) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}session_id=${encodeURIComponent(sessionId)}`;
+}
+
+async function loadSequences({ sessionId = currentSequenceSessionId() } = {}) {
   const [defsResp, runsResp] = await Promise.all([
-    fetch("/api/sequences"),
-    fetch("/api/sequence-runs?limit=20"),
+    fetch(sequenceSessionPath("/api/sequences", sessionId)),
+    fetch(sequenceSessionPath("/api/sequence-runs?limit=20", sessionId)),
   ]);
-  state.sequenceDefinitions = await defsResp.json();
-  state.sequencePastRuns = await runsResp.json();
+  await requireOkResponse(defsResp, "Failed to load sequences.");
+  await requireOkResponse(runsResp, "Failed to load sequence runs.");
+  const definitions = jsonArray(await defsResp.json());
+  const pastRuns = jsonArray(await runsResp.json());
+  if (!isCurrentSequenceSession(sessionId)) {
+    return false;
+  }
+  state.sequenceDefinitions = definitions;
+  state.sequencePastRuns = pastRuns;
+  return true;
+}
+
+function handleSequenceActionError(error) {
+  console.error(error);
+  showToast(error?.message || "Sequence action failed.", "error", 6000);
 }
 
 async function createNewSequence() {
+  if (!(await flushSequenceDraft())) {
+    return false;
+  }
+  const sessionId = currentSequenceSessionId();
   const def = {
     id: crypto.randomUUID(),
     name: "New Sequence",
     steps: [],
   };
-  await fetch("/api/sequences", {
+  const response = await fetch("/api/sequences", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(def),
+    body: JSON.stringify({ ...def, session_id: sessionId }),
   });
-  await loadSequences();
+  if (!isCurrentSequenceSession(sessionId)) {
+    return false;
+  }
+  await requireOkResponse(response, "Failed to create sequence.");
+  if (!isCurrentSequenceSession(sessionId)) {
+    return false;
+  }
+  const loaded = await loadSequences({ sessionId });
+  if (!loaded) {
+    return false;
+  }
   state.selectedSequenceId = def.id;
   state.editingSequence = JSON.parse(JSON.stringify(def));
+  state.sequenceDirty = false;
+  bumpSequenceDraftVersion();
   renderSequencePanel();
+  return true;
 }
 
-function selectSequence(id) {
+async function selectSequence(id) {
+  if (state.selectedSequenceId === id) {
+    syncSequenceStepFromDom({ allowInvalidRequests: true });
+    return;
+  }
+  const selectionGeneration = (state.sequenceSelectionGeneration || 0) + 1;
+  state.sequenceSelectionGeneration = selectionGeneration;
+  if (!(await flushSequenceDraft())) {
+    return;
+  }
+  if (state.sequenceSelectionGeneration !== selectionGeneration) {
+    return;
+  }
   state.selectedSequenceId = id;
   const def = state.sequenceDefinitions.find((d) => d.id === id);
   state.editingSequence = def ? JSON.parse(JSON.stringify(def)) : null;
+  state.sequenceDirty = false;
+  bumpSequenceDraftVersion();
   state.sequenceRunResult = null;
   renderSequencePanel();
+}
+
+function bumpSequenceDraftVersion() {
+  state.sequenceDraftVersion = (state.sequenceDraftVersion || 0) + 1;
+}
+
+function markSequenceDraftDirty() {
+  state.sequenceDirty = true;
+  bumpSequenceDraftVersion();
 }
 
 function addSequenceStep() {
@@ -7062,12 +8653,14 @@ function addSequenceStep() {
     target: null,
     extractions: [],
   });
+  markSequenceDraftDirty();
   renderSequencePanel();
 }
 
 function removeSequenceStep(index) {
   if (!state.editingSequence) return;
   state.editingSequence.steps.splice(index, 1);
+  markSequenceDraftDirty();
   renderSequencePanel();
 }
 
@@ -7081,6 +8674,7 @@ function addExtractionRule(stepIndex) {
     pattern: "",
     group: 1,
   });
+  markSequenceDraftDirty();
   renderSequencePanel();
 }
 
@@ -7089,10 +8683,11 @@ function removeExtractionRule(stepIndex, ruleIndex) {
   const step = state.editingSequence.steps[stepIndex];
   if (!step) return;
   step.extractions.splice(ruleIndex, 1);
+  markSequenceDraftDirty();
   renderSequencePanel();
 }
 
-function syncSequenceStepFromDom() {
+function syncSequenceStepFromDom({ allowInvalidRequests = false } = {}) {
   if (!state.editingSequence) return;
   const container = document.getElementById("sequenceStepsContainer");
   if (!container) return;
@@ -7104,8 +8699,20 @@ function syncSequenceStepFromDom() {
     if (labelInput) step.label = labelInput.value;
     const reqTextarea = card.querySelector(".step-request-text");
     if (reqTextarea) {
-      const parsed = parseEditableRawRequest(reqTextarea.value, step.request);
-      Object.assign(step.request, parsed);
+      step.request_text = reqTextarea.value;
+      const httpVersion = replayHttpVersionFromText(reqTextarea.value);
+      step.http_version = httpVersion || null;
+      try {
+        const parsed = parseEditableRawRequest(reqTextarea.value, step.request);
+        parsed.http_version = httpVersion || undefined;
+        Object.assign(step.request, parsed);
+        delete step.request_parse_error;
+      } catch (error) {
+        step.request_parse_error = error?.message || "Invalid request";
+        if (!allowInvalidRequests) {
+          throw error;
+        }
+      }
     }
     card.querySelectorAll(".extraction-row").forEach((row, j) => {
       const rule = step.extractions[j];
@@ -7120,55 +8727,137 @@ function syncSequenceStepFromDom() {
   });
 }
 
-async function saveCurrentSequence() {
-  if (!state.editingSequence) return;
-  syncSequenceStepFromDom();
-  await fetch("/api/sequences", {
+async function saveCurrentSequence({ render = true, preserveSelection = false } = {}) {
+  if (!state.editingSequence) return false;
+  syncSequenceStepFromDom({ allowInvalidRequests: true });
+  const sessionId = currentSequenceSessionId();
+  const savedId = state.editingSequence.id;
+  const selectedBeforeSave = state.selectedSequenceId;
+  const draftVersion = state.sequenceDraftVersion || 0;
+  const payload = JSON.parse(JSON.stringify(state.editingSequence));
+  payload.session_id = sessionId;
+  const response = await fetch("/api/sequences", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(state.editingSequence),
+    body: JSON.stringify(payload),
   });
-  await loadSequences();
-  renderSequencePanel();
+  if (!isCurrentSequenceSession(sessionId)) {
+    return false;
+  }
+  await requireOkResponse(response, "Failed to save sequence.");
+  if (!isCurrentSequenceSession(sessionId)) {
+    return false;
+  }
+  const loaded = await loadSequences({ sessionId });
+  if (!loaded) {
+    return false;
+  }
+  if (state.selectedSequenceId !== selectedBeforeSave) {
+    return false;
+  }
+  if ((state.sequenceDraftVersion || 0) !== draftVersion) {
+    state.sequenceDirty = true;
+    return false;
+  }
+  const saved = state.sequenceDefinitions.find((def) => def.id === savedId);
+  if (saved && (!preserveSelection || state.selectedSequenceId === savedId)) {
+    state.editingSequence = JSON.parse(JSON.stringify(saved));
+    state.selectedSequenceId = savedId;
+  }
+  state.sequenceDirty = false;
+  if (render) {
+    renderSequencePanel();
+  }
+  return true;
+}
+
+async function flushSequenceDraft() {
+  if (!state.sequenceDirty || !state.editingSequence) return true;
+  return saveCurrentSequence({ render: false, preserveSelection: true });
 }
 
 async function deleteSequence(id) {
-  await fetch(`/api/sequences/${id}`, { method: "DELETE" });
+  const sessionId = currentSequenceSessionId();
+  const response = await fetch(sequenceSessionPath(`/api/sequences/${id}`, sessionId), { method: "DELETE" });
+  if (!isCurrentSequenceSession(sessionId)) {
+    return;
+  }
+  await requireOkResponse(response, "Failed to delete sequence.");
+  if (!isCurrentSequenceSession(sessionId)) {
+    return;
+  }
   if (state.selectedSequenceId === id) {
     state.selectedSequenceId = null;
     state.editingSequence = null;
+    bumpSequenceDraftVersion();
   }
-  await loadSequences();
+  await loadSequences({ sessionId });
   renderSequencePanel();
 }
 
 async function runCurrentSequence() {
   if (!state.editingSequence) return;
+  const runSequenceId = state.editingSequence.id;
+  const sessionId = currentSequenceSessionId();
+  const runGeneration = (state.sequenceRunGeneration || 0) + 1;
+  state.sequenceRunGeneration = runGeneration;
   syncSequenceStepFromDom();
-  await saveCurrentSequence();
+  const saved = await saveCurrentSequence();
+  if (!saved) {
+    return;
+  }
+  if (
+    state.sequenceRunGeneration !== runGeneration
+    || state.selectedSequenceId !== runSequenceId
+    || !isCurrentSequenceSession(sessionId)
+  ) {
+    return;
+  }
+  const runDraftVersion = state.sequenceDraftVersion || 0;
 
   const runBtn = document.getElementById("runSequenceButton");
   runBtn.disabled = true;
   runBtn.textContent = "Running...";
 
   try {
-    const response = await fetch(`/api/sequences/${state.editingSequence.id}/run`, {
+    const response = await fetch(`/api/sequences/${runSequenceId}/run`, {
       method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
     });
+    if (!isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion)) {
+      return;
+    }
     if (!response.ok) {
       const errText = await response.text();
+      if (!isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion)) {
+        return;
+      }
       showToast(`Sequence failed: ${errText}`, "error");
       return;
     }
-    state.sequenceRunResult = await response.json();
-    await loadSequences();
+    const result = normalizeSequenceRunResult(await response.json());
+    if (!isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion)) {
+      return;
+    }
+    state.sequenceRunResult = result;
+    await loadSequences({ sessionId });
     scheduleRefresh();
   } catch (err) {
+    if (!isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion)) {
+      return;
+    }
     showToast(`Sequence error: ${err.message}`, "error");
   } finally {
-    runBtn.disabled = false;
-    runBtn.textContent = "Run";
-    renderSequencePanel();
+    if (
+      state.sequenceRunGeneration === runGeneration
+      && state.selectedSequenceId === runSequenceId
+      && isCurrentSequenceSession(sessionId)
+    ) {
+      runBtn.disabled = false;
+      runBtn.textContent = "Run";
+      renderSequencePanel();
+    }
   }
 }
 
@@ -7198,11 +8887,11 @@ function renderSequencePanel() {
   listBody.querySelectorAll(".history-row").forEach((row) => {
     row.addEventListener("click", (e) => {
       if (e.target.closest(".seq-delete")) return;
-      selectSequence(row.dataset.seqId);
+      selectSequence(row.dataset.seqId).catch(handleSequenceActionError);
     });
   });
   listBody.querySelectorAll(".seq-delete").forEach((btn) => {
-    btn.addEventListener("click", () => deleteSequence(btn.dataset.seqDelete).catch((e) => console.error(e)));
+    btn.addEventListener("click", () => deleteSequence(btn.dataset.seqDelete).catch(handleSequenceActionError));
   });
 
   // Editor
@@ -7215,7 +8904,12 @@ function renderSequencePanel() {
 
   if (hasSequence) {
     stepsContainer.innerHTML = editing.steps.map((step, idx) => {
-      const reqText = buildEditableRawRequest(step.request);
+      const requestForRender = {
+        ...(step.request || {}),
+        http_version: normalizeReplayHttpVersion(step.http_version || step.request?.http_version || "")
+          || step.request?.http_version,
+      };
+      const reqText = step.request_text ?? buildEditableRawRequest(requestForRender);
       const extractionsHtml = step.extractions.map((rule, rIdx) => `
         <div class="extraction-row">
           <input class="ext-var" placeholder="Variable name" value="${escapeHtml(rule.variable_name)}" />
@@ -7242,22 +8936,32 @@ function renderSequencePanel() {
       </div>`;
     }).join("");
 
+    if (!stepsContainer._sequenceDraftSyncWired) {
+      stepsContainer._sequenceDraftSyncWired = true;
+      const markSequenceDirty = () => {
+        syncSequenceStepFromDom({ allowInvalidRequests: true });
+        markSequenceDraftDirty();
+      };
+      stepsContainer.addEventListener("input", markSequenceDirty);
+      stepsContainer.addEventListener("change", markSequenceDirty);
+    }
+
     stepsContainer.querySelectorAll(".step-remove").forEach((btn) => {
       btn.addEventListener("click", () => {
-        syncSequenceStepFromDom();
+        syncSequenceStepFromDom({ allowInvalidRequests: true });
         removeSequenceStep(parseInt(btn.dataset.removeStep, 10));
       });
     });
     stepsContainer.querySelectorAll(".ext-add").forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.preventDefault();
-        syncSequenceStepFromDom();
+        syncSequenceStepFromDom({ allowInvalidRequests: true });
         addExtractionRule(parseInt(btn.dataset.addExt, 10));
       });
     });
     stepsContainer.querySelectorAll(".ext-remove").forEach((btn) => {
       btn.addEventListener("click", () => {
-        syncSequenceStepFromDom();
+        syncSequenceStepFromDom({ allowInvalidRequests: true });
         removeExtractionRule(parseInt(btn.dataset.step, 10), parseInt(btn.dataset.rule, 10));
       });
     });
@@ -7266,16 +8970,18 @@ function renderSequencePanel() {
   }
 
   // Run results
-  const run = state.sequenceRunResult;
+  const run = normalizeSequenceRunResult(state.sequenceRunResult);
+  state.sequenceRunResult = run;
   if (run) {
-    runMeta.textContent = `${run.sequence_name} — ${run.status} — ${run.step_results.length} steps`;
-    resultsBody.innerHTML = run.step_results.map((sr, i) => {
-      const extracted = Object.entries(sr.extracted || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+    const stepResults = jsonArray(run.step_results);
+    runMeta.textContent = `${run.sequence_name || "Sequence"} — ${run.status || "unknown"} — ${stepResults.length} steps`;
+    resultsBody.innerHTML = stepResults.map((sr, i) => {
+      const extracted = Object.entries((sr && typeof sr.extracted === "object" && sr.extracted) || {}).map(([k, v]) => `${k}=${v}`).join(", ");
       return `<tr>
         <td>${i + 1}</td>
-        <td>${escapeHtml(sr.label)}</td>
-        <td>${sr.error ? `<span style="color:var(--danger)">${escapeHtml(sr.error)}</span>` : escapeHtml(String(sr.status ?? "-"))}</td>
-        <td>${sr.duration_ms != null ? `${sr.duration_ms} ms` : "-"}</td>
+        <td>${escapeHtml(sr?.label || `Step ${i + 1}`)}</td>
+        <td>${sr?.error ? `<span style="color:var(--danger)">${escapeHtml(sr.error)}</span>` : escapeHtml(String(sr?.status ?? "-"))}</td>
+        <td>${sr?.duration_ms != null ? `${sr.duration_ms} ms` : "-"}</td>
         <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(extracted || "-")}</td>
       </tr>`;
     }).join("");
@@ -7295,33 +9001,80 @@ function renderSequencePanel() {
     : `<tr class="empty-row"><td colspan="4">No past runs.</td></tr>`;
 }
 
+function normalizeSequenceRunResult(run) {
+  if (!run || typeof run !== "object") return null;
+  return {
+    ...run,
+    step_results: jsonArray(run.step_results),
+  };
+}
+
 async function toggleIntercept() {
   if (!state.runtime) {
     return;
   }
 
+  const sessionId = currentSessionId();
   const turningOff = state.runtime.intercept_enabled;
   // Optimistic UI update — render immediately, sync in background
   state.runtime.intercept_enabled = !state.runtime.intercept_enabled;
+  const desiredInterceptEnabled = state.runtime.intercept_enabled;
+  const requestSeq = ++_interceptToggleRequestSeq;
   renderInterceptStatus();
 
   fetch("/api/runtime", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ intercept_enabled: state.runtime.intercept_enabled }),
-  }).then((r) => r.json()).then((rt) => { state.runtime = rt; }).catch(console.error);
+    body: JSON.stringify({ session_id: sessionId, intercept_enabled: desiredInterceptEnabled }),
+  }).then(async (r) => {
+    await requireOkResponse(r, "Failed to update intercept mode.");
+    return r.json();
+  }).then((rt) => {
+    if (requestSeq === _interceptToggleRequestSeq && sessionId === currentSessionId()) {
+      state.runtime = rt;
+      renderInterceptStatus();
+    }
+  })
+    .catch((error) => {
+      if (requestSeq !== _interceptToggleRequestSeq || sessionId !== currentSessionId()) {
+        return;
+      }
+      console.error(error);
+      showToast(error?.message || "Failed to update intercept mode.", "error");
+      loadRuntimeSettings().then(renderInterceptStatus).catch(console.error);
+    });
 
   if (turningOff) {
     Promise.all([
-      fetch("/api/intercepts/forward-all", { method: "POST" }),
-      fetch("/api/response-intercepts/forward-all", { method: "POST" }),
-    ]).then(() => Promise.all([loadIntercepts(false), loadResponseIntercepts(false)]))
-      .then(() => scheduleRefresh())
-      .catch(console.error);
+      fetch(sessionQueryPath("/api/intercepts/forward-all", sessionId), { method: "POST" }),
+      fetch(sessionQueryPath("/api/response-intercepts/forward-all", sessionId), { method: "POST" }),
+    ]).then(async ([requestResponse, responseResponse]) => {
+      await requireOkResponse(requestResponse, "Failed to forward queued requests.");
+      await requireOkResponse(responseResponse, "Failed to forward queued responses.");
+    }).then(() => {
+      if (sessionId !== currentSessionId()) {
+        return null;
+      }
+      return Promise.all([loadIntercepts(false), loadResponseIntercepts(false)]);
+    })
+      .then(() => {
+        if (sessionId === currentSessionId()) {
+          scheduleRefresh();
+        }
+      })
+      .catch((error) => {
+        if (sessionId !== currentSessionId()) {
+          return;
+        }
+        console.error(error);
+        showToast(error?.message || "Failed to forward queued intercepts.", "error");
+        Promise.all([loadIntercepts(false), loadResponseIntercepts(false)]).catch(console.error);
+      });
   }
 }
 
 async function saveProxySettings() {
+  const sessionId = currentSessionId();
   const scopePatterns = els.proxySettingScopePatterns.value
     .split("\n")
     .map((line) => line.trim())
@@ -7332,48 +9085,73 @@ async function saveProxySettings() {
     .filter(Boolean);
 
   const bindHost = els.proxySettingBindHost.value.trim();
-  const proxyPort = Number.parseInt(els.proxySettingPort.value, 10);
+  const proxyPortText = els.proxySettingPort.value.trim();
+  const proxyPort = strictIntegerInRange(proxyPortText, 1, 65535);
+  if (proxyPortText && proxyPort === null) {
+    throw new Error("Proxy port must be an integer between 1 and 65535.");
+  }
+  if (bindHost && !isValidIpLiteral(bindHost)) {
+    throw new Error("Proxy bind host must be an IPv4 or IPv6 address.");
+  }
+  const startupUpdate = {
+    proxy_bind_host: bindHost || undefined,
+    proxy_port: proxyPortText ? proxyPort : undefined,
+  };
+  const oastTokenValue = document.getElementById("proxySettingOastToken")?.value?.trim() || "";
+  const oastIntervalText = document.getElementById("proxySettingOastInterval")?.value?.trim() || "";
+  const oastInterval = oastIntervalText ? strictIntegerInRange(oastIntervalText, 1, 300) : 5;
+  if (oastInterval === null) {
+    throw new Error("OAST polling interval must be an integer between 1 and 300 seconds.");
+  }
+  const runtimeUpdate = {
+    session_id: sessionId,
+    intercept_enabled: els.proxySettingIntercept.checked,
+    websocket_capture_enabled: els.proxySettingWebsocketCapture.checked,
+    upstream_insecure: els.proxySettingUpstreamInsecure.checked,
+    scope_patterns: scopePatterns,
+    passthrough_hosts: passthroughHosts,
+    oast_enabled: document.getElementById("proxySettingOastEnabled")?.checked ?? false,
+    oast_provider: document.getElementById("proxySettingOastProvider")?.value || "custom",
+    oast_server_url: document.getElementById("proxySettingOastServerUrl")?.value?.trim() || "",
+    oast_polling_interval_secs: oastInterval,
+  };
+  if (state.oastTokenClearPending) {
+    runtimeUpdate.oast_token = "";
+  } else if (oastTokenValue && oastTokenValue !== OAST_TOKEN_REDACTION) {
+    runtimeUpdate.oast_token = oastTokenValue;
+  }
 
   const runtimeResponse = await fetch("/api/runtime", {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({
-      intercept_enabled: els.proxySettingIntercept.checked,
-      websocket_capture_enabled: els.proxySettingWebsocketCapture.checked,
-      upstream_insecure: els.proxySettingUpstreamInsecure.checked,
-      scope_patterns: scopePatterns,
-      passthrough_hosts: passthroughHosts,
-      oast_enabled: document.getElementById("proxySettingOastEnabled")?.checked ?? false,
-      oast_provider: document.getElementById("proxySettingOastProvider")?.value || "custom",
-      oast_server_url: document.getElementById("proxySettingOastServerUrl")?.value?.trim() || "",
-      oast_token: document.getElementById("proxySettingOastToken")?.value?.trim() || "",
-      oast_polling_interval_secs: parseInt(document.getElementById("proxySettingOastInterval")?.value) || 5,
-    }),
+    body: JSON.stringify(runtimeUpdate),
   });
 
   if (!runtimeResponse.ok) {
     throw new Error(await runtimeResponse.text());
   }
+  const runtimeResult = await runtimeResponse.json();
 
   const startupResponse = await fetch("/api/startup-settings", {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({
-      proxy_bind_host: bindHost || undefined,
-      proxy_port: Number.isFinite(proxyPort) ? proxyPort : undefined,
-    }),
+    body: JSON.stringify(startupUpdate),
   });
 
   if (!startupResponse.ok) {
     throw new Error(await startupResponse.text());
   }
 
-  state.runtime = await runtimeResponse.json();
   const startupResult = await startupResponse.json();
+  if (sessionId !== currentSessionId()) {
+    return startupResult;
+  }
+  state.runtime = runtimeResult;
+  state.oastTokenClearPending = false;
   state.settings.startup = startupResult;
 
   // If proxy was rebound, update the main proxy_addr in settings too
@@ -7384,8 +9162,35 @@ async function saveProxySettings() {
   renderInterceptStatus();
   renderProxySettings();
   invalidateVisibleEntriesCache();
-  renderHistory();
+  scheduleRefresh();
   return startupResult;
+}
+
+function isValidIpLiteral(value) {
+  const host = String(value || "").trim();
+  if (!host) return false;
+  if (host.includes(":")) {
+    const inner = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+    if (!inner || inner.includes("[") || inner.includes("]")) return false;
+    try {
+      const parsed = new URL(`http://[${inner}]/`);
+      return parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]");
+    } catch (_error) {
+      return false;
+    }
+  }
+  const octets = host.split(".");
+  return octets.length === 4 && octets.every((octet) => {
+    if (!/^\d{1,3}$/.test(octet)) return false;
+    const value = Number(octet);
+    return value >= 0 && value <= 255 && String(value) === octet;
+  });
+}
+
+async function requireOkResponse(response, fallbackMessage) {
+  if (response.ok) return;
+  const message = await response.text().catch(() => "");
+  throw new Error(message || fallbackMessage);
 }
 
 async function forwardSelectedIntercept() {
@@ -7393,6 +9198,7 @@ async function forwardSelectedIntercept() {
     return;
   }
 
+  const sessionId = currentSessionId();
   const id = state.selectedInterceptRecord.id;
   const interceptReqText = getCMView("interceptReq")
     ? getCMView("interceptReq").getContent()
@@ -7401,21 +9207,39 @@ async function forwardSelectedIntercept() {
     interceptReqText,
     state.selectedInterceptRecord.request,
   );
+  if (state.selectedInterceptRecord.is_websocket && request.body) {
+    showToast("WebSocket upgrade requests must not include a request body.", "error");
+    return;
+  }
 
   // Optimistic: remove from UI immediately
   state.intercepts = state.intercepts.filter((i) => i.id !== id);
   state.selectedInterceptRecord = null;
   state.interceptEditorSeedId = null;
-  state.selectedInterceptId = state.intercepts[0]?.id ?? null;
+  state.selectedInterceptId = getVisibleRequestInterceptSummaries()[0]?.id ?? null;
   renderIntercepts();
   updateInterceptQueueBadges();
 
-  fetch(`/api/intercepts/${id}/forward`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ request }),
-  }).then(() => { loadIntercepts(true).catch(console.error); scheduleRefresh(); })
-    .catch((e) => { console.error(e); loadIntercepts(false).catch(console.error); });
+  try {
+    const response = await fetch(sessionQueryPath(`/api/intercepts/${id}/forward`, sessionId), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request }),
+    });
+    await requireOkResponse(response, "Failed to forward intercepted request.");
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    await loadIntercepts(true);
+    scheduleRefresh();
+  } catch (e) {
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    console.error(e);
+    showToast(e?.message || "Failed to forward intercepted request.", "error");
+    await loadIntercepts(false).catch(console.error);
+  }
 }
 
 async function dropSelectedIntercept() {
@@ -7423,35 +9247,58 @@ async function dropSelectedIntercept() {
     return;
   }
 
+  const sessionId = currentSessionId();
   const id = state.selectedInterceptRecord.id;
 
   // Optimistic: remove from UI immediately
   state.intercepts = state.intercepts.filter((i) => i.id !== id);
   state.selectedInterceptRecord = null;
   state.interceptEditorSeedId = null;
-  state.selectedInterceptId = state.intercepts[0]?.id ?? null;
+  state.selectedInterceptId = getVisibleRequestInterceptSummaries()[0]?.id ?? null;
   renderIntercepts();
   updateInterceptQueueBadges();
 
-  fetch(`/api/intercepts/${id}/drop`, { method: "POST" })
-    .then(() => { loadIntercepts(true).catch(console.error); scheduleRefresh(); })
-    .catch((e) => { console.error(e); loadIntercepts(false).catch(console.error); });
+  try {
+    const response = await fetch(sessionQueryPath(`/api/intercepts/${id}/drop`, sessionId), { method: "POST" });
+    await requireOkResponse(response, "Failed to drop intercepted request.");
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    await loadIntercepts(true);
+    scheduleRefresh();
+  } catch (e) {
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    console.error(e);
+    showToast(e?.message || "Failed to drop intercepted request.", "error");
+    await loadIntercepts(false).catch(console.error);
+  }
 }
 
 /* ─── Response Intercept ─── */
 
 async function loadResponseIntercepts(preserveSelection = true) {
-  const response = await fetch("/api/response-intercepts");
-  state.responseIntercepts = await response.json();
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath("/api/response-intercepts", sessionId));
+  await requireOkResponse(response, "Failed to load intercepted responses.");
+  const responseIntercepts = jsonArray(await response.json());
+  if (sessionId !== currentSessionId()) {
+    return;
+  }
+  state.responseIntercepts = responseIntercepts;
 
-  if (!preserveSelection || !state.responseIntercepts.some((item) => item.id === state.selectedResponseInterceptId)) {
-    state.selectedResponseInterceptId = state.responseIntercepts[0]?.id ?? null;
+  const visibleResponseIntercepts = getVisibleResponseInterceptSummaries();
+  if (!preserveSelection || !visibleResponseIntercepts.some((item) => item.id === state.selectedResponseInterceptId)) {
+    state.selectedResponseInterceptId = visibleResponseIntercepts[0]?.id ?? null;
+    state.selectedResponseInterceptRecord = null;
+    state.responseInterceptEditorSeedId = null;
   }
 
   renderResponseIntercepts();
   updateInterceptQueueBadges();
   // Auto-switch to Response Queue when responses arrive and Request Queue is empty
-  if (state.responseIntercepts.length > 0 && state.intercepts.length === 0 && state.interceptQueueTab === "request") {
+  if (visibleResponseIntercepts.length > 0 && getVisibleRequestInterceptSummaries().length === 0 && state.interceptQueueTab === "request") {
     switchInterceptQueueTab("response");
   }
   if (state.selectedResponseInterceptId) {
@@ -7463,86 +9310,91 @@ async function loadResponseIntercepts(preserveSelection = true) {
 }
 
 async function loadResponseInterceptDetail(id) {
-  const response = await fetch(`/api/response-intercepts/${id}`);
+  const sessionId = currentSessionId();
+  const response = await fetch(sessionQueryPath(`/api/response-intercepts/${id}`, sessionId));
+  if (sessionId !== currentSessionId() || state.selectedResponseInterceptId !== id) {
+    return;
+  }
   if (!response.ok) {
     state.selectedResponseInterceptRecord = null;
     renderResponseIntercepts();
     return;
   }
 
-  state.selectedResponseInterceptRecord = await response.json();
+  const record = await response.json();
+  if (sessionId !== currentSessionId() || state.selectedResponseInterceptId !== id) {
+    return;
+  }
+  state.selectedResponseInterceptRecord = record;
   renderResponseIntercepts();
 }
 
 function buildEditableRawResponse(resp) {
-  let text = `HTTP/1.1 ${resp.status}\r\n`;
-  for (const h of resp.headers || []) {
+  const source = resp || {};
+  let text = `HTTP/1.1 ${source.status ?? 200}\r\n`;
+  for (const h of normalizedHeaders(source.headers)) {
     text += `${h.name}: ${h.value}\r\n`;
   }
   text += "\r\n";
-  if (resp.body_encoding === "base64") {
-    try {
-      text += atob(resp.body);
-    } catch {
-      text += resp.body;
-    }
+  if (source.body_encoding === "base64") {
+    text += safeDecodeBase64(source.body);
   } else {
-    text += resp.body || "";
+    text += source.body || "";
   }
   return text;
 }
 
 function parseEditableRawResponse(text, original) {
-  const lines = text.split(/\r?\n/);
+  const { head, body } = splitRawHttpMessage(text);
+  const lines = head.split("\n").filter((line) => line.length > 0);
   const statusLine = lines[0] || "";
-  const statusMatch = statusLine.match(/^HTTP\/[\d.]+ (\d+)/);
+  const hasStatusLine = /^HTTP\//i.test(statusLine);
+  const statusMatch = hasStatusLine ? statusLine.match(/^HTTP\/[0-9.]+\s+(\d{3})(?:\s+.*)?$/i) : null;
+  if (hasStatusLine && !statusMatch) {
+    throw new Error("Invalid response status line in editor");
+  }
   const status = statusMatch ? parseInt(statusMatch[1], 10) : (original?.status || 200);
 
   const headers = [];
-  let bodyStart = 1;
-  for (let i = 1; i < lines.length; i++) {
+  for (let i = hasStatusLine ? 1 : 0; i < lines.length; i++) {
     const line = lines[i];
-    if (line === "" || line === "\r") {
-      bodyStart = i + 1;
-      break;
-    }
     const colonIdx = line.indexOf(":");
     if (colonIdx > 0) {
       headers.push({
         name: line.substring(0, colonIdx).trim(),
         value: line.substring(colonIdx + 1).trim(),
       });
-      bodyStart = i + 1;
     } else {
-      bodyStart = i;
-      break;
+      throw new Error(`Invalid response header line: ${line}`);
     }
   }
 
-  const bodyText = lines.slice(bodyStart).join("\n");
+  const bodyText = body;
   const isText = !original || original.body_encoding === "utf8";
+  const bodyEncoding = isText ? "utf8" : "base64";
+  const bodyLength = editableResponseBodyLength(bodyText, bodyEncoding);
 
   // Auto-update Content-Length if enabled
-  if (document.getElementById("proxySettingAutoContentLength")?.checked && bodyText) {
-    const bodyBytes = new TextEncoder().encode(bodyText).length;
-    const clIdx = headers.findIndex((h) => h.name.toLowerCase() === "content-length");
-    if (clIdx !== -1) {
-      headers[clIdx].value = String(bodyBytes);
+  if (document.getElementById("proxySettingAutoContentLength")?.checked) {
+    for (const header of headers) {
+      if (headerNameEquals(header, "content-length")) {
+        header.value = String(bodyLength);
+      }
     }
   }
+  validateRawHttpBodyFraming(headers, bodyLength);
 
   return {
     status,
     headers,
-    body: isText ? bodyText : btoa(bodyText),
-    body_encoding: isText ? "utf8" : "base64",
+    body: isText ? bodyText : safeEncodeBase64(bodyText),
+    body_encoding: bodyEncoding,
   };
 }
 
 function renderResponseIntercepts() {
-  const filteredResponseIntercepts = state.interceptInScopeOnly
-    ? state.responseIntercepts.filter((item) => isInScopeHost(item.host))
-    : state.responseIntercepts;
+  const filteredResponseIntercepts = getVisibleResponseInterceptSummaries();
+  reconcileResponseInterceptSelection(filteredResponseIntercepts);
   els.responseInterceptTableBody.innerHTML = filteredResponseIntercepts.length
     ? filteredResponseIntercepts
         .map((item) => {
@@ -7624,6 +9476,7 @@ function renderResponseIntercepts() {
 async function forwardSelectedResponseIntercept() {
   if (!state.selectedResponseInterceptRecord) return;
 
+  const sessionId = currentSessionId();
   const id = state.selectedResponseInterceptRecord.id;
   const interceptResText = getCMView("interceptRes")
     ? getCMView("interceptRes").getContent()
@@ -7637,34 +9490,62 @@ async function forwardSelectedResponseIntercept() {
   state.responseIntercepts = state.responseIntercepts.filter((i) => i.id !== id);
   state.selectedResponseInterceptRecord = null;
   state.responseInterceptEditorSeedId = null;
-  state.selectedResponseInterceptId = state.responseIntercepts[0]?.id ?? null;
+  state.selectedResponseInterceptId = getVisibleResponseInterceptSummaries()[0]?.id ?? null;
   renderResponseIntercepts();
   updateInterceptQueueBadges();
 
-  fetch(`/api/response-intercepts/${id}/forward`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ response: editedResponse }),
-  }).then(() => { loadResponseIntercepts(true).catch(console.error); scheduleRefresh(); })
-    .catch((e) => { console.error(e); loadResponseIntercepts(false).catch(console.error); });
+  try {
+    const response = await fetch(sessionQueryPath(`/api/response-intercepts/${id}/forward`, sessionId), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ response: editedResponse }),
+    });
+    await requireOkResponse(response, "Failed to forward intercepted response.");
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    await loadResponseIntercepts(true);
+    scheduleRefresh();
+  } catch (e) {
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    console.error(e);
+    showToast(e?.message || "Failed to forward intercepted response.", "error");
+    await loadResponseIntercepts(false).catch(console.error);
+  }
 }
 
 async function dropSelectedResponseIntercept() {
   if (!state.selectedResponseInterceptRecord) return;
 
+  const sessionId = currentSessionId();
   const id = state.selectedResponseInterceptRecord.id;
 
   // Optimistic UI
   state.responseIntercepts = state.responseIntercepts.filter((i) => i.id !== id);
   state.selectedResponseInterceptRecord = null;
   state.responseInterceptEditorSeedId = null;
-  state.selectedResponseInterceptId = state.responseIntercepts[0]?.id ?? null;
+  state.selectedResponseInterceptId = getVisibleResponseInterceptSummaries()[0]?.id ?? null;
   renderResponseIntercepts();
   updateInterceptQueueBadges();
 
-  fetch(`/api/response-intercepts/${id}/drop`, { method: "POST" })
-    .then(() => { loadResponseIntercepts(true).catch(console.error); scheduleRefresh(); })
-    .catch((e) => { console.error(e); loadResponseIntercepts(false).catch(console.error); });
+  try {
+    const response = await fetch(sessionQueryPath(`/api/response-intercepts/${id}/drop`, sessionId), { method: "POST" });
+    await requireOkResponse(response, "Failed to drop intercepted response.");
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    await loadResponseIntercepts(true);
+    scheduleRefresh();
+  } catch (e) {
+    if (sessionId !== currentSessionId()) {
+      return;
+    }
+    console.error(e);
+    showToast(e?.message || "Failed to drop intercepted response.", "error");
+    await loadResponseIntercepts(false).catch(console.error);
+  }
 }
 
 function updateInterceptQueueBadges() {
@@ -7696,48 +9577,16 @@ function switchInterceptQueueTab(tab) {
 }
 
 async function openReplayFromSelection() {
-  let record = state.selectedRecord;
-  if (!record && state.selectedId) {
-    const response = await fetch(`/api/transactions/${state.selectedId}`);
-    if (response.ok) {
-      record = await response.json();
-    }
+  const record = await loadSelectedTransactionRecord();
+
+  if (!record) {
+    throw new Error("Selected transaction could not be loaded.");
+  }
+  if (record.kind === "tunnel") {
+    throw new Error("Tunnel records cannot be sent to Replay.");
   }
 
-  if (!record || record.kind === "tunnel") {
-    return;
-  }
-
-  // If this is a WebSocket upgrade (status 101), open as WS Replay
-  if (record.status === 101 || record.request?.headers?.some(
-    (h) => h.name.toLowerCase() === "upgrade" && h.value.toLowerCase() === "websocket"
-  )) {
-    const scheme = record.scheme === "https" ? "wss" : record.scheme === "http" ? "ws" : record.scheme || "wss";
-    createWsReplayTab({
-      scheme,
-      host: record.host?.replace(/:443$|:80$/, "") || "",
-      port: record.host?.includes(":") ? parseInt(record.host.split(":").pop()) : (scheme === "wss" ? 443 : 80),
-      path: record.path || "/",
-      headers: record.request?.headers || [],
-    });
-    state.activeTool = "replay";
-    scheduleWorkspaceStateSave();
-    renderToolPanels();
-    return;
-  }
-
-  const request = editableRequestFromRecord(record);
-  const tab = createReplayTab({
-    baseRequest: request,
-    sourceTransactionId: record.id,
-    notice: record.request.preview_truncated ? buildTruncatedBodyNotice(record, "Replay") : "",
-    requestText: buildEditableRawRequest(request),
-  });
-  state.replayTabs.push(tab);
-  state.activeReplayTabId = tab.id;
-  state.activeTool = "replay";
-  scheduleWorkspaceStateSave();
-  renderToolPanels();
+  openTransactionRecordInReplay(record);
 }
 
 function resetReplay() {
@@ -7764,22 +9613,67 @@ function resetReplay() {
 }
 
 let _replayAbortController = null;
+let _replaySendingTabId = null;
 
 function setReplaySending(sending) {
   els.sendReplayButton.disabled = sending;
   els.cancelReplayButton.disabled = !sending;
-  els.replayBackButton.disabled = sending;
-  els.replayForwardButton.disabled = sending;
+  if (els.replayFollowRedirectButton) {
+    els.replayFollowRedirectButton.disabled = sending;
+  }
+  if (sending) {
+    els.replayBackButton.disabled = true;
+    els.replayForwardButton.disabled = true;
+  } else {
+    const tab = getActiveReplayTab();
+    if (tab && tab.type !== "websocket") {
+      syncReplayToolbar(tab);
+    } else {
+      els.replayBackButton.disabled = true;
+      els.replayForwardButton.disabled = true;
+    }
+  }
 }
 
 function cancelReplaySend() {
+  const sendingTabId = _replaySendingTabId;
   if (_replayAbortController) {
     _replayAbortController.abort();
     _replayAbortController = null;
   }
+  _replaySendingTabId = null;
+  const tab = sendingTabId
+    ? state.replayTabs.find((item) => item.id === sendingTabId)
+    : getActiveReplayTab();
+  if (tab && tab.type !== "websocket") {
+    tab.responseRecord = null;
+    tab.notice = "Cancelled.";
+    scheduleWorkspaceStateSave();
+    renderReplayTabs();
+  }
   setReplaySending(false);
-  els.replayResponseMeta.textContent = "Cancelled.";
-  renderReplayResponseView("");
+  if (!sendingTabId || state.activeReplayTabId === sendingTabId) {
+    els.replayResponseMeta.textContent = "Cancelled.";
+    renderReplayResponseView("");
+  }
+}
+
+function clearReplaySendInFlight() {
+  if (_replayAbortController) {
+    _replayAbortController.abort();
+    _replayAbortController = null;
+  }
+  _replaySendingTabId = null;
+  setReplaySending(false);
+}
+
+function isReplayTabStillCurrent(tab, tabId, sessionId) {
+  return Boolean(
+    tab
+    && state.replayTabs.includes(tab)
+    && tab.id === tabId
+    && (state.activeSession?.id || null) === sessionId
+  );
 }
 
 async function sendReplay() {
@@ -7788,162 +9682,270 @@ async function sendReplay() {
     return;
   }
 
-  // Enter sending state immediately
-  tab.responseRecord = null;
-  tab.notice = "";
-  els.replayResponseMeta.textContent = "";
-  renderReplayResponseView("");
-  setReplaySending(true);
+  const targetValidation = validateManualRepeaterTargetInput(
+    els.replayHostInput.value,
+    els.replayPortInput.value,
+  );
+  setReplayTargetInputValidity(targetValidation);
+  if (!targetValidation.valid) {
+    els.replayHostInput.reportValidity();
+    els.replayPortInput.reportValidity();
+    return;
+  }
 
   let request, requestText, target;
   try {
     const fallback = tab.baseRequest || createDefaultEditableRequest();
-    const replayReqText = getCMView("replayReq")
-      ? getCMView("replayReq").getContent()
-      : (els.replayRequestEditor ? els.replayRequestEditor.value : tab.requestText);
+    const replayReqText = tab.requestText || "";
     request = parseEditableRawRequest(replayReqText, fallback);
     requestText = replayReqText;
     target = getRepeaterTargetConfig(tab, request);
   } catch (e) {
-    setReplaySending(false);
     els.replayResponseMeta.textContent = "Error";
     renderReplayResponseView(e.message || "Failed to parse request.");
     return;
   }
 
-  // HTTP version: prefer dropdown selection, fall back to request line
-  const versionDropdown = document.getElementById("replayHttpVersionSelect")?.value;
-  let httpVersion = versionDropdown || undefined;
-  if (!httpVersion) {
-    const firstLine = (requestText || "").split(/\r?\n/)[0] || "";
-    const verMatch = firstLine.match(/^[A-Z]+\s+\S+\s+(HTTP\/[0-9.]+)$/i);
-    httpVersion = verMatch ? verMatch[1] : undefined;
-  }
+  // Enter sending state after validation so parse errors do not discard the last response.
+  tab.responseRecord = null;
+  tab.notice = "";
+  els.replayResponseMeta.textContent = "";
+  renderReplayResponseView("");
+  setReplaySending(true);
+  const sendingTabId = tab.id;
+  const sendingSessionId = state.activeSession?.id || null;
 
-  _replayAbortController = new AbortController();
+  // HTTP version: prefer dropdown selection, fall back to request line
+  const httpVersion = normalizeReplayHttpVersion(tab.httpVersionMode || "")
+    || replayHttpVersionFromText(requestText)
+    || undefined;
+
+  const replayController = new AbortController();
+  _replayAbortController = replayController;
+  _replaySendingTabId = sendingTabId;
 
   let response;
   try {
+    const targetPayload = replayTargetOverridePayload(tab, request, target);
     response = await fetch("/api/replay/send", {
       method: "POST",
       headers: {
         "content-type": "application/json",
       },
       body: JSON.stringify({
+        session_id: sendingSessionId,
         request,
-        target: {
-          scheme: target.scheme,
-          host: target.host,
-          port: target.port,
-        },
+        target: targetPayload,
         source_transaction_id: tab.sourceTransactionId,
         http_version: httpVersion,
       }),
-      signal: _replayAbortController.signal,
+      signal: replayController.signal,
     });
   } catch (e) {
     if (e.name === "AbortError") return; // cancelled
-    throw e;
-  } finally {
-    _replayAbortController = null;
-    setReplaySending(false);
-  }
-
-  if (!response.ok) {
-    tab.responseRecord = null;
-    tab.notice = await response.text();
-    tab.baseRequest = cloneEditableRequest(request);
-    tab.targetScheme = target.scheme;
-    tab.targetHost = target.host;
-    tab.targetPort = target.port;
-    tab.requestText = requestText;
+    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) return;
+    const notice = e?.message || "Failed to send replay.";
+    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+    if (draftUnchanged) {
+      tab.responseRecord = null;
+      tab.notice = notice;
+      applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+    }
     recordRepeaterHistory(tab, {
       request,
       requestText,
       responseRecord: null,
-      notice: tab.notice,
+      notice,
       target,
     });
     scheduleWorkspaceStateSave();
-    renderReplayResponseOnly(tab);
-    syncReplayToolbar(tab);
+    if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
+      renderReplayResponseOnly(tab);
+      syncReplayToolbar(tab);
+    }
+    showToast(notice, "error");
+    return;
+  } finally {
+    if (_replayAbortController === replayController && _replaySendingTabId === sendingTabId) {
+      _replayAbortController = null;
+      _replaySendingTabId = null;
+      setReplaySending(false);
+    }
+  }
+
+  if (!state.replayTabs.some((item) => item.id === sendingTabId)) {
+    return;
+  }
+  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
     return;
   }
 
-  tab.baseRequest = cloneEditableRequest(request);
-  tab.targetScheme = target.scheme;
-  tab.targetHost = target.host;
-  tab.targetPort = target.port;
-  tab.notice = "";
-  tab.requestText = requestText;
-  tab.responseRecord = await response.json();
+  if (!response.ok) {
+    const errorPayload = await readReplaySendError(response);
+    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
+      return;
+    }
+    const notice = errorPayload.notice;
+    const responseRecord = errorPayload.responseRecord;
+    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+    if (draftUnchanged) {
+      tab.responseRecord = responseRecord;
+      tab.notice = notice;
+      applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+    }
+    recordRepeaterHistory(tab, {
+      request,
+      requestText,
+      responseRecord,
+      notice,
+      target,
+    });
+    scheduleWorkspaceStateSave();
+    if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
+      renderReplayResponseOnly(tab);
+      syncReplayToolbar(tab);
+    }
+    showToast(notice, "error");
+    if (responseRecord) {
+      scheduleRefresh();
+    }
+    return;
+  }
+
+  const responseRecord = await response.json();
+  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
+    return;
+  }
+  const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+  if (draftUnchanged) {
+    applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+    tab.notice = "";
+    tab.responseRecord = responseRecord;
+  }
   recordRepeaterHistory(tab, {
     request,
     requestText,
-    responseRecord: tab.responseRecord,
+    responseRecord,
     notice: "",
     target,
   });
   scheduleWorkspaceStateSave();
   // Only update response side — don't re-render request to preserve cursor/scroll
-  renderReplayResponseOnly(tab);
-  syncReplayToolbar(tab);
-  renderReplayViewTabs();
+  if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
+    renderReplayResponseOnly(tab);
+    syncReplayToolbar(tab);
+    renderReplayViewTabs();
+  } else if (!draftUnchanged && state.activeReplayTabId === sendingTabId) {
+    syncReplayToolbar(tab);
+    showToast("Replay response was saved to history; current request changed while sending.", "info", 4000);
+  }
   scheduleRefresh();
+}
+
+async function readReplaySendError(response) {
+  const fallback = `Replay failed (${response.status})`;
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.toLowerCase().includes("application/json")) {
+    try {
+      const payload = await response.json();
+      return {
+        notice: String(payload?.error || fallback),
+        responseRecord: payload?.record || payload?.response_record || null,
+      };
+    } catch (_error) {
+      return { notice: fallback, responseRecord: null };
+    }
+  }
+  const text = await response.text();
+  return {
+    notice: text || fallback,
+    responseRecord: null,
+  };
+}
+
+function replaySentDraftUnchanged(tab, requestText, target) {
+  if (!tab || tab.type === "websocket") return false;
+  if ((tab.requestText || "") !== requestText) {
+    return false;
+  }
+  const effectiveTarget = getRepeaterTargetConfig(tab, requestText ? deriveRepeaterRequest(tab) : null);
+  return targetStatesEquivalent(effectiveTarget, target);
+}
+
+function applyReplaySentDraftIfUnchanged(tab, request, requestText, target) {
+  if (!replaySentDraftUnchanged(tab, requestText, target)) {
+    return;
+  }
+  tab.baseRequest = cloneEditableRequest(request);
+  tab.targetScheme = target.scheme;
+  tab.targetHost = target.host;
+  tab.targetPort = target.port;
+  tab.targetManuallyEdited = !targetStatesEquivalent(
+    target,
+    authorityToTargetState(request.host, request.scheme),
+  );
+  tab.requestText = requestText;
 }
 
 async function followRedirect() {
   const tab = getActiveReplayTab();
   if (!tab || !tab.responseRecord) return;
+  if (_replaySendingTabId) return;
 
   const resp = tab.responseRecord.response;
   if (!resp) return;
 
   const status = tab.responseRecord.status;
-  const locationHeader = resp.headers.find((h) => h.name.toLowerCase() === "location");
+  const responseHeaders = normalizedHeaders(resp.headers);
+  const locationHeader = responseHeaders.find((h) => headerNameEquals(h, "location"));
   if (!locationHeader) return;
-
-  // Parse location URL
-  const location = locationHeader.value;
-  let newScheme = tab.targetScheme;
-  let newHost = tab.targetHost;
-  let newPort = tab.targetPort;
-  let newPath = location;
-
-  if (/^https?:\/\//i.test(location)) {
-    try {
-      const url = new URL(location);
-      newScheme = url.protocol.replace(":", "");
-      newHost = url.hostname;
-      newPort = url.port || (newScheme === "https" ? "443" : "80");
-      newPath = `${url.pathname || "/"}${url.search || ""}`;
-    } catch (_) {
-      newPath = location;
-    }
-  } else if (location.startsWith("/")) {
-    newPath = location;
-  } else {
-    // Relative path
-    const currentPath = tab.baseRequest?.path || "/";
-    const base = currentPath.substring(0, currentPath.lastIndexOf("/") + 1);
-    newPath = base + location;
-  }
 
   // Build new request from current request
   const fallback = tab.baseRequest || createDefaultEditableRequest();
-  const replayReqText = getCMView("replayReq")
-    ? getCMView("replayReq").getContent()
-    : (els.replayRequestEditor ? els.replayRequestEditor.value : tab.requestText);
-  const currentRequest = parseEditableRawRequest(replayReqText, fallback);
+  const replayReqText = tab.requestText || "";
+  let currentRequest;
+  let httpVersion;
+  try {
+    currentRequest = parseEditableRawRequest(replayReqText, fallback);
+    httpVersion = normalizeReplayHttpVersion(tab.httpVersionMode || "")
+      || replayHttpVersionFromText(replayReqText)
+      || undefined;
+  } catch (e) {
+    const message = e?.message || "Failed to parse request.";
+    els.replayResponseMeta.textContent = "Error";
+    showToast(message, "error");
+    return;
+  }
+
+  const location = String(locationHeader.value || "").trim();
+  let redirectUrl;
+  try {
+    const currentTarget = getRepeaterTargetConfig(tab, currentRequest);
+    const currentUrl = buildUrlFromTarget(
+      currentTarget.scheme || currentRequest.scheme || "https",
+      currentTarget.host || currentRequest.host || "localhost",
+      currentTarget.port || "",
+      currentRequest.path || "/",
+    );
+    redirectUrl = new URL(location, currentUrl);
+  } catch (_error) {
+    showToast("Invalid redirect Location header", "error");
+    return;
+  }
+  const newScheme = redirectUrl.protocol.replace(":", "") || currentRequest.scheme || "https";
+  const newHost = stripIpv6Brackets(redirectUrl.hostname);
+  const newPort = redirectUrl.port || (newScheme === "https" ? "443" : "80");
+  const newPath = `${redirectUrl.pathname || "/"}${redirectUrl.search || ""}`;
 
   // 301/302/303 → GET (drop body), 307/308 → keep method
   const useGet = status === 301 || status === 302 || status === 303;
   const newMethod = useGet ? "GET" : currentRequest.method;
   const newBody = useGet ? "" : currentRequest.body;
+  const newBodyEncoding = useGet ? "utf8" : (currentRequest.body_encoding || "utf8");
 
   // Collect Set-Cookie from response
-  const setCookies = resp.headers
-    .filter((h) => h.name.toLowerCase() === "set-cookie")
+  const setCookies = responseHeaders
+    .filter((h) => headerNameEquals(h, "set-cookie"))
     .map((h) => {
       // Extract just the cookie name=value (before ;)
       const raw = h.value.split(";")[0].trim();
@@ -7953,7 +9955,8 @@ async function followRedirect() {
 
   // Merge with existing cookies
   let existingCookies = [];
-  const cookieHeader = currentRequest.headers.find((h) => h.name.toLowerCase() === "cookie");
+  const currentHeaders = normalizedHeaders(currentRequest.headers);
+  const cookieHeader = currentHeaders.find((h) => headerNameEquals(h, "cookie"));
   if (cookieHeader) {
     existingCookies = cookieHeader.value.split(";").map((c) => c.trim()).filter(Boolean);
   }
@@ -7972,12 +9975,13 @@ async function followRedirect() {
   }
 
   // Build new headers
-  const newHeaders = currentRequest.headers
-    .filter((h) => h.name.toLowerCase() !== "cookie" && h.name.toLowerCase() !== "host")
+  const newHeaders = currentHeaders
+    .filter((h) => !headerNameEquals(h, "cookie") && !headerNameEquals(h, "host"))
     .map((h) => ({ name: h.name, value: h.value }));
 
   // Add updated host
-  newHeaders.unshift({ name: "host", value: newHost + (newPort && newPort !== "443" && newPort !== "80" ? `:${newPort}` : "") });
+  const newHostPort = isDefaultPortForScheme(newScheme, newPort) ? "" : newPort;
+  newHeaders.unshift({ name: "host", value: joinAuthority(newHost, newHostPort) });
 
   // Add merged cookies
   if (cookieMap.size > 0) {
@@ -7991,7 +9995,7 @@ async function followRedirect() {
     path: newPath,
     headers: newHeaders,
     body: newBody,
-    body_encoding: "utf8",
+    body_encoding: newBodyEncoding,
     preview_truncated: false,
   };
 
@@ -8013,26 +10017,95 @@ async function followRedirect() {
 
   // Send the follow request
   const target = { scheme: newScheme, host: newHost, port: newPort };
-  const response = await fetch("/api/replay/send", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ request: newRequest, target, source_transaction_id: tab.sourceTransactionId }),
-  });
+  const followingTabId = tab.id;
+  const followingSessionId = state.activeSession?.id || null;
+  setReplaySending(true);
+  const replayController = new AbortController();
+  _replayAbortController = replayController;
+  _replaySendingTabId = followingTabId;
+  let response;
+  try {
+    response = await fetch("/api/replay/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: followingSessionId,
+        request: newRequest,
+        target,
+        source_transaction_id: null,
+        http_version: httpVersion,
+      }),
+      signal: replayController.signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
+    const notice = e?.message || "Failed to follow redirect.";
+    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+    if (draftUnchanged) {
+      tab.responseRecord = null;
+      tab.notice = notice;
+      applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+    }
+    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord: null, notice, target });
+    scheduleWorkspaceStateSave();
+    if (draftUnchanged && state.activeReplayTabId === followingTabId) {
+      renderReplayResponseOnly(tab);
+      syncReplayToolbar(tab);
+    }
+    showToast(notice, "error");
+    return;
+  } finally {
+    if (_replayAbortController === replayController && _replaySendingTabId === followingTabId) {
+      _replayAbortController = null;
+      _replaySendingTabId = null;
+      setReplaySending(false);
+    }
+  }
+
+  if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
 
   if (!response.ok) {
-    tab.responseRecord = null;
-    tab.notice = await response.text();
-    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord: null, notice: tab.notice, target });
+    const errorPayload = await readReplaySendError(response);
+    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
+    const notice = errorPayload.notice;
+    const responseRecord = errorPayload.responseRecord;
+    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+    if (draftUnchanged) {
+      tab.responseRecord = responseRecord;
+      tab.notice = notice;
+      applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+    }
+    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice, target });
     scheduleWorkspaceStateSave();
-    renderReplay();
+    if (draftUnchanged && state.activeReplayTabId === followingTabId) {
+      renderReplayResponseOnly(tab);
+      syncReplayToolbar(tab);
+    }
+    if (responseRecord) {
+      scheduleRefresh();
+    }
     return;
   }
 
-  tab.notice = "";
-  tab.responseRecord = await response.json();
-  recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord: tab.responseRecord, notice: "", target });
+  const responseRecord = await response.json();
+  if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
+  const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+  if (draftUnchanged) {
+    applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+    tab.notice = "";
+    tab.responseRecord = responseRecord;
+  }
+  recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice: "", target });
   scheduleWorkspaceStateSave();
-  renderReplay();
+  if (draftUnchanged && state.activeReplayTabId === followingTabId) {
+    renderReplayResponseOnly(tab);
+    syncReplayToolbar(tab);
+    renderReplayViewTabs();
+  } else if (!draftUnchanged && state.activeReplayTabId === followingTabId) {
+    syncReplayToolbar(tab);
+    showToast("Redirect response was saved to history; current request changed while sending.", "info", 4000);
+  }
   scheduleRefresh();
 }
 
@@ -8052,21 +10125,31 @@ function duplicateActiveReplayTab() {
   }
 
   if (tab.type === "websocket") {
+    if (state.activeReplayTabId === tab.id && els.wsHandshakeHeaders) {
+      tab.wsHandshakeText = els.wsHandshakeHeaders.value;
+      tab.wsHandshakeEdited = true;
+    }
     createWsReplayTab({
       scheme: tab.wsScheme,
       host: tab.wsHost,
       port: tab.wsPort,
       path: tab.wsPath,
-      headers: [...(tab.wsHeaders || [])],
+      headers: normalizedHeaders(tab.wsHeaders),
       handshakeText: tab.wsHandshakeText || "",
+      handshakeEdited: !!tab.wsHandshakeEdited,
+      editorText: tab.wsEditorText || "",
+      messageType: tab.wsMessageType || "text",
+      editorBodyEncoded: !!tab.wsEditorBodyEncoded,
+      setupQueue: Array.isArray(tab.wsSetupQueue)
+        ? tab.wsSetupQueue.map((item) => ({ ...item }))
+        : [],
       customLabel: tab.customLabel || "",
     });
     return;
   }
 
   const fallback = tab.baseRequest || createDefaultEditableRequest();
-  const requestText = (getCMView("replayReq") ? getCMView("replayReq").getContent() : null)
-    || els.replayRequestEditor?.value || tab.requestText || buildEditableRawRequest(fallback);
+  const requestText = tab.requestText || buildEditableRawRequest(fallback);
   let request = cloneEditableRequest(fallback);
   try {
     request = parseEditableRawRequest(requestText, fallback);
@@ -8074,11 +10157,7 @@ function duplicateActiveReplayTab() {
     request = cloneEditableRequest(fallback);
   }
 
-  const target = normalizeRepeaterTargetInput(
-    els.replayHostInput?.value || tab.targetHost,
-    els.replayPortInput?.value || tab.targetPort,
-    els.replaySchemeSelect?.value || tab.targetScheme || request.scheme || "https",
-  );
+  const target = getRepeaterTargetConfig(tab, request);
 
   tab.baseRequest = cloneEditableRequest(request);
   tab.requestText = requestText;
@@ -8094,11 +10173,13 @@ function duplicateActiveReplayTab() {
     sourceTransactionId: tab.sourceTransactionId,
     notice: tab.notice,
     requestText,
+    httpVersionMode: tab.httpVersionMode || "",
     customLabel: tab.customLabel || "",
     responseRecord: cloneTransactionRecord(tab.responseRecord),
     targetScheme: target.scheme,
     targetHost: target.host,
     targetPort: target.port,
+    targetManuallyEdited: !!tab.targetManuallyEdited,
     historyEntries,
     historyIndex: normalizeRepeaterHistoryIndex(tab.historyIndex, historyEntries.length),
   });
@@ -8126,11 +10207,13 @@ function createReplayTab(seed = {}) {
     baseRequest,
     sourceTransactionId: seed.sourceTransactionId || null,
     notice: seed.notice || "",
-    requestText: seed.requestText || buildEditableRawRequest(baseRequest),
+    requestText: seed.requestText ?? buildEditableRawRequest(baseRequest),
+    httpVersionMode: normalizeReplayHttpVersion(seed.httpVersionMode || ""),
     responseRecord: cloneTransactionRecord(seed.responseRecord),
     targetScheme: normalizedTarget.scheme,
     targetHost: normalizedTarget.host,
     targetPort: normalizedTarget.port,
+    targetManuallyEdited: !!seed.targetManuallyEdited,
     historyEntries: Array.isArray(seed.historyEntries) ? seed.historyEntries.map(cloneRepeaterHistoryEntry) : [],
     historyIndex: normalizeRepeaterHistoryIndex(seed.historyIndex, Array.isArray(seed.historyEntries) ? seed.historyEntries.length : 0),
   };
@@ -8172,12 +10255,16 @@ function renderReplayTabs() {
       const isActive = tab.id === state.activeReplayTabId;
       const active = isActive ? "active" : "";
       const pinned = tab.pinned ? "pinned" : "";
-      const showPinBtn = isActive || tab.pinned;
-      const pinBtn = showPinBtn ? `<button class="replay-tab-pin-btn ${tab.pinned ? "on" : ""}" type="button" aria-label="Pin tab">\uD83D\uDCCC</button>` : "";
+      const pinBtnState = tab.pinned ? "on" : (!isActive ? "idle" : "");
+      const pinHiddenAttrs = pinBtnState === "idle" ? 'tabindex="-1"' : "";
+      const pinLabel = tab.pinned ? "Unpin tab" : "Pin tab";
+      const pinBtn = `<button class="replay-tab-pin-btn ${pinBtnState}" type="button" aria-label="${pinLabel}" title="${pinLabel}" aria-pressed="${tab.pinned ? "true" : "false"}" ${pinHiddenAttrs}>\uD83D\uDCCC</button>`;
+      const autoLabel = replayTabAutoLabel(tab);
       const label = replayTabLabel(tab);
+      const title = tab.customLabel ? `${label} / ${autoLabel}` : label;
       const labelControl = state.replayRenamingTabId === tab.id
-        ? `<input class="replay-tab-name-input" type="text" value="${escapeHtml(tab.customLabel || "")}" placeholder="${escapeHtml(label)}" maxlength="80" aria-label="Replay tab name">`
-        : `<button class="replay-tab-button" type="button" title="${escapeHtml(label)}">${escapeHtml(label)}</button>`;
+        ? `<input class="replay-tab-name-input" type="text" value="${escapeHtml(tab.customLabel || "")}" placeholder="${escapeHtml(autoLabel)}" maxlength="80" aria-label="Replay tab name">`
+        : `<button class="replay-tab-button" type="button" title="${escapeHtml(title)}">${escapeHtml(label)}</button>`;
       return `
         <div class="replay-tab ${active} ${pinned}" data-replay-tab-id="${tab.id}">
           ${pinBtn}
@@ -8255,9 +10342,17 @@ function commitReplayTabRename(id, value) {
     renderReplayTabs();
     return;
   }
+  const previousLabel = tab.customLabel || "";
   tab.customLabel = normalizeReplayTabCustomLabel(value);
+  const attemptedLabel = tab.customLabel;
   state.replayRenamingTabId = null;
-  scheduleWorkspaceStateSave();
+  flushWorkspaceState().catch((error) => {
+    if (tab.customLabel === attemptedLabel) {
+      tab.customLabel = previousLabel;
+    }
+    handleWorkspaceActionError(error);
+    renderReplayTabs();
+  });
   renderReplayTabs();
 }
 
@@ -8268,9 +10363,17 @@ function normalizeReplayTabCustomLabel(value) {
 function toggleReplayTabPin(id) {
   const tab = state.replayTabs.find((t) => t.id === id);
   if (!tab) return;
+  const previousPinned = !!tab.pinned;
   tab.pinned = !tab.pinned;
+  const attemptedPinned = tab.pinned;
   // Flush immediately so pin state survives quick app quit
-  flushWorkspaceState().catch((error) => console.error(error));
+  flushWorkspaceState().catch((error) => {
+    if (tab.pinned === attemptedPinned) {
+      tab.pinned = previousPinned;
+    }
+    handleWorkspaceActionError(error);
+    renderReplayTabs();
+  });
   renderReplayTabs();
 }
 
@@ -8288,9 +10391,20 @@ function closeRepeaterTab(id) {
     return;
   }
 
+  const visualOrderBeforeClose = getReplayTabVisualOrder().map((tab) => tab.id);
+  const visualIndex = visualOrderBeforeClose.indexOf(id);
   const closingTab = state.replayTabs[index];
   if (closingTab.type === "websocket") {
-    stopWsPoll(closingTab);
+    cleanupWsReplayTab(closingTab);
+  }
+  if (_replaySendingTabId === id) {
+    const controller = _replayAbortController;
+    _replayAbortController = null;
+    _replaySendingTabId = null;
+    if (controller) {
+      controller.abort();
+    }
+    setReplaySending(false);
   }
   if (state.replayRenamingTabId === id) {
     state.replayRenamingTabId = null;
@@ -8303,7 +10417,11 @@ function closeRepeaterTab(id) {
     state.replayTabs = [replacement];
     state.activeReplayTabId = replacement.id;
   } else if (state.activeReplayTabId === id) {
-    state.activeReplayTabId = state.replayTabs[Math.max(0, index - 1)].id;
+    const remainingVisualIds = visualOrderBeforeClose.filter((tabId) =>
+      tabId !== id && state.replayTabs.some((tab) => tab.id === tabId)
+    );
+    const replacementIndex = Math.min(Math.max(0, visualIndex - 1), remainingVisualIds.length - 1);
+    state.activeReplayTabId = remainingVisualIds[replacementIndex] || state.replayTabs[Math.max(0, index - 1)].id;
   }
   scheduleWorkspaceStateSave();
   renderReplay();
@@ -8342,6 +10460,15 @@ async function applyReplayTargetFields() {
     return;
   }
 
+  const validation = validateManualRepeaterTargetInput(
+    els.replayHostInput.value,
+    els.replayPortInput.value,
+  );
+  setReplayTargetInputValidity(validation);
+  if (!validation.valid) {
+    return;
+  }
+
   const normalizedTarget = normalizeRepeaterTargetInput(
     els.replayHostInput.value,
     els.replayPortInput.value,
@@ -8350,9 +10477,20 @@ async function applyReplayTargetFields() {
   tab.targetScheme = normalizedTarget.scheme;
   tab.targetHost = normalizedTarget.host;
   tab.targetPort = normalizedTarget.port;
+  tab.targetManuallyEdited = true;
   tab.responseRecord = null;
   scheduleWorkspaceStateSave();
   renderReplay();
+}
+
+function setReplayTargetInputValidity(validation) {
+  if (!els.replayHostInput || !els.replayPortInput) {
+    return;
+  }
+  els.replayHostInput.setCustomValidity(validation.hostError || "");
+  els.replayPortInput.setCustomValidity(validation.portError || "");
+  els.replayHostInput.toggleAttribute("aria-invalid", !!validation.hostError);
+  els.replayPortInput.toggleAttribute("aria-invalid", !!validation.portError);
 }
 
 function applyRepeaterTargetOverride(request, target) {
@@ -8371,17 +10509,78 @@ function getRepeaterTargetConfig(tab, request = null) {
     tab.targetPort,
     tab.targetScheme || derived.scheme,
   );
-  return {
+  const target = {
     scheme: normalizedOverride.scheme || derived.scheme,
     host: normalizedOverride.host || derived.host,
     port: normalizedOverride.port || derived.port,
   };
+  if (repeaterTargetLooksStale(tab, derived, target)) {
+    return derived;
+  }
+  return target;
+}
+
+function replayTargetOverridePayload(tab, request, target) {
+  if (!request || !target) return null;
+  const requestTarget = authorityToTargetState(request.host, request.scheme);
+  if (targetStatesEquivalent(target, requestTarget)) {
+    return null;
+  }
+  return {
+    scheme: target.scheme,
+    host: target.host,
+    port: target.port,
+  };
+}
+
+function repeaterTargetLooksStale(tab, derivedTarget, target) {
+  if (!tab?.baseRequest) {
+    return false;
+  }
+  if (tab.targetManuallyEdited) {
+    return false;
+  }
+  const baseTarget = authorityToTargetState(tab.baseRequest.host, tab.baseRequest.scheme);
+  return targetStatesEquivalent(target, baseTarget)
+    && !targetStatesEquivalent(derivedTarget, baseTarget);
+}
+
+function targetStatesEquivalent(left, right) {
+  const scheme = String(left?.scheme || right?.scheme || "https").toLowerCase();
+  const leftScheme = String(left?.scheme || scheme).toLowerCase();
+  const rightScheme = String(right?.scheme || scheme).toLowerCase();
+  if (leftScheme !== rightScheme) {
+    return false;
+  }
+  const leftAuthority = joinAuthority(left?.host, left?.port);
+  const rightAuthority = joinAuthority(right?.host, right?.port);
+  if (!leftAuthority || !rightAuthority) {
+    return leftAuthority === rightAuthority;
+  }
+  return httpRequestAuthoritiesEquivalent(leftAuthority, rightAuthority, scheme);
 }
 
 function authorityToTargetState(authority, scheme = "https") {
   const fallbackScheme = scheme || "https";
   if (!authority) {
     return { scheme: fallbackScheme, host: "", port: "" };
+  }
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(authority)) {
+    try {
+      const parsed = new URL(authority);
+      return {
+        scheme: parsed.protocol ? parsed.protocol.replace(":", "") : fallbackScheme,
+        host: parsed.hostname ? stripIpv6Brackets(parsed.hostname) : authority,
+        port: parsed.port || "",
+      };
+    } catch (_error) {
+      return {
+        scheme: fallbackScheme,
+        host: authority,
+        port: "",
+      };
+    }
   }
 
   try {
@@ -8415,15 +10614,146 @@ function joinAuthority(host, port) {
   return normalizedPort ? `${authorityHost}:${normalizedPort}` : authorityHost;
 }
 
+function isDefaultPortForScheme(scheme, port) {
+  const normalizedScheme = String(scheme || "").toLowerCase();
+  const normalizedPort = normalizePortValue(port);
+  return (normalizedScheme === "https" && normalizedPort === "443")
+    || (normalizedScheme === "http" && normalizedPort === "80")
+    || (normalizedScheme === "wss" && normalizedPort === "443")
+    || (normalizedScheme === "ws" && normalizedPort === "80");
+}
+
+function buildUrlFromTarget(scheme, host, port, path = "/") {
+  const normalizedScheme = scheme || "https";
+  const rawPath = String(path || "/");
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawPath)) {
+    return rawPath;
+  }
+  if (rawPath.startsWith("//")) {
+    return `${normalizedScheme}:${rawPath}`;
+  }
+  const target = normalizeRepeaterTargetInput(host, port, normalizedScheme);
+  const normalizedPort = isDefaultPortForScheme(normalizedScheme, target.port) ? "" : target.port;
+  const authority = joinAuthority(target.host, normalizedPort);
+  const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  return `${normalizedScheme}://${authority || "localhost"}${normalizedPath}`;
+}
+
 function normalizeRepeaterTargetInput(host, port, scheme = "https") {
   const normalizedScheme = scheme || "https";
   const normalizedHost = String(host || "").trim();
   const parsedHost = authorityToTargetState(normalizedHost, normalizedScheme);
+  const normalizedPort = normalizePortValue(port);
+  const effectiveScheme = parsedHost.scheme || normalizedScheme;
   return {
-    scheme: normalizedScheme,
+    scheme: effectiveScheme,
     host: normalizedHost ? parsedHost.host : "",
-    port: normalizePortValue(port) || (normalizedHost ? parsedHost.port : ""),
+    port: (parsedHost.port && normalizedHost)
+      ? parsedHost.port
+      : (normalizedHost ? (normalizedPort || defaultHttpPortForScheme(effectiveScheme)) : normalizedPort),
   };
+}
+
+function validateManualRepeaterTargetInput(host, port) {
+  const rawHost = String(host || "").trim();
+  const rawPort = String(port ?? "").trim();
+  let hostError = "";
+  let portError = "";
+
+  if (rawHost) {
+    const absoluteTarget = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawHost);
+    if (/\s/.test(rawHost) || rawHost.includes("\\") || rawHost.includes("@")) {
+      hostError = "Target host must not include whitespace, user info, or URL components.";
+    } else if (absoluteTarget) {
+      try {
+        const parsed = new URL(rawHost);
+        const scheme = parsed.protocol.replace(":", "").toLowerCase();
+        const hasUrlComponents = parsed.username
+          || parsed.password
+          || (parsed.pathname && parsed.pathname !== "/")
+          || parsed.search
+          || parsed.hash;
+        if (scheme !== "http" && scheme !== "https") {
+          hostError = "Target URL scheme must be HTTP or HTTPS.";
+        } else if (hasUrlComponents) {
+          hostError = "Target host must not include path, query, fragment, or credentials.";
+        } else if (parsed.port && rawPort && normalizePortValue(rawPort) !== parsed.port) {
+          portError = `Port conflicts with target URL port ${parsed.port}.`;
+        }
+      } catch (_error) {
+        hostError = "Target host is not a valid URL.";
+      }
+    } else if (/[/?#]/.test(rawHost)) {
+      hostError = "Target host must not include path, query, or fragment.";
+    } else if (rawHost.includes(":") && !isLikelyIpv6Literal(rawHost)) {
+      hostError = "Target host must not include a port; use the Port field.";
+    }
+  }
+
+  if (rawPort && (!/^\d+$/.test(rawPort) || !normalizePortValue(rawPort))) {
+    portError = "Port must be a number from 1 to 65535.";
+  }
+
+  return {
+    valid: !hostError && !portError,
+    hostError,
+    portError,
+  };
+}
+
+function validateWsReplayTargetInput(scheme, host, port, path) {
+  const normalizedScheme = String(scheme || "").toLowerCase();
+  const base = validateManualRepeaterTargetInput(host, port);
+  let schemeError = "";
+  let pathError = "";
+  if (!["ws", "wss"].includes(normalizedScheme)) {
+    schemeError = "WebSocket scheme must be WS or WSS.";
+  }
+  const rawHost = String(host || "").trim();
+  if (!rawHost) {
+    base.hostError = "WebSocket host is required.";
+  } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawHost)) {
+    base.hostError = "WebSocket host must not include URL components.";
+  }
+  const rawPort = String(port ?? "").trim();
+  if (!rawPort) {
+    base.portError = "WebSocket port is required.";
+  }
+  const rawPath = String(path || "").trim();
+  if (!rawPath) {
+    pathError = "WebSocket path is required.";
+  } else if (!rawPath.startsWith("/") || rawPath.startsWith("//") || /[\s#]/.test(rawPath)) {
+    pathError = "WebSocket path must start with / and must not include whitespace or fragment.";
+  }
+  return {
+    valid: !schemeError && !base.hostError && !base.portError && !pathError,
+    schemeError,
+    hostError: base.hostError,
+    portError: base.portError,
+    pathError,
+  };
+}
+
+function setWsReplayTargetInputValidity(validation) {
+  if (!els.wsSchemeSelect || !els.wsHostInput || !els.wsPortInput || !els.wsPathInput) {
+    return;
+  }
+  els.wsSchemeSelect.setCustomValidity(validation.schemeError || "");
+  els.wsHostInput.setCustomValidity(validation.hostError || "");
+  els.wsPortInput.setCustomValidity(validation.portError || "");
+  els.wsPathInput.setCustomValidity(validation.pathError || "");
+  els.wsSchemeSelect.toggleAttribute("aria-invalid", !!validation.schemeError);
+  els.wsHostInput.toggleAttribute("aria-invalid", !!validation.hostError);
+  els.wsPortInput.toggleAttribute("aria-invalid", !!validation.portError);
+  els.wsPathInput.toggleAttribute("aria-invalid", !!validation.pathError);
+}
+
+function isLikelyIpv6Literal(host) {
+  const normalized = String(host || "").trim();
+  if (normalized.startsWith("[") || normalized.endsWith("]")) {
+    return normalized.startsWith("[") && normalized.endsWith("]");
+  }
+  return (normalized.match(/:/g) || []).length >= 2;
 }
 
 function stripIpv6Brackets(host) {
@@ -8436,12 +10766,43 @@ function normalizePortValue(value) {
     return "";
   }
 
-  const parsed = Number.parseInt(normalized, 10);
-  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+  if (!/^\d+$/.test(normalized)) {
+    return "";
+  }
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65535) {
     return "";
   }
 
   return String(parsed);
+}
+
+function strictIntegerInRange(value, min, max) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized || !/^\d+$/.test(normalized)) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
+}
+
+function defaultHttpPortForScheme(scheme) {
+  return String(scheme || "").toLowerCase() === "http" ? "80" : "443";
+}
+
+function normalizeHttpRequestAuthority(authority, scheme = "https") {
+  const normalizedScheme = String(scheme || "https").toLowerCase();
+  const target = authorityToTargetState(authority, normalizedScheme);
+  return {
+    host: stripIpv6Brackets(String(target.host || "").trim()).toLowerCase(),
+    port: normalizePortValue(target.port) || defaultHttpPortForScheme(normalizedScheme),
+  };
+}
+
+function httpRequestAuthoritiesEquivalent(left, right, scheme = "https") {
+  const normalizedLeft = normalizeHttpRequestAuthority(left, scheme);
+  const normalizedRight = normalizeHttpRequestAuthority(right, scheme);
+  return normalizedLeft.host === normalizedRight.host && normalizedLeft.port === normalizedRight.port;
 }
 
 function normalizeRepeaterHistoryIndex(index, length) {
@@ -8461,6 +10822,8 @@ function cloneRepeaterHistoryEntry(entry) {
   return {
     request: cloneEditableRequest(entry.request),
     requestText: entry.requestText || "",
+    httpVersionMode: normalizeReplayHttpVersion(entry.httpVersionMode || "")
+      || replayHttpVersionFromText(entry.requestText || ""),
     responseRecord: cloneTransactionRecord(entry.responseRecord),
     notice: entry.notice || "",
     targetScheme: normalizedTarget.scheme,
@@ -8473,6 +10836,8 @@ function recordRepeaterHistory(tab, snapshot) {
   const entry = {
     request: cloneEditableRequest(snapshot.request),
     requestText: snapshot.requestText || "",
+    httpVersionMode: normalizeReplayHttpVersion(snapshot.httpVersionMode || tab.httpVersionMode || "")
+      || replayHttpVersionFromText(snapshot.requestText || ""),
     responseRecord: cloneTransactionRecord(snapshot.responseRecord),
     notice: snapshot.notice || "",
     targetScheme: snapshot.target.scheme || "https",
@@ -8510,11 +10875,17 @@ function restoreRepeaterHistoryEntry(tab, entry) {
   );
   tab.baseRequest = cloneEditableRequest(entry.request);
   tab.requestText = entry.requestText || buildEditableRawRequest(entry.request);
+  tab.httpVersionMode = normalizeReplayHttpVersion(entry.httpVersionMode || "")
+    || replayHttpVersionFromText(tab.requestText);
   tab.responseRecord = entry.responseRecord || null;
   tab.notice = entry.notice || "";
   tab.targetScheme = normalizedTarget.scheme;
   tab.targetHost = normalizedTarget.host;
   tab.targetPort = normalizedTarget.port;
+  tab.targetManuallyEdited = !targetStatesEquivalent(
+    normalizedTarget,
+    authorityToTargetState(entry.request.host, entry.request.scheme),
+  );
   // Clear hex state so it re-generates from the new requestText
   tab.requestBytes = null;
   tab.requestOriginalBytes = null;
@@ -8566,15 +10937,16 @@ function createDefaultEditableRequest() {
 }
 
 function cloneEditableRequest(request) {
+  const source = request || {};
   return {
-    scheme: request.scheme,
-    host: request.host,
-    method: request.method,
-    path: request.path,
-    headers: request.headers.map((header) => ({ name: header.name, value: header.value })),
-    body: request.body,
-    body_encoding: request.body_encoding,
-    preview_truncated: request.preview_truncated,
+    scheme: source.scheme,
+    host: source.host,
+    method: source.method,
+    path: source.path,
+    headers: normalizedHeaders(source.headers),
+    body: source.body,
+    body_encoding: source.body_encoding,
+    preview_truncated: source.preview_truncated,
   };
 }
 
@@ -8583,8 +10955,14 @@ function cloneTransactionRecord(record) {
 }
 
 function buildTruncatedBodyNotice(record, tool) {
-  const previewCap = state.settings?.body_preview_bytes || record.request.body_preview.length;
-  return `${tool} cannot safely resend this capture yet. The original request body is ${formatSize(record.request.body_size)}, but only a ${formatSize(previewCap)} preview was captured. Increase the preview cap and capture it again, or paste the full body manually before sending.`;
+  const request = record?.request || {};
+  const previewCap = state.settings?.body_preview_bytes || String(request.body_preview || "").length;
+  const originalSize = request.decoded_body_size ?? request.body_size;
+  return `${tool} cannot safely resend this capture yet. The original request body is ${formatSize(originalSize)}, but only a ${formatSize(previewCap)} preview was captured. Increase the preview cap and capture it again, or paste the full body manually before sending.`;
+}
+
+function isRequestPreviewTruncated(record) {
+  return Boolean(record?.request?.preview_truncated);
 }
 
 function openCertificateModal() {
@@ -8636,6 +11014,13 @@ function getActiveModalAction() {
     return {
       close: closeFilterModal,
       apply: applyFilterSettings,
+    };
+  }
+
+  if (isModalVisible(els.curlImportModal)) {
+    return {
+      close: closeCurlImportModal,
+      apply: null,
     };
   }
 
@@ -9011,44 +11396,67 @@ function hydrateFilterForm() {
 }
 
 function applyFilterSettings() {
+  const searchTerm = els.filterSearchTerm.value.trim();
+  const nextMime = {
+    html: els.filterMimeHtml.checked,
+    script: els.filterMimeScript.checked,
+    json: els.filterMimeJson.checked,
+    css: els.filterMimeCss.checked,
+    image: els.filterMimeImage.checked,
+    other: els.filterMimeOther.checked,
+  };
+  const nextStatus = {
+    success: els.filterStatus2xx.checked,
+    redirect: els.filterStatus3xx.checked,
+    clientError: els.filterStatus4xx.checked,
+    serverError: els.filterStatus5xx.checked,
+    other: els.filterStatusOther.checked,
+  };
+  if (!Object.values(nextStatus).some(Boolean)) {
+    showToast("Select at least one status filter.", "error");
+    return;
+  }
+  if (!Object.values(nextMime).some(Boolean)) {
+    showToast("Select at least one MIME filter.", "error");
+    return;
+  }
+  if (els.filterRegex.checked && searchTerm) {
+    try {
+      new RegExp(searchTerm, els.filterCaseSensitive.checked ? "" : "i");
+    } catch (error) {
+      const message = `Invalid regex: ${error.message}`;
+      if (els.historyMeta) els.historyMeta.textContent = message;
+      showToast(message);
+      return;
+    }
+  }
   state.filterSettings = {
     inScopeOnly: els.filterInScopeOnly.checked,
     hideWithoutResponses: els.filterHideWithoutResponses.checked,
     onlyParameterized: els.filterOnlyParameterized.checked,
     onlyNotes: els.filterOnlyNotes.checked,
-    searchTerm: els.filterSearchTerm.value.trim(),
+    searchTerm,
     regex: els.filterRegex.checked,
     caseSensitive: els.filterCaseSensitive.checked,
     negativeSearch: els.filterNegativeSearch.checked,
-    mime: {
-      html: els.filterMimeHtml.checked,
-      script: els.filterMimeScript.checked,
-      json: els.filterMimeJson.checked,
-      css: els.filterMimeCss.checked,
-      image: els.filterMimeImage.checked,
-      other: els.filterMimeOther.checked,
-    },
-    status: {
-      success: els.filterStatus2xx.checked,
-      redirect: els.filterStatus3xx.checked,
-      clientError: els.filterStatus4xx.checked,
-      serverError: els.filterStatus5xx.checked,
-      other: els.filterStatusOther.checked,
-    },
+    mime: nextMime,
+    status: nextStatus,
     hiddenExtensions: els.filterHiddenExtensions.value.trim(),
     port: els.filterPort.value.trim(),
     colorTags: state.filterSettings.colorTags,
   };
   closeFilterModal();
   syncHttpInScopePill();
-  scheduleRefresh();
+  scheduleRefresh({ resetScroll: true });
 }
 
 async function openCertificateFolder() {
   try {
-    await fetch("/api/certificates/reveal", { method: "POST" });
+    const response = await fetch("/api/certificates/reveal", { method: "POST" });
+    await requireOkResponse(response, "Failed to open certificate folder.");
   } catch (error) {
     console.error("Failed to open certificate folder:", error);
+    showToast(error?.message || "Failed to open certificate folder.", "error");
   }
 }
 
@@ -9090,24 +11498,26 @@ function buildRawRequest(record) {
   const startLine = record.kind === "tunnel"
     ? `CONNECT ${record.host} ${httpVer}`
     : `${record.method} ${record.path || "/"} ${httpVer}`;
-  const merged = mergeHeaders(record.request.headers);
+  const request = record.request || {};
+  const merged = mergeHeaders(request.headers);
   // Ensure a host header is present — the proxy stores the host separately
   // and some tunnelled HTTPS requests omit Host from the captured headers.
-  if (record.host && !merged.some((h) => h.name.toLowerCase() === "host")) {
+  if (record.host && !merged.some((h) => headerNameEquals(h, "host"))) {
     merged.unshift({ name: "host", value: record.host });
   }
   const headers = merged
     .map((header) => `${header.name}: ${header.value}`)
     .join("\n");
-  const body = renderBody(record.request);
-  return `${startLine}\n${headers}\n\n${body}`.trim();
+  const body = renderBody(request);
+  const head = headers ? `${startLine}\n${headers}` : startLine;
+  return body.length > 0 ? `${head}\n\n${body}` : head;
 }
 
 function mergeHeaders(headers) {
   const merged = [];
   const cookieParts = [];
-  for (const h of headers) {
-    if (h.name.toLowerCase() === "cookie") {
+  for (const h of normalizedHeaders(headers)) {
+    if (headerNameEquals(h, "cookie")) {
       cookieParts.push(h.value);
     } else {
       merged.push(h);
@@ -9119,17 +11529,32 @@ function mergeHeaders(headers) {
   return merged;
 }
 
+function normalizedHeaders(headers) {
+  return (Array.isArray(headers) ? headers : [])
+    .map((h) => ({
+      name: String(h?.name || ""),
+      value: String(h?.value ?? ""),
+    }))
+    .filter((h) => h.name);
+}
+
+function headerNameEquals(header, name) {
+  return String(header?.name || "").toLowerCase() === String(name || "").toLowerCase();
+}
+
 function buildRawResponse(record) {
   if (!record.response) {
     return "No response was captured for this exchange.";
   }
 
-  const headers = record.response.headers
+  const response = record.response || {};
+  const headers = normalizedHeaders(response.headers)
     .map((header) => `${header.name}: ${header.value}`)
     .join("\n");
-  const body = renderBody(record.response);
+  const body = renderBody(response);
   const httpVer = record.http_version || "HTTP/1.1";
-  return `${httpVer} ${record.status ?? 0}\n${headers}\n\n${body}`.trim();
+  const head = headers ? `${httpVer} ${record.status ?? 0}\n${headers}` : `${httpVer} ${record.status ?? 0}`;
+  return body.length > 0 ? `${head}\n\n${body}` : head;
 }
 
 function buildFindingsRawMessage(record, side) {
@@ -9139,18 +11564,21 @@ function buildFindingsRawMessage(record, side) {
     const startLine = record.kind === "tunnel"
       ? `CONNECT ${record.host} ${httpVer}`
       : `${record.method} ${record.path || "/"} ${httpVer}`;
-    const merged = mergeHeaders(record.request.headers);
-    if (record.host && !merged.some((h) => h.name.toLowerCase() === "host")) {
+    const request = record.request || {};
+    const merged = mergeHeaders(request.headers);
+    if (record.host && !merged.some((h) => headerNameEquals(h, "host"))) {
       merged.unshift({ name: "host", value: record.host });
     }
     const headers = merged.map((h) => `${h.name}: ${h.value}`).join("\n");
     const body = findingsBodyPlaceholder(msg);
-    return `${startLine}\n${headers}\n\n${body}`.trim();
+    const head = headers ? `${startLine}\n${headers}` : startLine;
+    return body.length > 0 ? `${head}\n\n${body}` : head;
   }
   if (!msg) return "No response was captured for this exchange.";
-  const headers = msg.headers.map((h) => `${h.name}: ${h.value}`).join("\n");
+  const headers = normalizedHeaders(msg.headers).map((h) => `${h.name}: ${h.value}`).join("\n");
   const body = findingsBodyPlaceholder(msg);
-  return `${httpVer} ${record.status ?? 0}\n${headers}\n\n${body}`.trim();
+  const head = headers ? `${httpVer} ${record.status ?? 0}\n${headers}` : `${httpVer} ${record.status ?? 0}`;
+  return body.length > 0 ? `${head}\n\n${body}` : head;
 }
 
 function findingsBodyPlaceholder(msg) {
@@ -9165,10 +11593,10 @@ function findingsBodyPlaceholder(msg) {
 }
 
 function buildRawWebsocketRequest(session) {
-  const headers = mergeHeaders(session.request.headers)
+  const headers = mergeHeaders(session?.request?.headers)
     .map((header) => `${header.name}: ${header.value}`)
     .join("\n");
-  return `GET ${session.path || "/"} HTTP/1.1\n${headers}`.trim();
+  return `GET ${session?.path || "/"} HTTP/1.1\n${headers}`.trim();
 }
 
 function buildRawWebsocketResponse(session) {
@@ -9176,7 +11604,7 @@ function buildRawWebsocketResponse(session) {
     return "No handshake response was captured.";
   }
 
-  const headers = session.response.headers
+  const headers = normalizedHeaders(session.response.headers)
     .map((header) => `${header.name}: ${header.value}`)
     .join("\n");
   return `HTTP/1.1 ${session.status ?? 101}\n${headers}`.trim();
@@ -9248,53 +11676,55 @@ function compactFormat(text) {
 }
 
 function editableRequestFromRecord(record) {
+  const request = record.request || {};
   return {
     scheme: record.scheme,
     host: record.host,
     method: record.method,
     path: record.path || "/",
     http_version: record.http_version,
-    headers: [...record.request.headers],
-    body: record.request.body_preview || "",
-    body_encoding: record.request.body_encoding,
-    preview_truncated: record.request.preview_truncated,
+    headers: normalizedHeaders(request.headers),
+    body: request.body_preview || "",
+    body_encoding: request.body_encoding,
+    preview_truncated: request.preview_truncated,
   };
 }
 
 function buildEditableRawRequest(request) {
-  const headers = [...request.headers];
-  if (!headers.some((header) => header.name.toLowerCase() === "host") && request.host) {
-    headers.unshift({ name: "host", value: request.host });
+  const source = request || {};
+  const headers = normalizedHeaders(source.headers);
+  if (!headers.some((header) => headerNameEquals(header, "host")) && source.host) {
+    headers.unshift({ name: "host", value: source.host });
   }
-  const httpVer = request.http_version || "HTTP/1.1";
-  const head = `${request.method} ${request.path || "/"} ${httpVer}`;
+  const httpVer = source.http_version || "HTTP/1.1";
+  const head = `${source.method || "GET"} ${source.path || "/"} ${httpVer}`;
   const headerBlock = mergeHeaders(headers).map((header) => `${header.name}: ${header.value}`).join("\n");
-  const body = request.body || "";
-  return `${head}\n${headerBlock}\n\n${body}`.trimEnd();
+  const body = source.body || "";
+  const rawHead = headerBlock ? `${head}\n${headerBlock}` : head;
+  return body.length > 0 ? `${rawHead}\n\n${body}` : rawHead;
 }
 
 function parseEditableRawRequest(text, fallback) {
-  const normalized = String(text || "").replace(/\r\n/g, "\n");
-  const boundary = normalized.indexOf("\n\n");
-  const head = boundary === -1 ? normalized : normalized.slice(0, boundary);
-  const body = boundary === -1 ? "" : normalized.slice(boundary + 2);
+  const { head, body } = splitRawHttpMessage(text);
   const lines = head.split("\n").filter((line) => line.length > 0);
   const [startLine = "GET / HTTP/1.1", ...headerLines] = lines;
-  const match = startLine.match(/^([A-Z]+)\s+(\S+)(?:\s+HTTP\/[0-9.]+)?$/i);
+  const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)(?:\s+(HTTP\/[0-9.]+))?$/);
 
   if (!match) {
     throw new Error("Invalid request line in editor");
   }
 
-  let [, method, target] = match;
+  let [, method, target, httpVersionToken] = match;
+  const httpVersion = parseReplayHttpVersionToken(httpVersionToken);
   let scheme = fallback?.scheme || "https";
   let host = fallback?.host || "";
   let path = target;
+  let absoluteAuthority = "";
   const headers = headerLines
     .map((line) => {
       const index = line.indexOf(":");
       if (index === -1) {
-        return null;
+        throw new Error(`Invalid header line: ${line}`);
       }
       return {
         name: line.slice(0, index).trim(),
@@ -9305,17 +11735,34 @@ function parseEditableRawRequest(text, fallback) {
 
   if (/^https?:\/\//i.test(target)) {
     const absolute = new URL(target);
+    if (absolute.username || absolute.password) {
+      throw new Error("Absolute request target must not include credentials");
+    }
+    if (absolute.hash) {
+      throw new Error("Absolute request target must not include a fragment");
+    }
     scheme = absolute.protocol.replace(":", "");
     host = absolute.host;
+    absoluteAuthority = absolute.host;
     path = `${absolute.pathname || "/"}${absolute.search || ""}`;
   }
 
   const hostHeader = headerValue(headers, "host");
   if (hostHeader) {
-    host = hostHeader;
+    if (absoluteAuthority) {
+      if (!httpRequestAuthoritiesEquivalent(absoluteAuthority, hostHeader, scheme)) {
+        throw new Error("Absolute-form request target does not match Host header");
+      }
+    } else {
+      host = hostHeader;
+    }
   }
 
-  if (!path.startsWith("/")) {
+  if (method.toUpperCase() === "CONNECT") {
+    throw new Error("CONNECT authority-form requests are not supported by Replay");
+  }
+
+  if (path !== "*" && !path.startsWith("/")) {
     path = `/${path}`;
   }
 
@@ -9323,29 +11770,83 @@ function parseEditableRawRequest(text, fallback) {
     throw new Error("Request is missing a Host header");
   }
 
+  const bodyEncoding = fallback?.body_encoding === "base64" ? "base64" : "utf8";
+  const bodyLength = editableRequestBodyLength(body, bodyEncoding);
+  const acceptedBodyLengths = [bodyLength];
+
   // Auto-update Content-Length if enabled
-  if (document.getElementById("proxySettingAutoContentLength")?.checked && body) {
-    const bodyBytes = new TextEncoder().encode(body).length;
-    const clIdx = headers.findIndex((h) => h.name.toLowerCase() === "content-length");
-    if (clIdx !== -1) {
-      headers[clIdx].value = String(bodyBytes);
+  if (document.getElementById("proxySettingAutoContentLength")?.checked) {
+    for (const header of headers) {
+      if (headerNameEquals(header, "content-length")) {
+        header.value = String(bodyLength);
+      }
     }
   }
+  validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths);
 
   return {
     scheme,
     host,
-    method: method.toUpperCase(),
+    method,
     path,
+    http_version: httpVersion,
     headers,
     body,
-    body_encoding: fallback?.body_encoding === "base64" ? "base64" : "utf8",
+    body_encoding: bodyEncoding,
     preview_truncated: false,
   };
 }
 
+function validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths = [bodyLength]) {
+  if (headers.some((header) => headerNameEquals(header, "transfer-encoding")
+    && String(header.value || "").split(",").some((value) => value.trim().toLowerCase() === "chunked"))) {
+    throw new Error("Raw HTTP input with Transfer-Encoding: chunked is not supported");
+  }
+
+  let contentLength = null;
+  for (const header of headers.filter((item) => headerNameEquals(item, "content-length"))) {
+    const value = String(header.value || "").trim();
+    if (!/^\d+$/.test(value)) {
+      throw new Error(`Invalid Content-Length: ${header.value}`);
+    }
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new Error(`Invalid Content-Length: ${header.value}`);
+    }
+    if (contentLength !== null && contentLength !== parsed) {
+      throw new Error("Conflicting Content-Length headers");
+    }
+    contentLength = parsed;
+  }
+
+  if (contentLength !== null && !acceptedBodyLengths.includes(contentLength)) {
+    throw new Error(`Content-Length ${contentLength} does not match raw body length ${bodyLength}`);
+  }
+}
+
+function splitRawHttpMessage(text) {
+  const raw = String(text ?? "");
+  const crlfBoundary = raw.indexOf("\r\n\r\n");
+  if (crlfBoundary !== -1) {
+    return {
+      head: raw.slice(0, crlfBoundary).replace(/\r\n/g, "\n"),
+      body: raw.slice(crlfBoundary + 4),
+    };
+  }
+
+  const lfBoundary = raw.indexOf("\n\n");
+  if (lfBoundary !== -1) {
+    return {
+      head: raw.slice(0, lfBoundary).replace(/\r\n/g, "\n"),
+      body: raw.slice(lfBoundary + 2),
+    };
+  }
+
+  return { head: raw.replace(/\r\n/g, "\n"), body: "" };
+}
+
 function headerValue(headers, name) {
-  return headers.find((header) => header.name.toLowerCase() === name.toLowerCase())?.value || null;
+  return normalizedHeaders(headers).find((header) => headerNameEquals(header, name))?.value || null;
 }
 
 function renderFramePreview(frame) {
@@ -9370,11 +11871,7 @@ function showFrameDetail(frame) {
 
   let body = frame.body_preview || "(empty)";
   if (frame.body_encoding === "base64") {
-    try {
-      body = atob(frame.body_preview);
-    } catch {
-      body = `[base64] ${frame.body_preview}`;
-    }
+    body = safeDecodeBase64(frame.body_preview, `[base64] ${frame.body_preview}`);
   }
 
   // Try to pretty-print JSON
@@ -9396,43 +11893,11 @@ function showFrameDetail(frame) {
 }
 
 function hideFrameDetail() {
+  state.selectedFrameIdx = null;
   els.frameDetailResizer.classList.add("hidden");
   els.frameDetailPanel.classList.add("hidden");
   els.websocketFramesBody.querySelectorAll(".ws-frame-bubble.selected").forEach((r) => r.classList.remove("selected"));
-}
-
-function initFrameDetailResizer() {
-  const resizer = els.frameDetailResizer;
-  if (!resizer) return;
-  const container = resizer.parentElement;
-
-  let startY = 0;
-  let startHeight = 0;
-
-  resizer.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    startY = e.clientY;
-    startHeight = els.frameDetailPanel.getBoundingClientRect().height;
-    document.addEventListener("mousemove", onMouseMove);
-    document.addEventListener("mouseup", onMouseUp);
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-  });
-
-  function onMouseMove(e) {
-    const delta = startY - e.clientY;
-    const newHeight = Math.max(120, startHeight + delta);
-    const maxHeight = container.getBoundingClientRect().height * 0.8;
-    const h = Math.min(newHeight, maxHeight);
-    els.frameDetailPanel.style.flex = "0 0 " + h + "px";
-  }
-
-  function onMouseUp() {
-    document.removeEventListener("mousemove", onMouseMove);
-    document.removeEventListener("mouseup", onMouseUp);
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-  }
+  els.websocketFramesBody.querySelectorAll(".frame-selected").forEach((r) => r.classList.remove("frame-selected"));
 }
 
 function initFrameDetailResizer() {
@@ -9575,6 +12040,9 @@ function startHexByteEdit(span, tab, container) {
     // Sync text
     tab.requestText = new TextDecoder().decode(tab.requestBytes);
     if (els.replayRequestEditor) els.replayRequestEditor.value = tab.requestText;
+    renderReplayTabs();
+    updateReplaySearchPane("request", tab.requestText);
+    scheduleWorkspaceStateSave();
   }
 
   input.addEventListener("keydown", (e) => {
@@ -10354,6 +12822,16 @@ function initSearchHitNavigation(metaElement, getViewFn) {
   new MutationObserver(() => { currentIndex = -1; }).observe(metaElement, { childList: true, subtree: true });
 }
 
+function initReplayResponseCMSearchNavigation() {
+  if (!els.replayResponseSearchMeta) return;
+  els.replayResponseSearchMeta.addEventListener("click", (event) => {
+    if (!event.target.closest(".search-hit-count") || !_replayResponseCMView) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    _replayResponseCMView.nextSearchMatch();
+  });
+}
+
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
@@ -10367,7 +12845,7 @@ function toggleSort(key) {
   }
 
   invalidateVisibleEntriesCache();
-  scheduleRefresh();
+  scheduleRefresh({ resetScroll: true });
 }
 
 function renderSortHeaders() {
@@ -10749,12 +13227,21 @@ function countLines(text) {
 
 function updateWsHandshakeLineNumbers() {
   if (!els.wsHandshakeLines) return;
+  const cv = getCMView("wsHandshake");
+  if (cv) {
+    els.wsHandshakeLines.textContent = buildLineNumbers(cv.view.state.doc.lines);
+    return;
+  }
   const resBtn = document.getElementById("wsHandshakeResBtn");
   const showingResponse = resBtn?.classList.contains("active");
   const activeView = showingResponse ? els.websocketResponseView : els.websocketRequestView;
   if (!activeView) return;
   const lineCount = activeView.querySelectorAll(".code-line").length || 1;
   els.wsHandshakeLines.textContent = buildLineNumbers(lineCount);
+}
+
+function getCurrentSelectedRecord() {
+  return state.selectedRecord?.id === state.selectedId ? state.selectedRecord : null;
 }
 
 function updateWsHandshakeSearch() {
@@ -10813,19 +13300,27 @@ function applyWsMessageJsonHighlight() {
 }
 
 function highlightJson(text) {
-  // Tokenize and highlight JSON
-  return text.replace(
-    /("(?:[^"\\]|\\.)*")\s*:|("(?:[^"\\]|\\.)*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b|(true|false)\b|(null)\b|([{}[\]:,])/g,
-    (match, key, str, num, bool, nul, punct) => {
-      if (key) return `<span class="json-key">${escapeHtml(key)}</span>:`;
-      if (str) return `<span class="json-string">${escapeHtml(str)}</span>`;
-      if (num) return `<span class="json-number">${escapeHtml(num)}</span>`;
-      if (bool) return `<span class="json-bool">${escapeHtml(bool)}</span>`;
-      if (nul) return `<span class="json-null">${escapeHtml(nul)}</span>`;
-      if (punct) return `<span class="json-punct">${escapeHtml(punct)}</span>`;
-      return escapeHtml(match);
-    }
-  );
+  const source = String(text ?? "");
+  const tokenPattern = /("(?:[^"\\]|\\.)*")\s*:|("(?:[^"\\]|\\.)*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b|(true|false)\b|(null)\b|([{}[\]:,])/g;
+  let cursor = 0;
+  let html = "";
+  let match;
+
+  while ((match = tokenPattern.exec(source)) !== null) {
+    html += escapeHtml(source.slice(cursor, match.index));
+    const [token, key, str, num, bool, nul, punct] = match;
+    if (key) html += `<span class="json-key">${escapeHtml(key)}</span>:`;
+    else if (str) html += `<span class="json-string">${escapeHtml(str)}</span>`;
+    else if (num) html += `<span class="json-number">${escapeHtml(num)}</span>`;
+    else if (bool) html += `<span class="json-bool">${escapeHtml(bool)}</span>`;
+    else if (nul) html += `<span class="json-null">${escapeHtml(nul)}</span>`;
+    else if (punct) html += `<span class="json-punct">${escapeHtml(punct)}</span>`;
+    else html += escapeHtml(token);
+    cursor = tokenPattern.lastIndex;
+  }
+
+  html += escapeHtml(source.slice(cursor));
+  return html;
 }
 
 function restoreCursorPosition(element, offset) {
@@ -10878,7 +13373,7 @@ function renderSummaryRows(rows) {
 }
 
 function inferProtocolState(record) {
-  const headerNames = record.request.headers.map((header) => header.name);
+  const headerNames = normalizedHeaders(record.request?.headers).map((header) => header.name);
   const looksLikeHttp2 = headerNames.some((name) => name.startsWith(":"));
   return {
     current: looksLikeHttp2 ? "HTTP/2" : "HTTP/1",
@@ -11037,6 +13532,8 @@ function getHistoryItemIndex(id) {
 }
 
 function countHiddenConnectItems() {
+  const hiddenTotal = state.historyPaging?.hiddenConnectTotal;
+  if (isKnownCount(hiddenTotal)) return hiddenTotal;
   // Use precomputed count when available; fall back to scan otherwise.
   if (typeof state._connectCount === "number") return state._connectCount;
   return state.items.filter((item) => item.method === "CONNECT").length;
@@ -11087,10 +13584,11 @@ function formatStatus(status) {
 }
 
 function statusTone(status) {
-  if (status == null || Number.isNaN(status)) return "none";
-  if (status >= 200 && status < 300) return "ok";
-  if (status >= 300 && status < 400) return "info";
-  if (status >= 400 && status < 500) return "warn";
+  const code = Number(status);
+  if (!Number.isFinite(code)) return "none";
+  if (code >= 200 && code < 300) return "ok";
+  if (code >= 300 && code < 400) return "info";
+  if (code >= 400 && code < 500) return "warn";
   return "error";
 }
 
@@ -11112,13 +13610,20 @@ function methodTone(method) {
 }
 
 function formatTimestamp(value) {
-  return HISTORY_TIME_FORMATTER.format(new Date(value));
+  if (value == null || value === "") {
+    return "-";
+  }
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return "-";
+  }
+  return HISTORY_TIME_FORMATTER.format(date);
 }
 
 function formatSize(bytes) {
-  if (!bytes) return "0 B";
+  let size = Number(bytes);
+  if (!Number.isFinite(size) || size <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
-  let size = bytes;
   let index = 0;
   while (size >= 1024 && index < units.length - 1) {
     size /= 1024;
@@ -11128,7 +13633,8 @@ function formatSize(bytes) {
 }
 
 function titleCase(value) {
-  return value.charAt(0).toUpperCase() + value.slice(1);
+  const text = String(value || "");
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function escapeHtml(value) {
@@ -11142,8 +13648,160 @@ function escapeHtml(value) {
 
 /* ─── WebSocket Replay ─── */
 
+function normalizeWebsocketFrames(frames) {
+  return (Array.isArray(frames) ? frames : [])
+    .filter((frame) => frame && typeof frame === "object")
+    .map((frame, fallbackIndex) => {
+      const index = Number(frame.index);
+      return {
+        ...frame,
+        index: Number.isFinite(index) ? index : fallbackIndex,
+        direction: frame.direction === "client_to_server" ? "client_to_server" : "server_to_client",
+        kind: String(frame.kind || "text"),
+        body: String(frame.body ?? frame.body_preview ?? ""),
+        body_preview: String(frame.body_preview ?? frame.body ?? ""),
+      };
+    });
+}
+
+function getWebsocketFrames(session) {
+  return normalizeWebsocketFrames(session?.frames);
+}
+
+function getWsReplayFrames(tab) {
+  return normalizeWebsocketFrames(tab?.wsFrames);
+}
+
+function utf8ByteLength(value) {
+  return new TextEncoder().encode(String(value || "")).length;
+}
+
+function truncateUtf8Preview(value, maxBytes) {
+  const text = String(value || "");
+  const fullBytes = utf8ByteLength(text);
+  if (fullBytes <= maxBytes) {
+    return { body: text, storedBytes: fullBytes, truncated: false };
+  }
+  const encoder = new TextEncoder();
+  let body = "";
+  let storedBytes = 0;
+  for (const char of text) {
+    const charBytes = encoder.encode(char).length;
+    if (storedBytes + charBytes > maxBytes) break;
+    body += char;
+    storedBytes += charBytes;
+  }
+  return { body, storedBytes, truncated: true };
+}
+
+function truncateBase64Preview(value, maxBytes) {
+  const encoded = String(value || "");
+  let decoded = "";
+  try {
+    decoded = atob(encoded);
+  } catch (_error) {
+    return { body: "", storedBytes: 0, truncated: true };
+  }
+  if (decoded.length <= maxBytes) {
+    return { body: encoded, storedBytes: decoded.length, truncated: false };
+  }
+  return {
+    body: btoa(decoded.slice(0, maxBytes)),
+    storedBytes: maxBytes,
+    truncated: true,
+  };
+}
+
+function snapshotWsReplayFrames(tab, budget = null) {
+  const frameLimit = budget
+    ? Math.min(WS_REPLAY_MAX_PERSISTED_FRAMES, Math.max(0, budget.frames))
+    : WS_REPLAY_MAX_PERSISTED_FRAMES;
+  const frames = getWsReplayFrames(tab).slice(-frameLimit);
+  const selected = [];
+  for (let reverseIndex = frames.length - 1; reverseIndex >= 0; reverseIndex -= 1) {
+    const frame = frames[reverseIndex];
+    const fallbackIndex = reverseIndex;
+    if (budget && (budget.frames <= 0 || budget.bytes <= 0)) {
+      break;
+    }
+    const encoding = frame.body_encoding === "base64" ? "base64" : "utf8";
+    const bodySource = String(frame.body ?? frame.body_preview ?? "");
+    const frameByteLimit = budget
+      ? Math.min(WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES, Math.max(0, budget.bytes))
+      : WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES;
+    const preview = encoding === "base64"
+      ? truncateBase64Preview(bodySource, frameByteLimit)
+      : truncateUtf8Preview(bodySource, frameByteLimit);
+    const declaredBodySize = Number(frame.body_size);
+    const bodySize = Number.isFinite(declaredBodySize) && declaredBodySize >= preview.storedBytes
+      ? declaredBodySize
+      : preview.storedBytes;
+    const capturedAt = Number.isFinite(Date.parse(frame.captured_at))
+      ? String(frame.captured_at)
+      : new Date().toISOString();
+    const index = Number(frame.index);
+    if (budget) {
+      budget.frames -= 1;
+      budget.bytes -= preview.storedBytes;
+    }
+    selected.push({
+      index: Number.isFinite(index) ? index : fallbackIndex,
+      captured_at: capturedAt,
+      direction: frame.direction === "client_to_server" ? "client_to_server" : "server_to_client",
+      kind: normalizeWsFrameKind(frame.kind),
+      body: preview.body,
+      body_encoding: encoding,
+      body_size: bodySize,
+      preview_truncated: Boolean(frame.preview_truncated || preview.truncated || bodySize > preview.storedBytes),
+    });
+  }
+  return selected.reverse();
+}
+
+function normalizeWsMessageType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["binary", "ping", "pong"].includes(normalized) ? normalized : "text";
+}
+
+function normalizeWsFrameKind(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["binary", "ping", "pong", "close", "other"].includes(normalized) ? normalized : "text";
+}
+
+function normalizeWsSetupItem(item = {}) {
+  const kind = normalizeWsMessageType(item.kind || item.messageType || item.message_type);
+  const body = String(item.body ?? "");
+  const bodyEncoded = !!(item.bodyEncoded ?? item.body_encoded);
+  return {
+    body,
+    kind,
+    bodyEncoded,
+    autoSend: !!item.autoSend,
+    sent: !!item.sent,
+    label: item.label || truncateSetupLabel(body, kind),
+  };
+}
+
+function wsSetupItemFromCapturedFrame(frame) {
+  const kind = wsReplayMessageTypeForFrame(frame);
+  const rawFrameBody = frame.body || frame.body_preview || "";
+  const bodyEncoded = kind !== "text" && frame.body_encoding === "base64";
+  const body = kind === "text" && frame.body_encoding === "base64"
+    ? safeDecodeBase64(rawFrameBody, rawFrameBody)
+    : rawFrameBody;
+  return normalizeWsSetupItem({
+    body,
+    kind,
+    bodyEncoded,
+    autoSend: true,
+    sent: false,
+    label: truncateSetupLabel(body, kind),
+  });
+}
+
 function createWsReplayTab(seed = {}) {
   state.replayTabSequence += 1;
+  const selectedFrameIndex = Number(seed.selectedFrameIndex);
   const tab = {
     id: crypto.randomUUID(),
     type: "websocket",
@@ -11152,22 +13810,30 @@ function createWsReplayTab(seed = {}) {
     label: `WS ${seed.host || "draft"}`,
     wsScheme: seed.scheme || "wss",
     wsHost: seed.host || "",
-    wsPort: seed.port || (seed.scheme === "ws" ? 80 : 443),
+    wsPort: seed.port || defaultWsPortForScheme(seed.scheme),
     wsPath: seed.path || "/",
-    wsHeaders: seed.headers || [],
+    wsHeaders: normalizedHeaders(seed.headers),
     wsHandshakeText: seed.handshakeText || "",
+    wsHandshakeEdited: !!seed.handshakeEdited,
     wsStatus: "disconnected",
     wsFrames: [],
     wsSelectedFrameIndex: -1,
-    wsEditorText: "",
+    wsSessionId: null,
+    wsEditorText: seed.editorText || "",
+    wsMessageType: normalizeWsMessageType(seed.messageType),
+    wsEditorBodyEncoded: !!seed.editorBodyEncoded,
     wsError: null,
     wsPollTimer: null,
-    wsSetupQueue: (seed.capturedFrames || [])
-      .filter((f) => f.direction === "client_to_server" && f.kind === "text")
-      .map((f) => {
-        const text = f.body_encoding === "base64" ? atob(f.body_preview || f.body || "") : (f.body_preview || f.body || "");
-        return { body: text, autoSend: true, sent: false, label: truncateSetupLabel(text) };
-      }),
+    wsLifecycleToken: 0,
+    wsSetupPending: false,
+    wsSetupRunning: false,
+    wsSetupQueue: Array.isArray(seed.setupQueue)
+      ? seed.setupQueue.map((item) => normalizeWsSetupItem(item))
+      : normalizeWebsocketFrames(seed.capturedFrames)
+        .filter((f) => f.direction === "client_to_server")
+        .filter((f) => !Number.isFinite(selectedFrameIndex) || f.index < selectedFrameIndex)
+        .filter((f) => !f.preview_truncated)
+        .map((f) => wsSetupItemFromCapturedFrame(f)),
   };
   state.replayTabs.push(tab);
   state.activeReplayTabId = tab.id;
@@ -11176,7 +13842,11 @@ function createWsReplayTab(seed = {}) {
   return tab;
 }
 
-function truncateSetupLabel(body) {
+function truncateSetupLabel(body, kind = "text") {
+  const messageKind = normalizeWsMessageType(kind);
+  if (messageKind !== "text") {
+    return messageKind.toUpperCase();
+  }
   try {
     const parsed = JSON.parse(body);
     if (parsed.event) return parsed.event;
@@ -11189,17 +13859,42 @@ function truncateSetupLabel(body) {
 async function wsConnect() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
+  const sessionId = state.activeSession?.id || null;
+  const lifecycleToken = (tab.wsLifecycleToken || 0) + 1;
+  tab.wsLifecycleToken = lifecycleToken;
+  tab.wsSessionId = sessionId;
 
   // Sync fields from UI
-  tab.wsScheme = els.wsSchemeSelect.value;
-  tab.wsHost = els.wsHostInput.value;
-  tab.wsPort = parseInt(els.wsPortInput.value) || (tab.wsScheme === "wss" ? 443 : 80);
-  tab.wsPath = els.wsPathInput.value;
+  const wsScheme = els.wsSchemeSelect.value;
+  const wsHost = els.wsHostInput.value.trim();
+  const wsPortText = els.wsPortInput.value.trim();
+  const wsPath = els.wsPathInput.value.trim();
+  const validation = validateWsReplayTargetInput(wsScheme, wsHost, wsPortText, wsPath);
+  setWsReplayTargetInputValidity(validation);
+  if (!validation.valid) {
+    els.wsSchemeSelect.reportValidity();
+    els.wsHostInput.reportValidity();
+    els.wsPortInput.reportValidity();
+    els.wsPathInput.reportValidity();
+    return;
+  }
+  const wsPort = normalizePortValue(wsPortText);
+  tab.wsScheme = wsScheme;
+  tab.wsHost = wsHost;
+  tab.wsPort = wsPort;
+  tab.wsPath = wsPath;
 
   tab.wsStatus = "connecting";
   tab.wsFrames = [];
   tab.wsSelectedFrameIndex = -1;
   tab.wsError = null;
+  tab.wsSetupPending = Array.isArray(tab.wsSetupQueue)
+    && tab.wsSetupQueue.some((item) => item.autoSend && !item.sent);
+  tab.wsSetupRunning = false;
+  for (const item of Array.isArray(tab.wsSetupQueue) ? tab.wsSetupQueue : []) {
+    item.sent = false;
+  }
+  scheduleWorkspaceStateSave();
   renderWsStatus();
   renderWsFrameList();
 
@@ -11209,14 +13904,19 @@ async function wsConnect() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        session_id: sessionId,
         id: tab.id,
-        scheme: tab.wsScheme,
-        host: tab.wsHost,
-        port: Number(tab.wsPort),
-        path: tab.wsPath,
+        scheme: wsScheme,
+        host: wsHost,
+        port: Number(wsPort),
+        path: wsPath,
         headers,
       }),
     });
+    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+      await disconnectWsReplayBackend(tab.id, { remove: true, sessionId });
+      return;
+    }
     if (!resp.ok) {
       const text = await resp.text().catch(() => "Connection failed");
       throw new Error(text);
@@ -11225,44 +13925,72 @@ async function wsConnect() {
     renderReplayTabs();
 
     // Auto-send setup queue after connection
-    await runSetupQueue(tab);
+    await runSetupQueue(tab, lifecycleToken);
   } catch (e) {
+    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+      return;
+    }
     tab.wsStatus = "error";
     tab.wsError = e.message;
+    scheduleWorkspaceStateSave();
     renderWsStatus();
+    renderReplayTabs();
+    showToast(tab.wsError || "WebSocket connection failed.", "error");
   }
 }
 
-async function runSetupQueue(tab) {
-  if (!tab.wsSetupQueue || !tab.wsSetupQueue.length) return;
-
-  // Wait for connection to be established
-  for (let i = 0; i < 20; i++) {
-    await new Promise((r) => setTimeout(r, 150));
-    if (tab.wsStatus === "connected") break;
-    if (tab.wsStatus === "error" || tab.wsStatus === "disconnected") return;
+async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
+  const setupQueue = Array.isArray(tab?.wsSetupQueue) ? tab.wsSetupQueue : [];
+  if (!setupQueue.some((item) => item.autoSend && !item.sent)) {
+    if (tab) tab.wsSetupPending = false;
+    return;
   }
-  if (tab.wsStatus !== "connected") return;
+  if (tab.wsSetupRunning) return;
+  tab.wsSetupRunning = true;
 
-  for (const item of tab.wsSetupQueue) {
-    if (!item.autoSend || item.sent) continue;
-    if (tab.wsStatus !== "connected") break;
-
-    try {
-      const resp = await fetch("/api/replay/ws-send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: tab.id, body: item.body, binary: false }),
-      });
-      if (resp.ok) {
-        item.sent = true;
-        renderWsSetupQueue();
-      }
-    } catch (e) {
-      break;
+  try {
+    // Wait for connection to be established
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
+      if (tab.wsStatus === "connected") break;
+      if (tab.wsStatus === "error" || tab.wsStatus === "disconnected") return;
     }
-    // Small delay between messages
-    await new Promise((r) => setTimeout(r, 100));
+    if (tab.wsStatus !== "connected") {
+      tab.wsSetupPending = true;
+      return;
+    }
+    tab.wsSetupPending = false;
+
+    for (const item of setupQueue) {
+      if (!item.autoSend || item.sent) continue;
+      if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
+      if (tab.wsStatus !== "connected") break;
+
+      try {
+        const kind = normalizeWsMessageType(item.kind);
+        const sendBody = wsReplayBodyForSend(item.body, kind, !!item.bodyEncoded);
+        const resp = await fetch("/api/replay/ws-send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: tab.wsSessionId || state.activeSession?.id || null, id: tab.id, body: sendBody, binary: kind !== "text", kind }),
+        });
+        if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
+        if (resp.ok) {
+          item.sent = true;
+          renderWsSetupQueue();
+          scheduleWorkspaceStateSave();
+        }
+      } catch (e) {
+        break;
+      }
+      // Small delay between messages
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } finally {
+    if (isWsReplayTabAlive(tab, lifecycleToken)) {
+      tab.wsSetupRunning = false;
+    }
   }
 }
 
@@ -11271,19 +13999,27 @@ function parseWsHandshakeHeaders(tab) {
   const text = els.wsHandshakeHeaders ? els.wsHandshakeHeaders.value : (tab.wsHandshakeText || "");
   if (text.trim()) {
     for (const line of text.split("\n")) {
-      const colonIdx = line.indexOf(":");
-      if (colonIdx > 0) {
-        headers.push({
-          name: line.slice(0, colonIdx).trim(),
-          value: line.slice(colonIdx + 1).trim(),
-        });
+      if (!line.trim()) {
+        continue;
       }
+      const colonIdx = line.indexOf(":");
+      const name = colonIdx > 0 ? line.slice(0, colonIdx).trim() : "";
+      if (!name) {
+        throw new Error(`Invalid WebSocket handshake header: ${line.trim()}`);
+      }
+      headers.push({
+        name,
+        value: line.slice(colonIdx + 1).trim(),
+      });
     }
+  }
+  if (tab.wsHandshakeEdited) {
+    return headers;
   }
   // Merge with any pre-set headers from seed
   const merged = [...headers];
-  for (const h of (tab.wsHeaders || [])) {
-    if (!merged.some(m => m.name.toLowerCase() === h.name.toLowerCase())) {
+  for (const h of normalizedHeaders(tab.wsHeaders)) {
+    if (!merged.some(m => headerNameEquals(m, h.name))) {
       merged.push(h);
     }
   }
@@ -11295,15 +14031,17 @@ async function wsSend() {
   if (!tab || tab.type !== "websocket" || tab.wsStatus !== "connected") return;
 
   const body = els.wsMessageEditor.value;
-  if (!body.trim()) return;
 
-  const binary = els.wsMessageType.value === "binary";
+  tab.wsMessageType = normalizeWsMessageType(els.wsMessageType.value);
+  const binary = tab.wsMessageType !== "text";
+  const sendBody = wsReplayBodyForSend(body, tab.wsMessageType, tab.wsEditorBodyEncoded);
+  scheduleWorkspaceStateSave();
 
   try {
     const resp = await fetch("/api/replay/ws-send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: tab.id, body, binary }),
+      body: JSON.stringify({ session_id: tab.wsSessionId || state.activeSession?.id || null, id: tab.id, body: sendBody, binary, kind: tab.wsMessageType }),
     });
     if (!resp.ok) {
       const text = await resp.text().catch(() => "Send failed");
@@ -11318,35 +14056,170 @@ async function wsDisconnect() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
 
+  await cleanupWsReplayTab(tab, {
+    markDisconnected: true,
+    removeBackend: tab.wsStatus === "connecting",
+  });
+}
+
+async function cleanupWsReplayTab(tab, { markDisconnected = false, removeBackend = true } = {}) {
+  if (!tab || tab.type !== "websocket") return;
+  tab.wsLifecycleToken = (tab.wsLifecycleToken || 0) + 1;
+  clearWsFrameListRender(tab);
+  await refreshWsReplayFramesOnce(tab);
   stopWsPoll(tab);
+  await disconnectWsReplayBackend(tab.id, { remove: removeBackend, sessionId: tab.wsSessionId || state.activeSession?.id || null });
+  if (!removeBackend) {
+    await refreshWsReplayFramesUntilSettled(tab);
+  }
+  if (markDisconnected) {
+    tab.wsStatus = "disconnected";
+    tab.wsError = null;
+    scheduleWorkspaceStateSave();
+    if (state.activeReplayTabId === tab.id) {
+      renderWsStatus();
+    }
+  }
+}
+
+async function refreshWsReplayFramesOnce(tab) {
+  if (!tab || tab.type !== "websocket") return false;
+  const sessionId = encodeURIComponent(tab.wsSessionId || state.activeSession?.id || "");
+  if (!sessionId) return false;
+  const sinceIndex = nextWsFrameIndex(tab);
+  const resp = await fetch(`/api/replay/ws-frames/${tab.id}?since=${sinceIndex}&session_id=${sessionId}`)
+    .catch(() => null);
+  if (!resp || !resp.ok) {
+    return false;
+  }
+  const data = await resp.json().catch(() => null) || {};
+  const incomingFrames = normalizeWebsocketFrames(data.frames);
+  let addedFrames = false;
+  if (incomingFrames.length > 0) {
+    const existing = new Set(getWsReplayFrames(tab).map((frame) => frame.index));
+    const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
+    if (fresh.length) {
+      if (!Array.isArray(tab.wsFrames)) tab.wsFrames = [];
+      tab.wsFrames.push(...fresh);
+      trimWsReplayFrames(tab);
+      scheduleWsTranscriptWorkspaceSave();
+      addedFrames = true;
+      if (state.activeReplayTabId === tab.id) {
+        scheduleWsFrameListRender(tab);
+      }
+    }
+  }
+  if (data.status && data.status !== tab.wsStatus) {
+    tab.wsStatus = data.status;
+    tab.wsError = data.error || null;
+    scheduleWorkspaceStateSave();
+    if (state.activeReplayTabId === tab.id) {
+      renderWsStatus();
+    }
+  }
+  return addedFrames;
+}
+
+async function refreshWsReplayFramesUntilSettled(tab) {
+  const started = Date.now();
+  let sawFrame = false;
+  do {
+    const added = await refreshWsReplayFramesOnce(tab);
+    sawFrame = sawFrame || added;
+    if (!added) {
+      return sawFrame;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, WS_REPLAY_FINAL_POLL_INTERVAL_MS));
+  } while (Date.now() - started < WS_REPLAY_FINAL_POLL_TIMEOUT_MS);
+  return sawFrame;
+}
+
+async function disconnectWsReplayBackend(id, { remove = false, sessionId = state.activeSession?.id || null } = {}) {
   try {
     await fetch("/api/replay/ws-disconnect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: tab.id }),
+      body: JSON.stringify({ session_id: sessionId, id, remove }),
     });
   } catch (e) {
     // ignore disconnect errors
   }
-  tab.wsStatus = "disconnected";
-  renderWsStatus();
+}
+
+function isWsReplayTabAlive(tab, lifecycleToken) {
+  return Boolean(
+    tab
+    && state.replayTabs.includes(tab)
+    && tab.wsLifecycleToken === lifecycleToken
+  );
+}
+
+function clearWsFrameListRender(tab) {
+  if (tab?.wsFrameRenderTimer) {
+    window.clearTimeout(tab.wsFrameRenderTimer);
+    tab.wsFrameRenderTimer = null;
+  }
+}
+
+function scheduleWsFrameListRender(tab) {
+  if (!tab || state.activeReplayTabId !== tab.id || tab.wsFrameRenderTimer) {
+    return;
+  }
+  tab.wsFrameRenderTimer = window.setTimeout(() => {
+    tab.wsFrameRenderTimer = null;
+    if (state.activeReplayTabId === tab.id && state.replayTabs.includes(tab)) {
+      renderWsFrameList();
+    }
+  }, 300);
 }
 
 function startWsPoll(tab) {
   stopWsPoll(tab);
-  let sinceIndex = 0;
-  tab.wsPollTimer = setInterval(async () => {
-    try {
-      const resp = await fetch(`/api/replay/ws-frames/${tab.id}?since=${sinceIndex}`);
-      if (!resp.ok) return;
-      const data = await resp.json();
+  let sinceIndex = nextWsFrameIndex(tab);
+  const generation = (tab.wsPollGeneration || 0) + 1;
+  const lifecycleToken = tab.wsLifecycleToken;
+  tab.wsPollGeneration = generation;
 
-      if (data.frames && data.frames.length > 0) {
-        tab.wsFrames.push(...data.frames);
-        sinceIndex = tab.wsFrames.length;
+  const poll = async () => {
+    if (!tab.wsPollTimer || tab.wsPollGeneration !== generation || !isWsReplayTabAlive(tab, lifecycleToken)) return;
+    try {
+      const sessionId = encodeURIComponent(tab.wsSessionId || state.activeSession?.id || "");
+      const resp = await fetch(`/api/replay/ws-frames/${tab.id}?since=${sinceIndex}&session_id=${sessionId}`);
+      if (!tab.wsPollTimer || tab.wsPollGeneration !== generation || !isWsReplayTabAlive(tab, lifecycleToken)) return;
+      if (!resp.ok) {
+        if (resp.status === 404 || resp.status === 409) {
+          const text = await resp.text().catch(() => "");
+          if (!tab.wsPollTimer || tab.wsPollGeneration !== generation || !isWsReplayTabAlive(tab, lifecycleToken)) return;
+          tab.wsStatus = resp.status === 404 ? "disconnected" : "error";
+          tab.wsError = text || (resp.status === 404
+            ? "WebSocket replay connection is no longer available."
+            : "WebSocket replay session changed.");
+          stopWsPoll(tab);
+          scheduleWorkspaceStateSave();
+          if (state.activeReplayTabId === tab.id) {
+            renderWsStatus();
+          }
+          renderReplayTabs();
+        }
+        return;
+      }
+      const data = await resp.json() || {};
+      if (!tab.wsPollTimer || tab.wsPollGeneration !== generation || !isWsReplayTabAlive(tab, lifecycleToken)) return;
+
+      const incomingFrames = normalizeWebsocketFrames(data.frames);
+      if (incomingFrames.length > 0) {
+        const existing = new Set(getWsReplayFrames(tab).map((frame) => frame.index));
+        const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
+        if (fresh.length) {
+          if (!Array.isArray(tab.wsFrames)) tab.wsFrames = [];
+          tab.wsFrames.push(...fresh);
+          trimWsReplayFrames(tab);
+          scheduleWsTranscriptWorkspaceSave();
+        }
+        sinceIndex = Math.max(sinceIndex, nextWsFrameIndex({ wsFrames: incomingFrames }), nextWsFrameIndex(tab));
         // Only re-render if this tab is still active
-        if (state.activeReplayTabId === tab.id) {
-          renderWsFrameList();
+        if (fresh.length && state.activeReplayTabId === tab.id) {
+          scheduleWsFrameListRender(tab);
         }
       }
 
@@ -11356,20 +14229,55 @@ function startWsPoll(tab) {
         if (state.activeReplayTabId === tab.id) {
           renderWsStatus();
         }
+        if (data.status === "connected" && tab.wsSetupPending) {
+          runSetupQueue(tab, tab.wsLifecycleToken).catch((error) => console.error(error));
+        }
         if (data.status === "disconnected" || data.status === "error") {
+          scheduleWorkspaceStateSave();
           stopWsPoll(tab);
+          return;
         }
       }
     } catch (_e) {
       // ignore poll errors
+    } finally {
+      if (tab.wsPollTimer && tab.wsPollGeneration === generation && isWsReplayTabAlive(tab, lifecycleToken)) {
+        tab.wsPollTimer = setTimeout(poll, 200);
+      }
     }
-  }, 200);
+  };
+
+  tab.wsPollTimer = setTimeout(poll, 0);
 }
 
 function stopWsPoll(tab) {
+  if (!tab) return;
+  tab.wsPollGeneration = (tab.wsPollGeneration || 0) + 1;
   if (tab && tab.wsPollTimer) {
-    clearInterval(tab.wsPollTimer);
+    clearTimeout(tab.wsPollTimer);
     tab.wsPollTimer = null;
+  }
+}
+
+function nextWsFrameIndex(tab) {
+  const frames = getWsReplayFrames(tab);
+  return frames.reduce((next, frame) => {
+    const index = Number(frame?.index);
+    return Number.isFinite(index) ? Math.max(next, index + 1) : next;
+  }, frames.length);
+}
+
+function trimWsReplayFrames(tab) {
+  if (!tab) return;
+  tab.wsFrames = getWsReplayFrames(tab);
+  const overflow = tab.wsFrames.length - WS_REPLAY_MAX_LOADED_FRAMES;
+  if (overflow <= 0) return;
+  tab.wsFrames.splice(0, overflow);
+  if (
+    tab.wsSelectedFrameIndex !== -1
+    && !tab.wsFrames.some((frame) => frame.index === tab.wsSelectedFrameIndex)
+  ) {
+    tab.wsSelectedFrameIndex = -1;
   }
 }
 
@@ -11384,18 +14292,22 @@ function renderWsReplay() {
 
   // Restore handshake headers
   if (els.wsHandshakeHeaders) {
-    if (tab.wsHandshakeText) {
+    if (tab.wsHandshakeEdited) {
       els.wsHandshakeHeaders.value = tab.wsHandshakeText;
-    } else if (tab.wsHeaders && tab.wsHeaders.length > 0) {
-      els.wsHandshakeHeaders.value = tab.wsHeaders
-        .map(h => `${h.name}: ${h.value}`)
-        .join("\n");
     } else {
-      els.wsHandshakeHeaders.value = "";
+      const wsHeaders = normalizedHeaders(tab.wsHeaders);
+      els.wsHandshakeHeaders.value = wsHeaders.length > 0
+        ? wsHeaders
+        .map(h => `${h.name}: ${h.value}`)
+        .join("\n")
+        : "";
     }
   }
 
   // Restore editor text
+  if (els.wsMessageType) {
+    els.wsMessageType.value = normalizeWsMessageType(tab.wsMessageType);
+  }
   els.wsMessageEditor.value = tab.wsEditorText || "";
   setWsMessageHighlightText(tab.wsEditorText || "");
 
@@ -11408,7 +14320,11 @@ function renderWsSetupQueue() {
   const container = document.getElementById("wsSetupQueue");
   if (!container) return;
   const tab = getActiveReplayTab();
-  if (!tab || tab.type !== "websocket" || !tab.wsSetupQueue || !tab.wsSetupQueue.length) {
+  const setupQueue = Array.isArray(tab?.wsSetupQueue) ? tab.wsSetupQueue : [];
+  if (tab && tab.type === "websocket" && !Array.isArray(tab.wsSetupQueue)) {
+    tab.wsSetupQueue = setupQueue;
+  }
+  if (!tab || tab.type !== "websocket" || !setupQueue.length) {
     container.classList.add("hidden");
     return;
   }
@@ -11417,13 +14333,13 @@ function renderWsSetupQueue() {
   const listEl = document.getElementById("wsSetupQueueList");
   if (!listEl) return;
 
-  listEl.innerHTML = tab.wsSetupQueue.map((item, i) => {
+  listEl.innerHTML = setupQueue.map((item, i) => {
     const sentClass = item.sent ? "sent" : "";
     const checked = item.autoSend ? "checked" : "";
     return `<div class="ws-setup-row ${sentClass}" data-idx="${i}">
       <input type="checkbox" class="ws-setup-check" data-idx="${i}" ${checked} />
       <span class="ws-setup-index">#${i + 1}</span>
-      <span class="ws-setup-label">${escapeHtml(item.label)}</span>
+      <span class="ws-setup-label" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</span>
       <button class="ws-setup-send" data-idx="${i}" title="Send this message">▶</button>
       ${item.sent ? '<span class="ws-setup-sent-badge">✓</span>' : ""}
     </div>`;
@@ -11433,7 +14349,9 @@ function renderWsSetupQueue() {
   listEl.querySelectorAll(".ws-setup-check").forEach((cb) => {
     cb.addEventListener("change", () => {
       const idx = parseInt(cb.dataset.idx);
-      tab.wsSetupQueue[idx].autoSend = cb.checked;
+      const item = setupQueue[idx];
+      if (!item) return;
+      item.autoSend = cb.checked;
       scheduleWorkspaceStateSave();
     });
   });
@@ -11442,20 +14360,29 @@ function renderWsSetupQueue() {
   listEl.querySelectorAll(".ws-setup-send").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const idx = parseInt(btn.dataset.idx);
-      const item = tab.wsSetupQueue[idx];
+      const item = setupQueue[idx];
       if (!item || tab.wsStatus !== "connected") return;
+      const lifecycleToken = tab.wsLifecycleToken;
       try {
+        const kind = normalizeWsMessageType(item.kind);
+        const sendBody = wsReplayBodyForSend(item.body, kind, !!item.bodyEncoded);
         const resp = await fetch("/api/replay/ws-send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: tab.id, body: item.body, binary: false }),
+          body: JSON.stringify({ session_id: tab.wsSessionId || state.activeSession?.id || null, id: tab.id, body: sendBody, binary: kind !== "text", kind }),
         });
-        if (resp.ok) {
-          item.sent = true;
-          renderWsSetupQueue();
+        if (!isWsReplayTabAlive(tab, lifecycleToken) || tab.wsStatus !== "connected") return;
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => "Setup message send failed");
+          showToast(text, "error");
+          return;
         }
+        item.sent = true;
+        renderWsSetupQueue();
+        scheduleWorkspaceStateSave();
       } catch (e) {
         console.error(e);
+        showToast(e?.message || "Setup message send failed.", "error");
       }
     });
   });
@@ -11464,11 +14391,18 @@ function renderWsSetupQueue() {
   listEl.querySelectorAll(".ws-setup-row").forEach((row) => {
     row.addEventListener("dblclick", () => {
       const idx = parseInt(row.dataset.idx);
-      const item = tab.wsSetupQueue[idx];
+      const item = setupQueue[idx];
       if (item) {
+        const kind = normalizeWsMessageType(item.kind);
         els.wsMessageEditor.value = item.body;
+        if (els.wsMessageType) {
+          els.wsMessageType.value = kind;
+        }
+        tab.wsMessageType = kind;
         tab.wsEditorText = item.body;
+        tab.wsEditorBodyEncoded = !!item.bodyEncoded;
         setWsMessageHighlightText(item.body);
+        scheduleWorkspaceStateSave();
       }
     });
   });
@@ -11486,24 +14420,57 @@ function renderWsStatus() {
     : "Disconnected";
 
   els.wsConnectButton.disabled = status === "connected" || status === "connecting";
-  els.wsDisconnectButton.disabled = status !== "connected";
+  els.wsDisconnectButton.disabled = status !== "connected" && status !== "connecting";
   els.wsSendButton.disabled = status !== "connected";
+  const targetLocked = status === "connected" || status === "connecting";
+  els.wsSchemeSelect.disabled = targetLocked;
+  els.wsHostInput.disabled = targetLocked;
+  els.wsPortInput.disabled = targetLocked;
+  els.wsPathInput.disabled = targetLocked;
+  if (els.wsHandshakeHeaders) {
+    els.wsHandshakeHeaders.disabled = targetLocked;
+  }
+}
+
+function wsRenderedFrameWindow(frames, selectedFrameIndex) {
+  if (frames.length <= WS_REPLAY_MAX_RENDERED_FRAMES) {
+    return frames;
+  }
+  const tailStart = frames.length - WS_REPLAY_MAX_RENDERED_FRAMES;
+  const selectedPosition = frames.findIndex((frame) => frame.index === selectedFrameIndex);
+  if (selectedPosition === -1 || selectedPosition >= tailStart) {
+    return frames.slice(tailStart);
+  }
+  const halfWindow = Math.floor(WS_REPLAY_MAX_RENDERED_FRAMES / 2);
+  const start = Math.max(
+    0,
+    Math.min(selectedPosition - halfWindow, frames.length - WS_REPLAY_MAX_RENDERED_FRAMES),
+  );
+  return frames.slice(start, start + WS_REPLAY_MAX_RENDERED_FRAMES);
 }
 
 function renderWsFrameList() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
+  clearWsFrameListRender(tab);
 
-  const frames = tab.wsFrames;
+  const frames = getWsReplayFrames(tab);
+  tab.wsFrames = frames;
   els.wsFrameCount.textContent = `${frames.length} frame${frames.length === 1 ? "" : "s"}`;
+  const previousFrameListScrollTop = els.wsFrameList.scrollTop;
+  const wasNearBottom = els.wsFrameList.scrollHeight - els.wsFrameList.scrollTop - els.wsFrameList.clientHeight < 24;
 
   if (!frames.length) {
+    els.wsFrameList.onclick = null;
+    els.wsFrameList.ondblclick = null;
     els.wsFrameList.innerHTML = '<div class="empty-copy">Connect to start a WebSocket conversation.</div>';
     renderWsFrameDetail();
     return;
   }
 
-  els.wsFrameList.innerHTML = frames.map((frame) => {
+  const renderedFrames = wsRenderedFrameWindow(frames, tab.wsSelectedFrameIndex);
+
+  els.wsFrameList.innerHTML = renderedFrames.map((frame) => {
     const isClient = frame.direction === "client_to_server";
     const dirClass = isClient ? "client" : "server";
     const dirLabel = isClient ? "you" : "server";
@@ -11522,29 +14489,47 @@ function renderWsFrameList() {
     </div>`;
   }).join("");
 
-  // Auto-scroll to bottom
-  els.wsFrameList.scrollTop = els.wsFrameList.scrollHeight;
+  if (wasNearBottom || tab.wsSelectedFrameIndex == null || tab.wsSelectedFrameIndex < 0) {
+    els.wsFrameList.scrollTop = els.wsFrameList.scrollHeight;
+  } else {
+    els.wsFrameList.scrollTop = previousFrameListScrollTop;
+  }
 
-  // Add click handlers
-  els.wsFrameList.querySelectorAll(".ws-frame-bubble").forEach((bubble) => {
-    bubble.addEventListener("click", () => {
-      const idx = parseInt(bubble.dataset.frameIndex);
-      tab.wsSelectedFrameIndex = idx;
-      els.wsFrameList.querySelectorAll(".ws-frame-bubble").forEach(b => b.classList.remove("selected"));
-      bubble.classList.add("selected");
-      renderWsFrameDetail();
-    });
-    bubble.addEventListener("dblclick", () => {
-      const idx = parseInt(bubble.dataset.frameIndex);
-      const frame = tab.wsFrames.find(f => f.index === idx);
-      if (frame && frame.direction === "client_to_server") {
-        const decoded = decodeWsFrameBody(frame);
-        els.wsMessageEditor.value = decoded;
-        tab.wsEditorText = decoded;
-        setWsMessageHighlightText(decoded);
+  els.wsFrameList.onclick = (event) => {
+    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+    const bubble = target?.closest(".ws-frame-bubble");
+    if (!bubble || !els.wsFrameList.contains(bubble)) return;
+    const idx = parseInt(bubble.dataset.frameIndex, 10);
+    tab.wsSelectedFrameIndex = idx;
+    els.wsFrameList.querySelectorAll(".ws-frame-bubble").forEach((node) => node.classList.remove("selected"));
+    bubble.classList.add("selected");
+    renderWsFrameDetail();
+  };
+  els.wsFrameList.ondblclick = (event) => {
+    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+    const bubble = target?.closest(".ws-frame-bubble");
+    if (!bubble || !els.wsFrameList.contains(bubble)) return;
+    const idx = parseInt(bubble.dataset.frameIndex, 10);
+    const frame = frames.find((item) => item.index === idx);
+    if (frame && frame.direction === "client_to_server") {
+      const messageType = wsReplayMessageTypeForFrame(frame);
+      if (frame.preview_truncated) {
+        showToast("Frame preview is truncated and cannot be replayed safely.", "error");
+        return;
       }
-    });
-  });
+      const editorText = wsReplayEditorTextForFrame(frame);
+      const editorBodyEncoded = messageType !== "text" && frame.body_encoding === "base64";
+      if (els.wsMessageType) {
+        els.wsMessageType.value = messageType;
+      }
+      els.wsMessageEditor.value = editorText;
+      tab.wsMessageType = messageType;
+      tab.wsEditorText = editorText;
+      tab.wsEditorBodyEncoded = editorBodyEncoded;
+      setWsMessageHighlightText(editorText);
+      scheduleWorkspaceStateSave();
+    }
+  };
 
   renderWsFrameDetail();
 }
@@ -11553,7 +14538,8 @@ function renderWsFrameDetail() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
 
-  const frame = tab.wsFrames.find(f => f.index === tab.wsSelectedFrameIndex);
+  const frames = getWsReplayFrames(tab);
+  const frame = frames.find(f => f.index === tab.wsSelectedFrameIndex);
   if (!frame) {
     els.wsFrameDetailPath.textContent = "DETAIL";
     els.wsFrameDetailTitle.textContent = "Select a frame";
@@ -11582,40 +14568,62 @@ function renderWsFrameDetail() {
 function decodeWsFrameBody(frame) {
   if (!frame || !frame.body) return "";
   if (frame.body_encoding === "base64") {
-    try {
-      return atob(frame.body);
-    } catch (_e) {
-      return frame.body;
-    }
+    return safeDecodeBase64(frame.body);
   }
   return frame.body;
 }
 
+function wsReplayMessageTypeForFrame(frame) {
+  const kind = normalizeWsMessageType(frame?.kind);
+  if (kind === "ping" || kind === "pong") return kind;
+  return kind === "binary" || frame?.body_encoding === "base64" ? "binary" : "text";
+}
+
+function wsReplayEditorTextForFrame(frame) {
+  const rawBody = frame?.body || frame?.body_preview || "";
+  if (wsReplayMessageTypeForFrame(frame) !== "text") {
+    return rawBody;
+  }
+  return frame?.body_encoding === "base64" ? safeDecodeBase64(rawBody) : rawBody;
+}
+
 function formatWsFrameSize(bytes) {
-  if (bytes == null) return "";
-  if (bytes < 1024) return `${bytes} B`;
-  return `${(bytes / 1024).toFixed(1)} KB`;
+  const size = Number(bytes);
+  if (!Number.isFinite(size) || size < 0) return "";
+  if (size < 1024) return `${size} B`;
+  return `${(size / 1024).toFixed(1)} KB`;
+}
+
+function handleWsReplayActionError(error) {
+  console.error(error);
+  showToast(error?.message || "WebSocket Replay action failed.", "error");
 }
 
 function bindWsReplayEvents() {
   if (!els.wsConnectButton) return;
 
   els.wsConnectButton.addEventListener("click", () => {
-    wsConnect().catch((error) => console.error(error));
+    wsConnect().catch(handleWsReplayActionError);
   });
   els.wsDisconnectButton.addEventListener("click", () => {
-    wsDisconnect().catch((error) => console.error(error));
+    wsDisconnect().catch(handleWsReplayActionError);
   });
   els.wsSendButton.addEventListener("click", () => {
-    wsSend().catch((error) => console.error(error));
+    wsSend().catch(handleWsReplayActionError);
   });
 
   els.wsSchemeSelect.addEventListener("change", () => {
     const tab = getActiveReplayTab();
     if (tab && tab.type === "websocket") {
       tab.wsScheme = els.wsSchemeSelect.value;
-      tab.wsPort = tab.wsScheme === "wss" ? 443 : 80;
+      tab.wsPort = defaultWsPortForScheme(tab.wsScheme);
       els.wsPortInput.value = tab.wsPort;
+      setWsReplayTargetInputValidity(validateWsReplayTargetInput(
+        tab.wsScheme,
+        els.wsHostInput.value,
+        els.wsPortInput.value,
+        els.wsPathInput.value,
+      ));
       renderReplayTabs();
       scheduleWorkspaceStateSave();
     }
@@ -11623,7 +14631,13 @@ function bindWsReplayEvents() {
   els.wsHostInput.addEventListener("input", () => {
     const tab = getActiveReplayTab();
     if (tab && tab.type === "websocket") {
-      tab.wsHost = els.wsHostInput.value;
+      tab.wsHost = els.wsHostInput.value.trim();
+      setWsReplayTargetInputValidity(validateWsReplayTargetInput(
+        els.wsSchemeSelect.value,
+        tab.wsHost,
+        els.wsPortInput.value,
+        els.wsPathInput.value,
+      ));
       renderReplayTabs();
       scheduleWorkspaceStateSave();
     }
@@ -11631,14 +14645,34 @@ function bindWsReplayEvents() {
   els.wsPortInput.addEventListener("change", () => {
     const tab = getActiveReplayTab();
     if (tab && tab.type === "websocket") {
-      tab.wsPort = parseInt(els.wsPortInput.value) || (tab.wsScheme === "wss" ? 443 : 80);
+      const rawPort = els.wsPortInput.value.trim();
+      const normalizedPort = normalizePortValue(rawPort);
+      const validation = validateWsReplayTargetInput(
+        els.wsSchemeSelect.value,
+        els.wsHostInput.value,
+        rawPort,
+        els.wsPathInput.value,
+      );
+      setWsReplayTargetInputValidity(validation);
+      if (!validation.valid || !normalizedPort) {
+        els.wsPortInput.reportValidity();
+        return;
+      }
+      tab.wsPort = normalizedPort;
+      els.wsPortInput.value = normalizedPort;
       scheduleWorkspaceStateSave();
     }
   });
   els.wsPathInput.addEventListener("input", () => {
     const tab = getActiveReplayTab();
     if (tab && tab.type === "websocket") {
-      tab.wsPath = els.wsPathInput.value;
+      tab.wsPath = els.wsPathInput.value.trim();
+      setWsReplayTargetInputValidity(validateWsReplayTargetInput(
+        els.wsSchemeSelect.value,
+        els.wsHostInput.value,
+        els.wsPortInput.value,
+        tab.wsPath,
+      ));
       scheduleWorkspaceStateSave();
     }
   });
@@ -11646,6 +14680,15 @@ function bindWsReplayEvents() {
     const tab = getActiveReplayTab();
     if (tab && tab.type === "websocket") {
       tab.wsHandshakeText = els.wsHandshakeHeaders.value;
+      tab.wsHandshakeEdited = true;
+      scheduleWorkspaceStateSave();
+    }
+  });
+  els.wsMessageType?.addEventListener("change", () => {
+    const tab = getActiveReplayTab();
+    if (tab && tab.type === "websocket") {
+      tab.wsMessageType = normalizeWsMessageType(els.wsMessageType.value);
+      tab.wsEditorBodyEncoded = false;
       scheduleWorkspaceStateSave();
     }
   });
@@ -11653,9 +14696,11 @@ function bindWsReplayEvents() {
   els.wsMessageHighlight.addEventListener("input", () => {
     const plainText = els.wsMessageHighlight.innerText || "";
     els.wsMessageEditor.value = plainText;
-    const tab = getActiveReplayTab();
+	    const tab = getActiveReplayTab();
     if (tab && tab.type === "websocket") {
       tab.wsEditorText = plainText;
+      tab.wsEditorBodyEncoded = false;
+      scheduleWorkspaceStateSave();
     }
     applyWsMessageJsonHighlight();
   });
@@ -11664,7 +14709,7 @@ function bindWsReplayEvents() {
   els.wsMessageHighlight.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
-      wsSend().catch((error) => console.error(error));
+      wsSend().catch(handleWsReplayActionError);
     }
   });
 
@@ -11728,48 +14773,9 @@ function bindWsReplayEvents() {
 
 }
 
-/* ─── WS Send to Replay (from captured frame) ─── */
-
-function sendWsFrameToReplay(frameIdx) {
-  const session = state.selectedWebsocketRecord;
-  if (!session) return;
-
-  const frame = session.frames[frameIdx];
-  const rawBody = frame ? (frame.body_preview || frame.body || "") : "";
-  const editorText = frame
-    ? (frame.body_encoding === "base64" ? atob(rawBody) : rawBody)
-    : "";
-
-  // Try JSON pretty-print for editor
-  let prettyText = editorText;
-  try { prettyText = JSON.stringify(JSON.parse(editorText), null, 2); } catch (e) {}
-
-  // Detect scheme: wss/ws from session, or infer from https/host:443
-  let scheme = session.scheme || "";
-  if (scheme === "wss" || scheme === "ws") { /* keep */ }
-  else if (scheme === "https" || session.host?.endsWith(":443")) scheme = "wss";
-  else scheme = "wss"; // default safe
-
-  const hostRaw = session.host || "";
-  const hostClean = hostRaw.replace(/:443$|:80$/, "");
-  const port = hostRaw.includes(":") ? parseInt(hostRaw.split(":").pop()) : (scheme === "ws" ? 80 : 443);
-
-  const tab = createWsReplayTab({
-    scheme,
-    host: hostClean,
-    port,
-    path: session.path || "/",
-    headers: session.request?.headers || [],
-    capturedFrames: session.frames || [],
-  });
-  tab.wsEditorText = prettyText;
-  state.activeTool = "replay";
-  scheduleWorkspaceStateSave();
-  renderToolPanels();
-}
-
 /* ─── Compare / Diff ─── */
 let compareBaseId = null;
+let compareBaseSessionId = null;
 let compareActiveTab = "request";
 let compareBaseRecord = null;
 let compareTargetRecord = null;
@@ -11792,6 +14798,7 @@ function computeUnifiedDiff(linesA, linesB, labelA, labelB) {
 
 async function setCompareBase(transactionId) {
   compareBaseId = transactionId;
+  compareBaseSessionId = currentSessionId();
   const btn = document.getElementById("compareWithBaseBtn");
   if (btn) btn.disabled = false;
   const item = getHistoryItem(transactionId);
@@ -11800,10 +14807,16 @@ async function setCompareBase(transactionId) {
 
 async function openCompareModal(targetId) {
   if (!compareBaseId || compareBaseId === targetId) return;
+  const sessionId = currentSessionId();
+  if (compareBaseSessionId !== sessionId) {
+    clearCompareState();
+    return;
+  }
   const [baseRes, targetRes] = await Promise.all([
-    fetch(`/api/transactions/${compareBaseId}`).then((r) => r.ok ? r.json() : null),
-    fetch(`/api/transactions/${targetId}`).then((r) => r.ok ? r.json() : null),
+    fetch(transactionPath(compareBaseId, sessionId)).then((r) => r.ok ? r.json() : null),
+    fetch(transactionPath(targetId, sessionId)).then((r) => r.ok ? r.json() : null),
   ]);
+  if (currentSessionId() !== sessionId) return;
   if (!baseRes || !targetRes) return;
   compareBaseRecord = baseRes;
   compareTargetRecord = targetRes;
@@ -11841,12 +14854,28 @@ function closeCompareModal() {
   document.getElementById("compareModal").classList.add("hidden");
 }
 
+function clearCompareState() {
+  compareBaseId = null;
+  compareBaseSessionId = null;
+  compareBaseRecord = null;
+  compareTargetRecord = null;
+  compareActiveTab = "request";
+  const btn = document.getElementById("compareWithBaseBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Compare with base";
+  }
+  document.getElementById("compareModal")?.classList.add("hidden");
+}
+
 /* ─── Context menu (color tags & notes) ─── */
 let contextMenuTargetId = null;
+let contextMenuSessionId = null;
 let contextMenuNoteTimer = null;
 
 function openContextMenu(x, y, transactionId) {
   contextMenuTargetId = transactionId;
+  contextMenuSessionId = currentSessionId();
   const menu = els.contextMenu;
   menu.classList.remove("hidden");
 
@@ -11873,38 +14902,80 @@ function openContextMenu(x, y, transactionId) {
 function closeContextMenu() {
   els.contextMenu.classList.add("hidden");
   contextMenuTargetId = null;
+  contextMenuSessionId = null;
 }
 
 async function loadUserNote(transactionId) {
+  const sessionId = currentSessionId();
   try {
-    const response = await fetch(`/api/transactions/${transactionId}`);
+    const response = await fetch(transactionPath(transactionId, sessionId));
+    if (currentSessionId() !== sessionId) return;
     if (response.ok) {
       const record = await response.json();
-      if (contextMenuTargetId === transactionId) {
+      if (currentSessionId() === sessionId && contextMenuTargetId === transactionId) {
         els.contextMenuNote.value = record.user_note || "";
       }
     }
   } catch { /* ignore */ }
 }
 
-async function updateAnnotations(transactionId, payload) {
+async function updateAnnotations(transactionId, payload, sessionId = currentSessionId()) {
   if (!state._pendingAnnotations) state._pendingAnnotations = new Map();
+  if (!state._annotationInFlight) state._annotationInFlight = new Set();
   const pending = state._pendingAnnotations;
-  pending.set(transactionId, { ...pending.get(transactionId), ...payload });
+  const existing = pending.get(transactionId);
+  pending.set(transactionId, {
+    sessionId,
+    payload: { ...(existing?.sessionId === sessionId ? existing.payload : {}), ...payload },
+  });
+  if (!state._annotationInFlight.has(transactionId)) {
+    flushPendingAnnotations(transactionId);
+  }
+}
 
+async function flushPendingAnnotations(transactionId) {
+  if (!state._pendingAnnotations) return;
+  if (!state._annotationInFlight) state._annotationInFlight = new Set();
+  const pending = state._pendingAnnotations;
+  const entry = pending.get(transactionId);
+  if (!entry) return;
+  const { sessionId, payload } = entry;
+
+  state._annotationInFlight.add(transactionId);
+  let saved = false;
+  let failureMessage = "";
   try {
-    const response = await fetch(`/api/transactions/${transactionId}/annotations`, {
+    const response = await fetch(sessionQueryPath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, sessionId), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (response.ok) {
-      const summary = await response.json();
+    if (!response.ok) {
+      failureMessage = await response.text().catch(() => "Failed to save annotation");
+      throw new Error(failureMessage || "Failed to save annotation");
+    }
+    const summary = await response.json();
+    if (currentSessionId() !== sessionId) {
+      saved = true;
+    } else if (pending.get(transactionId) === entry) {
       const index = getHistoryItemIndex(transactionId);
       if (index !== -1) {
         Object.assign(state.items[index], summary);
         prepareHistoryItem(state.items[index]);
-        state._itemById.set(transactionId, state.items[index]);
+        if (!summaryMatchesActiveHistoryFilters(state.items[index])) {
+          state.items.splice(index, 1);
+          if (state.historyPaging && isKnownCount(state.historyPaging.filteredTotal)) {
+            state.historyPaging.filteredTotal = Math.max(0, state.historyPaging.filteredTotal - 1);
+          }
+          if (state.selectedId === transactionId) {
+            state.selectedId = null;
+            state.selectedRecord = null;
+            renderEmptyDetail();
+          }
+          rebuildHistoryItemIndex();
+        } else {
+          state._itemById.set(transactionId, state.items[index]);
+        }
         state._itemsVersion += 1;
         invalidateVisibleEntriesCache();
         renderHistory();
@@ -11916,12 +14987,22 @@ async function updateAnnotations(transactionId, payload) {
         if (payload.user_note !== undefined) {
           state.selectedRecord.user_note = payload.user_note;
         }
+        renderDetail(state.selectedRecord, { preserveOriginalToggles: true });
       }
+      saved = true;
     }
   } catch (error) {
     console.error("Failed to update annotations:", error);
+    if (currentSessionId() === sessionId) {
+      showToast(failureMessage || error.message || "Failed to save annotation", "error");
+    }
   } finally {
-    pending.delete(transactionId);
+    state._annotationInFlight.delete(transactionId);
+    if (saved && pending.get(transactionId) === entry) {
+      pending.delete(transactionId);
+    } else if (pending.get(transactionId) !== entry) {
+      flushPendingAnnotations(transactionId);
+    }
   }
 }
 
@@ -11941,7 +15022,7 @@ els.contextMenu.querySelectorAll(".color-dot").forEach((dot) => {
   dot.addEventListener("click", () => {
     if (!contextMenuTargetId) return;
     const color = dot.dataset.color || null;
-    updateAnnotations(contextMenuTargetId, { color_tag: color });
+    updateAnnotations(contextMenuTargetId, { color_tag: color }, contextMenuSessionId);
     els.contextMenu.querySelectorAll(".color-dot").forEach((d) => {
       d.classList.toggle("active", d.dataset.color === (color || ""));
     });
@@ -11951,32 +15032,41 @@ els.contextMenu.querySelectorAll(".color-dot").forEach((dot) => {
 els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
   item.addEventListener("click", () => {
     const action = item.dataset.action;
-    if (!contextMenuTargetId) return;
-    state.selectedId = contextMenuTargetId;
+    const targetId = contextMenuTargetId;
+    if (!targetId) return;
+    state.selectedId = targetId;
     closeContextMenu();
     if (action === "send-to-replay") {
-      openReplayFromSelection().catch((error) => console.error(error));
+      openReplayFromSelection().catch(handleSendActionError);
     } else if (action === "send-to-fuzzer") {
-      openFuzzerFromSelection().catch((error) => console.error(error));
+      openFuzzerFromSelection().catch(handleSendActionError);
     } else if (action === "send-to-sequence") {
-      sendToSequenceFromSelection().catch((error) => console.error(error));
+      sendToSequenceFromSelection().catch(handleSendActionError);
     } else if (action === "copy-url") {
-      copyTransactionUrl(contextMenuTargetId);
+      copyTransactionUrl(targetId);
     } else if (action?.startsWith("copy-as-")) {
       const format = action.replace("copy-as-", "");
       // Use selectedRecord if available (sync, preserves user gesture for clipboard)
-      if (state.selectedRecord && state.selectedRecord.id === contextMenuTargetId) {
+      if (state.selectedRecord && state.selectedRecord.id === targetId) {
         const text = selectedRecordToFormat(format);
-        if (text) { copyTextToClipboard(text); showToast(`Copied as ${format}`); }
+        if (text) {
+          copyTextToClipboard(text)
+            .then(() => showToast(`Copied as ${format}`))
+            .catch(() => showToast("Failed to copy", "error"));
+        }
       } else {
-        historyRequestToFormat(contextMenuTargetId, format).then((text) => {
-          if (text) { copyTextToClipboard(text); showToast(`Copied as ${format}`); }
+        historyRequestToFormat(targetId, format).then((text) => {
+          if (text) {
+            copyTextToClipboard(text)
+              .then(() => showToast(`Copied as ${format}`))
+              .catch(() => showToast("Failed to copy", "error"));
+          }
         });
       }
     } else if (action === "compare-set-base") {
-      setCompareBase(contextMenuTargetId);
+      setCompareBase(targetId);
     } else if (action === "compare-with-base") {
-      openCompareModal(contextMenuTargetId).catch((error) => console.error(error));
+      openCompareModal(targetId).catch((error) => console.error(error));
     }
   });
 });
@@ -11985,9 +15075,10 @@ els.contextMenuNote.addEventListener("input", () => {
   if (!contextMenuTargetId) return;
   clearTimeout(contextMenuNoteTimer);
   const id = contextMenuTargetId;
+  const sessionId = contextMenuSessionId;
   const value = els.contextMenuNote.value;
   contextMenuNoteTimer = setTimeout(() => {
-    updateAnnotations(id, { user_note: value || null });
+    updateAnnotations(id, { user_note: value || null }, sessionId);
   }, 500);
 });
 
@@ -11995,9 +15086,11 @@ els.contextMenuNote.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     if (!contextMenuTargetId) return;
+    const id = contextMenuTargetId;
+    const sessionId = contextMenuSessionId;
     const value = els.contextMenuNote.value;
     clearTimeout(contextMenuNoteTimer);
-    updateAnnotations(contextMenuTargetId, { user_note: value || null });
+    updateAnnotations(id, { user_note: value || null }, sessionId);
     closeContextMenu();
   }
   event.stopPropagation();
@@ -12039,8 +15132,22 @@ document.addEventListener("keydown", (event) => {
 
 function sendWsFrameToReplay(frameIdx) {
   const session = state.selectedWebsocketRecord;
-  if (!session || frameIdx == null) return;
-  const frame = session.frames[frameIdx];
+  if (!session) return;
+  if (session.id && state.selectedWebsocketId && session.id !== state.selectedWebsocketId) {
+    showToast("WebSocket session is still loading. Select the frame again.", "error");
+    return;
+  }
+  if (frameIdx == null) {
+    showToast("Select a WebSocket frame first.", "error");
+    return;
+  }
+  const frames = getWebsocketFrames(session);
+  const requestedIndex = Number(frameIdx);
+  if (!Number.isFinite(requestedIndex)) {
+    showToast("Select a WebSocket frame first.", "error");
+    return;
+  }
+  const frame = frames.find((candidate) => candidate.index === requestedIndex);
   if (!frame) return;
 
   // Determine WS scheme
@@ -12053,32 +15160,27 @@ function sendWsFrameToReplay(frameIdx) {
     wsScheme = "ws";
   }
 
-  // Build frame body
-  let body = frame.body_preview || "";
-  if (frame.body_encoding === "base64") {
-    try {
-      body = atob(frame.body_preview);
-    } catch {
-      body = frame.body_preview;
-    }
+  const messageType = wsReplayMessageTypeForFrame(frame);
+  if (frame.preview_truncated) {
+    showToast("Frame preview is truncated and cannot be replayed safely.", "error");
+    return;
   }
+  const body = wsReplayEditorTextForFrame(frame);
+  const editorBodyEncoded = messageType !== "text" && frame.body_encoding === "base64";
 
-  // Try to pretty-print JSON
-  try {
-    const parsed = JSON.parse(body);
-    body = JSON.stringify(parsed, null, 2);
-  } catch {
-    // not JSON, keep as-is
-  }
-
-  const host = session.host?.replace(/:443$|:80$/, "") || "";
-  const port = session.host?.includes(":") ? parseInt(session.host.split(":").pop()) : (wsScheme === "wss" ? 443 : 80);
+  const target = authorityToTargetState(session.host || "", wsScheme === "ws" ? "http" : "https");
+  const port = normalizePortValue(target.port) || defaultWsPortForScheme(wsScheme);
   createWsReplayTab({
     scheme: wsScheme,
-    host,
+    host: target.host,
     port,
     path: session.path || "/",
-    headers: session.request?.headers || [],
+    headers: normalizedHeaders(session.request?.headers),
+    capturedFrames: frames,
+    selectedFrameIndex: frame.index,
+    editorText: body,
+    messageType,
+    editorBodyEncoded,
   });
   state.activeTool = "replay";
   renderToolPanels();
@@ -12142,60 +15244,59 @@ function changeReplayMethod(newMethod) {
 function replayRequestToCurl() {
   const tab = getActiveReplayTab();
   if (!tab) return "";
-
-  const text = tab.requestText || "";
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const [startLine = "GET / HTTP/1.1", ...rest] = lines;
-  const match = startLine.match(/^([A-Z]+)\s+(\S+)/i);
-  if (!match) return "";
-
-  const method = match[1];
-  const path = match[2];
-  const scheme = tab.targetScheme || "https";
-  const host = tab.targetHost || "localhost";
-  const port = tab.targetPort || "";
-  const portSuffix = port && !(scheme === "https" && port === "443") && !(scheme === "http" && port === "80") ? `:${port}` : "";
-  const url = `${scheme}://${host}${portSuffix}${path}`;
-
-  const parts = [`curl -X ${method}`];
-
-  // Separate headers and body
-  let bodyIdx = rest.indexOf("");
-  if (bodyIdx === -1) {
-    for (let i = 0; i < rest.length; i++) {
-      const c = rest[i].charAt(0);
-      if (c === "{" || c === "[" || c === "<" || c === '"') { bodyIdx = i; break; }
-      if (!rest[i].includes(":")) { bodyIdx = i; break; }
-    }
+  const blocked = replayExportBlockedReason(tab);
+  if (blocked) {
+    showToast(blocked, "error");
+    return "";
   }
-  const headerLines = (bodyIdx === -1 ? rest : rest.slice(0, bodyIdx)).filter((l) => l.includes(":"));
-  const body = bodyIdx === -1 ? "" : (rest[bodyIdx] === "" ? rest.slice(bodyIdx + 1) : rest.slice(bodyIdx)).join("\n");
+  const target = getReplayExportTarget(tab);
+  const parsed = parseRequestForExport(
+    tab.requestText ?? "",
+    target.scheme || "https",
+    target.host || "localhost",
+    target.port || "",
+  );
+  return requestToCurl(parsed);
+}
 
-  for (const h of headerLines) {
-    const idx = h.indexOf(":");
-    if (idx === -1) continue;
-    const name = h.slice(0, idx).trim();
-    const value = h.slice(idx + 1).trim();
-    parts.push(`-H '${name}: ${value}'`);
+function replayExportBlockedReason(tab) {
+  if (!tab || tab.type === "websocket") return "";
+  const request = deriveRepeaterRequest(tab);
+  if (request.body_encoding === "base64" && String(request.body || "").length > 0) {
+    return "Binary request bodies cannot be exported safely from Replay.";
   }
+  return "";
+}
 
-  if (body.trim()) {
-    parts.push(`-d '${body.replace(/'/g, "'\\''")}'`);
+function historyRequestExportBlockedReason(record) {
+  const request = record?.request;
+  if (!request) return "";
+  if (request.body_encoding === "base64" && String(request.body_preview || "").length > 0) {
+    return "Binary captured request bodies cannot be exported safely.";
   }
+  if (request.preview_truncated) {
+    return "Truncated captured request bodies cannot be exported safely.";
+  }
+  return "";
+}
 
-  parts.push(`'${url}'`);
-  return parts.join(" \\\n  ");
+function getReplayExportTarget(tab) {
+  const request = deriveRepeaterRequest(tab);
+  return getRepeaterTargetConfig(tab, request);
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 function parseRequestForExport(rawText, scheme, host, port) {
   const lines = String(rawText || "").replace(/\r\n/g, "\n").split("\n");
   const [startLine = "GET / HTTP/1.1", ...rest] = lines;
-  const match = startLine.match(/^([A-Z]+)\s+(\S+)/i);
+  const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)/);
   if (!match) return null;
   const method = match[1];
   const path = match[2];
-  const portSuffix = port && !(scheme === "https" && port === "443") && !(scheme === "http" && port === "80") ? `:${port}` : "";
-  const url = `${scheme}://${host}${portSuffix}${path}`;
+  const url = buildUrlFromTarget(scheme, host, port, path);
   let bodyIdx = rest.indexOf("");
   if (bodyIdx === -1) {
     for (let i = 0; i < rest.length; i++) {
@@ -12206,53 +15307,100 @@ function parseRequestForExport(rawText, scheme, host, port) {
   }
   const headerLines = bodyIdx === -1 ? rest : rest.slice(0, bodyIdx);
   const body = bodyIdx === -1 ? "" : (rest[bodyIdx] === "" ? rest.slice(bodyIdx + 1) : rest.slice(bodyIdx)).join("\n");
+  const bodyProvided = bodyIdx !== -1;
   const headers = headerLines.map((h) => {
     const idx = h.indexOf(":");
     return idx === -1 ? null : { name: h.slice(0, idx).trim(), value: h.slice(idx + 1).trim() };
   }).filter(Boolean);
-  return { method, url, headers, body };
+  return { method, url, headers, body, bodyProvided };
 }
 
 function requestToPython(parsed) {
   if (!parsed) return "";
-  const esc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const py = (s) => JSON.stringify(String(s));
   const lines = [`import requests`, ""];
-  const hasBody = parsed.body.trim();
-  const headerObj = parsed.headers.filter((h) => h.name.toLowerCase() !== "host" && h.name.toLowerCase() !== "content-length");
+  const hasBody = parsed.bodyProvided || parsed.body.length > 0;
+  const headerObj = exportableHeaders(parsed.headers, parsed.url);
   if (headerObj.length) {
     lines.push("headers = {");
-    for (const h of headerObj) lines.push(`    "${esc(h.name)}": "${esc(h.value)}",`);
+    for (const h of headerObj) lines.push(`    ${py(h.name)}: ${py(h.value)},`);
     lines.push("}");
     lines.push("");
   }
   if (hasBody) {
-    lines.push(`data = """${parsed.body}"""`);
+    lines.push(`data = ${py(parsed.body)}`);
     lines.push("");
   }
-  const args = [`"${esc(parsed.url)}"`];
+  const args = [py(parsed.url)];
+  args.unshift(py(parsed.method));
   if (headerObj.length) args.push("headers=headers");
   if (hasBody) args.push("data=data");
-  lines.push(`response = requests.${parsed.method.toLowerCase()}(${args.join(", ")})`);
+  lines.push(`response = requests.request(${args.join(", ")})`);
   lines.push(`print(response.status_code)`);
   lines.push(`print(response.text)`);
   return lines.join("\n");
 }
 
+function exportableHeaders(headers, url = "") {
+  return exportableHeadersForUrl(headers, url);
+}
+
+function exportableHeadersForUrl(headers, url = "") {
+  const normalized = normalizedHeaders(headers);
+  const hostHeader = normalized.find((h) => headerNameEquals(h, "host"));
+  const preserveHost = hostHeader && hostHeaderDiffersFromUrl(hostHeader.value, url);
+  return normalized
+    .filter((h) => {
+      if (headerNameEquals(h, "content-length")) return false;
+      if (headerNameEquals(h, "host")) return !!preserveHost;
+      return true;
+    });
+}
+
+function hostHeaderDiffersFromUrl(hostHeader, url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const scheme = parsed.protocol.replace(":", "") || "https";
+    const port = parsed.port || (scheme === "https" ? "443" : "80");
+    const authority = joinAuthority(stripIpv6Brackets(parsed.hostname), port);
+    return !httpRequestAuthoritiesEquivalent(authority, hostHeader, scheme);
+  } catch (_error) {
+    return false;
+  }
+}
+
 function requestToFetch(parsed) {
   if (!parsed) return "";
-  const esc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const headerObj = parsed.headers.filter((h) => h.name.toLowerCase() !== "host" && h.name.toLowerCase() !== "content-length");
+  const js = (s) => JSON.stringify(String(s));
+  if (fetchExportBlockedReason(parsed)) {
+    return "";
+  }
+  const headerObj = exportableHeadersForUrl(parsed.headers, parsed.url);
   const opts = [];
-  if (parsed.method !== "GET") opts.push(`  method: "${parsed.method}"`);
+  if (parsed.method !== "GET") opts.push(`  method: ${js(parsed.method)}`);
   if (headerObj.length) {
-    const hLines = headerObj.map((h) => `    "${esc(h.name)}": "${esc(h.value)}"`).join(",\n");
+    const hLines = headerObj.map((h) => `    ${js(h.name)}: ${js(h.value)}`).join(",\n");
     opts.push(`  headers: {\n${hLines}\n  }`);
   }
-  if (parsed.body.trim()) {
+  if (parsed.bodyProvided || parsed.body.length > 0) {
     opts.push(`  body: ${JSON.stringify(parsed.body)}`);
   }
-  if (!opts.length) return `fetch("${esc(parsed.url)}")\n  .then(res => res.text())\n  .then(console.log);`;
-  return `fetch("${esc(parsed.url)}", {\n${opts.join(",\n")}\n})\n  .then(res => res.text())\n  .then(console.log);`;
+  if (!opts.length) return `fetch(${js(parsed.url)})\n  .then(res => res.text())\n  .then(console.log);`;
+  return `fetch(${js(parsed.url)}, {\n${opts.join(",\n")}\n})\n  .then(res => res.text())\n  .then(console.log);`;
+}
+
+function fetchExportBlockedReason(parsed) {
+  if (!parsed) return "";
+  const hasBody = parsed.bodyProvided || parsed.body.length > 0;
+  if (hasBody && ["GET", "HEAD"].includes(parsed.method.toUpperCase())) {
+    return "Fetch cannot send GET or HEAD requests with a body. Use cURL or Python export instead.";
+  }
+  const hostHeader = normalizedHeaders(parsed.headers).find((h) => headerNameEquals(h, "host"));
+  if (hostHeader && hostHeaderDiffersFromUrl(hostHeader.value, parsed.url)) {
+    return "Fetch cannot preserve a custom Host header. Use cURL or Python export instead.";
+  }
+  return "";
 }
 
 function requestToPowerShell(parsed) {
@@ -12260,22 +15408,58 @@ function requestToPowerShell(parsed) {
   const esc = (s) => s.replace(/'/g, "''");
   const parts = [`Invoke-WebRequest -Uri '${esc(parsed.url)}'`];
   if (parsed.method !== "GET") parts.push(`-Method ${parsed.method}`);
-  const headerObj = parsed.headers.filter((h) => h.name.toLowerCase() !== "host" && h.name.toLowerCase() !== "content-length");
+  const headerObj = exportableHeaders(parsed.headers, parsed.url);
   if (headerObj.length) {
     const hLines = headerObj.map((h) => `'${esc(h.name)}'='${esc(h.value)}'`).join("; ");
     parts.push(`-Headers @{${hLines}}`);
   }
-  if (parsed.body.trim()) {
+  if (parsed.bodyProvided || parsed.body.length > 0) {
     parts.push(`-Body '${esc(parsed.body)}'`);
   }
   return parts.join(" `\n  ");
 }
 
+function requestToCurl(parsed) {
+  if (!parsed) return "";
+  const parts = [`curl -X ${shellQuote(parsed.method)}`];
+  if (urlNeedsPathAsIs(parsed.url)) parts.push("--path-as-is");
+  for (const h of exportableHeaders(parsed.headers, parsed.url)) {
+    parts.push(`-H ${shellQuote(`${h.name}: ${h.value}`)}`);
+  }
+  if (parsed.bodyProvided || parsed.body.length > 0) {
+    parts.push(`--data-raw ${shellQuote(parsed.body)}`);
+  }
+  parts.push(shellQuote(parsed.url));
+  return parts.join(" \\\n  ");
+}
+
+function urlNeedsPathAsIs(url) {
+  return /(?:^|\/)\.\.?(?=\/|\?|$)/.test(rawPathFromUrlString(url || "") || "");
+}
+
 function replayRequestToFormat(format) {
   const tab = getActiveReplayTab();
   if (!tab) return "";
-  const parsed = parseRequestForExport(tab.requestText, tab.targetScheme || "https", tab.targetHost || "localhost", tab.targetPort || "");
-  if (format === "curl") return replayRequestToCurl();
+  const blocked = replayExportBlockedReason(tab);
+  if (blocked) {
+    showToast(blocked, "error");
+    return "";
+  }
+  const target = getReplayExportTarget(tab);
+  const parsed = parseRequestForExport(
+    tab.requestText,
+    target.scheme || "https",
+    target.host || "localhost",
+    target.port || "",
+  );
+  if (format === "fetch") {
+    const fetchBlocked = fetchExportBlockedReason(parsed);
+    if (fetchBlocked) {
+      showToast(fetchBlocked, "error");
+      return "";
+    }
+  }
+  if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
   if (format === "fetch") return requestToFetch(parsed);
   if (format === "powershell") return requestToPowerShell(parsed);
@@ -12283,26 +15467,26 @@ function replayRequestToFormat(format) {
 }
 
 function copySelectedTransactionUrl() {
-  const record = state.selectedRecord;
+  const record = getCurrentSelectedRecord();
   if (!record) return;
   const scheme = record.scheme || "https";
   const host = record.host || "";
   const path = record.path || "/";
-  const url = `${scheme}://${host}${path}`;
+  const url = buildUrlFromTarget(scheme, host, "", path);
   copyTextToClipboard(url);
   showToast("Copied URL");
 }
 
 function copyResponseContent(format) {
-  const record = state.selectedRecord;
+  const record = getCurrentSelectedRecord();
   if (!record?.response) return;
   let text = "";
   if (format === "response-headers") {
     text = `HTTP/1.1 ${record.status || 200}\r\n`;
-    for (const h of record.response.headers || []) text += `${h.name}: ${h.value}\r\n`;
+    for (const h of normalizedHeaders(record.response.headers)) text += `${h.name}: ${h.value}\r\n`;
   } else if (format === "response-body") {
     text = record.response.body_encoding === "base64"
-      ? atob(record.response.body_preview || "")
+      ? safeDecodeBase64(record.response.body_preview || "")
       : (record.response.body_preview || "");
   } else {
     text = buildRawResponse(record);
@@ -12314,22 +15498,27 @@ function copyResponseContent(format) {
 
 // Synchronous version using already-loaded selectedRecord (preserves user gesture for clipboard)
 function selectedRecordToFormat(format) {
-  const record = state.selectedRecord;
+  const record = getCurrentSelectedRecord();
   if (!record) return "";
+  const blocked = historyRequestExportBlockedReason(record);
+  if (blocked) {
+    showToast(blocked, "error");
+    return "";
+  }
   const rawText = buildRawRequest(record);
   const scheme = record.scheme || "https";
-  const hostHeader = record.request?.headers?.find((h) => h.name.toLowerCase() === "host");
+  const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
   const host = hostHeader?.value || record.host || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
-  if (format === "curl") {
-    const esc = (s) => s.replace(/'/g, "'\\''");
-    const parts = [`curl -X ${parsed.method}`];
-    for (const h of parsed.headers) parts.push(`-H '${h.name}: ${esc(h.value)}'`);
-    if (parsed.body.trim()) parts.push(`-d '${esc(parsed.body)}'`);
-    parts.push(`'${parsed.url}'`);
-    return parts.join(" \\\n  ");
+  if (format === "fetch") {
+    const fetchBlocked = fetchExportBlockedReason(parsed);
+    if (fetchBlocked) {
+      showToast(fetchBlocked, "error");
+      return "";
+    }
   }
+  if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
   if (format === "fetch") return requestToFetch(parsed);
   if (format === "powershell") return requestToPowerShell(parsed);
@@ -12337,23 +15526,31 @@ function selectedRecordToFormat(format) {
 }
 
 async function historyRequestToFormat(transactionId, format) {
-  const response = await fetch(`/api/transactions/${transactionId}`);
+  const sessionId = currentSessionId();
+  const response = await fetch(transactionPath(transactionId, sessionId));
+  if (currentSessionId() !== sessionId) return "";
   if (!response.ok) return "";
   const record = await response.json();
+  if (currentSessionId() !== sessionId) return "";
+  const blocked = historyRequestExportBlockedReason(record);
+  if (blocked) {
+    showToast(blocked, "error");
+    return "";
+  }
   const rawText = buildRawRequest(record);
   const scheme = record.scheme || "https";
-  const hostHeader = record.request?.headers?.find((h) => h.name.toLowerCase() === "host");
+  const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
   const host = hostHeader?.value || record.host || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
-  if (format === "curl") {
-    const esc = (s) => s.replace(/'/g, "'\\''");
-    const parts = [`curl -X ${parsed.method}`];
-    for (const h of parsed.headers) parts.push(`-H '${h.name}: ${esc(h.value)}'`);
-    if (parsed.body.trim()) parts.push(`-d '${esc(parsed.body)}'`);
-    parts.push(`'${parsed.url}'`);
-    return parts.join(" \\\n  ");
+  if (format === "fetch") {
+    const fetchBlocked = fetchExportBlockedReason(parsed);
+    if (fetchBlocked) {
+      showToast(fetchBlocked, "error");
+      return "";
+    }
   }
+  if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
   if (format === "fetch") return requestToFetch(parsed);
   if (format === "powershell") return requestToPowerShell(parsed);
@@ -12366,69 +15563,176 @@ function copyTransactionUrl(transactionId) {
   const scheme = item.scheme || "https";
   const host = item.host || "";
   const path = item.path || "/";
-  const url = `${scheme}://${host}${path}`;
+  const url = buildUrlFromTarget(scheme, host, "", path);
   copyTextToClipboard(url).then(() => showToast("Copied URL")).catch(() => {});
 }
 
 function copyReplayUrl() {
   const tab = getActiveReplayTab();
   if (!tab) return;
-  const scheme = tab.targetScheme || "https";
-  const host = tab.targetHost || "localhost";
-  const port = tab.targetPort || "";
-  const portSuffix = port && !(scheme === "https" && port === "443") && !(scheme === "http" && port === "80") ? `:${port}` : "";
+  const target = getReplayExportTarget(tab);
+  const scheme = target.scheme || "https";
+  const host = target.host || "localhost";
+  const port = target.port || "";
   const text = tab.requestText || "";
   const match = text.match(/^[A-Z]+\s+(\S+)/i);
   const path = match ? match[1] : "/";
-  const url = `${scheme}://${host}${portSuffix}${path}`;
+  const url = buildUrlFromTarget(scheme, host, port, path);
   copyTextToClipboard(url).then(() => showToast("Copied URL")).catch(() => {});
 }
 
 function parseCurlCommand(text) {
   const normalized = text.replace(/\\\s*\n/g, " ").trim();
-  if (!normalized.toLowerCase().startsWith("curl")) return null;
-  const tokens = [];
-  let i = 4; // skip "curl"
-  while (i < normalized.length) {
-    while (i < normalized.length && normalized[i] === " ") i++;
-    if (i >= normalized.length) break;
-    let token = "";
-    const ch = normalized[i];
-    if (ch === "'" || ch === '"') {
-      const quote = ch;
-      i++;
-      while (i < normalized.length && normalized[i] !== quote) {
-        if (normalized[i] === "\\" && quote === '"') { i++; token += normalized[i] || ""; }
-        else token += normalized[i];
-        i++;
-      }
-      i++; // skip closing quote
-    } else {
-      while (i < normalized.length && normalized[i] !== " ") { token += normalized[i]; i++; }
-    }
-    tokens.push(token);
-  }
+  const shellWords = splitShellWords(normalized);
+  if (!shellWords.length || shellWords[0].toLowerCase() !== "curl") return null;
+  const tokens = shellWords.slice(1);
   let method = "GET";
+  let methodExplicit = false;
+  let getMode = false;
+  let pathAsIs = false;
   let url = "";
   const headers = [];
-  let body = "";
+  const bodyParts = [];
+  let bodyProvided = false;
+  const addBodyPart = (flag, value) => {
+    if (flag === "--data-urlencode") {
+      const encoded = encodeCurlDataUrlencode(value);
+      if (encoded.error) return encoded.error;
+      bodyParts.push(encoded.value);
+      bodyProvided = true;
+      if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
+      return "";
+    }
+    if (flag !== "--data-raw" && value.startsWith("@")) {
+      return "cURL @file body imports are not supported. Use --data-raw for literal @ bodies.";
+    }
+    bodyParts.push(value);
+    bodyProvided = true;
+    if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
+    return "";
+  };
+  const ensureHeader = (name, value) => {
+    if (!normalizedHeaders(headers).some((header) => headerNameEquals(header, name))) {
+      headers.push({ name, value });
+    }
+  };
+  const addJsonBody = (value) => {
+    const raw = String(value ?? "");
+    if (raw.startsWith("@")) {
+      return "cURL --json @file imports are not supported.";
+    }
+    const error = addBodyPart("--data-raw", raw);
+    if (error) return error;
+    ensureHeader("Content-Type", "application/json");
+    ensureHeader("Accept", "application/json");
+    return "";
+  };
   for (let t = 0; t < tokens.length; t++) {
     const tok = tokens[t];
-    if (tok === "-X" || tok === "--request") { method = (tokens[++t] || "GET").toUpperCase(); }
+    if (tok === "-X" || tok === "--request") {
+      method = (tokens[++t] || "GET").toUpperCase();
+      methodExplicit = true;
+    }
+    else if (tok.startsWith("-X") && tok.length > 2) {
+      method = tok.slice(2).toUpperCase() || "GET";
+      methodExplicit = true;
+    }
+    else if (tok.startsWith("--request=")) {
+      method = tok.slice("--request=".length).toUpperCase() || "GET";
+      methodExplicit = true;
+    }
+    else if (tok === "-I" || tok === "--head") {
+      method = "HEAD";
+      methodExplicit = true;
+    }
+    else if (tok === "-G" || tok === "--get") {
+      getMode = true;
+      if (!methodExplicit) method = "GET";
+    }
     else if (tok === "-H" || tok === "--header") {
       const hVal = tokens[++t] || "";
       const ci = hVal.indexOf(":");
       if (ci > 0) headers.push({ name: hVal.slice(0, ci).trim(), value: hVal.slice(ci + 1).trim() });
     }
-    else if (tok === "-d" || tok === "--data" || tok === "--data-raw" || tok === "--data-binary") { body = tokens[++t] || ""; if (!method || method === "GET") method = "POST"; }
+    else if (tok.startsWith("--header=")) {
+      const hVal = tok.slice("--header=".length);
+      const ci = hVal.indexOf(":");
+      if (ci > 0) headers.push({ name: hVal.slice(0, ci).trim(), value: hVal.slice(ci + 1).trim() });
+    }
+    else if (tok === "-d" || tok === "--data" || tok === "--data-raw" || tok === "--data-binary" || tok === "--data-urlencode") {
+      const error = addBodyPart(tok, tokens[++t] || "");
+      if (error) return { error };
+    }
+    else if (tok === "--json") {
+      const error = addJsonBody(tokens[++t] || "");
+      if (error) return { error };
+    }
+    else if (tok.startsWith("-d") && tok.length > 2) {
+      const error = addBodyPart("-d", tok.slice(2));
+      if (error) return { error };
+    }
+    else if (tok.startsWith("--data=") || tok.startsWith("--data-raw=") || tok.startsWith("--data-binary=") || tok.startsWith("--data-urlencode=")) {
+      const flag = tok.slice(0, tok.indexOf("="));
+      const error = addBodyPart(flag, tok.slice(tok.indexOf("=") + 1));
+      if (error) return { error };
+    }
+    else if (tok.startsWith("--json=")) {
+      const error = addJsonBody(tok.slice("--json=".length));
+      if (error) return { error };
+    }
     else if (tok === "-u" || tok === "--user") {
       const cred = tokens[++t] || "";
-      headers.push({ name: "Authorization", value: `Basic ${btoa(cred)}` });
+      headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(cred)}` });
+    }
+    else if (tok.startsWith("--user=")) {
+      const cred = tok.slice("--user=".length);
+      headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(cred)}` });
+    }
+    else if (tok === "-A" || tok === "--user-agent") {
+      headers.push({ name: "User-Agent", value: tokens[++t] || "" });
+    }
+    else if (tok.startsWith("--user-agent=")) {
+      headers.push({ name: "User-Agent", value: tok.slice("--user-agent=".length) });
+    }
+    else if (tok === "-e" || tok === "--referer") {
+      headers.push({ name: "Referer", value: tokens[++t] || "" });
+    }
+    else if (tok.startsWith("--referer=")) {
+      headers.push({ name: "Referer", value: tok.slice("--referer=".length) });
+    }
+    else if (tok === "-b" || tok === "--cookie") {
+      headers.push({ name: "Cookie", value: tokens[++t] || "" });
+    }
+    else if (tok.startsWith("--cookie=")) {
+      headers.push({ name: "Cookie", value: tok.slice("--cookie=".length) });
+    }
+    else if (tok === "--url") {
+      url = tokens[++t] || "";
+    }
+    else if (tok.startsWith("--url=")) {
+      url = tok.slice("--url=".length);
+    }
+    else if (tok === "--path-as-is") {
+      pathAsIs = true;
     }
     else if (tok === "--compressed" || tok === "-k" || tok === "--insecure" || tok === "-s" || tok === "--silent" || tok === "-v" || tok === "--verbose" || tok === "-L" || tok === "--location") { /* skip flags */ }
+    else if (["-o", "--output", "-x", "--proxy", "--connect-timeout", "--max-time"].includes(tok)) { t++; }
+    else if (/^--(?:output|proxy|connect-timeout|max-time)=/.test(tok)) { /* skip option=value */ }
     else if (!tok.startsWith("-") && !url) { url = tok; }
   }
   if (!url) return null;
+  if (getMode && !methodExplicit) {
+    method = "GET";
+  }
+  if (!HTTP_METHOD_TOKEN_RE.test(method)) {
+    return { error: "Invalid HTTP method in cURL command." };
+  }
+  let body = bodyParts.join("&");
+  if (getMode && body) {
+    url += `${url.includes("?") ? "&" : "?"}${body}`;
+    body = "";
+    bodyProvided = false;
+  }
   let scheme = "https";
   let host = "";
   let path = "/";
@@ -12436,13 +15740,97 @@ function parseCurlCommand(text) {
     const parsed = new URL(url);
     scheme = parsed.protocol.replace(":", "");
     host = parsed.host;
-    path = `${parsed.pathname || "/"}${parsed.search || ""}`;
+    path = pathAsIs ? rawPathFromUrlString(url) : `${parsed.pathname || "/"}${parsed.search || ""}`;
   } catch (_) { return null; }
-  const hasHost = headers.some((h) => h.name.toLowerCase() === "host");
+  const hasHost = normalizedHeaders(headers).some((h) => headerNameEquals(h, "host"));
   if (!hasHost) headers.unshift({ name: "Host", value: host });
   const headerText = headers.map((h) => `${h.name}: ${h.value}`).join("\n");
-  const requestText = body ? `${method} ${path} HTTP/1.1\n${headerText}\n\n${body}` : `${method} ${path} HTTP/1.1\n${headerText}`;
+  const requestText = bodyProvided ? `${method} ${path} HTTP/1.1\n${headerText}\n\n${body}` : `${method} ${path} HTTP/1.1\n${headerText}`;
   return { scheme, host, port: "", method, path, headers, body, requestText };
+}
+
+function encodeCurlDataUrlencode(value) {
+  const raw = String(value ?? "");
+  if (raw.startsWith("@") || (!raw.includes("=") && /^[^@=]+@/.test(raw))) {
+    return { error: "cURL --data-urlencode @file imports are not supported." };
+  }
+  const formEncode = (part) => encodeURIComponent(part).replace(/%20/g, "+");
+  const eq = raw.indexOf("=");
+  if (eq > 0) {
+    return { value: `${raw.slice(0, eq)}=${formEncode(raw.slice(eq + 1))}` };
+  }
+  if (eq === 0) {
+    return { value: formEncode(raw.slice(1)) };
+  }
+  return { value: formEncode(raw) };
+}
+
+function rawPathFromUrlString(url) {
+  const input = String(url || "");
+  const schemeIndex = input.indexOf("://");
+  if (schemeIndex < 0) return "";
+  const authorityStart = schemeIndex + 3;
+  let pathStart = input.length;
+  for (const marker of ["/", "?", "#"]) {
+    const index = input.indexOf(marker, authorityStart);
+    if (index >= 0 && index < pathStart) pathStart = index;
+  }
+  const raw = pathStart < input.length ? input.slice(pathStart) : "/";
+  const hashIndex = raw.indexOf("#");
+  const withoutHash = hashIndex >= 0 ? raw.slice(0, hashIndex) : raw;
+  if (withoutHash.startsWith("?")) return `/${withoutHash}`;
+  return withoutHash || "/";
+}
+
+function splitShellWords(input) {
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let active = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else { token += ch; active = true; }
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+      } else if (ch === "\\" && i + 1 < input.length) {
+        token += input[++i];
+        active = true;
+      } else {
+        token += ch;
+        active = true;
+      }
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (active || token.length) tokens.push(token);
+      token = "";
+      active = false;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      active = true;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < input.length) {
+      token += input[++i];
+      active = true;
+      continue;
+    }
+    token += ch;
+    active = true;
+  }
+
+  if (quote) return [];
+  if (active || token.length) tokens.push(token);
+  return tokens;
 }
 
 function openCurlImportModal() {
@@ -12459,18 +15847,30 @@ function closeCurlImportModal() {
 function applyCurlImport() {
   const text = document.getElementById("curlImportInput").value;
   const result = parseCurlCommand(text);
-  if (!result) return;
+  if (!result) {
+    showToast("Could not parse cURL command", "error");
+    return;
+  }
+  if (result.error) {
+    showToast(result.error, "error");
+    return;
+  }
   const tab = createReplayTab();
+  const target = authorityToTargetState(result.host, result.scheme || "https");
   tab.requestText = result.requestText;
   tab.targetScheme = result.scheme;
-  tab.targetHost = result.host.replace(/:\d+$/, "");
-  tab.targetPort = result.host.includes(":") ? result.host.split(":").pop() : "";
+  tab.targetHost = target.host;
+  tab.targetPort = target.port;
+  tab.targetManuallyEdited = hostHeaderDiffersFromUrl(
+    headerValue(result.headers, "host") || result.host,
+    buildUrlFromTarget(result.scheme, target.host, target.port, result.path),
+  );
   tab.baseRequest = {
     scheme: result.scheme,
     host: result.host,
     method: result.method,
     path: result.path,
-    headers: result.headers,
+    headers: normalizedHeaders(result.headers),
     body: result.body,
     body_encoding: "utf8",
     preview_truncated: false,
@@ -12525,7 +15925,9 @@ function initReplayContextMenu() {
       } else if (action === "copy-as-curl" || action === "copy-as-python" || action === "copy-as-fetch" || action === "copy-as-powershell") {
         const format = action.replace("copy-as-", "");
         const text = replayRequestToFormat(format);
-        copyTextToClipboard(text).then(() => showToast(`Copied as ${format}`)).catch(() => {});
+        if (text) {
+          copyTextToClipboard(text).then(() => showToast(`Copied as ${format}`)).catch(() => {});
+        }
       } else if (action === "import-curl") {
         openCurlImportModal();
       }
@@ -13182,7 +16584,7 @@ const searchDecoField = CM.StateField.define({
         return buildSearchDecorations(tr.state.doc, value.query, e.value);
       }
     }
-    if (tr.docChanged && value.matchCount > 0) {
+    if (tr.docChanged && value.query) {
       return buildSearchDecorations(tr.state.doc, value.query, value.activeIndex);
     }
     return value;
@@ -13210,19 +16612,22 @@ class SniperCodeView {
     if (view.state.doc.toString() === nextText) {
       return;
     }
-    view.dispatch({
-      changes: { from: 0, to: view.state.doc.length, insert: nextText },
-      annotations: cmProgrammaticSetContent.of(true),
-    });
+	view.dispatch({
+	  changes: { from: 0, to: view.state.doc.length, insert: nextText },
+	  annotations: [
+	    cmProgrammaticSetContent.of(true),
+	    CM.Transaction.addToHistory.of(false),
+	  ],
+	});
   }
 
   /** Apply search highlights and return match info. */
-  applySearch(query) {
+  applySearch(query, options = {}) {
     this._searchNavIndex = -1;
     this.view.dispatch({ effects: setSearchQuery.of(query || "") });
     const field = this.view.state.field(searchDecoField);
     // Scroll to first match
-    if (field.matchPositions.length > 0) {
+    if (options.scrollToFirst !== false && field.matchPositions.length > 0) {
       const pos = field.matchPositions[0];
       this.view.dispatch({ selection: { anchor: pos }, scrollIntoView: true });
     }

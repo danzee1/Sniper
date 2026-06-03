@@ -1,20 +1,29 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
-use http::{HeaderName, HeaderValue};
+use futures_util::{
+    future::{AbortHandle, Abortable},
+    SinkExt, StreamExt,
+};
+use http::{
+    header::{COOKIE, HOST},
+    HeaderMap, HeaderName, HeaderValue,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{
-    connect_async,
+    connect_async_tls_with_config,
     tungstenite::{client::IntoClientRequest, protocol::Message as WsMessage},
 };
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::model::{BodyEncoding, WebSocketFrameDirection, WebSocketFrameKind};
+
+const MAX_WS_REPLAY_FRAMES_PER_CONNECTION: usize = 10_000;
+const MAX_WS_REPLAY_FRAME_PREVIEW_BYTES: usize = 64 * 1024;
+const WS_REPLAY_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// A single frame in the WS replay conversation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,6 +35,8 @@ pub struct WsReplayFrame {
     pub body: String,
     pub body_encoding: BodyEncoding,
     pub body_size: usize,
+    #[serde(default)]
+    pub preview_truncated: bool,
 }
 
 /// Status of a WS replay connection.
@@ -48,16 +59,27 @@ pub struct WsReplaySnapshot {
 }
 
 /// Sender half to push messages into the WebSocket.
-type WsSender = mpsc::UnboundedSender<WsMessage>;
+type WsSender = mpsc::UnboundedSender<WsReplayOutboundMessage>;
+
+#[derive(Debug)]
+enum WsReplayOutboundMessage {
+    Message(WsMessage),
+    Close { recorded_index: Option<usize> },
+}
 
 /// Internal state for a single WS replay connection.
 struct WsReplayConnection {
+    owner_session_id: Uuid,
     status: WsReplayStatus,
     frames: Vec<WsReplayFrame>,
     frame_counter: usize,
     sender: Option<WsSender>,
+    task_abort: Option<AbortHandle>,
     error: Option<String>,
 }
+
+type WsReplayConnectionHandle = Arc<RwLock<WsReplayConnection>>;
+type WsReplayConnectionMap = Arc<RwLock<HashMap<Uuid, WsReplayConnectionHandle>>>;
 
 impl WsReplayConnection {
     fn snapshot(&self, id: Uuid) -> WsReplaySnapshot {
@@ -69,40 +91,55 @@ impl WsReplayConnection {
         }
     }
 
-    fn push_frame(&mut self, direction: WebSocketFrameDirection, msg: &WsMessage) {
-        let (kind, body, encoding, size) = match msg {
-            WsMessage::Text(text) => (
-                WebSocketFrameKind::Text,
-                text.to_string(),
-                BodyEncoding::Utf8,
-                text.len(),
-            ),
+    fn push_frame(&mut self, direction: WebSocketFrameDirection, msg: &WsMessage) -> Option<usize> {
+        let (kind, body, encoding, size, preview_truncated) = match msg {
+            WsMessage::Text(text) => {
+                let text = text.to_string();
+                let size = text.len();
+                let (preview, truncated) = truncate_text_preview(&text);
+                (
+                    WebSocketFrameKind::Text,
+                    preview,
+                    BodyEncoding::Utf8,
+                    size,
+                    truncated,
+                )
+            }
             WsMessage::Binary(data) => {
                 use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_ref());
+                let bytes = data.as_ref();
+                let (preview, truncated) = preview_bytes(bytes);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(preview);
                 (
                     WebSocketFrameKind::Binary,
                     b64,
                     BodyEncoding::Base64,
-                    data.len(),
+                    bytes.len(),
+                    truncated,
                 )
             }
             WsMessage::Ping(data) => {
                 use base64::Engine;
+                let bytes = data.as_ref();
+                let (preview, truncated) = preview_bytes(bytes);
                 (
                     WebSocketFrameKind::Ping,
-                    base64::engine::general_purpose::STANDARD.encode(data.as_ref()),
+                    base64::engine::general_purpose::STANDARD.encode(preview),
                     BodyEncoding::Base64,
-                    data.len(),
+                    bytes.len(),
+                    truncated,
                 )
             }
             WsMessage::Pong(data) => {
                 use base64::Engine;
+                let bytes = data.as_ref();
+                let (preview, truncated) = preview_bytes(bytes);
                 (
                     WebSocketFrameKind::Pong,
-                    base64::engine::general_purpose::STANDARD.encode(data.as_ref()),
+                    base64::engine::general_purpose::STANDARD.encode(preview),
                     BodyEncoding::Base64,
-                    data.len(),
+                    bytes.len(),
+                    truncated,
                 )
             }
             WsMessage::Close(frame) => {
@@ -111,34 +148,68 @@ impl WsReplayConnection {
                     .map(|f| format!("{}: {}", f.code, f.reason))
                     .unwrap_or_default();
                 let size = text.len();
-                (WebSocketFrameKind::Close, text, BodyEncoding::Utf8, size)
+                let (preview, truncated) = truncate_text_preview(&text);
+                (
+                    WebSocketFrameKind::Close,
+                    preview,
+                    BodyEncoding::Utf8,
+                    size,
+                    truncated,
+                )
             }
-            WsMessage::Frame(_) => return,
+            WsMessage::Frame(_) => return None,
         };
 
+        let index = self.frame_counter;
         let frame = WsReplayFrame {
-            index: self.frame_counter,
+            index,
             captured_at: Utc::now().to_rfc3339(),
             direction,
             kind,
             body,
             body_encoding: encoding,
             body_size: size,
+            preview_truncated,
         };
         self.frame_counter += 1;
         self.frames.push(frame);
+        if self.frames.len() > MAX_WS_REPLAY_FRAMES_PER_CONNECTION {
+            let overflow = self.frames.len() - MAX_WS_REPLAY_FRAMES_PER_CONNECTION;
+            self.frames.drain(..overflow);
+        }
+        Some(index)
+    }
+
+    fn remove_frame(&mut self, index: usize) {
+        if let Some(position) = self.frames.iter().position(|frame| frame.index == index) {
+            self.frames.remove(position);
+        }
+    }
+
+    fn push_auto_reply_frame(&mut self, msg: &WsMessage) -> Option<usize> {
+        match msg {
+            WsMessage::Ping(payload) => self.push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Pong(payload.clone()),
+            ),
+            WsMessage::Close(frame) => self.push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Close(frame.clone()),
+            ),
+            _ => None,
+        }
     }
 }
 
 /// Manages all active WS replay connections.
 pub struct WsReplayStore {
-    connections: RwLock<HashMap<Uuid, Arc<RwLock<WsReplayConnection>>>>,
+    connections: WsReplayConnectionMap,
 }
 
 impl WsReplayStore {
     pub fn new() -> Self {
         Self {
-            connections: RwLock::new(HashMap::new()),
+            connections: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -146,8 +217,10 @@ impl WsReplayStore {
     pub async fn connect(
         &self,
         id: Uuid,
+        owner_session_id: Uuid,
         url: &str,
         extra_headers: Vec<(String, String)>,
+        upstream_insecure: bool,
     ) -> Result<()> {
         // Build the tungstenite request with custom headers
         let mut request = url.into_client_request().context("invalid WebSocket URL")?;
@@ -158,142 +231,272 @@ impl WsReplayStore {
                     HeaderName::from_bytes(name.as_bytes()),
                     HeaderValue::from_str(value),
                 ) {
-                    headers.insert(n, v);
+                    insert_ws_replay_header(headers, n, v);
                 }
             }
         }
 
+        self.close_existing_connection(id).await;
+
+        let (task_abort, abort_registration) = AbortHandle::new_pair();
+
         // Create connection entry
         let conn = Arc::new(RwLock::new(WsReplayConnection {
+            owner_session_id,
             status: WsReplayStatus::Connecting,
             frames: Vec::new(),
             frame_counter: 0,
             sender: None,
+            task_abort: Some(task_abort),
             error: None,
         }));
         self.connections.write().await.insert(id, conn.clone());
 
         // Connect in the background
-        tokio::spawn(async move {
-            match connect_async(request).await {
-                Ok((ws_stream, _response)) => {
-                    let (mut write, mut read) = ws_stream.split();
-                    let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
-
-                    {
-                        let mut c = conn.write().await;
-                        c.status = WsReplayStatus::Connected;
-                        c.sender = Some(tx);
-                    }
-
-                    // Spawn writer task
-                    let conn_for_writer = conn.clone();
-                    let write_task = tokio::spawn(async move {
-                        while let Some(msg) = rx.recv().await {
-                            // Record outgoing frame
-                            {
-                                let mut c = conn_for_writer.write().await;
-                                c.push_frame(WebSocketFrameDirection::ClientToServer, &msg);
-                            }
-                            if write.send(msg).await.is_err() {
-                                break;
-                            }
+        let connections = Arc::clone(&self.connections);
+        tokio::spawn(Abortable::new(
+            async move {
+                match connect_async_tls_with_config(
+                    request,
+                    None,
+                    false,
+                    crate::ws_tls::insecure_connector(upstream_insecure),
+                )
+                .await
+                {
+                    Ok((mut ws_stream, _response)) => {
+                        if !connection_is_current(&connections, id, &conn).await {
+                            let _ = ws_stream.close(None).await;
+                            return;
                         }
-                    });
 
-                    // Read incoming messages
-                    while let Some(msg_result) = read.next().await {
-                        match msg_result {
-                            Ok(msg) => {
-                                // Auto-respond to pings
-                                if let WsMessage::Ping(data) = &msg {
-                                    let mut c = conn.write().await;
-                                    c.push_frame(WebSocketFrameDirection::ServerToClient, &msg);
-                                    if let Some(sender) = &c.sender {
-                                        let _ = sender.send(WsMessage::Pong(data.clone()));
+                        let (tx, mut rx) = mpsc::unbounded_channel::<WsReplayOutboundMessage>();
+
+                        {
+                            let mut c = conn.write().await;
+                            if c.status != WsReplayStatus::Connecting {
+                                c.task_abort = None;
+                                let _ = ws_stream.close(None).await;
+                                return;
+                            }
+                            c.status = WsReplayStatus::Connected;
+                            c.sender = Some(tx);
+                        }
+
+                        let (mut write, mut read) = ws_stream.split();
+
+                        // Spawn writer task
+                        let conn_for_writer = conn.clone();
+                        let mut write_task = tokio::spawn(async move {
+                            while let Some(outbound) = rx.recv().await {
+                                let (msg, recorded_index) = match outbound {
+                                    WsReplayOutboundMessage::Message(msg) => (msg, None),
+                                    WsReplayOutboundMessage::Close { recorded_index } => {
+                                        (WsMessage::Close(None), recorded_index)
                                     }
-                                    continue;
-                                }
-
-                                let is_close = matches!(msg, WsMessage::Close(_));
-                                {
-                                    let mut c = conn.write().await;
-                                    c.push_frame(WebSocketFrameDirection::ServerToClient, &msg);
-                                }
-                                if is_close {
+                                };
+                                let recorded_msg = msg.clone();
+                                let recorded_index = if recorded_index.is_some() {
+                                    recorded_index
+                                } else {
+                                    let mut c = conn_for_writer.write().await;
+                                    c.push_frame(
+                                        WebSocketFrameDirection::ClientToServer,
+                                        &recorded_msg,
+                                    )
+                                };
+                                if let Err(error) = write.send(msg).await {
+                                    let mut c = conn_for_writer.write().await;
+                                    if let Some(index) = recorded_index {
+                                        c.remove_frame(index);
+                                    }
+                                    c.status = WsReplayStatus::Error;
+                                    c.error =
+                                        Some(format!("failed to send WebSocket frame: {error}"));
+                                    c.sender = None;
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                warn!("ws replay read error: {}", e);
-                                break;
+                            if let Err(error) = write.close().await {
+                                warn!(?error, "failed to close WebSocket replay writer");
+                            }
+                        });
+
+                        // Read incoming messages
+                        let mut read_error = None;
+                        while let Some(msg_result) = read.next().await {
+                            match msg_result {
+                                Ok(msg) => {
+                                    if matches!(msg, WsMessage::Ping(_)) {
+                                        let mut c = conn.write().await;
+                                        c.push_frame(WebSocketFrameDirection::ServerToClient, &msg);
+                                        c.push_auto_reply_frame(&msg);
+                                        continue;
+                                    }
+
+                                    let is_close = matches!(msg, WsMessage::Close(_));
+                                    {
+                                        let mut c = conn.write().await;
+                                        c.push_frame(WebSocketFrameDirection::ServerToClient, &msg);
+                                        if is_close {
+                                            c.push_auto_reply_frame(&msg);
+                                            c.sender = None;
+                                        }
+                                    }
+                                    if is_close {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    let message = format!("ws replay read error: {e}");
+                                    warn!("{}", message);
+                                    read_error = Some(message);
+                                    break;
+                                }
                             }
                         }
+
+                        // Clean up
+                        {
+                            let mut c = conn.write().await;
+                            c.sender = None;
+                        }
+                        if tokio::time::timeout(WS_REPLAY_CLOSE_GRACE, &mut write_task)
+                            .await
+                            .is_err()
+                        {
+                            write_task.abort();
+                        }
+                        let mut c = conn.write().await;
+                        if let Some(error) = read_error {
+                            if c.status != WsReplayStatus::Disconnected {
+                                c.status = WsReplayStatus::Error;
+                                c.error = Some(error);
+                            }
+                        } else if c.status != WsReplayStatus::Error {
+                            c.status = WsReplayStatus::Disconnected;
+                        }
+                        c.sender = None;
+                        c.task_abort = None;
                     }
+                    Err(e) => {
+                        if !connection_is_current(&connections, id, &conn).await {
+                            return;
+                        }
+                        let mut c = conn.write().await;
+                        if c.status != WsReplayStatus::Connecting {
+                            return;
+                        }
+                        c.status = WsReplayStatus::Error;
+                        c.error = Some(e.to_string());
+                        c.sender = None;
+                        c.task_abort = None;
+                    }
+                }
+            },
+            abort_registration,
+        ));
 
-                    // Clean up
-                    write_task.abort();
-                    let mut c = conn.write().await;
-                    c.status = WsReplayStatus::Disconnected;
-                    c.sender = None;
-                }
-                Err(e) => {
-                    let mut c = conn.write().await;
-                    c.status = WsReplayStatus::Error;
-                    c.error = Some(e.to_string());
-                    c.sender = None;
-                }
+        Ok(())
+    }
+
+    async fn close_existing_connection(&self, id: Uuid) {
+        let existing = {
+            let mut connections = self.connections.write().await;
+            connections.remove(&id)
+        };
+
+        if let Some(conn) = existing {
+            let mut c = conn.write().await;
+            let graceful_close = if let Some(sender) = c.sender.take() {
+                sender
+                    .send(WsReplayOutboundMessage::Close {
+                        recorded_index: None,
+                    })
+                    .is_ok()
+            } else {
+                false
+            };
+            if let Some(abort) = c.task_abort.take() {
+                abort_connection_after_close(abort, graceful_close);
             }
-        });
+            c.status = WsReplayStatus::Disconnected;
+        }
+    }
 
+    async fn connection(&self, id: Uuid) -> Option<WsReplayConnectionHandle> {
+        self.connections.read().await.get(&id).cloned()
+    }
+
+    pub async fn belongs_to_session(&self, id: Uuid, session_id: Uuid) -> Option<bool> {
+        let conn = self.connection(id).await?;
+        let c = conn.read().await;
+        Some(c.owner_session_id == session_id)
+    }
+
+    async fn send_message(&self, id: Uuid, msg: WsMessage) -> Result<()> {
+        let conn = self
+            .connection(id)
+            .await
+            .context("no such WS replay connection")?;
+        let c = conn.read().await;
+        let sender = c.sender.as_ref().context("connection is not open")?;
+        sender
+            .send(WsReplayOutboundMessage::Message(msg))
+            .map_err(|_| anyhow::anyhow!("failed to send message"))?;
         Ok(())
     }
 
     /// Send a text message on an existing connection.
     pub async fn send_text(&self, id: Uuid, text: String) -> Result<()> {
-        let connections = self.connections.read().await;
-        let conn = connections
-            .get(&id)
-            .context("no such WS replay connection")?;
-        let c = conn.read().await;
-        let sender = c.sender.as_ref().context("connection is not open")?;
-        sender
-            .send(WsMessage::Text(text.into()))
-            .map_err(|_| anyhow::anyhow!("failed to send message"))?;
-        Ok(())
+        self.send_message(id, WsMessage::Text(text.into())).await
     }
 
     /// Send a binary message on an existing connection.
     pub async fn send_binary(&self, id: Uuid, data: Vec<u8>) -> Result<()> {
-        let connections = self.connections.read().await;
-        let conn = connections
-            .get(&id)
-            .context("no such WS replay connection")?;
-        let c = conn.read().await;
-        let sender = c.sender.as_ref().context("connection is not open")?;
-        sender
-            .send(WsMessage::Binary(data.into()))
-            .map_err(|_| anyhow::anyhow!("failed to send message"))?;
-        Ok(())
+        self.send_message(id, WsMessage::Binary(data.into())).await
+    }
+
+    /// Send a ping control frame on an existing connection.
+    pub async fn send_ping(&self, id: Uuid, data: Vec<u8>) -> Result<()> {
+        self.send_message(id, WsMessage::Ping(data.into())).await
+    }
+
+    /// Send a pong control frame on an existing connection.
+    pub async fn send_pong(&self, id: Uuid, data: Vec<u8>) -> Result<()> {
+        self.send_message(id, WsMessage::Pong(data.into())).await
     }
 
     /// Disconnect an active connection.
     pub async fn disconnect(&self, id: Uuid) -> Result<()> {
-        let connections = self.connections.read().await;
-        if let Some(conn) = connections.get(&id) {
-            let mut c = conn.write().await;
-            if let Some(sender) = c.sender.take() {
-                let _ = sender.send(WsMessage::Close(None));
+        if let Some(conn) = self.connection(id).await {
+            let (abort, graceful_close) = {
+                let mut c = conn.write().await;
+                let graceful_close = if let Some(sender) = c.sender.take() {
+                    let recorded_index = c.push_frame(
+                        WebSocketFrameDirection::ClientToServer,
+                        &WsMessage::Close(None),
+                    );
+                    sender
+                        .send(WsReplayOutboundMessage::Close { recorded_index })
+                        .is_ok()
+                } else {
+                    false
+                };
+                let abort = c.task_abort.take();
+                c.status = WsReplayStatus::Disconnected;
+                (abort, graceful_close)
+            };
+            if let Some(abort) = abort {
+                abort_connection_after_close(abort, graceful_close);
             }
-            c.status = WsReplayStatus::Disconnected;
         }
         Ok(())
     }
 
     /// Get the current snapshot of a connection (status + all frames).
     pub async fn snapshot(&self, id: Uuid) -> Option<WsReplaySnapshot> {
-        let connections = self.connections.read().await;
-        let conn = connections.get(&id)?;
+        let conn = self.connection(id).await?;
         let c = conn.read().await;
         Some(c.snapshot(id))
     }
@@ -303,28 +506,420 @@ impl WsReplayStore {
         &self,
         id: Uuid,
         since_index: usize,
-    ) -> Option<(WsReplayStatus, Vec<WsReplayFrame>)> {
-        let connections = self.connections.read().await;
-        let conn = connections.get(&id)?;
+    ) -> Option<(WsReplayStatus, Option<String>, Vec<WsReplayFrame>)> {
+        let conn = self.connection(id).await?;
         let c = conn.read().await;
-        let new_frames: Vec<WsReplayFrame> = c
-            .frames
-            .iter()
-            .filter(|f| f.index >= since_index)
-            .cloned()
-            .collect();
-        Some((c.status.clone(), new_frames))
+        let first_new = c.frames.partition_point(|frame| frame.index < since_index);
+        let new_frames = c.frames[first_new..].to_vec();
+        Some((c.status.clone(), c.error.clone(), new_frames))
     }
 
     /// Remove a connection and its data.
     pub async fn remove(&self, id: Uuid) {
-        self.disconnect(id).await.ok();
-        self.connections.write().await.remove(&id);
+        self.close_existing_connection(id).await;
     }
+
+    /// Disconnect and remove every replay connection.
+    pub async fn disconnect_all(&self) {
+        let ids = {
+            let connections = self.connections.read().await;
+            connections.keys().copied().collect::<Vec<_>>()
+        };
+        for id in ids {
+            self.remove(id).await;
+        }
+    }
+}
+
+fn truncate_text_preview(text: &str) -> (String, bool) {
+    if text.len() <= MAX_WS_REPLAY_FRAME_PREVIEW_BYTES {
+        return (text.to_string(), false);
+    }
+
+    let end = text
+        .char_indices()
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .take_while(|end| *end <= MAX_WS_REPLAY_FRAME_PREVIEW_BYTES)
+        .last()
+        .unwrap_or(0);
+    (text[..end].to_string(), true)
+}
+
+fn preview_bytes(bytes: &[u8]) -> (&[u8], bool) {
+    let end = bytes.len().min(MAX_WS_REPLAY_FRAME_PREVIEW_BYTES);
+    (&bytes[..end], bytes.len() > end)
+}
+
+fn insert_ws_replay_header(headers: &mut HeaderMap, name: HeaderName, value: HeaderValue) {
+    if name == COOKIE {
+        if let (Some(existing), Ok(next)) = (
+            headers.get(COOKIE).and_then(|value| value.to_str().ok()),
+            value.to_str(),
+        ) {
+            let existing = existing.trim();
+            let next = next.trim();
+            let merged = match (existing.is_empty(), next.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => next.to_string(),
+                (false, true) => existing.to_string(),
+                (false, false) => format!("{existing}; {next}"),
+            };
+            if let Ok(merged) = HeaderValue::from_str(&merged) {
+                headers.insert(COOKIE, merged);
+                return;
+            }
+        }
+        headers.insert(COOKIE, value);
+    } else if name == HOST {
+        headers.insert(name, value);
+    } else {
+        headers.append(name, value);
+    }
+}
+
+async fn connection_is_current(
+    connections: &WsReplayConnectionMap,
+    id: Uuid,
+    conn: &WsReplayConnectionHandle,
+) -> bool {
+    connections
+        .read()
+        .await
+        .get(&id)
+        .is_some_and(|current| Arc::ptr_eq(current, conn))
 }
 
 impl Default for WsReplayStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn abort_connection_after_close(abort: AbortHandle, graceful_close: bool) {
+    if !graceful_close {
+        abort.abort();
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(WS_REPLAY_CLOSE_GRACE).await;
+        abort.abort();
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_connection(status: WsReplayStatus, sender: Option<WsSender>) -> WsReplayConnection {
+        WsReplayConnection {
+            owner_session_id: Uuid::new_v4(),
+            status,
+            frames: Vec::new(),
+            frame_counter: 0,
+            sender,
+            task_abort: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_since_includes_connection_error() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let mut connection = test_connection(WsReplayStatus::Error, None);
+        connection.owner_session_id = owner;
+        connection.error = Some("connection refused".to_string());
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(connection)));
+
+        let (status, error, frames) = store.frames_since(id, 0).await.unwrap();
+        assert_eq!(status, WsReplayStatus::Error);
+        assert_eq!(error.as_deref(), Some("connection refused"));
+        assert!(frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_owner_is_checked_by_session_id() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let mut connection = test_connection(WsReplayStatus::Connected, None);
+        connection.owner_session_id = owner;
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(connection)));
+
+        assert_eq!(store.belongs_to_session(id, owner).await, Some(true));
+        assert_eq!(
+            store.belongs_to_session(id, Uuid::new_v4()).await,
+            Some(false)
+        );
+        assert_eq!(store.belongs_to_session(Uuid::new_v4(), owner).await, None);
+    }
+
+    #[test]
+    fn replay_frame_body_is_preview_capped() {
+        let mut conn = test_connection(WsReplayStatus::Connected, None);
+        let data = vec![7_u8; MAX_WS_REPLAY_FRAME_PREVIEW_BYTES + 11];
+
+        conn.push_frame(
+            WebSocketFrameDirection::ServerToClient,
+            &WsMessage::Binary(data.clone().into()),
+        );
+
+        let frame = conn.frames.first().unwrap();
+        assert_eq!(frame.body_size, data.len());
+        assert!(frame.preview_truncated);
+
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(frame.body.as_bytes())
+            .unwrap();
+        assert_eq!(decoded.len(), MAX_WS_REPLAY_FRAME_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn replay_handshake_merges_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        insert_ws_replay_header(
+            &mut headers,
+            COOKIE,
+            HeaderValue::from_static("session=abc"),
+        );
+        insert_ws_replay_header(&mut headers, COOKIE, HeaderValue::from_static("theme=dark"));
+
+        assert_eq!(headers.get_all(COOKIE).iter().count(), 1);
+        assert_eq!(headers.get(COOKIE).unwrap(), "session=abc; theme=dark");
+    }
+
+    #[test]
+    fn replay_connection_caps_frames_but_keeps_monotonic_indexes() {
+        let mut conn = test_connection(WsReplayStatus::Connected, None);
+
+        for index in 0..(MAX_WS_REPLAY_FRAMES_PER_CONNECTION + 3) {
+            conn.push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Text(format!("frame-{index}").into()),
+            );
+        }
+
+        assert_eq!(conn.frames.len(), MAX_WS_REPLAY_FRAMES_PER_CONNECTION);
+        assert_eq!(conn.frame_counter, MAX_WS_REPLAY_FRAMES_PER_CONNECTION + 3);
+        assert_eq!(conn.frames.first().map(|frame| frame.index), Some(3));
+        assert_eq!(
+            conn.frames.last().map(|frame| frame.index),
+            Some(MAX_WS_REPLAY_FRAMES_PER_CONNECTION + 2)
+        );
+    }
+
+    #[test]
+    fn replay_connection_can_remove_unsent_frame_by_index() {
+        let mut conn = test_connection(WsReplayStatus::Connected, None);
+        let first = conn
+            .push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Text("first".into()),
+            )
+            .unwrap();
+        conn.push_frame(
+            WebSocketFrameDirection::ServerToClient,
+            &WsMessage::Text("reply".into()),
+        );
+
+        conn.remove_frame(first);
+
+        assert_eq!(conn.frames.len(), 1);
+        assert!(matches!(
+            conn.frames[0].direction,
+            WebSocketFrameDirection::ServerToClient
+        ));
+        assert_eq!(conn.frame_counter, 2);
+    }
+
+    #[test]
+    fn replay_connection_records_automatic_control_replies() {
+        let mut conn = test_connection(WsReplayStatus::Connected, None);
+        let ping = WsMessage::Ping(b"hello".to_vec().into());
+
+        conn.push_frame(WebSocketFrameDirection::ServerToClient, &ping);
+        conn.push_auto_reply_frame(&ping);
+
+        assert_eq!(conn.frames.len(), 2);
+        assert!(matches!(conn.frames[0].kind, WebSocketFrameKind::Ping));
+        assert!(matches!(conn.frames[1].kind, WebSocketFrameKind::Pong));
+        assert!(matches!(
+            conn.frames[1].direction,
+            WebSocketFrameDirection::ClientToServer
+        ));
+
+        let close = WsMessage::Close(None);
+        conn.push_frame(WebSocketFrameDirection::ServerToClient, &close);
+        conn.push_auto_reply_frame(&close);
+
+        assert!(matches!(conn.frames[2].kind, WebSocketFrameKind::Close));
+        assert!(matches!(conn.frames[3].kind, WebSocketFrameKind::Close));
+        assert!(matches!(
+            conn.frames[3].direction,
+            WebSocketFrameDirection::ClientToServer
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_replacement_disconnects_previous_connection() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let previous = Arc::new(RwLock::new(test_connection(
+            WsReplayStatus::Connected,
+            Some(tx),
+        )));
+        store.connections.write().await.insert(id, previous.clone());
+
+        store.close_existing_connection(id).await;
+
+        assert!(!store.connections.read().await.contains_key(&id));
+        assert_eq!(previous.read().await.status, WsReplayStatus::Disconnected);
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Close {
+                recorded_index: None
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_connection_snapshot() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(RwLock::new(test_connection(
+            WsReplayStatus::Connected,
+            Some(tx),
+        )));
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, connection.clone());
+
+        store.remove(id).await;
+
+        assert!(store.snapshot(id).await.is_none());
+        assert_eq!(connection.read().await.status, WsReplayStatus::Disconnected);
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Close {
+                recorded_index: None
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_aborts_connecting_connection_task() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (abort, _registration) = AbortHandle::new_pair();
+        let mut connection = test_connection(WsReplayStatus::Connecting, None);
+        connection.task_abort = Some(abort.clone());
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(connection)));
+
+        store.remove(id).await;
+
+        assert!(abort.is_aborted());
+        assert!(store.snapshot(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_connected_connection_queues_close_before_abort_grace() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (abort, _registration) = AbortHandle::new_pair();
+        let mut connection_state = test_connection(WsReplayStatus::Connected, Some(tx));
+        connection_state.task_abort = Some(abort.clone());
+        let connection = Arc::new(RwLock::new(connection_state));
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, connection.clone());
+
+        store.disconnect(id).await.unwrap();
+
+        let close_frame = connection
+            .read()
+            .await
+            .frames
+            .iter()
+            .find(|frame| matches!(frame.kind, WebSocketFrameKind::Close))
+            .cloned()
+            .expect("disconnect should record the client close frame before returning");
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Close {
+                recorded_index: Some(index)
+            }) if index == close_frame.index
+        ));
+        assert!(!abort.is_aborted());
+    }
+
+    #[tokio::test]
+    async fn send_ping_queues_control_frame() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        store.connections.write().await.insert(
+            id,
+            Arc::new(RwLock::new(test_connection(
+                WsReplayStatus::Connected,
+                Some(tx),
+            ))),
+        );
+
+        store.send_ping(id, b"hi".to_vec()).await.unwrap();
+
+        match rx.recv().await {
+            Some(WsReplayOutboundMessage::Message(WsMessage::Ping(payload))) => {
+                assert_eq!(payload.as_ref(), b"hi")
+            }
+            other => panic!("expected ping frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_all_closes_and_removes_connections() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(RwLock::new(test_connection(
+            WsReplayStatus::Connected,
+            Some(tx),
+        )));
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, connection.clone());
+
+        store.disconnect_all().await;
+
+        assert!(store.connections.read().await.is_empty());
+        assert_eq!(connection.read().await.status, WsReplayStatus::Disconnected);
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Close {
+                recorded_index: None
+            })
+        ));
     }
 }

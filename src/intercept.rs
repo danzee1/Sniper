@@ -132,6 +132,10 @@ impl InterceptRuleStore {
     pub async fn snapshot(&self) -> Vec<InterceptRule> {
         self.rules.read().await.clone()
     }
+
+    pub async fn replace_all(&self, rules: Vec<InterceptRule>) {
+        *self.rules.write().await = rules;
+    }
 }
 
 impl Default for InterceptRuleStore {
@@ -253,6 +257,17 @@ impl InterceptQueue {
             let _ = pending
                 .responder
                 .send(InterceptResolution::Forward(pending.record.request));
+        }
+        count
+    }
+
+    pub async fn drop_all(&self) -> usize {
+        let mut queue = self.queue.lock().await;
+        let count = queue.len();
+        while let Some(pending) = queue.pop_front() {
+            let _ = pending
+                .responder
+                .send(InterceptResolution::Drop(pending.record.request));
         }
         count
     }
@@ -397,6 +412,15 @@ impl ResponseInterceptQueue {
         count
     }
 
+    pub async fn drop_all(&self) -> usize {
+        let mut queue = self.queue.lock().await;
+        let count = queue.len();
+        while let Some(pending) = queue.pop_front() {
+            let _ = pending.responder.send(ResponseInterceptResolution::Drop);
+        }
+        count
+    }
+
     pub async fn drop_response(&self, id: Uuid) -> Result<()> {
         let mut queue = self.queue.lock().await;
         let index = queue
@@ -434,4 +458,101 @@ fn host_without_port(host: &str) -> &str {
             .unwrap_or(trimmed);
     }
     trimmed
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::model::BodyEncoding;
+
+    use super::*;
+
+    fn request() -> EditableRequest {
+        EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        }
+    }
+
+    fn response() -> EditableResponse {
+        EditableResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_all_releases_pending_request_intercepts() {
+        let queue = Arc::new(InterceptQueue::new());
+        let original = request();
+        let record = InterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            peer_addr: "127.0.0.1:12345".to_string(),
+            request: original.clone(),
+            is_websocket: false,
+        };
+        let pending = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.enqueue(record).await }
+        });
+
+        for _ in 0..10 {
+            if !queue.list().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+        assert_eq!(queue.drop_all().await, 1);
+
+        match pending.await.unwrap() {
+            InterceptResolution::Drop(request) => assert_eq!(request.host, original.host),
+            InterceptResolution::Forward(_) => panic!("expected pending intercept to be dropped"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_all_releases_pending_response_intercepts() {
+        let queue = Arc::new(ResponseInterceptQueue::new());
+        let record = ResponseInterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            status: 200,
+            response: response(),
+        };
+        let pending = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.enqueue(record).await }
+        });
+
+        for _ in 0..10 {
+            if !queue.list().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+        assert_eq!(queue.drop_all().await, 1);
+
+        match pending.await.unwrap() {
+            ResponseInterceptResolution::Drop => {}
+            ResponseInterceptResolution::PassThrough | ResponseInterceptResolution::Forward(_) => {
+                panic!("expected pending response intercept to be dropped")
+            }
+        }
+    }
 }

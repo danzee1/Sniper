@@ -2,6 +2,7 @@ use http::{
     header::{CONTENT_DISPOSITION, CONTENT_TYPE},
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
 };
+use std::net::SocketAddr;
 
 use crate::{certificate::SPECIAL_HOST, state::AppState};
 
@@ -26,15 +27,38 @@ impl SpecialHostResponse {
 }
 
 pub fn is_special_host(host: &str) -> bool {
-    host.split(':')
-        .next()
-        .map(|value| value.eq_ignore_ascii_case(SPECIAL_HOST))
-        .unwrap_or(false)
+    authority_host(host).eq_ignore_ascii_case(SPECIAL_HOST)
 }
 
-pub fn respond(path: &str, method: &Method, state: &AppState, secure: bool) -> SpecialHostResponse {
+fn authority_host(host: &str) -> &str {
+    let trimmed = host.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        return trimmed;
+    }
+
+    if trimmed.matches(':').count() == 1 {
+        if let Some((value, port)) = trimmed.split_once(':') {
+            if !value.is_empty() && port.chars().all(|char| char.is_ascii_digit()) {
+                return value;
+            }
+        }
+    }
+
+    trimmed
+}
+
+pub fn respond(
+    path: &str,
+    method: &Method,
+    state: &AppState,
+    secure: bool,
+    proxy_addr: SocketAddr,
+) -> SpecialHostResponse {
     match (method, path) {
-        (&Method::GET, "/") | (&Method::GET, "") => certificate_portal(state, secure),
+        (&Method::GET, "/") | (&Method::GET, "") => certificate_portal(state, secure, proxy_addr),
         (&Method::GET, "/cert/root.pem") => {
             let mut response = SpecialHostResponse::new(
                 StatusCode::OK,
@@ -76,7 +100,11 @@ pub fn respond(path: &str, method: &Method, state: &AppState, secure: bool) -> S
     }
 }
 
-fn certificate_portal(state: &AppState, secure: bool) -> SpecialHostResponse {
+fn certificate_portal(
+    state: &AppState,
+    secure: bool,
+    proxy_addr: SocketAddr,
+) -> SpecialHostResponse {
     let certificate = state.certificates.export();
     let scheme_name = if secure { "HTTPS" } else { "HTTP" };
     let html = format!(
@@ -246,7 +274,7 @@ fn certificate_portal(state: &AppState, secure: bool) -> SpecialHostResponse {
         escape_html(&certificate.expires_at.to_rfc3339()),
         escape_html(&certificate.pem_path),
         escape_html(&certificate.der_path),
-        escape_html(&state.config.proxy_addr.to_string()),
+        escape_html(&proxy_addr.to_string()),
         SPECIAL_HOST,
         SPECIAL_HOST,
         escape_html(&certificate.special_host_http),
@@ -271,4 +299,19 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#039;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{authority_host, is_special_host};
+
+    #[test]
+    fn special_host_detection_handles_ports_and_colons() {
+        assert!(is_special_host("sniper"));
+        assert!(is_special_host("SnIpEr:443"));
+        assert!(!is_special_host("sniper:not-a-port"));
+        assert!(!is_special_host("sniper.example:443"));
+        assert_eq!(authority_host("[::1]:443"), "::1");
+        assert_eq!(authority_host("::1"), "::1");
+    }
 }

@@ -4,23 +4,27 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficKind {
+    #[default]
     Http,
     Tunnel,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyEncoding {
+    #[default]
     Utf8,
     Base64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HeaderRecord {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub value: String,
 }
 
@@ -30,9 +34,13 @@ pub struct EditableRequest {
     pub host: String,
     pub method: String,
     pub path: String,
+    #[serde(default)]
     pub headers: Vec<HeaderRecord>,
+    #[serde(default)]
     pub body: String,
+    #[serde(default)]
     pub body_encoding: BodyEncoding,
+    #[serde(default)]
     pub preview_truncated: bool,
 }
 
@@ -73,9 +81,13 @@ impl EditableResponse {
     }
 
     pub fn body_bytes(&self) -> Vec<u8> {
+        self.try_body_bytes().unwrap_or_default()
+    }
+
+    pub fn try_body_bytes(&self) -> Result<Vec<u8>, base64::DecodeError> {
         match self.body_encoding {
-            BodyEncoding::Utf8 => self.body.as_bytes().to_vec(),
-            BodyEncoding::Base64 => STANDARD.decode(self.body.as_bytes()).unwrap_or_default(),
+            BodyEncoding::Utf8 => Ok(self.body.as_bytes().to_vec()),
+            BodyEncoding::Base64 => STANDARD.decode(self.body.as_bytes()),
         }
     }
 }
@@ -162,9 +174,13 @@ impl EditableRequest {
     }
 
     pub fn body_bytes(&self) -> Vec<u8> {
+        self.try_body_bytes().unwrap_or_default()
+    }
+
+    pub fn try_body_bytes(&self) -> Result<Vec<u8>, base64::DecodeError> {
         match self.body_encoding {
-            BodyEncoding::Utf8 => self.body.as_bytes().to_vec(),
-            BodyEncoding::Base64 => STANDARD.decode(self.body.as_bytes()).unwrap_or_default(),
+            BodyEncoding::Utf8 => Ok(self.body.as_bytes().to_vec()),
+            BodyEncoding::Base64 => STANDARD.decode(self.body.as_bytes()),
         }
     }
 
@@ -178,10 +194,17 @@ impl EditableRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageRecord {
+    #[serde(default)]
     pub headers: Vec<HeaderRecord>,
+    #[serde(default)]
     pub body_preview: String,
+    #[serde(default)]
     pub body_encoding: BodyEncoding,
+    #[serde(default)]
     pub body_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoded_body_size: Option<usize>,
+    #[serde(default)]
     pub preview_truncated: bool,
     pub content_type: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -199,10 +222,18 @@ impl MessageRecord {
         let content_decoded = decoded_body.is_some();
         let body_ref = decoded_body.as_deref().unwrap_or(body);
         let original_size = body.len();
+        let decoded_body_size = decoded_body.as_ref().map(|body| body.len());
 
         let preview_len = max_preview.min(body_ref.len());
         let preview_bytes = &body_ref[..preview_len];
-        let textual = is_textual_body(content_type.as_deref(), preview_bytes);
+        let preview_truncated = body_ref.len() > max_preview;
+        let textual =
+            is_textual_body_preview(content_type.as_deref(), preview_bytes, preview_truncated);
+        let preview_bytes = if textual {
+            &preview_bytes[..utf8_preview_len(preview_bytes)]
+        } else {
+            preview_bytes
+        };
         let body_preview = if textual {
             String::from_utf8_lossy(preview_bytes).into_owned()
         } else {
@@ -218,7 +249,8 @@ impl MessageRecord {
                 BodyEncoding::Base64
             },
             body_size: original_size,
-            preview_truncated: body_ref.len() > max_preview,
+            decoded_body_size,
+            preview_truncated,
             content_type,
             content_decoded,
         }
@@ -245,6 +277,7 @@ impl MessageRecord {
 pub struct TransactionRecord {
     pub id: Uuid,
     pub started_at: DateTime<Utc>,
+    #[serde(default)]
     pub kind: TrafficKind,
     /// Stable capture sequence number (1-based, monotonically increasing).
     #[serde(default)]
@@ -254,9 +287,11 @@ pub struct TransactionRecord {
     pub host: String,
     pub path: String,
     pub status: Option<u16>,
+    #[serde(default)]
     pub duration_ms: u64,
     pub request: MessageRecord,
     pub response: Option<MessageRecord>,
+    #[serde(default)]
     pub notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_tag: Option<String>,
@@ -309,6 +344,11 @@ impl TransactionRecord {
 
     pub fn with_http_version(mut self, version: http::Version) -> Self {
         self.http_version = Some(format_http_version(version));
+        self
+    }
+
+    pub fn with_response(mut self, response: MessageRecord) -> Self {
+        self.response = Some(response);
         self
     }
 
@@ -440,13 +480,18 @@ pub enum WebSocketFrameKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebSocketFrameRecord {
+    #[serde(default)]
     pub index: usize,
     pub captured_at: DateTime<Utc>,
     pub direction: WebSocketFrameDirection,
     pub kind: WebSocketFrameKind,
+    #[serde(default)]
     pub body_preview: String,
+    #[serde(default)]
     pub body_encoding: BodyEncoding,
+    #[serde(default)]
     pub body_size: usize,
+    #[serde(default)]
     pub preview_truncated: bool,
 }
 
@@ -462,7 +507,9 @@ pub struct WebSocketSessionRecord {
     pub status: Option<u16>,
     pub request: MessageRecord,
     pub response: Option<MessageRecord>,
+    #[serde(default)]
     pub frames: Vec<WebSocketFrameRecord>,
+    #[serde(default)]
     pub notes: Vec<String>,
 }
 
@@ -552,47 +599,67 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn decode_content_encoding(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode_content_encoding(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> {
     if body.is_empty() {
         return None;
     }
-    let encoding = headers
+    let encodings = headers
         .get(http::header::CONTENT_ENCODING)?
         .to_str()
         .ok()?
-        .to_ascii_lowercase();
+        .split(',')
+        .map(|encoding| encoding.trim().to_ascii_lowercase())
+        .filter(|encoding| !encoding.is_empty())
+        .collect::<Vec<_>>();
+    if encodings.is_empty() {
+        return None;
+    }
 
-    let result = match encoding.as_str() {
+    let mut decoded = body.to_vec();
+    for encoding in encodings.iter().rev() {
+        decoded = decode_single_content_encoding(encoding, &decoded)?;
+    }
+
+    Some(decoded)
+}
+
+fn decode_single_content_encoding(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
+    match encoding {
         "gzip" | "x-gzip" => {
             use std::io::Read;
             let mut decoder = flate2::read::GzDecoder::new(body);
             let mut out = Vec::new();
             decoder.read_to_end(&mut out).ok()?;
-            out
+            Some(out)
         }
         "deflate" => {
             use std::io::Read;
-            let mut decoder = flate2::read::DeflateDecoder::new(body);
+            let mut zlib_decoder = flate2::read::ZlibDecoder::new(body);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out).ok()?;
-            out
+            if zlib_decoder.read_to_end(&mut out).is_ok() {
+                return Some(out);
+            }
+            let mut raw_decoder = flate2::read::DeflateDecoder::new(body);
+            let mut out = Vec::new();
+            raw_decoder.read_to_end(&mut out).ok()?;
+            Some(out)
         }
         "br" => {
             let mut out = Vec::new();
             brotli::BrotliDecompress(&mut std::io::Cursor::new(body), &mut out).ok()?;
-            out
+            Some(out)
         }
-        "zstd" | "zstandard" => zstd::decode_all(std::io::Cursor::new(body)).ok()?,
-        _ => return None,
-    };
-
-    Some(result)
+        "zstd" | "zstandard" => zstd::decode_all(std::io::Cursor::new(body)).ok(),
+        _ => None,
+    }
 }
 
 fn is_textual_body(content_type: Option<&str>, sample: &[u8]) -> bool {
     if sample.is_empty() {
         return true;
     }
+
+    let valid_utf8 = std::str::from_utf8(sample).is_ok() && !sample.contains(&0);
 
     if let Some(content_type) = content_type {
         let normalized = content_type.to_ascii_lowercase();
@@ -604,22 +671,67 @@ fn is_textual_body(content_type: Option<&str>, sample: &[u8]) -> bool {
             || normalized.contains("graphql")
             || normalized.contains("yaml")
         {
-            return true;
+            return valid_utf8;
         }
     }
 
-    std::str::from_utf8(sample).is_ok() && !sample.contains(&0)
+    valid_utf8
+}
+
+fn is_textual_body_preview(content_type: Option<&str>, sample: &[u8], truncated: bool) -> bool {
+    if sample.is_empty() {
+        return true;
+    }
+
+    let valid_utf8 = match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(error) if truncated && error.error_len().is_none() => !sample.contains(&0),
+        Err(_) => false,
+    };
+
+    if let Some(content_type) = content_type {
+        let normalized = content_type.to_ascii_lowercase();
+        if normalized.starts_with("text/")
+            || normalized.contains("json")
+            || normalized.contains("xml")
+            || normalized.contains("javascript")
+            || normalized.contains("x-www-form-urlencoded")
+            || normalized.contains("graphql")
+            || normalized.contains("yaml")
+        {
+            return valid_utf8;
+        }
+    }
+
+    valid_utf8
+}
+
+fn utf8_preview_len(sample: &[u8]) -> usize {
+    match std::str::from_utf8(sample) {
+        Ok(_) => sample.len(),
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        Err(_) => sample.len(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::{write::GzEncoder, Compression};
+    use flate2::{
+        write::{GzEncoder, ZlibEncoder},
+        Compression,
+    };
     use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
     use std::io::Write;
 
     fn gzip(body: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zlib_deflate(body: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(body).unwrap();
         encoder.finish().unwrap()
     }
@@ -643,8 +755,128 @@ mod tests {
         assert_eq!(record.body_preview, String::from_utf8_lossy(raw));
         assert_eq!(record.body_encoding, BodyEncoding::Utf8);
         assert_eq!(record.body_size, compressed.len());
+        assert_eq!(record.decoded_body_size, Some(raw.len()));
         assert!(!record.preview_truncated);
         assert!(record.content_decoded);
+    }
+
+    #[test]
+    fn message_record_decodes_zlib_wrapped_deflate() {
+        let raw = br#"{"ok":"deflate"}"#;
+        let compressed = zlib_deflate(raw);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "deflate".parse().unwrap());
+        headers.insert(
+            CONTENT_LENGTH,
+            compressed.len().to_string().parse().unwrap(),
+        );
+
+        let record = MessageRecord::from_headers_and_body(&headers, &compressed, 1024);
+
+        assert_eq!(record.body_preview, String::from_utf8_lossy(raw));
+        assert_eq!(record.body_size, compressed.len());
+        assert_eq!(record.decoded_body_size, Some(raw.len()));
+        assert!(record.content_decoded);
+    }
+
+    #[test]
+    fn message_record_decodes_stacked_content_encodings() {
+        let raw = br#"{"ok":"stacked"}"#;
+        let compressed = gzip(&gzip(raw));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "gzip, gzip".parse().unwrap());
+        headers.insert(
+            CONTENT_LENGTH,
+            compressed.len().to_string().parse().unwrap(),
+        );
+
+        let record = MessageRecord::from_headers_and_body(&headers, &compressed, 1024);
+
+        assert_eq!(record.body_preview, String::from_utf8_lossy(raw));
+        assert_eq!(record.body_size, compressed.len());
+        assert_eq!(record.decoded_body_size, Some(raw.len()));
+        assert!(record.content_decoded);
+    }
+
+    #[test]
+    fn message_record_text_preview_does_not_split_utf8_codepoint() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
+
+        let record = MessageRecord::from_headers_and_body(&headers, "ab😀cd".as_bytes(), 4);
+
+        assert_eq!(record.body_preview, "ab");
+        assert_eq!(record.body_encoding, BodyEncoding::Utf8);
+        assert!(record.preview_truncated);
+    }
+
+    #[test]
+    fn message_record_accepts_legacy_missing_body_metadata() {
+        let record: MessageRecord = serde_json::from_value(serde_json::json!({
+            "headers": [{ "name": "host", "value": "example.com" }]
+        }))
+        .expect("legacy message record should deserialize");
+
+        assert_eq!(record.body_preview, "");
+        assert_eq!(record.body_encoding, BodyEncoding::Utf8);
+        assert_eq!(record.body_size, 0);
+        assert_eq!(record.decoded_body_size, None);
+        assert!(!record.preview_truncated);
+        assert_eq!(record.header_value("host"), Some("example.com"));
+    }
+
+    #[test]
+    fn websocket_record_accepts_legacy_missing_collections_and_frame_metadata() {
+        let record: WebSocketSessionRecord = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-00000000f001",
+            "started_at": "2026-01-01T00:00:00Z",
+            "scheme": "wss",
+            "host": "socket.example.com",
+            "path": "/stream",
+            "request": { "headers": [] },
+            "frames": [{
+                "captured_at": "2026-01-01T00:00:01Z",
+                "direction": "server_to_client",
+                "kind": "text"
+            }]
+        }))
+        .expect("legacy websocket session should deserialize");
+
+        assert!(record.notes.is_empty());
+        assert_eq!(record.summary().frame_count, 1);
+        let frame = &record.frames[0];
+        assert_eq!(frame.index, 0);
+        assert_eq!(frame.body_preview, "");
+        assert_eq!(frame.body_encoding, BodyEncoding::Utf8);
+        assert_eq!(frame.body_size, 0);
+        assert!(!frame.preview_truncated);
+    }
+
+    #[test]
+    fn transaction_record_accepts_legacy_missing_kind_duration_and_notes() {
+        let record: TransactionRecord = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-00000000b001",
+            "started_at": "2026-01-01T00:00:00Z",
+            "method": "GET",
+            "scheme": "https",
+            "host": "example.com",
+            "path": "/legacy",
+            "status": 200,
+            "request": {
+                "headers": [{ "name": "host" }],
+                "body_preview": "",
+                "body_encoding": "utf8"
+            }
+        }))
+        .expect("legacy transaction record should deserialize");
+
+        assert!(matches!(record.kind, TrafficKind::Http));
+        assert_eq!(record.duration_ms, 0);
+        assert!(record.notes.is_empty());
+        assert_eq!(record.summary().note_count, 0);
+        assert_eq!(record.request.header_value("host"), Some(""));
     }
 
     #[test]
@@ -697,6 +929,35 @@ mod tests {
             .headers
             .iter()
             .all(|h| !h.name.eq_ignore_ascii_case("content-length")));
+    }
+
+    #[test]
+    fn editable_request_preserves_invalid_utf8_text_body_as_base64() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
+
+        let request = EditableRequest::from_headers_and_body(
+            "https",
+            "example.com",
+            "POST",
+            "/upload",
+            &headers,
+            &[0xff],
+        );
+
+        assert_eq!(request.body_encoding, BodyEncoding::Base64);
+        assert_eq!(request.try_body_bytes().unwrap(), vec![0xff]);
+    }
+
+    #[test]
+    fn editable_response_preserves_invalid_utf8_text_body_as_base64() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
+
+        let response = EditableResponse::from_status_headers_body(200, &headers, &[0xff]);
+
+        assert_eq!(response.body_encoding, BodyEncoding::Base64);
+        assert_eq!(response.try_body_bytes().unwrap(), vec![0xff]);
     }
 
     #[test]

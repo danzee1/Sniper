@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -9,8 +9,12 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tracing::warn;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
     event_log::{EventLogEntry, EventLogStore},
@@ -19,13 +23,14 @@ use crate::{
     match_replace::{MatchReplaceRule, MatchReplaceStore},
     model::{TransactionRecord, WebSocketSessionRecord},
     runtime::{RuntimeSettings, RuntimeSettingsSnapshot},
-    scanner::{ScannerFinding, ScannerStore},
+    scanner::{scan_transaction, ScannerConfig, ScannerFinding, ScannerStore},
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceStore},
     store::{
         transaction_journal_checkpoint_path, NullableStringPatch, TransactionJournalEntry,
         TransactionStore,
     },
     websocket::WebSocketStore,
+    workspace::WorkspaceReplaceError,
     workspace::{WorkspaceStateSnapshot, WorkspaceStateStore},
 };
 
@@ -72,6 +77,35 @@ pub struct SessionSummary {
 struct SessionRegistrySnapshot {
     active_session_id: Uuid,
     sessions: Vec<SessionMetadata>,
+    #[serde(default)]
+    deleted_session_ids: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StoredSessionRegistrySnapshot {
+    active_session_id: Option<Uuid>,
+    #[serde(default)]
+    sessions: Vec<SessionMetadata>,
+    #[serde(default)]
+    deleted_session_ids: Vec<Uuid>,
+}
+
+impl StoredSessionRegistrySnapshot {
+    fn into_snapshot(self) -> (SessionRegistrySnapshot, bool) {
+        let repaired = self.active_session_id.is_none();
+        let active_session_id = self
+            .active_session_id
+            .or_else(|| self.sessions.first().map(|session| session.id))
+            .unwrap_or_else(Uuid::nil);
+        (
+            SessionRegistrySnapshot {
+                active_session_id,
+                sessions: self.sessions,
+                deleted_session_ids: self.deleted_session_ids,
+            },
+            repaired,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -87,6 +121,8 @@ struct StoredSessionSnapshot {
     #[serde(default)]
     scanner_findings: Vec<ScannerFinding>,
     #[serde(default)]
+    scanner_config: ScannerConfig,
+    #[serde(default)]
     intercept_rules: Vec<crate::intercept::InterceptRule>,
     #[serde(default)]
     sequence_definitions: Vec<SequenceDefinition>,
@@ -94,7 +130,15 @@ struct StoredSessionSnapshot {
     sequence_runs: Vec<SequenceRunRecord>,
     #[serde(default)]
     oast_callbacks: Option<Vec<crate::oast::OastCallback>>,
+    #[serde(default)]
+    oast_cleared_callback_keys: Vec<crate::oast::OastCallbackDedupKey>,
+    #[serde(default)]
+    oast_registration: Option<crate::oast::StoredOastRegistration>,
     workspace: WorkspaceStateSnapshot,
+    #[serde(skip)]
+    replayed_transaction_journal: bool,
+    #[serde(skip)]
+    replayed_transaction_ids: HashSet<Uuid>,
 }
 
 pub struct SessionContext {
@@ -115,6 +159,8 @@ pub struct SessionContext {
     pub oast: Arc<crate::oast::OastStore>,
     pub workspace: Arc<WorkspaceStateStore>,
     metadata: RwLock<SessionMetadata>,
+    mutation_lock: AsyncMutex<()>,
+    persist_lock: AsyncMutex<()>,
 }
 
 impl SessionContext {
@@ -126,6 +172,20 @@ impl SessionContext {
         snapshot: StoredSessionSnapshot,
     ) -> Self {
         let journal_path = transaction_journal_path(&storage_dir);
+        let runtime_snapshot = snapshot.runtime.clone();
+        let scanner_config = snapshot.scanner_config.clone();
+        let scanner_findings = if snapshot.replayed_transaction_journal {
+            recover_missing_scanner_findings(
+                snapshot.scanner_findings,
+                &snapshot.transactions,
+                &snapshot.replayed_transaction_ids,
+                &scanner_config,
+                max_entries,
+            )
+        } else {
+            snapshot.scanner_findings
+        };
+        let websockets = close_restored_open_websockets(snapshot.websockets);
         Self {
             id: metadata.id,
             storage_dir,
@@ -135,7 +195,7 @@ impl SessionContext {
                 journal_path,
                 Some(max_entries),
             )),
-            runtime: Arc::new(RuntimeSettings::from_snapshot(snapshot.runtime)),
+            runtime: Arc::new(RuntimeSettings::from_snapshot(runtime_snapshot.clone())),
             intercepts: Arc::new(InterceptQueue::new()),
             response_intercepts: Arc::new(ResponseInterceptQueue::new()),
             intercept_rules: Arc::new(crate::intercept::InterceptRuleStore::from_rules(
@@ -144,7 +204,7 @@ impl SessionContext {
             websockets: Arc::new(WebSocketStore::from_sessions(
                 max_entries,
                 max_frames_per_session,
-                snapshot.websockets,
+                websockets,
             )),
             event_log: Arc::new(EventLogStore::from_entries(max_entries, snapshot.event_log)),
             match_replace: Arc::new(MatchReplaceStore::from_rules(snapshot.match_replace_rules)),
@@ -152,9 +212,10 @@ impl SessionContext {
                 max_entries,
                 snapshot.fuzzer_attacks,
             )),
-            scanner: Arc::new(ScannerStore::from_findings(
+            scanner: Arc::new(ScannerStore::from_findings_with_config(
                 max_entries,
-                snapshot.scanner_findings,
+                scanner_findings,
+                scanner_config,
             )),
             sequence: Arc::new(SequenceStore::from_data(
                 max_entries,
@@ -162,16 +223,27 @@ impl SessionContext {
                 snapshot.sequence_runs,
             )),
             oast: {
-                let store = Arc::new(crate::oast::OastStore::new(max_entries));
+                let store = Arc::new(crate::oast::OastStore::new_with_config(
+                    max_entries,
+                    crate::oast::OastConfig {
+                        enabled: runtime_snapshot.oast_enabled,
+                        server_url: runtime_snapshot.oast_server_url,
+                        token: runtime_snapshot.oast_token,
+                        polling_interval_secs: runtime_snapshot.oast_polling_interval_secs,
+                        provider: runtime_snapshot.oast_provider,
+                    },
+                ));
                 if let Some(callbacks) = snapshot.oast_callbacks {
-                    // Restore synchronously — VecDeque assignment doesn't need async
-                    let entries: std::collections::VecDeque<_> = callbacks.into();
-                    *store.entries_mut_blocking() = entries;
+                    store.restore_blocking(callbacks);
                 }
+                store.restore_cleared_keys_blocking(snapshot.oast_cleared_callback_keys);
+                store.restore_registration_blocking(snapshot.oast_registration);
                 store
             },
             workspace: Arc::new(WorkspaceStateStore::from_snapshot(snapshot.workspace)),
             metadata: RwLock::new(metadata),
+            mutation_lock: AsyncMutex::new(()),
+            persist_lock: AsyncMutex::new(()),
         }
     }
 
@@ -192,7 +264,48 @@ impl SessionContext {
         session_summary(&metadata, &self.storage_dir, active)
     }
 
+    pub fn replace_metadata(&self, metadata: SessionMetadata) {
+        *self
+            .metadata
+            .write()
+            .expect("session metadata lock poisoned") = metadata;
+    }
+
     pub async fn persist(&self) -> Result<SessionMetadata> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        self.persist_mutation_locked().await
+    }
+
+    pub async fn mutation_guard(&self) -> AsyncMutexGuard<'_, ()> {
+        self.mutation_lock.lock().await
+    }
+
+    pub async fn persist_mutation_locked(&self) -> Result<SessionMetadata> {
+        let _persist_guard = self.persist_lock.lock().await;
+        self.persist_with_workspace_snapshot_locked(self.workspace.snapshot().await)
+            .await
+    }
+
+    pub async fn replace_workspace_snapshot_checked_and_persist(
+        &self,
+        snapshot: WorkspaceStateSnapshot,
+    ) -> std::result::Result<
+        (WorkspaceStateSnapshot, SessionMetadata),
+        WorkspaceReplaceError<anyhow::Error>,
+    > {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let _persist_guard = self.persist_lock.lock().await;
+        self.workspace
+            .replace_snapshot_checked_persisting(snapshot, |workspace| async move {
+                self.persist_with_workspace_snapshot_locked(workspace).await
+            })
+            .await
+    }
+
+    async fn persist_with_workspace_snapshot_locked(
+        &self,
+        workspace: WorkspaceStateSnapshot,
+    ) -> Result<SessionMetadata> {
         let snapshot = StoredSessionSnapshot {
             runtime: self.runtime.snapshot().await,
             transactions: self
@@ -210,11 +323,16 @@ impl SessionContext {
             match_replace_rules: self.match_replace.snapshot().await,
             fuzzer_attacks: self.fuzzer.snapshot(Some(self.max_entries)).await,
             scanner_findings: self.scanner.snapshot(Some(self.max_entries)).await,
+            scanner_config: self.scanner.get_config().await,
             intercept_rules: self.intercept_rules.snapshot().await,
             sequence_definitions: self.sequence.snapshot_definitions().await,
             sequence_runs: self.sequence.snapshot_runs(Some(self.max_entries)).await,
             oast_callbacks: Some(self.oast.snapshot().await),
-            workspace: self.workspace.snapshot().await,
+            oast_cleared_callback_keys: self.oast.snapshot_cleared_keys().await,
+            oast_registration: self.oast.snapshot_registration().await,
+            workspace,
+            replayed_transaction_journal: false,
+            replayed_transaction_ids: HashSet::new(),
         };
 
         let mut metadata = self
@@ -229,14 +347,20 @@ impl SessionContext {
         metadata.fuzzer_count = snapshot.fuzzer_attacks.len();
         metadata.rule_count = snapshot.match_replace_rules.len();
 
-        fs::create_dir_all(&self.storage_dir).with_context(|| {
+        create_private_dir_all(&self.storage_dir).with_context(|| {
             format!(
                 "failed to create session directory {}",
                 self.storage_dir.display()
             )
         })?;
         write_json(&snapshot_path(&self.storage_dir), &snapshot)?;
-        discard_transaction_journal_checkpoint(&self.storage_dir)?;
+        if let Err(error) = discard_transaction_journal_checkpoint(&self.storage_dir) {
+            warn!(
+                %error,
+                session_id = %self.id,
+                "failed to remove transaction journal checkpoint after writing session snapshot"
+            );
+        }
 
         *self
             .metadata
@@ -245,6 +369,61 @@ impl SessionContext {
 
         Ok(metadata)
     }
+}
+
+fn close_restored_open_websockets(
+    records: Vec<WebSocketSessionRecord>,
+) -> Vec<WebSocketSessionRecord> {
+    let closed_at = Utc::now();
+    records
+        .into_iter()
+        .map(|mut record| {
+            if record.closed_at.is_none() {
+                record.duration_ms.get_or_insert_with(|| {
+                    closed_at
+                        .signed_duration_since(record.started_at)
+                        .num_milliseconds()
+                        .max(0) as u64
+                });
+                record.closed_at = Some(closed_at);
+                record
+                    .notes
+                    .push("Sniper restarted before this WebSocket session was closed.".to_string());
+            }
+            record
+        })
+        .collect()
+}
+
+fn recover_missing_scanner_findings(
+    mut findings: Vec<ScannerFinding>,
+    transactions: &[TransactionRecord],
+    recovered_record_ids: &HashSet<Uuid>,
+    config: &ScannerConfig,
+    max_entries: usize,
+) -> Vec<ScannerFinding> {
+    if max_entries == 0 {
+        findings.clear();
+        return findings;
+    }
+
+    let covered_records: HashSet<Uuid> = findings.iter().map(|finding| finding.record_id).collect();
+    let mut recovered = Vec::new();
+    for record in transactions {
+        if !recovered_record_ids.contains(&record.id) {
+            continue;
+        }
+        if covered_records.contains(&record.id) {
+            continue;
+        }
+        for finding in scan_transaction(record, config) {
+            recovered.push(finding);
+        }
+    }
+    recovered.extend(findings);
+    recovered.truncate(max_entries);
+
+    recovered
 }
 
 pub struct SessionRegistry {
@@ -262,29 +441,44 @@ impl SessionRegistry {
         max_frames_per_session: usize,
     ) -> Result<(Self, Arc<SessionContext>)> {
         let root_dir = data_dir.join(SESSIONS_DIR);
-        fs::create_dir_all(&root_dir).with_context(|| {
+        create_private_dir_all(&root_dir).with_context(|| {
             format!("failed to create sessions directory {}", root_dir.display())
         })?;
         let registry_path = root_dir.join(REGISTRY_FILE);
 
+        let mut repair_registry = false;
         let mut registry = match fs::read(&registry_path) {
-            Ok(bytes) => {
-                serde_json::from_slice::<SessionRegistrySnapshot>(&bytes).with_context(|| {
-                    format!(
-                        "failed to parse session registry {}",
-                        registry_path.display()
-                    )
-                })?
-            }
+            Ok(bytes) => match serde_json::from_slice::<StoredSessionRegistrySnapshot>(&bytes) {
+                Ok(snapshot) => {
+                    let (snapshot, repaired) = snapshot.into_snapshot();
+                    repair_registry |= repaired;
+                    snapshot
+                }
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        path = %registry_path.display(),
+                        "discarding corrupt session registry"
+                    );
+                    move_corrupt_session_file_aside(&root_dir, &registry_path, "registry");
+                    repair_registry = true;
+                    rebuild_registry_from_session_dirs(&root_dir, max_entries)?
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let default = default_session_metadata("Default session");
-                let snapshot = SessionRegistrySnapshot {
-                    active_session_id: default.id,
-                    sessions: vec![default.clone()],
-                };
-                persist_session_snapshot(&root_dir, &default, &StoredSessionSnapshot::default())?;
+                let snapshot = rebuild_registry_from_session_dirs(&root_dir, max_entries)?;
                 write_json(&registry_path, &snapshot)?;
                 snapshot
+            }
+            Err(error) if registry_path.is_dir() => {
+                warn!(
+                    ?error,
+                    path = %registry_path.display(),
+                    "discarding invalid session registry path"
+                );
+                move_corrupt_session_file_aside(&root_dir, &registry_path, "registry");
+                repair_registry = true;
+                rebuild_registry_from_session_dirs(&root_dir, max_entries)?
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -296,12 +490,29 @@ impl SessionRegistry {
             }
         };
 
+        if normalize_registry_snapshot(&root_dir, &mut registry) {
+            repair_registry = true;
+        }
+
         if registry.sessions.is_empty() {
-            let default = default_session_metadata("Default session");
-            registry.active_session_id = default.id;
-            registry.sessions.push(default.clone());
-            persist_session_snapshot(&root_dir, &default, &StoredSessionSnapshot::default())?;
-            write_json(&registry_path, &registry)?;
+            registry = rebuild_registry_from_session_dirs_excluding(
+                &root_dir,
+                max_entries,
+                &registry
+                    .deleted_session_ids
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>(),
+            )?;
+            repair_registry = true;
+        }
+
+        if recover_unregistered_session_dirs(&root_dir, max_entries, &mut registry)? {
+            repair_registry = true;
+        }
+
+        if normalize_registry_snapshot(&root_dir, &mut registry) {
+            repair_registry = true;
         }
 
         if !registry
@@ -310,6 +521,10 @@ impl SessionRegistry {
             .any(|session| session.id == registry.active_session_id)
         {
             registry.active_session_id = registry.sessions[0].id;
+            repair_registry = true;
+        }
+
+        if repair_registry {
             write_json(&registry_path, &registry)?;
         }
 
@@ -365,13 +580,21 @@ impl SessionRegistry {
             rule_count: 0,
         };
 
-        {
-            let mut registry = self.inner.write().expect("session registry lock poisoned");
-            registry.sessions.push(metadata.clone());
-            write_json(&self.registry_path, &*registry)?;
-        }
-
         persist_session_snapshot(&self.root_dir, &metadata, &StoredSessionSnapshot::default())?;
+        let registry_result = {
+            let mut registry = self.inner.write().expect("session registry lock poisoned");
+            let mut next = registry.clone();
+            next.sessions.push(metadata.clone());
+            next.deleted_session_ids
+                .retain(|deleted_id| *deleted_id != metadata.id);
+            write_json(&self.registry_path, &next).map(|()| {
+                *registry = next;
+            })
+        };
+        if let Err(error) = registry_result {
+            let _ = fs::remove_dir_all(session_dir(&self.root_dir, metadata.id));
+            return Err(error);
+        }
         Ok(metadata)
     }
 
@@ -381,7 +604,8 @@ impl SessionRegistry {
 
     pub fn update_metadata(&self, metadata: SessionMetadata) -> Result<()> {
         let mut registry = self.inner.write().expect("session registry lock poisoned");
-        let Some(existing) = registry
+        let mut next = registry.clone();
+        let Some(existing) = next
             .sessions
             .iter_mut()
             .find(|session| session.id == metadata.id)
@@ -389,7 +613,14 @@ impl SessionRegistry {
             return Err(anyhow!("session {} was not found", metadata.id));
         };
         *existing = metadata;
-        write_json(&self.registry_path, &*registry)
+        write_json(&self.registry_path, &next)?;
+        *registry = next;
+        Ok(())
+    }
+
+    pub fn contains_session(&self, id: Uuid) -> bool {
+        let registry = self.inner.read().expect("session registry lock poisoned");
+        registry.sessions.iter().any(|session| session.id == id)
     }
 
     pub fn delete_session(&self, id: Uuid) -> Result<()> {
@@ -397,17 +628,61 @@ impl SessionRegistry {
         if registry.active_session_id == id {
             return Err(anyhow!("cannot delete the active session"));
         }
-        let index = registry
-            .sessions
-            .iter()
-            .position(|session| session.id == id)
-            .ok_or_else(|| anyhow!("session {id} was not found"))?;
-        registry.sessions.remove(index);
-        write_json(&self.registry_path, &*registry)?;
+        let previous = registry.clone();
+        let mut next = registry.clone();
+        if !next.sessions.iter().any(|session| session.id == id) {
+            return Err(anyhow!("session {id} was not found"));
+        }
 
         let storage_dir = session_dir(&self.root_dir, id);
-        if storage_dir.exists() {
-            let _ = fs::remove_dir_all(&storage_dir);
+        let storage_metadata = session_storage_metadata(&storage_dir)?;
+
+        next.sessions.retain(|session| session.id != id);
+        if !next.deleted_session_ids.contains(&id) {
+            next.deleted_session_ids.push(id);
+        }
+        write_json(&self.registry_path, &next)?;
+        *registry = next;
+        drop(registry);
+
+        if storage_metadata.is_some() {
+            if let Err(error) = fs::remove_dir_all(&storage_dir) {
+                let mut registry = self.inner.write().expect("session registry lock poisoned");
+                if let Err(rollback_error) = write_json(&self.registry_path, &previous) {
+                    warn!(
+                        ?rollback_error,
+                        session_id = %id,
+                        "failed to restore session registry after storage delete failure"
+                    );
+                } else {
+                    *registry = previous;
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to delete session storage directory {}",
+                        storage_dir.display()
+                    )
+                });
+            }
+        }
+        let mut registry = self.inner.write().expect("session registry lock poisoned");
+        if registry.deleted_session_ids.contains(&id) {
+            let mut cleaned = registry.clone();
+            cleaned
+                .deleted_session_ids
+                .retain(|deleted_id| *deleted_id != id);
+            match write_json(&self.registry_path, &cleaned) {
+                Ok(()) => {
+                    *registry = cleaned;
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        session_id = %id,
+                        "failed to prune deleted session tombstone after storage removal"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -421,7 +696,7 @@ impl SessionRegistry {
     }
 
     pub fn load_context(&self, id: Uuid) -> Result<Arc<SessionContext>> {
-        let metadata = self
+        let mut metadata = self
             .inner
             .read()
             .expect("session registry lock poisoned")
@@ -432,6 +707,29 @@ impl SessionRegistry {
             .ok_or_else(|| anyhow!("session {id} was not found"))?;
         let storage_dir = session_dir(&self.root_dir, id);
         let snapshot = load_session_snapshot(&storage_dir, self.max_entries)?;
+        if update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries) {
+            let mut registry = self.inner.write().expect("session registry lock poisoned");
+            let mut next = registry.clone();
+            if let Some(existing) = next.sessions.iter_mut().find(|session| session.id == id) {
+                existing.request_count = metadata.request_count;
+                existing.websocket_count = metadata.websocket_count;
+                existing.event_count = metadata.event_count;
+                existing.fuzzer_count = metadata.fuzzer_count;
+                existing.rule_count = metadata.rule_count;
+                match write_json(&self.registry_path, &next) {
+                    Ok(()) => {
+                        *registry = next;
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            session_id = %id,
+                            "failed to repair session metadata counts after snapshot load"
+                        );
+                    }
+                }
+            }
+        }
         Ok(Arc::new(SessionContext::from_snapshot(
             metadata,
             storage_dir,
@@ -443,20 +741,239 @@ impl SessionRegistry {
 
     fn touch_active_session(&self, id: Uuid) -> Result<SessionMetadata> {
         let mut registry = self.inner.write().expect("session registry lock poisoned");
-        let Some(index) = registry
-            .sessions
-            .iter()
-            .position(|session| session.id == id)
-        else {
+        let mut next = registry.clone();
+        let Some(index) = next.sessions.iter().position(|session| session.id == id) else {
             return Err(anyhow!("session {id} was not found"));
         };
 
-        registry.sessions[index].last_opened_at = Utc::now();
-        registry.active_session_id = id;
-        let metadata = registry.sessions[index].clone();
-        write_json(&self.registry_path, &*registry)?;
+        next.sessions[index].last_opened_at = Utc::now();
+        next.active_session_id = id;
+        let metadata = next.sessions[index].clone();
+        write_json(&self.registry_path, &next)?;
+        *registry = next;
         Ok(metadata)
     }
+}
+
+fn update_metadata_counts_from_snapshot(
+    metadata: &mut SessionMetadata,
+    snapshot: &StoredSessionSnapshot,
+    max_entries: usize,
+) -> bool {
+    let next_request_count = snapshot.transactions.len().min(max_entries);
+    let next_websocket_count = snapshot.websockets.len().min(max_entries);
+    let next_event_count = snapshot.event_log.len().min(max_entries);
+    let next_fuzzer_count = snapshot.fuzzer_attacks.len().min(max_entries);
+    let next_rule_count = snapshot.match_replace_rules.len();
+
+    let changed = metadata.request_count != next_request_count
+        || metadata.websocket_count != next_websocket_count
+        || metadata.event_count != next_event_count
+        || metadata.fuzzer_count != next_fuzzer_count
+        || metadata.rule_count != next_rule_count;
+
+    metadata.request_count = next_request_count;
+    metadata.websocket_count = next_websocket_count;
+    metadata.event_count = next_event_count;
+    metadata.fuzzer_count = next_fuzzer_count;
+    metadata.rule_count = next_rule_count;
+
+    changed
+}
+
+fn normalize_registry_snapshot(root_dir: &Path, registry: &mut SessionRegistrySnapshot) -> bool {
+    let mut changed = false;
+
+    let previous_deleted_len = registry.deleted_session_ids.len();
+    let mut deleted_seen = HashSet::new();
+    registry.deleted_session_ids.retain(|id| {
+        deleted_seen.insert(*id) && fs::symlink_metadata(session_dir(root_dir, *id)).is_ok()
+    });
+    changed |= registry.deleted_session_ids.len() != previous_deleted_len;
+
+    let deleted_ids = registry
+        .deleted_session_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let previous_sessions_len = registry.sessions.len();
+    let mut session_seen = HashSet::new();
+    registry.sessions.retain(|session| {
+        if deleted_ids.contains(&session.id) {
+            return false;
+        }
+        session_seen.insert(session.id)
+    });
+    changed |= registry.sessions.len() != previous_sessions_len;
+
+    changed
+}
+
+fn rebuild_registry_from_session_dirs(
+    root_dir: &Path,
+    max_entries: usize,
+) -> Result<SessionRegistrySnapshot> {
+    rebuild_registry_from_session_dirs_excluding(root_dir, max_entries, &HashSet::new())
+}
+
+fn rebuild_registry_from_session_dirs_excluding(
+    root_dir: &Path,
+    max_entries: usize,
+    deleted_ids: &HashSet<Uuid>,
+) -> Result<SessionRegistrySnapshot> {
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(root_dir)
+        .with_context(|| format!("failed to read sessions directory {}", root_dir.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read session directory entry in {}",
+                root_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(name) else {
+            continue;
+        };
+        if deleted_ids.contains(&id) {
+            continue;
+        }
+        match load_session_snapshot(&path, max_entries) {
+            Ok(snapshot) => {
+                sessions.push(recovered_session_metadata(
+                    id,
+                    &path,
+                    &snapshot,
+                    max_entries,
+                ));
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    session_id = %id,
+                    path = %path.display(),
+                    "skipping unrecoverable session while rebuilding registry"
+                );
+            }
+        }
+    }
+
+    if sessions.is_empty() {
+        let default = default_session_metadata("Default session");
+        persist_session_snapshot(root_dir, &default, &StoredSessionSnapshot::default())?;
+        sessions.push(default);
+    }
+
+    sessions.sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
+    Ok(SessionRegistrySnapshot {
+        active_session_id: sessions[0].id,
+        sessions,
+        deleted_session_ids: deleted_ids
+            .iter()
+            .copied()
+            .filter(|id| fs::symlink_metadata(session_dir(root_dir, *id)).is_ok())
+            .collect(),
+    })
+}
+
+fn recover_unregistered_session_dirs(
+    root_dir: &Path,
+    max_entries: usize,
+    registry: &mut SessionRegistrySnapshot,
+) -> Result<bool> {
+    let mut known = registry
+        .sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<HashSet<_>>();
+    let deleted = registry
+        .deleted_session_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut recovered = false;
+    for entry in fs::read_dir(root_dir)
+        .with_context(|| format!("failed to read sessions directory {}", root_dir.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read session directory entry in {}",
+                root_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(name) else {
+            continue;
+        };
+        if known.contains(&id) || deleted.contains(&id) {
+            continue;
+        }
+        match load_session_snapshot(&path, max_entries) {
+            Ok(snapshot) => {
+                registry.sessions.push(recovered_session_metadata(
+                    id,
+                    &path,
+                    &snapshot,
+                    max_entries,
+                ));
+                known.insert(id);
+                recovered = true;
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    session_id = %id,
+                    path = %path.display(),
+                    "skipping unrecoverable unregistered session"
+                );
+            }
+        }
+    }
+    if recovered {
+        registry
+            .sessions
+            .sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
+    }
+    Ok(recovered)
+}
+
+fn recovered_session_metadata(
+    id: Uuid,
+    storage_dir: &Path,
+    snapshot: &StoredSessionSnapshot,
+    max_entries: usize,
+) -> SessionMetadata {
+    let fallback_time = Utc::now();
+    let updated_at = fs::metadata(storage_dir)
+        .and_then(|metadata| metadata.modified())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(fallback_time);
+    let mut metadata = SessionMetadata {
+        id,
+        name: format!("Recovered session {}", &id.to_string()[..8]),
+        created_at: updated_at,
+        updated_at,
+        last_opened_at: updated_at,
+        request_count: 0,
+        websocket_count: 0,
+        event_count: 0,
+        fuzzer_count: 0,
+        rule_count: 0,
+    };
+    update_metadata_counts_from_snapshot(&mut metadata, snapshot, max_entries);
+    metadata
 }
 
 fn default_session_metadata(name: &str) -> SessionMetadata {
@@ -511,32 +1028,131 @@ fn transaction_journal_path(storage_dir: &Path) -> PathBuf {
     storage_dir.join(TRANSACTION_JOURNAL_FILE)
 }
 
-fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<StoredSessionSnapshot> {
-    fs::create_dir_all(storage_dir).with_context(|| {
+fn session_storage_metadata(storage_dir: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(storage_dir) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Err(anyhow!(
+                    "failed to access session storage directory {}",
+                    storage_dir.display()
+                ));
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to access session storage directory {}",
+                storage_dir.display()
+            )
+        }),
+    }
+}
+
+fn create_private_session_dir(storage_dir: &Path) -> Result<()> {
+    if session_storage_metadata(storage_dir)?.is_none() {
+        fs::create_dir_all(storage_dir).with_context(|| {
+            format!(
+                "failed to create session directory {}",
+                storage_dir.display()
+            )
+        })?;
+        session_storage_metadata(storage_dir)?;
+    }
+    tighten_private_dir(storage_dir).with_context(|| {
         format!(
-            "failed to create session directory {}",
+            "failed to set private permissions on session directory {}",
             storage_dir.display()
         )
-    })?;
+    })
+}
+
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    tighten_private_dir(path)
+}
+
+#[cfg(unix)]
+fn tighten_private_dir(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn tighten_private_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    fs::File::create(path)
+}
+
+#[cfg(unix)]
+fn tighten_private_file(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn tighten_private_file(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<StoredSessionSnapshot> {
+    create_private_session_dir(storage_dir)?;
     let path = snapshot_path(storage_dir);
     let mut snapshot = match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<StoredSessionSnapshot>(&bytes)
-            .with_context(|| format!("failed to parse session snapshot {}", path.display())),
+        Ok(bytes) => match serde_json::from_slice::<StoredSessionSnapshot>(&bytes) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                warn!(
+                    ?error,
+                    path = %path.display(),
+                    "discarding corrupt session snapshot"
+                );
+                move_corrupt_session_file_aside(storage_dir, &path, "snapshot");
+                Ok(StoredSessionSnapshot::default())
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(StoredSessionSnapshot::default())
         }
         Err(error) => Err(error)
             .with_context(|| format!("failed to read session snapshot {}", path.display())),
     }?;
-    replay_transaction_journal(storage_dir, max_entries, &mut snapshot)?;
+    snapshot.replayed_transaction_ids =
+        replay_transaction_journal(storage_dir, max_entries, &mut snapshot)?;
+    snapshot.replayed_transaction_journal = !snapshot.replayed_transaction_ids.is_empty();
     Ok(snapshot)
+}
+
+fn move_corrupt_session_file_aside(parent_dir: &Path, path: &Path, label: &str) {
+    let corrupt_path = parent_dir.join(format!(".{label}.corrupt-{}.json", Uuid::new_v4()));
+    if let Err(rename_error) = fs::rename(path, &corrupt_path) {
+        warn!(
+            ?rename_error,
+            path = %path.display(),
+            corrupt_path = %corrupt_path.display(),
+            "failed to move corrupt session file aside"
+        );
+    }
 }
 
 fn replay_transaction_journal(
     storage_dir: &Path,
     max_entries: usize,
     snapshot: &mut StoredSessionSnapshot,
-) -> Result<()> {
+) -> Result<HashSet<Uuid>> {
     let journal_path = transaction_journal_path(storage_dir);
     let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
 
@@ -549,6 +1165,8 @@ fn replay_transaction_journal(
             records.insert(record.id, record);
         }
     }
+    let snapshot_record_ids = seen.clone();
+    let mut replayed_transaction_ids = HashSet::new();
     let replay_insert_after_sequence = (!records.is_empty()).then(|| {
         records
             .values()
@@ -563,6 +1181,8 @@ fn replay_transaction_journal(
         &mut order,
         &mut records,
         &mut seen,
+        &mut replayed_transaction_ids,
+        Some(&snapshot_record_ids),
     )?;
     replay_transaction_journal_file(
         &journal_path,
@@ -570,6 +1190,8 @@ fn replay_transaction_journal(
         &mut order,
         &mut records,
         &mut seen,
+        &mut replayed_transaction_ids,
+        None,
     )?;
 
     snapshot.transactions = order
@@ -577,7 +1199,13 @@ fn replay_transaction_journal(
         .filter_map(|id| records.remove(&id))
         .take(max_entries)
         .collect();
-    Ok(())
+    let retained_ids: HashSet<Uuid> = snapshot
+        .transactions
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    replayed_transaction_ids.retain(|id| retained_ids.contains(id));
+    Ok(replayed_transaction_ids)
 }
 
 fn replay_transaction_journal_file(
@@ -586,6 +1214,8 @@ fn replay_transaction_journal_file(
     order: &mut Vec<Uuid>,
     records: &mut HashMap<Uuid, TransactionRecord>,
     seen: &mut HashSet<Uuid>,
+    replayed_transaction_ids: &mut HashSet<Uuid>,
+    skip_annotations_for: Option<&HashSet<Uuid>>,
 ) -> Result<()> {
     let file = match fs::File::open(journal_path) {
         Ok(file) => file,
@@ -633,13 +1263,14 @@ fn replay_transaction_journal_file(
                 break;
             }
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to parse transaction journal {} line {}",
-                        journal_path.display(),
-                        line_number
-                    )
-                })
+                warn!(
+                    ?error,
+                    path = %journal_path.display(),
+                    line = line_number,
+                    "stopping transaction journal replay at corrupt line"
+                );
+                preserve_corrupt_transaction_journal(journal_path);
+                break;
             }
         };
         match entry {
@@ -648,6 +1279,7 @@ fn replay_transaction_journal_file(
                     continue;
                 }
                 if seen.insert(record.id) {
+                    replayed_transaction_ids.insert(record.id);
                     inserted_order.push(record.id);
                     records.insert(record.id, record);
                 }
@@ -656,8 +1288,19 @@ fn replay_transaction_journal_file(
                 id,
                 color_tag,
                 user_note,
+                previous_color_tag,
+                previous_user_note,
             } => {
                 if let Some(record) = records.get_mut(&id) {
+                    if skip_annotations_for.is_some_and(|ids| ids.contains(&id))
+                        && !annotation_previous_values_match(
+                            record,
+                            previous_color_tag.as_ref(),
+                            previous_user_note.as_ref(),
+                        )
+                    {
+                        continue;
+                    }
                     apply_nullable_string_patch(&mut record.color_tag, color_tag);
                     apply_nullable_string_patch(&mut record.user_note, user_note);
                 }
@@ -673,6 +1316,42 @@ fn replay_transaction_journal_file(
     Ok(())
 }
 
+fn preserve_corrupt_transaction_journal(journal_path: &Path) {
+    let Some(parent) = journal_path.parent() else {
+        return;
+    };
+    let corrupt_path = parent.join(format!(".transactions.journal.corrupt-{}", Uuid::new_v4()));
+    if let Err(error) = fs::copy(journal_path, &corrupt_path) {
+        warn!(
+            ?error,
+            path = %journal_path.display(),
+            corrupt_path = %corrupt_path.display(),
+            "failed to preserve corrupt transaction journal"
+        );
+    }
+}
+
+fn annotation_previous_values_match(
+    record: &TransactionRecord,
+    previous_color_tag: Option<&NullableStringPatch>,
+    previous_user_note: Option<&NullableStringPatch>,
+) -> bool {
+    let (Some(previous_color_tag), Some(previous_user_note)) =
+        (previous_color_tag, previous_user_note)
+    else {
+        return false;
+    };
+    nullable_string_patch_matches(&record.color_tag, previous_color_tag)
+        && nullable_string_patch_matches(&record.user_note, previous_user_note)
+}
+
+fn nullable_string_patch_matches(value: &Option<String>, patch: &NullableStringPatch) -> bool {
+    match patch {
+        NullableStringPatch::Set(expected) => value.as_deref() == Some(expected.as_str()),
+        NullableStringPatch::Clear => value.is_none(),
+    }
+}
+
 fn apply_nullable_string_patch(target: &mut Option<String>, patch: Option<NullableStringPatch>) {
     match patch {
         Some(NullableStringPatch::Set(value)) => *target = Some(value),
@@ -685,7 +1364,12 @@ fn discard_transaction_journal_checkpoint(storage_dir: &Path) -> Result<()> {
     let checkpoint_path =
         transaction_journal_checkpoint_path(&transaction_journal_path(storage_dir));
     match fs::remove_file(&checkpoint_path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(parent) = checkpoint_path.parent() {
+                sync_directory(parent, "transaction journal checkpoint directory")?;
+            }
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| {
             format!(
@@ -702,40 +1386,77 @@ fn persist_session_snapshot(
     snapshot: &StoredSessionSnapshot,
 ) -> Result<()> {
     let storage_dir = session_dir(root_dir, metadata.id);
-    fs::create_dir_all(&storage_dir).with_context(|| {
-        format!(
-            "failed to create session directory {}",
-            storage_dir.display()
-        )
-    })?;
+    create_private_session_dir(&storage_dir)?;
     write_json(&snapshot_path(&storage_dir), snapshot)
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        create_private_dir_all(parent)
             .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
     }
-    let data = serde_json::to_vec_pretty(value).context("failed to serialize JSON file")?;
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, &data)
-        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    let tmp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    {
+        let mut file = create_private_file(&tmp_path)
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        {
+            let mut writer = BufWriter::new(&mut file);
+            serde_json::to_writer_pretty(&mut writer, value)
+                .context("failed to serialize JSON file")?;
+            writer
+                .flush()
+                .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+        }
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
+    }
     fs::rename(&tmp_path, path).with_context(|| {
         format!(
             "failed to rename {} to {}",
             tmp_path.display(),
             path.display()
         )
-    })
+    })?;
+    tighten_private_file(path).with_context(|| {
+        format!(
+            "failed to set private permissions on session JSON {}",
+            path.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        if let Err(error) = sync_directory(parent, "session JSON directory") {
+            warn!(
+                %error,
+                path = %path.display(),
+                "session JSON was replaced but directory sync failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path, label: &str) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync {label} {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use std::collections::HashSet;
+
+    use chrono::{Duration as ChronoDuration, Utc};
+    use uuid::Uuid;
 
     use super::SessionRegistry;
     use crate::{
-        model::{BodyEncoding, EditableRequest, HeaderRecord, MessageRecord, TransactionRecord},
+        model::{
+            BodyEncoding, EditableRequest, HeaderRecord, MessageRecord, TransactionRecord,
+            WebSocketFrameDirection, WebSocketFrameKind, WebSocketSessionRecord,
+        },
+        oast::OastProvider,
+        runtime::RuntimeSettingsUpdate,
+        scanner::{CustomRule, ScannerConfig, ScannerFinding, Severity},
         store::{
             transaction_journal_checkpoint_path, NullableStringPatch, TransactionJournalEntry,
         },
@@ -743,7 +1464,81 @@ mod tests {
             FuzzerWorkspaceState, ReplayHistoryEntryState, ReplayTabState, ReplayWorkspaceState,
             WorkspaceStateSnapshot,
         },
+        ws_replay::WsReplayFrame,
     };
+
+    #[test]
+    fn write_json_syncs_and_replaces_without_leaving_temp_files() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-write-json-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join("snapshot.json");
+
+        super::write_json(&path, &serde_json::json!({ "version": 1 })).unwrap();
+        super::write_json(&path, &serde_json::json!({ "version": 2 })).unwrap();
+
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap())
+            .expect("snapshot should be valid json");
+        assert_eq!(saved["version"], 2);
+        let temp_files = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(temp_files, 0);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn restored_open_websockets_are_marked_closed_after_restart() {
+        let started_at = Utc::now() - ChronoDuration::seconds(5);
+        let records = super::close_restored_open_websockets(vec![WebSocketSessionRecord {
+            id: Uuid::new_v4(),
+            started_at,
+            closed_at: None,
+            duration_ms: None,
+            scheme: "wss".to_string(),
+            host: "example.test".to_string(),
+            path: "/ws".to_string(),
+            status: Some(101),
+            request: MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 1024),
+            response: None,
+            frames: Vec::new(),
+            notes: Vec::new(),
+        }]);
+
+        let restored = &records[0];
+        assert!(restored.closed_at.is_some());
+        assert!(restored.duration_ms.unwrap_or_default() >= 5_000);
+        assert!(restored
+            .notes
+            .iter()
+            .any(|note| note.contains("restarted before this WebSocket session was closed")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_creates_private_file_and_parent_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let data_dir = std::env::temp_dir()
+            .join(format!(
+                "sniper-write-json-private-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .join("session");
+        let path = data_dir.join("snapshot.json");
+
+        super::write_json(&path, &serde_json::json!({ "version": 1 })).unwrap();
+
+        let dir_mode = std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(data_dir.parent().unwrap());
+    }
 
     #[tokio::test]
     async fn registry_persists_created_session_and_active_context() {
@@ -760,6 +1555,630 @@ mod tests {
             .summaries()
             .iter()
             .any(|session| session.id == created.id));
+    }
+
+    #[test]
+    fn registry_delete_session_preserves_metadata_when_storage_delete_fails() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-delete-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, _active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let created = registry
+            .create_session(Some("delete me".to_string()))
+            .unwrap();
+        let storage_path = registry.session_storage_path(created.id).unwrap();
+
+        std::fs::remove_dir_all(&storage_path).unwrap();
+        std::fs::write(&storage_path, b"not a directory").unwrap();
+
+        let error = registry
+            .delete_session(created.id)
+            .expect_err("file in place of session dir should fail deletion");
+
+        assert!(error.to_string().contains("session storage directory"));
+        assert!(registry.contains_session(created.id));
+
+        let _ = std::fs::remove_file(storage_path);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn registry_tombstone_prevents_deleted_session_resurrection() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-delete-tombstone-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let active = super::default_session_metadata("Active");
+        let deleted = super::default_session_metadata("Deleted");
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        super::persist_session_snapshot(
+            &root_dir,
+            &deleted,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("deleted snapshot should be left behind");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": active.id,
+                "sessions": [active.clone()],
+                "deleted_session_ids": [deleted.id]
+            }),
+        )
+        .expect("registry with tombstone should be written");
+
+        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("registry with deleted tombstone should load");
+
+        assert_eq!(loaded_active.id(), active.id);
+        assert!(registry.contains_session(active.id));
+        assert!(!registry.contains_session(deleted.id));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn registry_rebuilds_when_only_registered_session_is_tombstoned() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-active-tombstone-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let tombstoned = super::default_session_metadata("Tombstoned");
+        super::persist_session_snapshot(
+            &root_dir,
+            &tombstoned,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("tombstoned snapshot should be left behind");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": tombstoned.id,
+                "sessions": [tombstoned.clone()],
+                "deleted_session_ids": [tombstoned.id]
+            }),
+        )
+        .expect("registry should be written");
+
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("tombstoned active registry should repair without panicking");
+
+        assert_ne!(active.id(), tombstoned.id);
+        assert!(!registry.contains_session(tombstoned.id));
+        assert_eq!(registry.summaries().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn registry_empty_rebuild_preserves_tombstones() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-empty-tombstone-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let tombstoned = super::default_session_metadata("Tombstoned");
+        super::persist_session_snapshot(
+            &root_dir,
+            &tombstoned,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("tombstoned snapshot should be left behind");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": tombstoned.id,
+                "sessions": [],
+                "deleted_session_ids": [tombstoned.id]
+            }),
+        )
+        .expect("empty registry with tombstone should be written");
+
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("empty registry should repair without resurrecting tombstones");
+
+        assert_ne!(active.id(), tombstoned.id);
+        assert!(!registry.contains_session(tombstoned.id));
+        assert_eq!(registry.summaries().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn registry_delete_prunes_tombstone_after_storage_removal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-delete-prune-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let (registry, _active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let created = registry
+            .create_session(Some("delete me".to_string()))
+            .unwrap();
+
+        registry.delete_session(created.id).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root_dir.join(super::REGISTRY_FILE)).unwrap())
+                .unwrap();
+        let deleted = saved
+            .get("deleted_session_ids")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let created_id = created.id.to_string();
+        assert!(!deleted
+            .iter()
+            .any(|value| value.as_str() == Some(created_id.as_str())));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn registry_normalizes_duplicate_ids_before_delete() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-duplicate-registry-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let active = super::default_session_metadata("Active");
+        let duplicate = super::default_session_metadata("Duplicate");
+        let mut duplicate_stale = duplicate.clone();
+        duplicate_stale.name = "Duplicate stale".to_string();
+        duplicate_stale.request_count = 999;
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        super::persist_session_snapshot(
+            &root_dir,
+            &duplicate,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("duplicate snapshot should be written");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": active.id,
+                "sessions": [active.clone(), duplicate.clone(), duplicate_stale]
+            }),
+        )
+        .expect("duplicate registry should be written");
+
+        let (registry, _active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("duplicate registry should be normalized");
+        registry
+            .delete_session(duplicate.id)
+            .expect("deleting duplicate id should remove every duplicate entry");
+
+        assert!(!registry.contains_session(duplicate.id));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root_dir.join(super::REGISTRY_FILE)).unwrap())
+                .unwrap();
+        let duplicate_id = duplicate.id.to_string();
+        let occurrences = saved
+            .get("sessions")
+            .and_then(|value| value.as_array())
+            .unwrap()
+            .iter()
+            .filter(|session| {
+                session.get("id").and_then(|id| id.as_str()) == Some(duplicate_id.as_str())
+            })
+            .count();
+        assert_eq!(occurrences, 0);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_rejects_uuid_symlink_session_dir() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-symlink-registry-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let external_dir = std::env::temp_dir().join(format!(
+            "sniper-session-symlink-target-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let active = super::default_session_metadata("Active");
+        let linked = super::default_session_metadata("Linked");
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        std::fs::create_dir_all(&external_dir).expect("external dir should be created");
+        symlink(&external_dir, root_dir.join(linked.id.to_string()))
+            .expect("uuid symlink should be created");
+
+        let rebuilt = super::rebuild_registry_from_session_dirs(&root_dir, 32)
+            .expect("registry rebuild should skip uuid symlink dirs");
+        assert!(rebuilt
+            .sessions
+            .iter()
+            .any(|session| session.id == active.id));
+        assert!(!rebuilt
+            .sessions
+            .iter()
+            .any(|session| session.id == linked.id));
+
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": linked.id,
+                "sessions": [linked.clone()]
+            }),
+        )
+        .expect("registry pointing at symlink should be written");
+        let error = match SessionRegistry::load_or_create(&data_dir, 32, 32) {
+            Ok(_) => panic!("registered uuid symlink should not be loaded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("session storage directory"));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&external_dir);
+    }
+
+    #[test]
+    fn registry_accepts_missing_active_session_id() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-registry-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let metadata = super::default_session_metadata("Imported");
+        super::persist_session_snapshot(
+            &root_dir,
+            &metadata,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("session snapshot should be written");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({ "sessions": [metadata.clone()] }),
+        )
+        .expect("legacy registry should be written");
+
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("legacy registry should be repaired");
+
+        assert_eq!(registry.active_session_id(), metadata.id);
+        assert_eq!(active.id(), metadata.id);
+        let expected_active_id = metadata.id.to_string();
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root_dir.join(super::REGISTRY_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired
+                .get("active_session_id")
+                .and_then(|value| value.as_str()),
+            Some(expected_active_id.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn registry_recovers_from_corrupt_json_by_scanning_session_dirs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-registry-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let metadata = super::default_session_metadata("Recoverable");
+        super::persist_session_snapshot(
+            &root_dir,
+            &metadata,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("session snapshot should be written");
+        std::fs::write(root_dir.join(super::REGISTRY_FILE), b"{not json")
+            .expect("corrupt registry should be written");
+
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("corrupt registry should recover");
+
+        assert_eq!(active.id(), metadata.id);
+        assert!(registry.contains_session(metadata.id));
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root_dir.join(super::REGISTRY_FILE)).unwrap())
+                .unwrap();
+        let expected_active_id = metadata.id.to_string();
+        assert_eq!(
+            repaired
+                .get("active_session_id")
+                .and_then(|value| value.as_str()),
+            Some(expected_active_id.as_str())
+        );
+        let has_corrupt_backup = std::fs::read_dir(&root_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".registry.corrupt-")
+        });
+        assert!(has_corrupt_backup);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn registry_recovers_missing_json_by_scanning_session_dirs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-registry-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let metadata = super::default_session_metadata("Recoverable");
+        super::persist_session_snapshot(
+            &root_dir,
+            &metadata,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("session snapshot should be written");
+
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("missing registry should recover from session dirs");
+
+        assert_eq!(active.id(), metadata.id);
+        assert!(registry.contains_session(metadata.id));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn registry_recovers_empty_json_by_scanning_session_dirs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-registry-empty-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let metadata = super::default_session_metadata("Recoverable");
+        super::persist_session_snapshot(
+            &root_dir,
+            &metadata,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("session snapshot should be written");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({ "active_session_id": metadata.id, "sessions": [] }),
+        )
+        .expect("empty registry should be written");
+
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("empty registry should recover from session dirs");
+
+        assert_eq!(active.id(), metadata.id);
+        assert!(registry.contains_session(metadata.id));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn registry_recovers_unregistered_session_dir_from_valid_registry() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-registry-orphan-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let active = super::default_session_metadata("Active");
+        let orphan = super::default_session_metadata("Orphan");
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        super::persist_session_snapshot(
+            &root_dir,
+            &orphan,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("orphan snapshot should be written");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": active.id,
+                "sessions": [active.clone()]
+            }),
+        )
+        .expect("valid partial registry should be written");
+
+        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("valid registry should recover unregistered session dirs");
+
+        assert_eq!(loaded_active.id(), active.id);
+        assert!(registry.contains_session(active.id));
+        assert!(registry.contains_session(orphan.id));
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root_dir.join(super::REGISTRY_FILE)).unwrap())
+                .unwrap();
+        let sessions = repaired
+            .get("sessions")
+            .and_then(|value| value.as_array())
+            .expect("repaired registry should contain sessions");
+        let expected_orphan_id = orphan.id.to_string();
+        assert!(sessions.iter().any(|session| {
+            session.get("id").and_then(|id| id.as_str()) == Some(expected_orphan_id.as_str())
+        }));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_does_not_publish_when_registry_write_fails() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-create-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, _) = SessionRegistry::load_or_create(&data_dir, 100, 100).unwrap();
+        let before_ids = registry
+            .summaries()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+
+        std::fs::remove_file(&registry.registry_path).unwrap();
+        std::fs::create_dir(&registry.registry_path).unwrap();
+
+        let error = registry
+            .create_session(Some("Broken registry".to_string()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed to rename"));
+        let after_ids = registry
+            .summaries()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(after_ids, before_ids);
+
+        let session_dir_ids = std::fs::read_dir(&registry.root_dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?;
+                uuid::Uuid::parse_str(name).ok()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(session_dir_ids, before_ids);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn load_context_recovers_corrupt_snapshot_by_replaying_transaction_journal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-snapshot-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        active
+            .store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".to_string(),
+                "https".to_string(),
+                "journal.example:443".to_string(),
+                "/from-journal".to_string(),
+                Some(200),
+                1,
+                MessageRecord {
+                    headers: vec![],
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                None,
+                vec![],
+                None,
+                None,
+            ))
+            .await;
+        std::fs::write(super::snapshot_path(active.storage_dir()), b"{not json")
+            .expect("corrupt snapshot should be written");
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].host, "journal.example:443");
+        let has_corrupt_backup = std::fs::read_dir(active.storage_dir())
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".snapshot.corrupt-")
+            });
+        assert!(has_corrupt_backup);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn load_context_stops_at_corrupt_complete_transaction_journal_line() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-corrupt-line-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = active.storage_dir().to_path_buf();
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut journal = Vec::new();
+        serde_json::to_writer(
+            &mut journal,
+            &TransactionJournalEntry::Insert {
+                record: TransactionRecord::http(
+                    Utc::now(),
+                    "GET".to_string(),
+                    "https".to_string(),
+                    "valid-journal.example:443".to_string(),
+                    "/valid".to_string(),
+                    Some(200),
+                    1,
+                    MessageRecord {
+                        headers: vec![],
+                        body_preview: String::new(),
+                        body_encoding: BodyEncoding::Utf8,
+                        body_size: 0,
+                        decoded_body_size: None,
+                        preview_truncated: false,
+                        content_type: None,
+                        content_decoded: false,
+                    },
+                    None,
+                    vec![],
+                    None,
+                    None,
+                ),
+            },
+        )
+        .unwrap();
+        journal.extend_from_slice(b"\n{not json}\n");
+        std::fs::write(&journal_path, journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].host, "valid-journal.example:443");
+        let has_corrupt_backup = std::fs::read_dir(&storage_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".transactions.journal.corrupt-")
+        });
+        assert!(has_corrupt_backup);
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
@@ -784,42 +2203,84 @@ mod tests {
         active
             .workspace
             .replace_snapshot(WorkspaceStateSnapshot {
+                revision: 0,
                 replay: ReplayWorkspaceState {
-                    tabs: vec![ReplayTabState {
-                        id: "tab-1".to_string(),
-                        sequence: 1,
-                        custom_label: "Login replay".to_string(),
-                        base_request: Some(request.clone()),
-                        source_transaction_id: None,
-                        notice: "Saved".to_string(),
-                        request_text: "POST /login HTTP/1.1".to_string(),
-                        response_record: None,
-                        target_scheme: "https".to_string(),
-                        target_host: "example.com".to_string(),
-                        target_port: "443".to_string(),
-                        history_entries: vec![ReplayHistoryEntryState {
-                            request: request.clone(),
+                    tabs: vec![
+                        ReplayTabState {
+                            id: "tab-1".to_string(),
+                            sequence: 1,
+                            custom_label: "Login replay".to_string(),
+                            base_request: Some(request.clone()),
+                            source_transaction_id: None,
+                            notice: "Saved".to_string(),
                             request_text: "POST /login HTTP/1.1".to_string(),
                             response_record: None,
-                            notice: "Saved".to_string(),
                             target_scheme: "https".to_string(),
                             target_host: "example.com".to_string(),
                             target_port: "443".to_string(),
-                        }],
-                        history_index: Some(0),
-                        ..Default::default()
-                    }],
+                            history_entries: vec![ReplayHistoryEntryState {
+                                request: Some(request.clone()),
+                                request_text: "POST /login HTTP/1.1".to_string(),
+                                http_version_mode: "HTTP/2".to_string(),
+                                response_record: None,
+                                notice: "Saved".to_string(),
+                                target_scheme: "https".to_string(),
+                                target_host: "example.com".to_string(),
+                                target_port: "443".to_string(),
+                            }],
+                            history_index: Some(0),
+                            ..Default::default()
+                        },
+                        ReplayTabState {
+                            id: "ws-tab-1".to_string(),
+                            tab_type: "websocket".to_string(),
+                            sequence: 2,
+                            custom_label: "Chat socket".to_string(),
+                            ws_scheme: "wss".to_string(),
+                            ws_host: "socket.example.com".to_string(),
+                            ws_port: serde_json::json!(443),
+                            ws_path: "/stream".to_string(),
+                            ws_handshake_text: "Authorization: Bearer test".to_string(),
+                            ws_editor_text: "{\"type\":\"ping\"}".to_string(),
+                            ws_message_type: "binary".to_string(),
+                            ws_editor_body_encoded: true,
+                            ws_setup_queue: vec![serde_json::json!({
+                                "label": "subscribe",
+                                "body": "{\"op\":\"subscribe\"}",
+                                "autoSend": true,
+                                "sent": true
+                            })],
+                            ws_frames: vec![WsReplayFrame {
+                                index: 0,
+                                captured_at: Utc::now().to_rfc3339(),
+                                direction: WebSocketFrameDirection::ClientToServer,
+                                kind: WebSocketFrameKind::Text,
+                                body: "{\"op\":\"subscribe\"}".to_string(),
+                                body_encoding: BodyEncoding::Utf8,
+                                body_size: 18,
+                                preview_truncated: false,
+                            }],
+                            ..Default::default()
+                        },
+                    ],
                     active_tab_id: Some("tab-1".to_string()),
-                    tab_sequence: 1,
+                    tab_sequence: 2,
                 },
                 fuzzer: FuzzerWorkspaceState {
                     base_request: Some(request.clone()),
                     source_transaction_id: None,
+                    target: Some(crate::model::RequestTargetOverride {
+                        scheme: "https".to_string(),
+                        host: "override.example.com".to_string(),
+                        port: "8443".to_string(),
+                    }),
+                    target_request_authority: Some("https://example.com".to_string()),
                     notice: "Ready".to_string(),
                     request_text: "POST /login HTTP/1.1".to_string(),
                     payloads_text: "admin\nuser".to_string(),
                     attack_record: None,
                 },
+                ..Default::default()
             })
             .await;
 
@@ -827,7 +2288,7 @@ mod tests {
 
         let loaded = registry.load_context(active.id()).unwrap();
         let workspace = loaded.workspace.snapshot().await;
-        assert_eq!(workspace.replay.tabs.len(), 1);
+        assert_eq!(workspace.replay.tabs.len(), 2);
         assert_eq!(workspace.replay.active_tab_id.as_deref(), Some("tab-1"));
         assert_eq!(
             workspace
@@ -839,6 +2300,14 @@ mod tests {
         );
         assert_eq!(workspace.fuzzer.notice, "Ready");
         assert_eq!(workspace.fuzzer.payloads_text, "admin\nuser");
+        assert_eq!(
+            workspace.fuzzer.target.as_ref().map(|target| (
+                target.scheme.as_str(),
+                target.host.as_str(),
+                target.port.as_str()
+            )),
+            Some(("https", "override.example.com", "8443"))
+        );
         assert_eq!(
             workspace
                 .replay
@@ -865,6 +2334,556 @@ mod tests {
                 .map(|entry| entry.target_port.as_str()),
             Some("443")
         );
+        assert_eq!(
+            workspace
+                .replay
+                .tabs
+                .first()
+                .and_then(|tab| tab.history_entries.first())
+                .map(|entry| entry.http_version_mode.as_str()),
+            Some("HTTP/2")
+        );
+        let ws_tab = workspace
+            .replay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "ws-tab-1")
+            .expect("websocket replay tab should persist");
+        assert_eq!(ws_tab.tab_type, "websocket");
+        assert_eq!(ws_tab.ws_editor_text, "{\"type\":\"ping\"}");
+        assert_eq!(ws_tab.ws_message_type, "binary");
+        assert!(ws_tab.ws_editor_body_encoded);
+        assert_eq!(
+            ws_tab
+                .ws_setup_queue
+                .first()
+                .and_then(|item| item.get("sent"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(ws_tab.ws_frames.len(), 1);
+        assert_eq!(ws_tab.ws_frames[0].body, "{\"op\":\"subscribe\"}");
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_legacy_replay_history_without_request() {
+        let snapshot: super::StoredSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "workspace": {
+                "replay": {
+                    "tabs": [{
+                        "id": "tab-legacy",
+                        "sequence": 1,
+                        "base_request": {
+                            "scheme": "https",
+                            "host": "example.com",
+                            "method": "GET",
+                            "path": "/",
+                            "headers": [],
+                            "body": "",
+                            "body_encoding": "utf8",
+                            "preview_truncated": false
+                        },
+                        "history_entries": [{
+                            "request_text": "GET /legacy HTTP/1.1",
+                            "notice": "saved before request snapshots"
+                        }]
+                    }],
+                    "active_tab_id": "tab-legacy",
+                    "tab_sequence": 1
+                }
+            }
+        }))
+        .expect("legacy workspace snapshot should deserialize");
+
+        let entry = snapshot.workspace.replay.tabs[0]
+            .history_entries
+            .first()
+            .expect("history entry should survive");
+        assert!(entry.request.is_none());
+        assert_eq!(entry.request_text, "GET /legacy HTTP/1.1");
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_replay_base_request_missing_body_metadata() {
+        let snapshot: super::StoredSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "workspace": {
+                "replay": {
+                    "tabs": [{
+                        "id": "tab-partial",
+                        "sequence": 1,
+                        "base_request": {
+                            "scheme": "https",
+                            "host": "example.com",
+                            "method": "GET",
+                            "path": "/",
+                            "headers": [{ "name": "host", "value": "example.com" }]
+                        }
+                    }],
+                    "active_tab_id": "tab-partial",
+                    "tab_sequence": 1
+                }
+            }
+        }))
+        .expect("partial replay base request should not break snapshot parsing");
+
+        let request = snapshot.workspace.replay.tabs[0]
+            .base_request
+            .as_ref()
+            .expect("base request should survive");
+        assert_eq!(request.body, "");
+        assert_eq!(request.body_encoding, BodyEncoding::Utf8);
+        assert!(!request.preview_truncated);
+    }
+
+    #[tokio::test]
+    async fn registry_restores_oast_store_config_from_runtime_snapshot() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-oast-config-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        active
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                oast_enabled: Some(true),
+                oast_server_url: Some("https://oast.example.test".to_string()),
+                oast_token: Some("token-a".to_string()),
+                oast_polling_interval_secs: Some(11),
+                oast_provider: Some(OastProvider::Interactsh),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        active.persist().await.unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let config = loaded.oast.get_config().await;
+
+        assert!(config.enabled);
+        assert_eq!(config.server_url, "https://oast.example.test");
+        assert_eq!(config.token, "token-a");
+        assert_eq!(config.polling_interval_secs, 11);
+        assert_eq!(config.provider, OastProvider::Interactsh);
+    }
+
+    #[tokio::test]
+    async fn registry_persists_scanner_config() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-scanner-config-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let mut config = ScannerConfig {
+            enabled: false,
+            ..ScannerConfig::default()
+        };
+        config.rules.insert("jwt".to_string(), false);
+        active.scanner.update_config(config).await;
+        active.persist().await.unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.scanner.get_config().await;
+        assert!(!restored.enabled);
+        assert_eq!(restored.rules.get("jwt"), Some(&false));
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_partial_scanner_config() {
+        let snapshot: super::StoredSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "scanner_config": {
+                "enabled": false
+            }
+        }))
+        .expect("legacy scanner config should not break session snapshot parsing");
+
+        assert!(!snapshot.scanner_config.enabled);
+        assert!(snapshot.scanner_config.custom_rules.is_empty());
+        assert_eq!(snapshot.scanner_config.rules.get("jwt"), Some(&true));
+    }
+
+    #[test]
+    fn missing_scanner_findings_are_recovered_from_restored_transactions() {
+        let request = MessageRecord {
+            headers: vec![],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let response = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "content-type".to_string(),
+                value: "text/html".to_string(),
+            }],
+            body_preview: "<html><body>ok</body></html>".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 28,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: Some("text/html".to_string()),
+            content_decoded: false,
+        };
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "example.test".to_string(),
+            "/".to_string(),
+            Some(200),
+            1,
+            request,
+            Some(response),
+            Vec::new(),
+            None,
+            None,
+        );
+
+        let recovered_record_ids = HashSet::from([record.id]);
+        let findings = super::recover_missing_scanner_findings(
+            Vec::new(),
+            &[record],
+            &recovered_record_ids,
+            &ScannerConfig::default(),
+            100,
+        );
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Missing Content-Security-Policy"));
+    }
+
+    #[tokio::test]
+    async fn journal_scanner_recovery_does_not_resurrect_cleared_snapshot_findings() {
+        fn html_record(host: &str, sequence: u64) -> TransactionRecord {
+            let request = MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            };
+            let response = MessageRecord {
+                headers: vec![HeaderRecord {
+                    name: "content-type".to_string(),
+                    value: "text/html".to_string(),
+                }],
+                body_preview: "<html><body>journal</body></html>".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 33,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: Some("text/html".to_string()),
+                content_decoded: false,
+            };
+            let mut record = TransactionRecord::http(
+                Utc::now(),
+                "GET".to_string(),
+                "https".to_string(),
+                host.to_string(),
+                "/".to_string(),
+                Some(200),
+                sequence,
+                request,
+                Some(response),
+                Vec::new(),
+                None,
+                None,
+            );
+            record.sequence = sequence;
+            record
+        }
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-scanner-journal-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+
+        let cleared_record = html_record("cleared.example", 1);
+        let cleared_record_id = cleared_record.id;
+        let journal_record = html_record("journal.example", 2);
+        let journal_record_id = journal_record.id;
+
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![cleared_record],
+            scanner_findings: Vec::new(),
+            scanner_config: ScannerConfig {
+                custom_rules: vec![CustomRule {
+                    id: "journal-body".to_string(),
+                    name: "Journal body".to_string(),
+                    enabled: true,
+                    target: "response_body".to_string(),
+                    header_name: String::new(),
+                    pattern: "journal".to_string(),
+                    severity: Severity::Info,
+                    category: "custom".to_string(),
+                    description: String::new(),
+                }],
+                ..ScannerConfig::default()
+            },
+            ..Default::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut lines = Vec::new();
+        serde_json::to_writer(
+            &mut lines,
+            &TransactionJournalEntry::Insert {
+                record: journal_record,
+            },
+        )
+        .unwrap();
+        lines.push(b'\n');
+        std::fs::write(journal_path, lines).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let records = loaded.store.snapshot(Some(32)).await;
+        assert!(records.iter().any(|record| record.id == journal_record_id));
+        assert!(records.iter().any(|record| record.id == cleared_record_id));
+
+        let findings = loaded.scanner.snapshot(Some(32)).await;
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.record_id == journal_record_id));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.record_id == cleared_record_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn recovered_scanner_findings_evict_older_persisted_findings_at_capacity() {
+        let request = MessageRecord {
+            headers: vec![],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let response = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "content-type".to_string(),
+                value: "text/html".to_string(),
+            }],
+            body_preview: "<html><body>restored</body></html>".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 34,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: Some("text/html".to_string()),
+            content_decoded: false,
+        };
+        let restored_record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "new.example".to_string(),
+            "/".to_string(),
+            Some(200),
+            2,
+            request,
+            Some(response),
+            Vec::new(),
+            None,
+            None,
+        );
+        let old_finding = ScannerFinding {
+            id: Uuid::new_v4(),
+            record_id: Uuid::new_v4(),
+            found_at: Utc::now(),
+            severity: crate::scanner::Severity::Low,
+            category: "old".to_string(),
+            title: "Old persisted finding".to_string(),
+            detail: String::new(),
+            evidence: String::new(),
+            host: "old.example".to_string(),
+            path: "/".to_string(),
+        };
+
+        let recovered_record_ids = HashSet::from([restored_record.id]);
+        let findings = super::recover_missing_scanner_findings(
+            vec![old_finding],
+            &[restored_record],
+            &recovered_record_ids,
+            &ScannerConfig::default(),
+            1,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].host, "new.example");
+        assert_ne!(findings[0].title, "Old persisted finding");
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_legacy_websocket_without_collections() {
+        let snapshot: super::StoredSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "websockets": [{
+                "id": "00000000-0000-0000-0000-00000000a001",
+                "started_at": "2026-01-01T00:00:00Z",
+                "scheme": "wss",
+                "host": "socket.example.com",
+                "path": "/events",
+                "request": {
+                    "headers": [{ "name": "host", "value": "socket.example.com" }]
+                }
+            }]
+        }))
+        .expect("legacy websocket session should not break snapshot parsing");
+
+        let websocket = snapshot
+            .websockets
+            .first()
+            .expect("websocket should survive");
+        assert!(websocket.frames.is_empty());
+        assert!(websocket.notes.is_empty());
+        assert_eq!(websocket.request.body_encoding, BodyEncoding::Utf8);
+        assert_eq!(websocket.summary().frame_count, 0);
+    }
+
+    #[test]
+    fn metadata_count_repair_respects_max_entries_for_capped_stores() {
+        let snapshot: super::StoredSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "transactions": [
+                {
+                    "id": "00000000-0000-0000-0000-00000000c101",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "method": "GET",
+                    "scheme": "https",
+                    "host": "one.example",
+                    "path": "/one",
+                    "status": 200,
+                    "request": { "headers": [] }
+                },
+                {
+                    "id": "00000000-0000-0000-0000-00000000c102",
+                    "started_at": "2026-01-01T00:00:01Z",
+                    "method": "GET",
+                    "scheme": "https",
+                    "host": "two.example",
+                    "path": "/two",
+                    "status": 200,
+                    "request": { "headers": [] }
+                }
+            ],
+            "websockets": [
+                {
+                    "id": "00000000-0000-0000-0000-00000000c201",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "scheme": "wss",
+                    "host": "socket-one.example",
+                    "path": "/ws",
+                    "request": { "headers": [] }
+                },
+                {
+                    "id": "00000000-0000-0000-0000-00000000c202",
+                    "started_at": "2026-01-01T00:00:01Z",
+                    "scheme": "wss",
+                    "host": "socket-two.example",
+                    "path": "/ws",
+                    "request": { "headers": [] }
+                }
+            ],
+            "event_log": [
+                {
+                    "id": "00000000-0000-0000-0000-00000000c301",
+                    "captured_at": "2026-01-01T00:00:00Z",
+                    "level": "info",
+                    "source": "test",
+                    "title": "one",
+                    "message": "one"
+                },
+                {
+                    "id": "00000000-0000-0000-0000-00000000c302",
+                    "captured_at": "2026-01-01T00:00:01Z",
+                    "level": "info",
+                    "source": "test",
+                    "title": "two",
+                    "message": "two"
+                }
+            ],
+            "fuzzer_attacks": [
+                {
+                    "id": "00000000-0000-0000-0000-00000000c401",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "completed_at": "2026-01-01T00:00:01Z",
+                    "status": "completed",
+                    "template": {
+                        "scheme": "https",
+                        "host": "one.example",
+                        "method": "GET",
+                        "path": "/"
+                    }
+                },
+                {
+                    "id": "00000000-0000-0000-0000-00000000c402",
+                    "started_at": "2026-01-01T00:00:01Z",
+                    "completed_at": "2026-01-01T00:00:02Z",
+                    "status": "completed",
+                    "template": {
+                        "scheme": "https",
+                        "host": "two.example",
+                        "method": "GET",
+                        "path": "/"
+                    }
+                }
+            ]
+        }))
+        .expect("snapshot should deserialize");
+        let mut metadata = super::default_session_metadata("counts");
+
+        assert!(super::update_metadata_counts_from_snapshot(
+            &mut metadata,
+            &snapshot,
+            1
+        ));
+
+        assert_eq!(metadata.request_count, 1);
+        assert_eq!(metadata.websocket_count, 1);
+        assert_eq!(metadata.event_count, 1);
+        assert_eq!(metadata.fuzzer_count, 1);
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_legacy_transaction_without_optional_metadata() {
+        let snapshot: super::StoredSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "transactions": [{
+                "id": "00000000-0000-0000-0000-00000000b101",
+                "started_at": "2026-01-01T00:00:00Z",
+                "method": "GET",
+                "scheme": "https",
+                "host": "example.com",
+                "path": "/legacy",
+                "status": 200,
+                "request": {
+                    "headers": [{ "name": "host", "value": "example.com" }]
+                }
+            }]
+        }))
+        .expect("legacy transaction should not break snapshot parsing");
+
+        let transaction = snapshot
+            .transactions
+            .first()
+            .expect("transaction should survive");
+        assert!(matches!(transaction.kind, crate::model::TrafficKind::Http));
+        assert_eq!(transaction.duration_ms, 0);
+        assert!(transaction.notes.is_empty());
+        assert_eq!(transaction.summary().note_count, 0);
     }
 
     #[tokio::test]
@@ -883,6 +2902,7 @@ mod tests {
             body_preview: "{\"hello\":\"world\"}".to_string(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 17,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: Some("application/json".to_string()),
             content_decoded: false,
@@ -895,6 +2915,7 @@ mod tests {
             body_preview: "{\"ok\":true}".to_string(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 11,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: Some("application/json".to_string()),
             content_decoded: false,
@@ -960,6 +2981,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -991,6 +3013,8 @@ mod tests {
                 id: record_id,
                 color_tag: Some(NullableStringPatch::Set("red".to_string())),
                 user_note: Some(NullableStringPatch::Set("remember me".to_string())),
+                previous_color_tag: None,
+                previous_user_note: None,
             },
         )
         .unwrap();
@@ -1007,6 +3031,12 @@ mod tests {
         assert_eq!(restored[0].notes, vec!["journaled".to_string()]);
         assert_eq!(restored[0].color_tag.as_deref(), Some("red"));
         assert_eq!(restored[0].user_note.as_deref(), Some("remember me"));
+        let summary = registry
+            .summaries()
+            .into_iter()
+            .find(|summary| summary.id == active.id())
+            .unwrap();
+        assert_eq!(summary.request_count, 1);
     }
 
     #[tokio::test]
@@ -1025,6 +3055,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -1081,6 +3112,7 @@ mod tests {
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_type: None,
                 content_decoded: false,
@@ -1103,6 +3135,7 @@ mod tests {
                 body_preview: String::new(),
                 body_encoding: BodyEncoding::Utf8,
                 body_size: 0,
+                decoded_body_size: None,
                 preview_truncated: false,
                 content_type: None,
                 content_decoded: false,
@@ -1144,6 +3177,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_checkpoint_annotations_do_not_overwrite_snapshot_records() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-checkpoint-annotation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let mut record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "checkpoint-annotation.example:443".to_string(),
+            "/checkpoint-annotation".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        record.sequence = 9;
+        record.color_tag = Some("blue".to_string());
+        let record_id = record.id;
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![record],
+            ..Default::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
+        let mut checkpoint = Vec::new();
+        serde_json::to_writer(
+            &mut checkpoint,
+            &TransactionJournalEntry::Annotation {
+                id: record_id,
+                color_tag: Some(NullableStringPatch::Set("red".to_string())),
+                user_note: None,
+                previous_color_tag: None,
+                previous_user_note: None,
+            },
+        )
+        .unwrap();
+        checkpoint.push(b'\n');
+        std::fs::write(checkpoint_path, checkpoint).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].color_tag.as_deref(), Some("blue"));
+    }
+
+    #[tokio::test]
+    async fn registry_checkpoint_annotation_with_previous_updates_old_snapshot_record() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-checkpoint-annotation-previous-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let mut record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "checkpoint-annotation-previous.example:443".to_string(),
+            "/checkpoint-annotation-previous".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        record.sequence = 9;
+        record.color_tag = Some("blue".to_string());
+        let record_id = record.id;
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![record],
+            ..Default::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
+        let mut checkpoint = Vec::new();
+        serde_json::to_writer(
+            &mut checkpoint,
+            &TransactionJournalEntry::Annotation {
+                id: record_id,
+                color_tag: Some(NullableStringPatch::Set("red".to_string())),
+                user_note: None,
+                previous_color_tag: Some(NullableStringPatch::Set("blue".to_string())),
+                previous_user_note: Some(NullableStringPatch::Clear),
+            },
+        )
+        .unwrap();
+        checkpoint.push(b'\n');
+        std::fs::write(checkpoint_path, checkpoint).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].color_tag.as_deref(), Some("red"));
+    }
+
+    #[tokio::test]
+    async fn registry_active_journal_annotations_still_update_snapshot_records() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-active-annotation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let mut record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "active-annotation.example:443".to_string(),
+            "/active-annotation".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        record.sequence = 11;
+        record.color_tag = Some("blue".to_string());
+        let record_id = record.id;
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![record],
+            ..Default::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut journal = Vec::new();
+        serde_json::to_writer(
+            &mut journal,
+            &TransactionJournalEntry::Annotation {
+                id: record_id,
+                color_tag: Some(NullableStringPatch::Set("green".to_string())),
+                user_note: None,
+                previous_color_tag: None,
+                previous_user_note: None,
+            },
+        )
+        .unwrap();
+        journal.push(b'\n');
+        std::fs::write(journal_path, journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].color_tag.as_deref(), Some("green"));
+    }
+
+    #[tokio::test]
     async fn registry_ignores_old_journal_entries_already_trimmed_from_snapshot() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-session-journal-trim-test-{}",
@@ -1166,6 +3396,7 @@ mod tests {
                     body_preview: String::new(),
                     body_encoding: BodyEncoding::Utf8,
                     body_size: 0,
+                    decoded_body_size: None,
                     preview_truncated: false,
                     content_type: None,
                     content_decoded: false,
@@ -1226,6 +3457,7 @@ mod tests {
                     body_preview: String::new(),
                     body_encoding: BodyEncoding::Utf8,
                     body_size: 0,
+                    decoded_body_size: None,
                     preview_truncated: false,
                     content_type: None,
                     content_decoded: false,

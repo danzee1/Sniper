@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -12,7 +14,7 @@ use anyhow::Result;
 use reqwest::StatusCode;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -30,6 +32,14 @@ const APP_LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/sm1ee/Sniper/releases/latest";
 const APP_VERSION_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const APP_VERSION_FETCH_TIMEOUT: Duration = Duration::from_millis(1500);
+const EXPECTED_APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
+const EXPECTED_APP_EXECUTABLE: &str = "Sniper";
+const HDIUTIL_PATH: &str = "/usr/bin/hdiutil";
+const DITTO_PATH: &str = "/usr/bin/ditto";
+const CODESIGN_PATH: &str = "/usr/bin/codesign";
+const SPCTL_PATH: &str = "/usr/sbin/spctl";
+const PLIST_BUDDY_PATH: &str = "/usr/libexec/PlistBuddy";
+const SH_PATH: &str = "/bin/sh";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,10 +51,17 @@ pub struct AppState {
     pub proxy_online: Arc<AtomicBool>,
     active_session: Arc<RwLock<Arc<SessionContext>>>,
     app_version_cache: Arc<RwLock<Option<CachedAppVersionInfo>>>,
+    update_in_progress: Arc<AtomicBool>,
     /// The currently active proxy listener address (mutable — updated on rebind).
     pub active_proxy_addr: Arc<RwLock<SocketAddr>>,
+    /// The currently bound UI listener address (mutable because port 0 is resolved at bind time).
+    active_ui_addr: Arc<RwLock<SocketAddr>>,
     /// Handle for the running proxy task so it can be aborted on rebind.
     proxy_task: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// Serializes runtime proxy rebinds so reported state cannot race the actual listener.
+    pub proxy_rebind_lock: Arc<AsyncMutex<()>>,
+    /// Serializes workspace writes per session so inactive-session saves cannot race each other.
+    workspace_update_locks: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<AsyncMutex<()>>>>>,
     /// WebSocket replay connections.
     pub ws_replay: Arc<WsReplayStore>,
 }
@@ -64,6 +81,7 @@ impl AppState {
         )?;
 
         let active_proxy_addr = config.proxy_addr;
+        let active_ui_addr = config.ui_addr;
         Ok(Self {
             config,
             certificates,
@@ -73,8 +91,12 @@ impl AppState {
             proxy_online: Arc::new(AtomicBool::new(false)),
             active_session: Arc::new(RwLock::new(active_session)),
             app_version_cache: Arc::new(RwLock::new(None)),
+            update_in_progress: Arc::new(AtomicBool::new(false)),
             active_proxy_addr: Arc::new(RwLock::new(active_proxy_addr)),
+            active_ui_addr: Arc::new(RwLock::new(active_ui_addr)),
             proxy_task: Arc::new(RwLock::new(None)),
+            proxy_rebind_lock: Arc::new(AsyncMutex::new(())),
+            workspace_update_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             ws_replay: Arc::new(WsReplayStore::new()),
         })
     }
@@ -91,37 +113,97 @@ impl AppState {
         self.active_session.read().await.clone()
     }
 
+    pub(crate) async fn session_with_proxy_owner(
+        &self,
+    ) -> (Arc<SessionContext>, crate::proxy::ActiveProxySessionGuard) {
+        let active_session = self.active_session.read().await;
+        let session = active_session.clone();
+        let owner = crate::proxy::remember_active_proxy_session_owner(session.id());
+        (session, owner)
+    }
+
+    pub async fn workspace_update_lock(&self, id: uuid::Uuid) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.workspace_update_locks.lock().await;
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
         self.sessions.summaries()
     }
 
     pub async fn active_session_summary(&self) -> SessionSummary {
         let active_id = self.sessions.active_session_id();
-        self.session()
-            .await
-            .summary(active_id == self.sessions.active_session_id())
+        let session = self.session().await;
+        session.summary(session.id() == active_id)
     }
 
     pub async fn create_session(&self, name: Option<String>) -> Result<SessionSummary> {
         let metadata = self.sessions.create_session(name)?;
-        self.activate_session(metadata.id).await
+        match self.activate_session(metadata.id).await {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                if let Err(cleanup_error) = self.sessions.delete_session(metadata.id) {
+                    tracing::warn!(
+                        ?cleanup_error,
+                        session_id = %metadata.id,
+                        "failed to remove session created before activation failure"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn activate_session(&self, id: uuid::Uuid) -> Result<SessionSummary> {
-        let current = self.session().await;
+        let mut active_session = self.active_session.write().await;
+        let current = active_session.clone();
         let current_id = current.id();
         if current_id != id {
             self.persist_session_context(&current).await?;
+            let session = self.sessions.load_context(id)?;
+            let metadata = self.sessions.activate_session(id)?;
+            session.replace_metadata(metadata.clone());
+            let dropped_requests = current.intercepts.drop_all().await;
+            let dropped_responses = current.response_intercepts.drop_all().await;
+            if dropped_requests > 0 || dropped_responses > 0 {
+                tracing::info!(
+                    session_id = %current_id,
+                    dropped_requests,
+                    dropped_responses,
+                    "dropped pending intercepts before switching sessions"
+                );
+            }
+            self.ws_replay.disconnect_all().await;
+            *active_session = session.clone();
+            return Ok(session.summary(metadata.id == self.sessions.active_session_id()));
         }
 
         let metadata = self.sessions.activate_session(id)?;
-        let session = self.sessions.load_context(id)?;
-        *self.active_session.write().await = session.clone();
-        Ok(session.summary(metadata.id == self.sessions.active_session_id()))
+        current.replace_metadata(metadata.clone());
+        Ok(current.summary(metadata.id == self.sessions.active_session_id()))
     }
 
-    pub fn delete_session(&self, id: uuid::Uuid) -> Result<()> {
-        self.sessions.delete_session(id)
+    pub async fn delete_session(&self, id: uuid::Uuid) -> Result<()> {
+        let workspace_update_lock = self.workspace_update_lock(id).await;
+        let workspace_update_guard = workspace_update_lock.lock().await;
+        if crate::proxy::session_has_live_websocket_relays(id) {
+            anyhow::bail!("cannot delete a session while live captures are active");
+        }
+        if crate::proxy::session_has_active_proxy_work(id) {
+            anyhow::bail!("cannot delete a session while proxy activity is still running");
+        }
+        if crate::proxy::session_has_pending_persist(id) {
+            anyhow::bail!("cannot delete a session while capture persistence is pending");
+        }
+        let result = self.sessions.delete_session(id);
+        drop(workspace_update_guard);
+        if result.is_ok() {
+            self.workspace_update_locks.lock().await.remove(&id);
+        }
+        result
     }
 
     pub fn session_storage_path(&self, id: uuid::Uuid) -> Result<std::path::PathBuf> {
@@ -137,9 +219,91 @@ impl AppState {
         &self,
         session: &Arc<SessionContext>,
     ) -> Result<SessionSummary> {
+        if !self.sessions.contains_session(session.id()) {
+            anyhow::bail!("session {} was deleted", session.id());
+        }
         let metadata = session.persist().await?;
-        self.sessions.update_metadata(metadata)?;
-        Ok(session.summary(session.id() == self.sessions.active_session_id()))
+        self.finalize_session_persist(session, metadata)
+    }
+
+    pub async fn persist_session_context_mutation_locked(
+        &self,
+        session: &Arc<SessionContext>,
+    ) -> Result<SessionSummary> {
+        if !self.sessions.contains_session(session.id()) {
+            anyhow::bail!("session {} was deleted", session.id());
+        }
+        let metadata = session.persist_mutation_locked().await?;
+        self.finalize_session_persist(session, metadata)
+    }
+
+    pub async fn replace_workspace_state_and_persist(
+        &self,
+        session: &Arc<SessionContext>,
+        snapshot: crate::workspace::WorkspaceStateSnapshot,
+    ) -> std::result::Result<
+        crate::workspace::WorkspaceStateSnapshot,
+        crate::workspace::WorkspaceReplaceError<String>,
+    > {
+        if !self.sessions.contains_session(session.id()) {
+            return Err(crate::workspace::WorkspaceReplaceError::Persist(format!(
+                "session {} was deleted",
+                session.id()
+            )));
+        }
+        let (snapshot, metadata) = session
+            .replace_workspace_snapshot_checked_and_persist(snapshot)
+            .await
+            .map_err(|error| match error {
+                crate::workspace::WorkspaceReplaceError::Conflict(current) => {
+                    crate::workspace::WorkspaceReplaceError::Conflict(current)
+                }
+                crate::workspace::WorkspaceReplaceError::Persist(error) => {
+                    crate::workspace::WorkspaceReplaceError::Persist(error.to_string())
+                }
+            })?;
+        if let Err(error) = self.finalize_session_persist(session, metadata) {
+            tracing::warn!(
+                ?error,
+                session_id = %session.id(),
+                "workspace state snapshot committed but registry metadata update failed"
+            );
+            if !self.sessions.contains_session(session.id()) {
+                return Err(crate::workspace::WorkspaceReplaceError::Persist(
+                    error.to_string(),
+                ));
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn finalize_session_persist(
+        &self,
+        session: &Arc<SessionContext>,
+        metadata: crate::session::SessionMetadata,
+    ) -> Result<SessionSummary> {
+        let active = session.id() == self.sessions.active_session_id();
+        if let Err(error) = self.sessions.update_metadata(metadata) {
+            if !self.sessions.contains_session(session.id()) {
+                if let Err(cleanup_error) = std::fs::remove_dir_all(session.storage_dir()) {
+                    if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            ?cleanup_error,
+                            session_id = %session.id(),
+                            "failed to remove deleted session snapshot directory"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+            tracing::warn!(
+                ?error,
+                session_id = %session.id(),
+                "session snapshot persisted but registry metadata update failed"
+            );
+            return Err(error);
+        }
+        Ok(session.summary(active))
     }
 
     pub async fn get_active_proxy_addr(&self) -> SocketAddr {
@@ -148,6 +312,14 @@ impl AppState {
 
     pub async fn set_active_proxy_addr(&self, addr: SocketAddr) {
         *self.active_proxy_addr.write().await = addr;
+    }
+
+    pub async fn get_active_ui_addr(&self) -> SocketAddr {
+        *self.active_ui_addr.read().await
+    }
+
+    pub async fn set_active_ui_addr(&self, addr: SocketAddr) {
+        *self.active_ui_addr.write().await = addr;
     }
 
     pub async fn set_proxy_task(&self, handle: JoinHandle<()>) {
@@ -171,9 +343,10 @@ impl AppState {
     pub async fn runtime_info(&self) -> RuntimeInfo {
         let session = self.session().await;
         let active_addr = self.get_active_proxy_addr().await;
+        let ui_addr = self.get_active_ui_addr().await;
         RuntimeInfo {
             proxy_addr: active_addr.to_string(),
-            ui_addr: self.config.ui_addr.to_string(),
+            ui_addr: ui_addr.to_string(),
             max_entries: self.config.max_entries,
             body_preview_bytes: self.config.body_preview_bytes,
             data_dir: self.config.data_dir.display().to_string(),
@@ -210,7 +383,7 @@ impl AppState {
                     .to_string(),
             ],
             certificate: self.certificates.export().clone(),
-            runtime: session.runtime.snapshot().await,
+            runtime: session.runtime.snapshot().await.redacted_for_read(),
             startup: self.startup.view(active_addr).await,
             active_session: self.active_session_summary().await,
         }
@@ -281,7 +454,9 @@ impl AppState {
         use std::process::Command;
         use tokio::io::AsyncWriteExt;
 
+        let mut update_guard = self.begin_self_update()?;
         let app_bundle = self.app_bundle_path()?;
+        ensure_self_update_bundle_is_writable(&app_bundle)?;
 
         tx.send(UpdateProgress::step("Checking for updates..."))
             .await
@@ -308,11 +483,10 @@ impl AppState {
             .await
             .context("failed to decode release JSON")?;
 
-        let dmg_asset = release
-            .assets
-            .iter()
-            .find(|a| a.name.ends_with(".dmg"))
-            .context("no DMG asset found in the latest release")?;
+        ensure_release_is_newer(env!("CARGO_PKG_VERSION"), &release.tag_name)?;
+
+        let dmg_asset = select_release_dmg_asset(&release.assets, &release.tag_name)
+            .context("no native-compatible DMG asset found in the latest release")?;
 
         let total_size = dmg_asset.size;
         tx.send(UpdateProgress::step("Downloading update..."))
@@ -320,8 +494,9 @@ impl AppState {
             .ok();
 
         // Stream-download DMG with progress
-        let tmp_dir = std::env::temp_dir().join("sniper-update");
+        let tmp_dir = std::env::temp_dir().join(format!("sniper-update-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&tmp_dir).await?;
+        let mut artifact_guard = UpdateArtifactGuard::new(tmp_dir.clone());
         let dmg_path = tmp_dir.join(&dmg_asset.name);
 
         let response = client
@@ -358,7 +533,7 @@ impl AppState {
             .await
             .ok();
 
-        let mount_output = Command::new("hdiutil")
+        let mount_output = Command::new(HDIUTIL_PATH)
             .args(["attach", "-nobrowse"])
             .arg(&dmg_path)
             .output()
@@ -379,81 +554,131 @@ impl AppState {
                 let parts: Vec<&str> = line.splitn(3, '\t').collect();
                 parts.get(2).map(|s| s.trim().to_string())
             })
-            .find(|p| p.starts_with("/Volumes/"))
-            .context("could not find DMG mount point")?;
+            .find(|p| p.starts_with("/Volumes/"));
+        let Some(mount_point) = mount_point else {
+            cleanup_update_artifacts(None, &tmp_dir).await;
+            anyhow::bail!("could not find DMG mount point");
+        };
+        artifact_guard.set_mount_point(mount_point.clone());
 
         // Find the .app inside the mounted volume
         let mut new_app_path = None;
-        let mut read_dir = tokio::fs::read_dir(&mount_point).await?;
-        while let Some(entry) = read_dir.next_entry().await? {
+        let mut read_dir = match tokio::fs::read_dir(&mount_point).await {
+            Ok(read_dir) => read_dir,
+            Err(error) => {
+                cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+                return Err(error).context("failed to read mounted DMG");
+            }
+        };
+        loop {
+            let entry = match read_dir.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+                    return Err(error).context("failed to inspect mounted DMG");
+                }
+            };
             let name = entry.file_name();
             if name.to_string_lossy().ends_with(".app") {
                 new_app_path = Some(entry.path());
                 break;
             }
         }
-        let new_app_path = new_app_path.context("no .app found in DMG")?;
+        let Some(new_app_path) = new_app_path else {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            anyhow::bail!("no .app found in DMG");
+        };
 
-        // Copy new app over the current bundle
-        let copy_output = Command::new("ditto")
-            .arg(&new_app_path)
-            .arg(&app_bundle)
-            .output()
-            .context("failed to copy new app bundle")?;
-
-        if !copy_output.status.success() {
-            let _ = Command::new("hdiutil")
-                .args(["detach", "-quiet"])
-                .arg(&mount_point)
-                .output();
-            anyhow::bail!(
-                "ditto failed: {}",
-                String::from_utf8_lossy(&copy_output.stderr)
-            );
+        tx.send(UpdateProgress::step("Verifying signature..."))
+            .await
+            .ok();
+        if let Err(error) = verify_app_signature(&new_app_path, "downloaded app") {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            return Err(error);
         }
-
-        // Detach DMG & clean up
-        let _ = Command::new("hdiutil")
-            .args(["detach", "-quiet"])
-            .arg(&mount_point)
-            .output();
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-
-        // Re-sign the app bundle so macOS accepts the replaced binary.
-        // Without this the system kills the process with SIGKILL
-        // (Code Signature Invalid / Taskgated Invalid Signature).
-        tx.send(UpdateProgress::step("Signing...")).await.ok();
-        let sign_output = Command::new("codesign")
-            .args(["--force", "--deep", "--sign", "-"])
-            .arg(&app_bundle)
-            .output()
-            .context("failed to run codesign")?;
-        if !sign_output.status.success() {
+        if allow_ad_hoc_self_update() {
             tracing::warn!(
-                "codesign failed (non-fatal): {}",
-                String::from_utf8_lossy(&sign_output.stderr)
+                "SNIPER_ALLOW_ADHOC_SELF_UPDATE=1 set; skipping Gatekeeper assessment for downloaded app"
+            );
+        } else {
+            if let Err(error) = assess_app_gatekeeper(&new_app_path, "downloaded app") {
+                cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+                return Err(error);
+            }
+        }
+        if let Err(error) = verify_app_identity(&new_app_path, &release.tag_name, "downloaded app")
+        {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            return Err(error);
+        }
+        if let Err(error) = verify_app_signing_team_matches(&new_app_path, &app_bundle) {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            return Err(error);
+        }
+
+        let staged_app = tmp_dir.join("staged").join("Sniper.app");
+        if let Some(parent) = staged_app.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let stage_output = Command::new(DITTO_PATH)
+            .arg(&new_app_path)
+            .arg(&staged_app)
+            .output()
+            .context("failed to stage new app bundle")?;
+
+        if !stage_output.status.success() {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            anyhow::bail!(
+                "staging ditto failed: {}",
+                String::from_utf8_lossy(&stage_output.stderr)
             );
         }
 
-        tx.send(UpdateProgress::step("Restarting...")).await.ok();
+        tx.send(UpdateProgress::step("Verifying signature..."))
+            .await
+            .ok();
+        if let Err(error) = verify_app_signature(&staged_app, "staged app") {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            return Err(error);
+        }
+        if let Err(error) = verify_app_identity(&staged_app, &release.tag_name, "staged app") {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            return Err(error);
+        }
 
-        // Spawn a background shell that waits for this process to exit,
-        // then launches the updated app. This avoids port conflicts where
-        // the new process starts while the old one still holds the port.
-        let pid = std::process::id();
-        let bundle = app_bundle.display().to_string();
-        let _ = Command::new("sh")
-            .args([
-                "-c",
-                "pid=\"$1\"; bundle=\"$2\"; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done; sleep 0.5; open \"$bundle\"",
-                "sniper-restart",
-                &pid.to_string(),
-                &bundle,
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let expected_team = match app_signing_team_identifier(&app_bundle, "current app") {
+            Ok(team) => team.unwrap_or_default(),
+            Err(error) => {
+                cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+                return Err(error);
+            }
+        };
+
+        detach_update_dmg(&mount_point).await;
+        artifact_guard.clear_mount_point();
+
+        if let Err(error) = self.persist_active_session().await {
+            cleanup_update_artifacts(None, &tmp_dir).await;
+            return Err(error.context("failed to persist active session before self-update"));
+        }
+
+        if let Err(error) = spawn_update_installer_after_exit(
+            std::process::id(),
+            &staged_app,
+            &app_bundle,
+            &tmp_dir,
+            &release.tag_name,
+            &expected_team,
+        ) {
+            cleanup_update_artifacts(None, &tmp_dir).await;
+            return Err(error);
+        }
+
+        artifact_guard.disarm();
+        update_guard.keep_latched();
+        tx.send(UpdateProgress::step("Restarting...")).await.ok();
+        self.prepare_for_self_update_shutdown().await;
 
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -461,6 +686,40 @@ impl AppState {
         });
 
         Ok(())
+    }
+
+    fn begin_self_update(&self) -> Result<SelfUpdateGuard> {
+        self.update_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow::anyhow!("self-update is already in progress"))?;
+        Ok(SelfUpdateGuard {
+            in_progress: self.update_in_progress.clone(),
+            keep_latched: false,
+        })
+    }
+
+    async fn prepare_for_self_update_shutdown(&self) {
+        self.ws_replay.disconnect_all().await;
+        self.abort_proxy_task().await;
+        crate::proxy::close_live_websocket_relays(
+            self,
+            "Sniper self-update restart closed the live WebSocket relay.",
+        )
+        .await;
+        crate::proxy::drain_proxy_connections(Duration::from_secs(1)).await;
+        crate::proxy::flush_pending_session_persists(self).await;
+        if let Err(error) = self.persist_active_session().await {
+            tracing::warn!(
+                ?error,
+                "failed to persist active session before self-update restart"
+            );
+        }
+        if let Err(error) = crate::runtime_state::remove_runtime_state(&self.config.data_dir) {
+            tracing::warn!(
+                ?error,
+                "failed to remove runtime state before self-update restart"
+            );
+        }
     }
 
     /// Resolve the `.app` bundle directory from the current executable path.
@@ -518,6 +777,67 @@ impl AppState {
             .event_log
             .push(EventLevel::Error, source, title, message)
             .await;
+    }
+}
+
+struct SelfUpdateGuard {
+    in_progress: Arc<AtomicBool>,
+    keep_latched: bool,
+}
+
+impl SelfUpdateGuard {
+    fn keep_latched(&mut self) {
+        self.keep_latched = true;
+    }
+}
+
+impl Drop for SelfUpdateGuard {
+    fn drop(&mut self) {
+        if !self.keep_latched {
+            self.in_progress.store(false, Ordering::Release);
+        }
+    }
+}
+
+struct UpdateArtifactGuard {
+    tmp_dir: std::path::PathBuf,
+    mount_point: Option<String>,
+    disarmed: bool,
+}
+
+impl UpdateArtifactGuard {
+    fn new(tmp_dir: std::path::PathBuf) -> Self {
+        Self {
+            tmp_dir,
+            mount_point: None,
+            disarmed: false,
+        }
+    }
+
+    fn set_mount_point(&mut self, mount_point: String) {
+        self.mount_point = Some(mount_point);
+    }
+
+    fn clear_mount_point(&mut self) {
+        self.mount_point = None;
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for UpdateArtifactGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if let Some(mount_point) = self.mount_point.as_deref() {
+            let _ = std::process::Command::new(HDIUTIL_PATH)
+                .args(["detach", mount_point])
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }
 
@@ -588,6 +908,161 @@ struct GitHubAsset {
     size: Option<u64>,
 }
 
+fn select_release_dmg_asset<'a>(
+    assets: &'a [GitHubAsset],
+    release_tag: &str,
+) -> Option<&'a GitHubAsset> {
+    let native_arch = native_release_asset_arch();
+    assets
+        .iter()
+        .filter(|asset| is_dmg_asset(&asset.name))
+        .filter(|asset| release_asset_version_matches(&asset.name, release_tag))
+        .find(|asset| release_asset_matches_arch(&asset.name, native_arch))
+        .or_else(|| {
+            assets
+                .iter()
+                .filter(|asset| is_dmg_asset(&asset.name))
+                .filter(|asset| release_asset_version_matches(&asset.name, release_tag))
+                .find(|asset| is_universal_dmg(&asset.name))
+        })
+}
+
+fn native_release_asset_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        other => other,
+    }
+}
+
+fn is_dmg_asset(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".dmg")
+}
+
+fn release_asset_matches_arch(name: &str, arch: &str) -> bool {
+    match (
+        release_asset_arch_tag(name),
+        release_asset_arch_tag_from_alias(arch),
+    ) {
+        (Some(asset_arch), Some(native_arch)) => asset_arch == native_arch,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseAssetArchTag {
+    Arm64,
+    X86_64,
+    Universal,
+}
+
+fn release_asset_arch_tag(name: &str) -> Option<ReleaseAssetArchTag> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".dmg")?;
+    let (prefix, arch_tag) = stem.rsplit_once('-')?;
+    let version = prefix.strip_prefix("sniper-")?;
+    if !is_stable_release_version_tag(version) {
+        return None;
+    }
+    release_asset_arch_tag_from_alias(arch_tag)
+}
+
+fn release_asset_version_matches(name: &str, release_tag: &str) -> bool {
+    let Some(asset_version) = release_asset_version(name) else {
+        return false;
+    };
+    let Some(release_version) = parse_version(release_tag) else {
+        return false;
+    };
+    asset_version == release_version
+}
+
+fn release_asset_version(name: &str) -> Option<Version> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".dmg")?;
+    let (prefix, _arch_tag) = stem.rsplit_once('-')?;
+    let version = prefix.strip_prefix("sniper-")?;
+    if !is_stable_release_version_tag(version) {
+        return None;
+    }
+    parse_version(version)
+}
+
+fn ensure_self_update_bundle_is_writable(app_bundle: &Path) -> Result<()> {
+    if !self_update_bundle_is_writable(app_bundle) {
+        anyhow::bail!(
+            "move Sniper.app to /Applications or another writable folder before updating"
+        );
+    }
+    Ok(())
+}
+
+fn self_update_bundle_is_writable(app_bundle: &Path) -> bool {
+    if app_bundle.starts_with("/Volumes") {
+        return false;
+    }
+    if app_bundle
+        .components()
+        .any(|component| component.as_os_str() == "AppTranslocation")
+    {
+        return false;
+    }
+    let Some(parent) = app_bundle.parent() else {
+        return false;
+    };
+    std::fs::metadata(parent)
+        .map(|metadata| !metadata.permissions().readonly())
+        .unwrap_or(false)
+        && self_update_parent_write_preflight(parent).is_ok()
+}
+
+fn self_update_parent_write_preflight(parent: &Path) -> std::io::Result<()> {
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let probe = parent.join(format!(".sniper-update-write-test-{nonce}"));
+    let renamed = parent.join(format!(".sniper-update-write-test-{nonce}.renamed"));
+    let _ = std::fs::remove_dir_all(&probe);
+    let _ = std::fs::remove_dir_all(&renamed);
+    std::fs::create_dir(&probe)?;
+    match std::fs::rename(&probe, &renamed) {
+        Ok(()) => {
+            std::fs::remove_dir(&renamed)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&probe);
+            let _ = std::fs::remove_dir_all(&renamed);
+            Err(error)
+        }
+    }
+}
+
+fn release_asset_arch_tag_from_alias(arch: &str) -> Option<ReleaseAssetArchTag> {
+    match arch.to_ascii_lowercase().as_str() {
+        "arm64" | "aarch64" => Some(ReleaseAssetArchTag::Arm64),
+        "x86_64" | "x64" | "amd64" => Some(ReleaseAssetArchTag::X86_64),
+        "universal" => Some(ReleaseAssetArchTag::Universal),
+        _ => None,
+    }
+}
+
+fn is_stable_release_version_tag(value: &str) -> bool {
+    match parse_version(value) {
+        Some(version) => version.pre.is_empty() && version.build.is_empty(),
+        None => false,
+    }
+}
+
+fn is_universal_dmg(name: &str) -> bool {
+    release_asset_arch_tag(name) == Some(ReleaseAssetArchTag::Universal)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct UpdateProgress {
     pub step: String,
@@ -618,6 +1093,238 @@ impl UpdateProgress {
     }
 }
 
+async fn cleanup_update_artifacts(mount_point: Option<&str>, tmp_dir: &Path) {
+    if let Some(mount_point) = mount_point {
+        detach_update_dmg(mount_point).await;
+    }
+    let _ = tokio::fs::remove_dir_all(tmp_dir).await;
+}
+
+async fn detach_update_dmg(mount_point: &str) {
+    let _ = tokio::process::Command::new(HDIUTIL_PATH)
+        .args(["detach", "-quiet"])
+        .arg(mount_point)
+        .output()
+        .await;
+}
+
+fn spawn_update_installer_after_exit(
+    pid: u32,
+    staged_app: &Path,
+    app_bundle: &Path,
+    tmp_dir: &Path,
+    expected_version: &str,
+    expected_team: &str,
+) -> Result<()> {
+    std::process::Command::new(SH_PATH)
+        .args([
+            "-c",
+            update_installer_script(),
+            "sniper-installer",
+            &pid.to_string(),
+            &staged_app.display().to_string(),
+            &app_bundle.display().to_string(),
+            &tmp_dir.display().to_string(),
+            expected_version,
+            expected_team,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to spawn self-update installer")?;
+    Ok(())
+}
+
+fn update_installer_script() -> &'static str {
+    r#"pid="$1"
+staged="$2"
+bundle="$3"
+tmp="$4"
+expected_version="$5"
+case "$expected_version" in
+  v*|V*) expected_version="${expected_version#?}" ;;
+esac
+expected_team="$6"
+backup="${bundle}.previous.$$"
+while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+sleep 0.5
+rm -rf "$backup"
+if [ -e "$bundle" ]; then
+  if ! mv "$bundle" "$backup"; then
+    rm -rf "$tmp"
+    exit 1
+  fi
+fi
+if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --strict "$bundle"; then
+  installed_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  installed_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  installed_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  case "$installed_version" in
+    v*|V*) installed_version="${installed_version#?}" ;;
+  esac
+  installed_team=""
+  if [ -n "$expected_team" ]; then
+    installed_team="$(/usr/bin/codesign -dv --verbose=4 "$bundle" 2>&1 | /usr/bin/awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+  fi
+  if [ "$installed_bundle_id" = "com.sm1ee.sniper" ] && \
+    [ "$installed_executable" = "Sniper" ] && \
+    [ "$installed_version" = "$expected_version" ] && \
+    { [ -z "$expected_team" ] || [ "$installed_team" = "$expected_team" ]; } && \
+    { [ -z "$expected_team" ] || /usr/sbin/spctl --assess --type execute "$bundle"; }; then
+  rm -rf "$backup" "$tmp"
+  /usr/bin/open "$bundle"
+  exit 0
+  fi
+fi
+rm -rf "$bundle"
+if [ -e "$backup" ]; then
+  mv "$backup" "$bundle"
+  /usr/bin/open "$bundle"
+fi
+rm -rf "$tmp"
+exit 1
+"#
+}
+
+fn verify_app_signature(app_path: &Path, label: &str) -> Result<()> {
+    let output = std::process::Command::new(CODESIGN_PATH)
+        .args(["--verify", "--deep", "--strict"])
+        .arg(app_path)
+        .output()
+        .with_context(|| format!("failed to verify {label} signature"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{label} signature verification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assess_app_gatekeeper(app_path: &Path, label: &str) -> Result<()> {
+    let output = std::process::Command::new(SPCTL_PATH)
+        .args(["--assess", "--type", "execute"])
+        .arg(app_path)
+        .output()
+        .with_context(|| format!("failed to assess {label} with Gatekeeper"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{label} Gatekeeper assessment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn verify_app_identity(app_path: &Path, expected_version: &str, label: &str) -> Result<()> {
+    let plist_path = app_path.join("Contents/Info.plist");
+    let bundle_id = read_info_plist_value(&plist_path, "CFBundleIdentifier")?;
+    if bundle_id != EXPECTED_APP_BUNDLE_IDENTIFIER {
+        anyhow::bail!(
+            "{label} bundle identifier mismatch: expected {}, got {}",
+            EXPECTED_APP_BUNDLE_IDENTIFIER,
+            bundle_id
+        );
+    }
+
+    let executable = read_info_plist_value(&plist_path, "CFBundleExecutable")?;
+    if executable != EXPECTED_APP_EXECUTABLE {
+        anyhow::bail!(
+            "{label} executable mismatch: expected {}, got {}",
+            EXPECTED_APP_EXECUTABLE,
+            executable
+        );
+    }
+
+    let version = normalize_version_text(&read_info_plist_value(
+        &plist_path,
+        "CFBundleShortVersionString",
+    )?);
+    let expected_version = normalize_version_text(expected_version);
+    if version != expected_version {
+        anyhow::bail!(
+            "{label} version mismatch: expected {}, got {}",
+            expected_version,
+            version
+        );
+    }
+
+    Ok(())
+}
+
+fn verify_app_signing_team_matches(downloaded_app: &Path, current_app: &Path) -> Result<()> {
+    let current_team = app_signing_team_identifier(current_app, "current app")?;
+    let downloaded_team = app_signing_team_identifier(downloaded_app, "downloaded app")?;
+    match (current_team, downloaded_team) {
+        (Some(current), Some(downloaded)) if current == downloaded => Ok(()),
+        (Some(current), Some(downloaded)) => {
+            anyhow::bail!(
+                "downloaded app signing team mismatch: expected {current}, got {downloaded}"
+            )
+        }
+        (Some(current), None) => {
+            anyhow::bail!("downloaded app is missing signing team identifier {current}")
+        }
+        (None, _) if allow_ad_hoc_self_update() => {
+            tracing::warn!("current app has no signing team identifier; skipping team pin check");
+            Ok(())
+        }
+        (None, _) => {
+            anyhow::bail!(
+                "current app is missing a signing team identifier; self-update requires a Developer ID signed app"
+            )
+        }
+    }
+}
+
+fn allow_ad_hoc_self_update() -> bool {
+    std::env::var("SNIPER_ALLOW_ADHOC_SELF_UPDATE").as_deref() == Ok("1")
+}
+
+fn app_signing_team_identifier(app_path: &Path, label: &str) -> Result<Option<String>> {
+    let output = std::process::Command::new(CODESIGN_PATH)
+        .args(["-dv", "--verbose=4"])
+        .arg(app_path)
+        .output()
+        .with_context(|| format!("failed to inspect {label} signature"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to inspect {label} signature: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(parse_codesign_team_identifier(&String::from_utf8_lossy(
+        &output.stderr,
+    )))
+}
+
+fn parse_codesign_team_identifier(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("TeamIdentifier=")
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "not set")
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn read_info_plist_value(plist_path: &Path, key: &str) -> Result<String> {
+    let command = format!("Print :{key}");
+    let output = std::process::Command::new(PLIST_BUDDY_PATH)
+        .args(["-c", command.as_str()])
+        .arg(plist_path)
+        .output()
+        .with_context(|| format!("failed to read {key} from {}", plist_path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to read {key} from {}: {}",
+            plist_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn normalize_version_text(value: &str) -> String {
     value.trim().trim_start_matches(['v', 'V']).to_string()
 }
@@ -626,9 +1333,397 @@ fn parse_version(value: &str) -> Option<Version> {
     Version::parse(&normalize_version_text(value)).ok()
 }
 
+fn ensure_release_is_newer(current: &str, latest: &str) -> Result<()> {
+    if is_newer_version(current, latest) {
+        return Ok(());
+    }
+    anyhow::bail!("latest release {latest} is not newer than current version {current}");
+}
+
 fn is_newer_version(current: &str, latest: &str) -> bool {
     match (parse_version(current), parse_version(latest)) {
         (Some(current), Some(latest)) => latest > current,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ensure_release_is_newer, native_release_asset_arch, parse_codesign_team_identifier,
+        release_asset_matches_arch, select_release_dmg_asset, self_update_bundle_is_writable,
+        update_installer_script, verify_app_identity, AppState, GitHubAsset, UpdateArtifactGuard,
+        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
+        HDIUTIL_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+    };
+    use crate::config::AppConfig;
+    use std::path::Path;
+
+    fn asset(name: &str) -> GitHubAsset {
+        GitHubAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.test/{name}"),
+            size: Some(1),
+        }
+    }
+
+    #[test]
+    fn update_asset_selection_prefers_native_arch_dmg() {
+        let native = native_release_asset_arch();
+        let other = if native == "arm64" { "x86_64" } else { "arm64" };
+        let assets = vec![
+            asset(&format!("Sniper-0.2.4-{other}.dmg")),
+            asset(&format!("Sniper-0.2.4-{native}.dmg")),
+        ];
+
+        let selected = select_release_dmg_asset(&assets, "v0.2.4").unwrap();
+
+        assert!(selected.name.contains(native));
+    }
+
+    #[test]
+    fn release_asset_arch_matching_accepts_common_aliases() {
+        assert!(release_asset_matches_arch("Sniper-0.2.4-x64.dmg", "x86_64"));
+        assert!(release_asset_matches_arch(
+            "Sniper-0.2.4-amd64.dmg",
+            "x86_64"
+        ));
+        assert!(release_asset_matches_arch(
+            "Sniper-0.2.4-aarch64.dmg",
+            "arm64"
+        ));
+        assert!(!release_asset_matches_arch(
+            "Sniper-0.2.4-arm64.dmg",
+            "x86_64"
+        ));
+    }
+
+    #[test]
+    fn release_asset_arch_matching_rejects_misleading_tokens() {
+        assert!(!release_asset_matches_arch(
+            "Sniper-0.2.4-not-arm64.dmg",
+            "arm64"
+        ));
+        assert!(!release_asset_matches_arch(
+            "Sniper-0.2.4-arm64-copy.dmg",
+            "arm64"
+        ));
+        assert!(!release_asset_matches_arch(
+            "Other-0.2.4-arm64.dmg",
+            "arm64"
+        ));
+        assert!(!release_asset_matches_arch(
+            "Sniper-0.2.4+build-arm64.dmg",
+            "arm64"
+        ));
+    }
+
+    #[test]
+    fn self_update_system_tool_paths_are_absolute() {
+        for path in [
+            HDIUTIL_PATH,
+            DITTO_PATH,
+            CODESIGN_PATH,
+            SPCTL_PATH,
+            PLIST_BUDDY_PATH,
+            SH_PATH,
+        ] {
+            assert!(path.starts_with('/'), "{path} should be absolute");
+        }
+    }
+
+    #[test]
+    fn update_asset_selection_falls_back_to_universal_dmg() {
+        let assets = vec![
+            asset("Sniper-0.2.4.zip"),
+            asset("Sniper-0.2.4-universal.dmg"),
+        ];
+
+        let selected = select_release_dmg_asset(&assets, "v0.2.4").unwrap();
+
+        assert_eq!(selected.name, "Sniper-0.2.4-universal.dmg");
+    }
+
+    #[test]
+    fn update_asset_selection_ignores_stale_native_asset_for_latest_tag() {
+        let native = native_release_asset_arch();
+        let assets = vec![
+            asset(&format!("Sniper-0.2.4-{native}.dmg")),
+            asset("Sniper-0.2.5-universal.dmg"),
+        ];
+
+        let selected = select_release_dmg_asset(&assets, "v0.2.5").unwrap();
+
+        assert_eq!(selected.name, "Sniper-0.2.5-universal.dmg");
+    }
+
+    #[test]
+    fn update_asset_selection_prefers_current_native_over_current_universal() {
+        let native = native_release_asset_arch();
+        let assets = vec![
+            asset("Sniper-0.2.5-universal.dmg"),
+            asset(&format!("Sniper-0.2.5-{native}.dmg")),
+        ];
+
+        let selected = select_release_dmg_asset(&assets, "v0.2.5").unwrap();
+
+        assert_eq!(selected.name, format!("Sniper-0.2.5-{native}.dmg"));
+    }
+
+    #[test]
+    fn update_asset_selection_rejects_misleading_universal_dmg() {
+        let assets = vec![
+            asset("Sniper-0.2.4.zip"),
+            asset("Sniper-0.2.4-not-universal.dmg"),
+        ];
+
+        assert!(select_release_dmg_asset(&assets, "v0.2.4").is_none());
+    }
+
+    #[test]
+    fn self_update_bundle_eligibility_rejects_dmg_and_translocation_paths() {
+        assert!(!self_update_bundle_is_writable(Path::new(
+            "/Volumes/Sniper/Sniper.app"
+        )));
+        assert!(!self_update_bundle_is_writable(Path::new(
+            "/private/var/folders/xx/AppTranslocation/123/Sniper.app"
+        )));
+    }
+
+    #[test]
+    fn self_update_bundle_eligibility_accepts_writable_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "sniper-self-update-eligibility-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let app = root.join("Sniper.app");
+
+        assert!(self_update_bundle_is_writable(&app));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_asset_selection_rejects_explicit_non_native_arch_dmg() {
+        let native = native_release_asset_arch();
+        let other = if native == "arm64" { "x86_64" } else { "arm64" };
+        let assets = vec![
+            asset("Sniper-0.2.4.zip"),
+            asset(&format!("Sniper-0.2.4-{other}.dmg")),
+        ];
+
+        assert!(select_release_dmg_asset(&assets, "v0.2.4").is_none());
+    }
+
+    #[test]
+    fn update_asset_selection_rejects_unsuffixed_dmg_fallback() {
+        let native = native_release_asset_arch();
+        let other = if native == "arm64" { "x86_64" } else { "arm64" };
+        let assets = vec![
+            asset("Sniper-0.2.4.dmg"),
+            asset(&format!("Sniper-0.2.4-{other}.dmg")),
+        ];
+
+        assert!(select_release_dmg_asset(&assets, "v0.2.4").is_none());
+    }
+
+    #[test]
+    fn self_update_release_gate_requires_newer_version() {
+        assert!(ensure_release_is_newer("0.2.4", "v0.2.5").is_ok());
+        assert!(ensure_release_is_newer("0.2.4", "0.2.4").is_err());
+        assert!(ensure_release_is_newer("0.2.4", "v0.2.3").is_err());
+    }
+
+    #[test]
+    fn self_update_guard_rejects_concurrent_updates() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-update-guard-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+
+        let first = state.begin_self_update().unwrap();
+        assert!(state.begin_self_update().is_err());
+        drop(first);
+        assert!(state.begin_self_update().is_ok());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn self_update_guard_stays_latched_after_restart_is_pending() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-update-latched-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+
+        let mut first = state.begin_self_update().unwrap();
+        first.keep_latched();
+        drop(first);
+
+        assert!(state.begin_self_update().is_err());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn activating_session_updates_active_context_metadata_before_persist() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-activate-session-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let created = state
+            .create_session(Some("Review".to_string()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        let activated = state.activate_session(created.id).await.unwrap();
+        let touched_last_opened_at = activated.last_opened_at;
+        state.persist_active_session().await.unwrap();
+        let summary = state
+            .list_sessions()
+            .into_iter()
+            .find(|session| session.id == created.id)
+            .unwrap();
+
+        assert_eq!(summary.last_opened_at, touched_last_opened_at);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn self_update_artifact_guard_removes_tmp_dir_on_drop() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("sniper-update-artifacts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("download.dmg"), b"partial").unwrap();
+
+        {
+            let _guard = UpdateArtifactGuard::new(tmp_dir.clone());
+        }
+
+        assert!(!tmp_dir.exists());
+    }
+
+    #[test]
+    fn self_update_identity_check_pins_bundle_executable_and_version() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sniper-identity-{}", uuid::Uuid::new_v4()));
+        let app_dir = temp_dir.join("Sniper.app");
+        write_test_info_plist(
+            &app_dir,
+            EXPECTED_APP_BUNDLE_IDENTIFIER,
+            EXPECTED_APP_EXECUTABLE,
+            "0.2.5",
+        );
+
+        verify_app_identity(&app_dir, "v0.2.5", "test app").unwrap();
+
+        write_test_info_plist(
+            &app_dir,
+            "com.example.other",
+            EXPECTED_APP_EXECUTABLE,
+            "0.2.5",
+        );
+        assert!(verify_app_identity(&app_dir, "v0.2.5", "test app").is_err());
+
+        write_test_info_plist(
+            &app_dir,
+            EXPECTED_APP_BUNDLE_IDENTIFIER,
+            "OtherExecutable",
+            "0.2.5",
+        );
+        assert!(verify_app_identity(&app_dir, "v0.2.5", "test app").is_err());
+
+        write_test_info_plist(
+            &app_dir,
+            EXPECTED_APP_BUNDLE_IDENTIFIER,
+            EXPECTED_APP_EXECUTABLE,
+            "0.2.4",
+        );
+        assert!(verify_app_identity(&app_dir, "v0.2.5", "test app").is_err());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn self_update_installer_waits_then_replaces_with_rollback() {
+        let script = update_installer_script();
+        let wait_pos = script
+            .find("while kill -0 \"$pid\"")
+            .expect("installer should wait for the old process");
+        let ditto_pos = script
+            .find("/usr/bin/ditto \"$staged\" \"$bundle\"")
+            .expect("installer should copy the staged app");
+        assert!(wait_pos < ditto_pos);
+        assert!(script.contains("mv \"$bundle\" \"$backup\""));
+        assert!(script.contains("if ! mv \"$bundle\" \"$backup\""));
+        assert!(script.contains("mv \"$backup\" \"$bundle\""));
+        assert!(script.contains("/usr/bin/codesign --verify --deep --strict \"$bundle\""));
+        assert!(script.contains("v*|V*) expected_version="));
+        assert!(script.contains("v*|V*) installed_version="));
+    }
+
+    #[test]
+    fn self_update_team_identifier_parser_rejects_missing_or_wrong_team() {
+        assert_eq!(
+            parse_codesign_team_identifier(
+                "Executable=/Applications/Sniper.app/Contents/MacOS/Sniper\nTeamIdentifier=ABCDE12345\n"
+            ),
+            Some("ABCDE12345".to_string())
+        );
+        assert_eq!(
+            parse_codesign_team_identifier("TeamIdentifier=not set\n"),
+            None
+        );
+        assert_eq!(parse_codesign_team_identifier("Authority=Ad Hoc\n"), None);
+    }
+
+    fn write_test_info_plist(
+        app_dir: &std::path::Path,
+        bundle_id: &str,
+        executable: &str,
+        version: &str,
+    ) {
+        let contents_dir = app_dir.join("Contents");
+        std::fs::create_dir_all(&contents_dir).unwrap();
+        std::fs::write(
+            contents_dir.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>{bundle_id}</string>
+  <key>CFBundleExecutable</key>
+  <string>{executable}</string>
+  <key>CFBundleShortVersionString</key>
+  <string>{version}</string>
+</dict>
+</plist>
+"#
+            ),
+        )
+        .unwrap();
     }
 }

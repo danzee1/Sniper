@@ -11,9 +11,12 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, RwLock};
 use tracing::warn;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use regex::{Regex, RegexBuilder};
 
@@ -55,6 +58,7 @@ pub struct TransactionListPage {
     pub items: Vec<TransactionSummary>,
     pub total: usize,
     pub filtered_total: Option<usize>,
+    pub hidden_connect_total: Option<usize>,
     pub offset: usize,
     pub limit: usize,
     pub has_more: bool,
@@ -62,10 +66,20 @@ pub struct TransactionListPage {
 
 pub struct TransactionStore {
     inner: RwLock<StoreInner>,
+    insert_lock: AsyncMutex<()>,
     events: broadcast::Sender<TransactionSummary>,
     journal_tx: Option<mpsc::Sender<TransactionJournalCommand>>,
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AnnotationUpdate {
+    pub summary: TransactionSummary,
+    pub previous_color_tag: Option<String>,
+    pub previous_user_note: Option<String>,
+    pub applied_color_tag: Option<String>,
+    pub applied_user_note: Option<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -81,10 +95,14 @@ pub(crate) enum TransactionJournalEntry {
         color_tag: Option<NullableStringPatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_note: Option<NullableStringPatch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_color_tag: Option<NullableStringPatch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_user_note: Option<NullableStringPatch>,
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NullableStringPatch {
     Set(String),
@@ -229,8 +247,7 @@ impl StoreInner {
             return;
         }
 
-        let slack = if max_entries < 4096 { 0 } else { 1024 };
-        if self.entries.len() <= max_entries.saturating_add(slack) {
+        if self.entries.len() <= max_entries {
             return;
         }
 
@@ -267,6 +284,7 @@ impl TransactionStore {
         let max_seq = inner.entries.iter().map(|r| r.sequence).max().unwrap_or(0);
         Self {
             inner: RwLock::new(inner),
+            insert_lock: AsyncMutex::new(()),
             events,
             journal_tx: None,
             max_entries,
@@ -285,7 +303,7 @@ impl TransactionStore {
     }
 
     pub async fn insert(&self, mut record: TransactionRecord) {
-        let mut inner = self.inner.write().await;
+        let _insert_guard = self.insert_lock.lock().await;
         record.sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let journal_line = self
             .journal_tx
@@ -295,11 +313,16 @@ impl TransactionStore {
             if let Err(error) = append_transaction_journal(tx, line).await {
                 warn!(
                     ?error,
-                    "failed to append transaction insert journal entry before storing"
+                    "failed to append transaction insert journal entry before storing; record will rely on full snapshot persistence"
                 );
             }
+        } else if self.journal_tx.is_some() {
+            warn!(
+                "failed to encode transaction insert journal entry before storing; record will rely on full snapshot persistence"
+            );
         }
         let summary = record.summary();
+        let mut inner = self.inner.write().await;
         inner.push(record, summary.clone());
         if let Some(max_entries) = self.max_entries {
             inner.trim_to_max_entries(max_entries);
@@ -336,14 +359,23 @@ impl TransactionStore {
             .map(|value| value.to_ascii_lowercase());
         let limit = filters.limit.unwrap_or(5000);
         let offset = filters.offset.unwrap_or(0);
-        let before_sequence = filters.before_sequence;
+        let before_sequence = if can_stream_in_storage_order(filters) {
+            filters.before_sequence
+        } else {
+            None
+        };
         let advanced_matcher = AdvancedSearchMatcher::new(filters);
 
-        if can_stream_in_storage_order(filters) {
+        let summaries = {
             let inner = self.inner.read().await;
-            let total = inner.summaries.len();
-            let scan_end = newest_scan_end(&inner.summaries, before_sequence);
+            inner.summaries.clone()
+        };
+        let total = summaries.len();
+
+        if can_stream_in_storage_order(filters) {
+            let scan_end = newest_scan_end(&summaries, before_sequence);
             let mut matched_count = 0usize;
+            let mut hidden_connect_count = 0usize;
             let mut exhausted = true;
             let mut items = if limit == 0 {
                 Vec::new()
@@ -356,7 +388,25 @@ impl TransactionStore {
                 Some(offset.saturating_add(limit).saturating_add(1))
             };
 
-            for cached in inner.summaries[..scan_end].iter().rev() {
+            for cached in summaries[..scan_end].iter().rev() {
+                if filters.hide_connect
+                    && cached.summary.method == "CONNECT"
+                    && matches_filters(
+                        cached,
+                        query.as_deref(),
+                        method.as_deref(),
+                        host.as_deref(),
+                        status_pred.as_ref(),
+                        since_dt.as_ref(),
+                        mime.as_deref(),
+                        None,
+                        filters,
+                        advanced_matcher.as_ref(),
+                        false,
+                    )
+                {
+                    hidden_connect_count += 1;
+                }
                 if !matches_filters(
                     cached,
                     query.as_deref(),
@@ -368,6 +418,7 @@ impl TransactionStore {
                     None,
                     filters,
                     advanced_matcher.as_ref(),
+                    filters.hide_connect,
                 ) {
                     continue;
                 }
@@ -389,20 +440,22 @@ impl TransactionStore {
                 items,
                 total,
                 filtered_total: (exhausted && before_sequence.is_none()).then_some(matched_count),
+                hidden_connect_total: (filters.hide_connect
+                    && exhausted
+                    && before_sequence.is_none())
+                .then_some(hidden_connect_count),
                 offset,
                 limit,
             };
         }
 
-        let inner = self.inner.read().await;
-        let total = inner.summaries.len();
-
-        let mut filtered: Vec<_> = inner
-            .summaries
-            .iter()
-            .rev()
-            .filter(|cached| {
-                matches_filters(
+        let mut hidden_connect_count = 0usize;
+        let mut filtered = Vec::new();
+        for cached in summaries.iter().rev() {
+            if filters.hide_connect
+                && before_sequence.is_none()
+                && cached.summary.method == "CONNECT"
+                && matches_filters(
                     cached,
                     query.as_deref(),
                     method.as_deref(),
@@ -413,9 +466,27 @@ impl TransactionStore {
                     before_sequence,
                     filters,
                     advanced_matcher.as_ref(),
+                    false,
                 )
-            })
-            .collect();
+            {
+                hidden_connect_count += 1;
+            }
+            if matches_filters(
+                cached,
+                query.as_deref(),
+                method.as_deref(),
+                host.as_deref(),
+                status_pred.as_ref(),
+                since_dt.as_ref(),
+                mime.as_deref(),
+                before_sequence,
+                filters,
+                advanced_matcher.as_ref(),
+                filters.hide_connect,
+            ) {
+                filtered.push(cached);
+            }
+        }
         let filtered_total = filtered.len();
 
         sort_filtered_records(&mut filtered, filters);
@@ -441,6 +512,8 @@ impl TransactionStore {
             items,
             total,
             filtered_total: before_sequence.is_none().then_some(filtered_total),
+            hidden_connect_total: (filters.hide_connect && before_sequence.is_none())
+                .then_some(hidden_connect_count),
             offset,
             limit,
         }
@@ -461,9 +534,19 @@ impl TransactionStore {
         &self,
         limit: Option<usize>,
     ) -> io::Result<Vec<TransactionRecord>> {
+        let _insert_guard = self.insert_lock.lock().await;
         let inner = self.inner.write().await;
         if let Some(tx) = &self.journal_tx {
-            rotate_transaction_journal(tx)?;
+            if let Err(error) = rotate_transaction_journal(tx) {
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    warn!(
+                        ?error,
+                        "transaction journal writer stopped; continuing with full snapshot"
+                    );
+                } else {
+                    return Err(error);
+                }
+            }
         }
         Ok(snapshot_entries(&inner, limit))
     }
@@ -473,11 +556,16 @@ impl TransactionStore {
         id: Uuid,
         color_tag: Option<Option<String>>,
         user_note: Option<Option<String>>,
-    ) -> Option<TransactionSummary> {
+    ) -> Option<AnnotationUpdate> {
         let color_patch = nullable_string_patch(color_tag.as_ref());
         let note_patch = nullable_string_patch(user_note.as_ref());
-        let mut inner = self.inner.write().await;
-        let index = *inner.by_id.get(&id)?;
+        let _mutation_guard = self.insert_lock.lock().await;
+        let (previous_color_tag, previous_user_note) = {
+            let inner = self.inner.read().await;
+            let index = *inner.by_id.get(&id)?;
+            let record = inner.entries.get(index)?;
+            (record.color_tag.clone(), record.user_note.clone())
+        };
         if color_patch.is_some() || note_patch.is_some() {
             if let Some(tx) = &self.journal_tx {
                 if let Some(line) =
@@ -485,6 +573,12 @@ impl TransactionStore {
                         id,
                         color_tag: color_patch,
                         user_note: note_patch,
+                        previous_color_tag: Some(nullable_string_value_patch(
+                            previous_color_tag.clone(),
+                        )),
+                        previous_user_note: Some(nullable_string_value_patch(
+                            previous_user_note.clone(),
+                        )),
                     })
                 {
                     if let Err(error) = append_transaction_journal(tx, line).await {
@@ -496,6 +590,8 @@ impl TransactionStore {
                 }
             }
         }
+        let mut inner = self.inner.write().await;
+        let index = *inner.by_id.get(&id)?;
         let record = inner.entries.get_mut(index)?;
         if let Some(tag) = color_tag {
             record.color_tag = tag;
@@ -504,8 +600,80 @@ impl TransactionStore {
             record.user_note = note;
         }
         let summary = record.summary();
+        let applied_color_tag = record.color_tag.clone();
+        let applied_user_note = record.user_note.clone();
         inner.summaries[index] = CachedSummary::new(summary.clone());
-        Some(summary)
+        Some(AnnotationUpdate {
+            summary,
+            previous_color_tag,
+            previous_user_note,
+            applied_color_tag,
+            applied_user_note,
+        })
+    }
+
+    pub async fn restore_annotations_if_current(
+        &self,
+        id: Uuid,
+        expected_color_tag: Option<String>,
+        expected_user_note: Option<String>,
+        previous_color_tag: Option<String>,
+        previous_user_note: Option<String>,
+    ) -> io::Result<bool> {
+        let _mutation_guard = self.insert_lock.lock().await;
+        {
+            let inner = self.inner.read().await;
+            let Some(index) = inner.by_id.get(&id).copied() else {
+                return Ok(false);
+            };
+            let Some(record) = inner.entries.get(index) else {
+                return Ok(false);
+            };
+            if record.color_tag != expected_color_tag || record.user_note != expected_user_note {
+                return Ok(false);
+            }
+        }
+        let mut journal_error = None;
+        if let Some(tx) = &self.journal_tx {
+            let line = encode_transaction_journal_line(&TransactionJournalEntry::Annotation {
+                id,
+                color_tag: Some(nullable_string_value_patch(previous_color_tag.clone())),
+                user_note: Some(nullable_string_value_patch(previous_user_note.clone())),
+                previous_color_tag: Some(nullable_string_value_patch(expected_color_tag.clone())),
+                previous_user_note: Some(nullable_string_value_patch(expected_user_note.clone())),
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "failed to encode transaction annotation rollback journal entry",
+                )
+            });
+            match line {
+                Ok(line) => {
+                    if let Err(error) = append_transaction_journal(tx, line).await {
+                        journal_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    journal_error = Some(error);
+                }
+            }
+        }
+        let mut inner = self.inner.write().await;
+        let Some(index) = inner.by_id.get(&id).copied() else {
+            return Ok(false);
+        };
+        let Some(record) = inner.entries.get_mut(index) else {
+            return Ok(false);
+        };
+        record.color_tag = previous_color_tag;
+        record.user_note = previous_user_note;
+        let summary = record.summary();
+        inner.summaries[index] = CachedSummary::new(summary);
+        if let Some(error) = journal_error {
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub async fn replace_all(&self, records: Vec<TransactionRecord>) {
@@ -568,36 +736,84 @@ fn snapshot_entries(inner: &StoreInner, limit: Option<usize>) -> Vec<Transaction
     }
 }
 
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    tighten_private_dir(path)
+}
+
+#[cfg(unix)]
+fn tighten_private_dir(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn tighten_private_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn open_private_append_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    tighten_private_file(path)?;
+    Ok(file)
+}
+
+fn open_private_truncate_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    tighten_private_file(path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn tighten_private_file(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn tighten_private_file(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 fn start_transaction_journal_writer(
     journal_path: PathBuf,
 ) -> Option<mpsc::Sender<TransactionJournalCommand>> {
     let (tx, rx) = mpsc::channel::<TransactionJournalCommand>();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<io::Result<()>>(1);
     let spawn_result = thread::Builder::new()
         .name("sniper-transaction-journal".to_string())
         .spawn(move || {
             if let Some(parent) = journal_path.parent() {
-                if let Err(error) = fs::create_dir_all(parent) {
+                if let Err(error) = create_private_dir_all(parent) {
                     warn!(?error, path = %parent.display(), "failed to create transaction journal directory");
+                    let _ = ready_tx.send(Err(error));
                     return;
                 }
             }
 
-            let mut file = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&journal_path)
-            {
+            let mut file = match open_private_append_file(&journal_path) {
                 Ok(file) => file,
                 Err(error) => {
                     warn!(?error, path = %journal_path.display(), "failed to open transaction journal");
+                    let _ = ready_tx.send(Err(error));
                     return;
                 }
             };
+            let _ = ready_tx.send(Ok(()));
 
             while let Ok(command) = rx.recv() {
                 match command {
                     TransactionJournalCommand::Append { line, ack } => {
-                        let result = file.write_all(&line);
+                        let result = file
+                            .write_all(&line)
+                            .and_then(|()| file.flush())
+                            .and_then(|()| file.sync_data());
                         let failed = result.is_err();
                         if let Err(error) = &result {
                             warn!(?error, path = %journal_path.display(), "failed to append transaction journal entry");
@@ -625,7 +841,17 @@ fn start_transaction_journal_writer(
         });
 
     match spawn_result {
-        Ok(_) => Some(tx),
+        Ok(_) => match ready_rx.recv() {
+            Ok(Ok(())) => Some(tx),
+            Ok(Err(_)) => None,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "transaction journal writer stopped before startup completed"
+                );
+                None
+            }
+        },
         Err(error) => {
             warn!(?error, "failed to spawn transaction journal writer");
             None
@@ -684,18 +910,22 @@ fn rotate_transaction_journal_file(file: &mut fs::File, journal_path: &Path) -> 
     if !active.is_empty() {
         let checkpoint_path = transaction_journal_checkpoint_path(journal_path);
         if let Some(parent) = checkpoint_path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
-        let mut checkpoint = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&checkpoint_path)?;
+        let mut checkpoint = open_private_truncate_file(&checkpoint_path)?;
         checkpoint.write_all(&active)?;
-        checkpoint.flush()?;
+        checkpoint.sync_all()?;
+        if let Some(parent) = checkpoint_path.parent() {
+            sync_directory(parent)?;
+        }
     }
 
     file.set_len(0)?;
-    file.flush()
+    file.sync_all()
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path).and_then(|directory| directory.sync_all())
 }
 
 pub(crate) fn transaction_journal_checkpoint_path(journal_path: &Path) -> PathBuf {
@@ -732,6 +962,13 @@ fn nullable_string_patch(value: Option<&Option<String>>) -> Option<NullableStrin
         Some(value) => NullableStringPatch::Set(value.clone()),
         None => NullableStringPatch::Clear,
     })
+}
+
+fn nullable_string_value_patch(value: Option<String>) -> NullableStringPatch {
+    match value {
+        Some(value) => NullableStringPatch::Set(value),
+        None => NullableStringPatch::Clear,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -816,6 +1053,7 @@ fn matches_filters(
     before_sequence: Option<u64>,
     filters: &ListFilters,
     advanced_matcher: Option<&AdvancedSearchMatcher>,
+    hide_connect: bool,
 ) -> bool {
     let summary = &cached.summary;
 
@@ -859,7 +1097,7 @@ fn matches_filters(
         return false;
     }
 
-    if filters.hide_connect && summary.method == "CONNECT" {
+    if hide_connect && summary.method == "CONNECT" {
         return false;
     }
 
@@ -871,7 +1109,7 @@ fn matches_filters(
         return false;
     }
 
-    if filters.only_notes && summary.note_count == 0 {
+    if filters.only_notes && summary.note_count == 0 && !summary.has_user_note {
         return false;
     }
 
@@ -1240,6 +1478,350 @@ mod tests {
     use super::*;
     use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
 
+    fn test_record(host: &str) -> TransactionRecord {
+        let message = MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        TransactionRecord::http(
+            Utc::now(),
+            "GET".into(),
+            "https".into(),
+            host.into(),
+            "/".into(),
+            Some(200),
+            1,
+            message.clone(),
+            Some(message),
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn transaction_journal_writer_reports_open_failure() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-store-journal-open-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let journal_path = data_dir.join("transactions.journal");
+        std::fs::create_dir_all(&journal_path).unwrap();
+
+        let writer = start_transaction_journal_writer(journal_path);
+
+        assert!(writer.is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_journal_writer_creates_private_file_and_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-store-journal-private-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let journal_path = data_dir.join("transactions.journal");
+
+        let writer = start_transaction_journal_writer(journal_path.clone()).unwrap();
+        drop(writer);
+
+        let dir_mode = std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&journal_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_persistence_continues_when_journal_writer_stopped() {
+        let mut store =
+            TransactionStore::from_records_with_max_entries(vec![test_record("example.com")], None);
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        store.journal_tx = Some(tx);
+
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].host, "example.com");
+    }
+
+    #[tokio::test]
+    async fn insert_keeps_memory_and_snapshot_when_journal_append_fails() {
+        let mut store = TransactionStore::from_records_with_max_entries(Vec::new(), None);
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        store.journal_tx = Some(tx);
+
+        let record = test_record("lost.example");
+        store.insert(record).await;
+
+        let listed = store.list(&ListFilters::default()).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].host, "lost.example");
+
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].host, "lost.example");
+    }
+
+    #[tokio::test]
+    async fn insert_waiting_on_journal_does_not_block_history_reads() {
+        use std::{sync::Arc, time::Duration};
+
+        let mut store = TransactionStore::from_records_with_max_entries(
+            vec![test_record("existing.example")],
+            None,
+        );
+        let (tx, rx) = mpsc::channel();
+        store.journal_tx = Some(tx);
+        let store = Arc::new(store);
+
+        let insert_task = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store.insert(test_record("pending.example")).await;
+            })
+        };
+
+        let command = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let ack = match command {
+            TransactionJournalCommand::Append { ack: Some(ack), .. } => ack,
+            _ => panic!("expected journal append command with ack"),
+        };
+
+        let listed = tokio::time::timeout(
+            Duration::from_millis(200),
+            store.list(&ListFilters::default()),
+        )
+        .await
+        .expect("history reads should not wait on pending journal append");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].host, "existing.example");
+
+        let mut snapshot_task = Box::pin({
+            let store = store.clone();
+            tokio::spawn(async move { store.snapshot_for_persistence(None).await })
+        });
+        tokio::time::timeout(Duration::from_millis(200), &mut snapshot_task)
+            .await
+            .expect_err("snapshot compaction should wait for pending journaled insert");
+
+        ack.send(Ok(())).unwrap();
+        insert_task.await.unwrap();
+
+        let listed = store.list(&ListFilters::default()).await;
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].host, "pending.example");
+
+        let snapshot = snapshot_task.await.unwrap().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].host, "pending.example");
+    }
+
+    #[tokio::test]
+    async fn annotation_update_waiting_on_journal_does_not_block_history_reads() {
+        use std::{sync::Arc, time::Duration};
+
+        let mut store = TransactionStore::from_records_with_max_entries(
+            vec![test_record("existing.example")],
+            None,
+        );
+        let id = store.snapshot(None).await[0].id;
+        let (tx, rx) = mpsc::channel();
+        store.journal_tx = Some(tx);
+        let store = Arc::new(store);
+
+        let update_task = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .update_annotations(id, Some(Some("yellow".to_string())), None)
+                    .await
+            })
+        };
+
+        let command = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let ack = match command {
+            TransactionJournalCommand::Append { ack: Some(ack), .. } => ack,
+            _ => panic!("expected journal append command with ack"),
+        };
+
+        let listed = tokio::time::timeout(
+            Duration::from_millis(200),
+            store.list(&ListFilters::default()),
+        )
+        .await
+        .expect("history reads should not wait on pending annotation journal append");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].host, "existing.example");
+        assert!(listed[0].color_tag.is_none());
+
+        ack.send(Ok(())).unwrap();
+        let update = update_task.await.unwrap().unwrap();
+        assert_eq!(update.applied_color_tag.as_deref(), Some("yellow"));
+
+        let listed = store.list(&ListFilters::default()).await;
+        assert_eq!(listed[0].color_tag.as_deref(), Some("yellow"));
+    }
+
+    #[tokio::test]
+    async fn annotation_restore_appends_rollback_journal_entry() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-store-annotation-rollback-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let journal_path = data_dir.join("transactions.journal");
+        let mut record = test_record("example.com");
+        record.color_tag = Some("old".to_string());
+        let id = record.id;
+        let store =
+            TransactionStore::from_records_with_journal(vec![record], journal_path.clone(), None);
+
+        let update = store
+            .update_annotations(id, Some(Some("new".to_string())), Some(None))
+            .await
+            .unwrap();
+        assert!(store
+            .restore_annotations_if_current(
+                id,
+                update.applied_color_tag,
+                update.applied_user_note,
+                update.previous_color_tag,
+                update.previous_user_note,
+            )
+            .await
+            .unwrap());
+
+        let lines = std::fs::read_to_string(&journal_path).unwrap();
+        let entries = lines
+            .lines()
+            .map(|line| serde_json::from_str::<TransactionJournalEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        let Some(TransactionJournalEntry::Annotation {
+            color_tag,
+            user_note,
+            ..
+        }) = entries.last()
+        else {
+            panic!("expected annotation rollback journal entry");
+        };
+        assert!(matches!(
+            color_tag,
+            Some(NullableStringPatch::Set(value)) if value == "old"
+        ));
+        assert!(matches!(user_note, Some(NullableStringPatch::Clear)));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn annotation_restore_rolls_back_memory_when_rollback_journal_append_fails() {
+        let mut record = test_record("example.com");
+        record.color_tag = Some("old".to_string());
+        let id = record.id;
+        let mut store = TransactionStore::from_records_with_max_entries(vec![record], None);
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        store.journal_tx = Some(tx);
+
+        let update = store
+            .update_annotations(id, Some(Some("new".to_string())), Some(None))
+            .await
+            .unwrap();
+        let error = store
+            .restore_annotations_if_current(
+                id,
+                update.applied_color_tag,
+                update.applied_user_note,
+                update.previous_color_tag,
+                update.previous_user_note,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.color_tag.as_deref(), Some("old"));
+        assert_eq!(stored.user_note, None);
+    }
+
+    #[tokio::test]
+    async fn list_page_reports_hidden_connect_total() {
+        let mut connect = test_record("connect.example:443");
+        connect.method = "CONNECT".to_string();
+        connect.path = "connect.example:443".to_string();
+        let http = test_record("http.example:443");
+        let store = TransactionStore::from_records(vec![connect, http]);
+
+        let page = store
+            .list_page(&ListFilters {
+                hide_connect: true,
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.filtered_total, Some(1));
+        assert_eq!(page.hidden_connect_total, Some(1));
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].host, "http.example:443");
+    }
+
+    #[tokio::test]
+    async fn before_sequence_is_ignored_for_non_index_sorts() {
+        let store = TransactionStore::from_records(vec![
+            test_record("c.example"),
+            test_record("b.example"),
+            test_record("a.example"),
+        ]);
+
+        let first_page = store
+            .list_page(&ListFilters {
+                limit: Some(1),
+                sort_key: Some("host".into()),
+                sort_direction: Some("asc".into()),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(first_page.items[0].host, "a.example");
+
+        let second_page = store
+            .list_page(&ListFilters {
+                limit: Some(1),
+                offset: Some(1),
+                before_sequence: Some(first_page.items[0].sequence),
+                sort_key: Some("host".into()),
+                sort_direction: Some("asc".into()),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].host, "b.example");
+    }
+
     #[tokio::test]
     async fn store_respects_capacity_and_filters() {
         let store = TransactionStore::new();
@@ -1248,6 +1830,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: crate::model::BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -1356,6 +1939,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_notes_filter_includes_user_notes() {
+        let mut user_noted = test_record("user-note.local");
+        user_noted.user_note = Some("manual note".to_string());
+        let internal_noted = TransactionRecord::http(
+            Utc::now(),
+            "GET".into(),
+            "https".into(),
+            "internal-note.local".into(),
+            "/".into(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: Vec::new(),
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec!["scanner note".to_string()],
+            None,
+            None,
+        );
+        let unnoted = test_record("plain.local");
+        let store = TransactionStore::from_records(vec![unnoted, user_noted, internal_noted]);
+
+        let page = store
+            .list_page(&ListFilters {
+                only_notes: true,
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await;
+        let hosts = page
+            .items
+            .iter()
+            .map(|item| item.host.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(hosts.contains(&"user-note.local"));
+        assert!(hosts.contains(&"internal-note.local"));
+        assert!(!hosts.contains(&"plain.local"));
+    }
+
+    #[tokio::test]
     async fn store_applies_live_retention_limit() {
         let store = TransactionStore::from_records_with_max_entries(Vec::new(), Some(2));
         let empty_message = MessageRecord {
@@ -1363,6 +1994,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -1377,7 +2009,7 @@ mod tests {
                     format!("{}.local", index),
                     format!("/{index}"),
                     Some(200),
-                    index,
+                    index as u64,
                     empty_message.clone(),
                     None,
                     Vec::new(),
@@ -1395,6 +2027,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_applies_large_retention_limit_exactly() {
+        let max_entries = 5000;
+        let store = TransactionStore::from_records_with_max_entries(Vec::new(), Some(max_entries));
+        let empty_message = MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+
+        for index in 0..(max_entries + 32) {
+            store
+                .insert(TransactionRecord::http(
+                    Utc::now(),
+                    "GET".into(),
+                    "https".into(),
+                    format!("{index}.local"),
+                    format!("/{index}"),
+                    Some(200),
+                    index as u64,
+                    empty_message.clone(),
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                ))
+                .await;
+        }
+
+        let page = store
+            .list_page(&ListFilters {
+                limit: Some(max_entries + 100),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(page.total, max_entries);
+        assert_eq!(page.items.len(), max_entries);
+        assert_eq!(page.items[0].host, "5031.local");
+        assert_eq!(
+            page.items.last().map(|item| item.host.as_str()),
+            Some("32.local")
+        );
+    }
+
+    #[tokio::test]
     async fn storage_order_paging_uses_sequence_cursor_without_duplicates() {
         let store = TransactionStore::new();
         let empty_message = MessageRecord {
@@ -1402,6 +2083,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -1490,6 +2172,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -1558,6 +2241,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -1618,6 +2302,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,
@@ -1669,6 +2354,7 @@ mod tests {
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
+            decoded_body_size: None,
             preview_truncated: false,
             content_type: None,
             content_decoded: false,

@@ -776,10 +776,14 @@
                     <input id="proxySettingOastServerUrl" type="text" placeholder="https://interact.sh" />
                     <small id="oastServerUrlHint">Interactsh-compatible server. Sniper auto-registers and polls for callbacks.</small>
                   </label>
-                  <label class="settings-field" id="oastTokenField">
+                  <div class="settings-field" id="oastTokenField">
                     <span>OAST token</span>
-                    <input id="proxySettingOastToken" type="text" placeholder="Server authentication token (optional)" />
-                  </label>
+                    <div class="settings-inline-control">
+                      <input id="proxySettingOastToken" type="text" placeholder="Server authentication token (optional)" />
+                      <button class="secondary-action" id="proxySettingOastClearToken" type="button">Clear</button>
+                    </div>
+                    <small id="proxySettingOastTokenHint"></small>
+                  </div>
                   <label class="settings-field">
                     <span>Polling interval (seconds)</span>
                     <input id="proxySettingOastInterval" type="number" min="1" max="300" value="5" />
@@ -968,6 +972,8 @@
                   <select id="wsMessageType" class="compact-field-inline ws-type-field">
                     <option value="text">Text</option>
                     <option value="binary">Binary</option>
+                    <option value="ping">Ping</option>
+                    <option value="pong">Pong</option>
                   </select>
                 </div>
               </div>

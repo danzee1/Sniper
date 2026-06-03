@@ -24,10 +24,11 @@ pub mod ui_settings;
 pub mod websocket;
 pub mod workspace;
 pub mod ws_replay;
+pub mod ws_tls;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::AppConfig;
 use state::AppState;
 use tracing::{error, info, warn};
@@ -40,6 +41,7 @@ pub async fn run() -> Result<()> {
 
 pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let state = Arc::new(AppState::new(config.clone())?);
+    let oast_task = oast::start_oast_poller_for_state(state.clone());
 
     info!(
         proxy_addr = %config.proxy_addr,
@@ -52,6 +54,10 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
 
     match proxy::run_proxy_listener(state.clone()).await {
         Ok(listener) => {
+            let proxy_addr = listener
+                .local_addr()
+                .context("failed to read bound proxy address")?;
+            state.set_active_proxy_addr(proxy_addr).await;
             state.set_proxy_online(true);
             state
                 .log_info(
@@ -59,20 +65,28 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                     "Sniper started",
                     format!(
                         "Proxy listener {} and UI listener {} are starting",
-                        config.proxy_addr, config.ui_addr
+                        proxy_addr, config.ui_addr
                     ),
                 )
                 .await;
 
             let proxy_state = state.clone();
+            let offline_state = state.clone();
             let proxy_task = tokio::spawn(async move {
                 if let Err(e) = proxy::serve_proxy(listener, proxy_state).await {
                     error!(?e, "proxy task stopped");
+                    proxy::mark_proxy_offline_after_task_exit(
+                        &offline_state,
+                        proxy_addr,
+                        "after initial proxy task stopped",
+                    )
+                    .await;
                 }
             });
+            state.set_proxy_task(proxy_task).await;
 
-            let api_result = api::run_api(state).await;
-            proxy_task.abort();
+            let api_result = run_api_until_shutdown(state.clone()).await;
+            shutdown_headless_runtime(&state, oast_task).await;
             api_result
         }
         Err(bind_error) => {
@@ -88,8 +102,57 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 )
                 .await;
 
-            api::run_api(state).await
+            let api_result = run_api_until_shutdown(state.clone()).await;
+            shutdown_headless_runtime(&state, oast_task).await;
+            api_result
         }
+    }
+}
+
+async fn run_api_until_shutdown(state: Arc<AppState>) -> Result<()> {
+    tokio::select! {
+        result = api::run_api(state) => result,
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(error) = signal {
+                warn!(?error, "failed to listen for shutdown signal");
+            } else {
+                info!("shutdown signal received");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn shutdown_headless_runtime(state: &AppState, oast_task: tokio::task::JoinHandle<()>) {
+    oast_task.abort();
+    if let Err(error) = oast_task.await {
+        if !error.is_cancelled() {
+            warn!(
+                ?error,
+                "OAST poller stopped with an error during headless shutdown"
+            );
+        }
+    }
+    state.ws_replay.disconnect_all().await;
+    state.abort_proxy_task().await;
+    proxy::close_live_websocket_relays(
+        state,
+        "Sniper headless shutdown closed the live WebSocket relay.",
+    )
+    .await;
+    proxy::drain_proxy_connections(Duration::from_secs(1)).await;
+    proxy::flush_pending_session_persists(state).await;
+    if let Err(error) = state.persist_active_session().await {
+        warn!(
+            ?error,
+            "failed to persist active session before headless shutdown"
+        );
+    }
+    if let Err(error) = runtime_state::remove_runtime_state(&state.config.data_dir) {
+        warn!(
+            ?error,
+            "failed to remove runtime state during headless shutdown"
+        );
     }
 }
 

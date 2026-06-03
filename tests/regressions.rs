@@ -144,6 +144,120 @@ async fn replay_rejects_truncated_captured_request_reuse() {
 }
 
 #[tokio::test]
+async fn replay_rejects_mutated_truncated_captured_request_reuse() {
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 16,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-regression-replay-mutated-truncated-{}",
+            Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+    let session = state.session().await;
+
+    let mut request_headers = HeaderMap::new();
+    request_headers.insert("host", "example.test".parse().unwrap());
+    let mut captured_request =
+        MessageRecord::from_headers_and_body(&request_headers, b"prefix-$payload$-rest", 7);
+    captured_request.preview_truncated = true;
+    let source_record = TransactionRecord::http(
+        chrono::Utc::now(),
+        "POST".to_string(),
+        "http".to_string(),
+        "example.test".to_string(),
+        "/upload".to_string(),
+        Some(200),
+        1,
+        captured_request,
+        None,
+        Vec::new(),
+        None,
+        None,
+    );
+    session.store.insert(source_record).await;
+    let source_id = session.store.list(&ListFilters::default()).await[0].id;
+
+    let request = EditableRequest {
+        scheme: "http".to_string(),
+        host: "example.test".to_string(),
+        method: "POST".to_string(),
+        path: "/upload".to_string(),
+        headers: vec![sniper::model::HeaderRecord {
+            name: "host".to_string(),
+            value: "example.test".to_string(),
+        }],
+        body: "prefix-x".to_string(),
+        body_encoding: BodyEncoding::Utf8,
+        preview_truncated: true,
+    };
+
+    let error = send_replay_request(state, request, None, Some(source_id), None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("truncated at the preview cap"));
+}
+
+#[tokio::test]
+async fn replay_rejects_short_edited_body_from_truncated_capture_even_when_flag_cleared() {
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 16,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-regression-replay-short-edited-truncated-{}",
+            Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+    let session = state.session().await;
+
+    let mut request_headers = HeaderMap::new();
+    request_headers.insert("host", "example.test".parse().unwrap());
+    let mut captured_request =
+        MessageRecord::from_headers_and_body(&request_headers, b"prefix-$payload$-rest", 7);
+    captured_request.preview_truncated = true;
+    let source_record = TransactionRecord::http(
+        chrono::Utc::now(),
+        "POST".to_string(),
+        "http".to_string(),
+        "example.test".to_string(),
+        "/upload".to_string(),
+        Some(200),
+        1,
+        captured_request,
+        None,
+        Vec::new(),
+        None,
+        None,
+    );
+    session.store.insert(source_record).await;
+    let source_id = session.store.list(&ListFilters::default()).await[0].id;
+
+    let request = EditableRequest {
+        scheme: "http".to_string(),
+        host: "example.test".to_string(),
+        method: "POST".to_string(),
+        path: "/upload".to_string(),
+        headers: vec![sniper::model::HeaderRecord {
+            name: "host".to_string(),
+            value: "example.test".to_string(),
+        }],
+        body: "prefix-x".to_string(),
+        body_encoding: BodyEncoding::Utf8,
+        preview_truncated: false,
+    };
+
+    let error = send_replay_request(state, request, None, Some(source_id), None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("truncated at the preview cap"));
+}
+
+#[tokio::test]
 async fn replay_preserves_custom_host_header() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
@@ -201,6 +315,136 @@ async fn replay_preserves_custom_host_header() {
 }
 
 #[tokio::test]
+async fn replay_target_override_uses_override_port_with_explicit_logical_port() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream_app = Router::new().fallback(get(|headers: HeaderMap| async move {
+        let host = headers
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        format!("upstream:{host}")
+    }));
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream, upstream_app).await.unwrap();
+    });
+
+    let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let trap_addr = trap.local_addr().unwrap();
+    let trap_app = Router::new().fallback(get(|| async { "trap" }));
+    let trap_handle = tokio::spawn(async move {
+        axum::serve(trap, trap_app).await.unwrap();
+    });
+
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-regression-replay-target-port-{}",
+            Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let logical_host = format!("logical.example.test:{}", trap_addr.port());
+    let request = EditableRequest {
+        scheme: "http".to_string(),
+        host: logical_host.clone(),
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        headers: vec![sniper::model::HeaderRecord {
+            name: "host".to_string(),
+            value: logical_host.clone(),
+        }],
+        body: String::new(),
+        body_encoding: BodyEncoding::Utf8,
+        preview_truncated: false,
+    };
+
+    let target = RequestTargetOverride {
+        scheme: "http".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: upstream_addr.port().to_string(),
+    };
+
+    let record = send_replay_request(state, request, Some(target), None, None)
+        .await
+        .unwrap();
+    let response_body = record.response.as_ref().expect("response should exist");
+    assert_eq!(record.host, logical_host);
+    assert_eq!(
+        response_body.body_preview,
+        format!("upstream:{logical_host}")
+    );
+
+    upstream_handle.abort();
+    trap_handle.abort();
+}
+
+#[tokio::test]
+async fn replay_traffic_is_passively_scanned() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream_app = Router::new().fallback(get(|| async {
+        (
+            [("content-type", "text/html")],
+            "<html><body>scan me</body></html>",
+        )
+    }));
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream, upstream_app).await.unwrap();
+    });
+
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-regression-replay-scan-{}",
+            Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+    let session = state.session().await;
+    let request = EditableRequest {
+        scheme: "http".to_string(),
+        host: upstream_addr.to_string(),
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        headers: vec![sniper::model::HeaderRecord {
+            name: "host".to_string(),
+            value: upstream_addr.to_string(),
+        }],
+        body: String::new(),
+        body_encoding: BodyEncoding::Utf8,
+        preview_truncated: false,
+    };
+
+    let record = send_replay_request(state, request, None, None, None)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let findings = session.scanner.list(None).await;
+            if findings.iter().any(|finding| {
+                finding.record_id == record.id && finding.title.contains("Content-Security-Policy")
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replay response should be scanned");
+
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn intercept_forward_keeps_client_request_alive() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
@@ -236,7 +480,8 @@ async fn intercept_forward_keeps_client_request_alive() {
             passthrough_hosts: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .unwrap();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();

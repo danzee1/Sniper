@@ -5,31 +5,167 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 APP_NAME="${APP_NAME:-Sniper}"
+
+validate_path_component() {
+  local label="$1"
+  local name="$2"
+  if [[ -z "$name" || "$name" == "." || "$name" == ".." || "$name" == *"/"* || "$name" == *"\\"* || "$name" == *"'"* || "$name" == *"\""* || "$name" == *$'\n'* || "$name" == *$'\r'* || "$name" == *$'\t'* ]]; then
+    echo "Invalid $label: must be a single safe path component" >&2
+    exit 1
+  fi
+}
+
+validate_app_name() {
+  validate_path_component "APP_NAME" "$1"
+}
+
+validate_app_name "$APP_NAME"
+
 VERSION="${VERSION:-$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)}"
 APP_BUNDLE="$ROOT_DIR/dist/${APP_NAME}.app"
-DMG_PATH="$ROOT_DIR/dist/${APP_NAME}-${VERSION}.dmg"
-DMG_TMP="$ROOT_DIR/dist/${APP_NAME}-tmp.dmg"
-STAGING_DIR="$ROOT_DIR/dist/dmg-root"
+REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
+DMG_ARCH=""
+DMG_PATH=""
+TMP_ROOT=""
+DMG_TMP=""
+DMG_FINAL_TMP=""
+STAGING_DIR=""
 BG_IMG="$ROOT_DIR/packaging/macos/dmg-background.png"
 VOLUME_NAME="$APP_NAME"
+DEVICE=""
 
-if [[ ! -d "$APP_BUNDLE" ]]; then
+cleanup() {
+  if [[ -n "$DEVICE" ]]; then
+    hdiutil detach "$DEVICE" -quiet 2>/dev/null || hdiutil detach "$DEVICE" -force >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$TMP_ROOT" ]]; then
+    rm -rf "$TMP_ROOT"
+  fi
+}
+
+trap cleanup EXIT
+
+normalize_dmg_arch() {
+  local arch
+  arch="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$arch" in
+    arm64 | aarch64)
+      printf '%s\n' "arm64"
+      ;;
+    x86_64 | x64 | amd64)
+      printf '%s\n' "x86_64"
+      ;;
+    universal)
+      printf '%s\n' "universal"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bundle_executable_path() {
+  local app_bundle="$1"
+  local info_plist="$app_bundle/Contents/Info.plist"
+  local executable_name=""
+  if [[ -f "$info_plist" ]]; then
+    executable_name="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$info_plist" 2>/dev/null || true)"
+  fi
+  if [[ -z "$executable_name" ]]; then
+    executable_name="$APP_NAME"
+  fi
+  validate_path_component "CFBundleExecutable" "$executable_name"
+  printf '%s\n' "$app_bundle/Contents/MacOS/$executable_name"
+}
+
+dmg_arch_from_lipo_archs() {
+  local archs="$1"
+  local has_arm64=0
+  local has_x86_64=0
+  local arch
+
+  for arch in $archs; do
+    case "$arch" in
+      arm64 | aarch64)
+        has_arm64=1
+        ;;
+      x86_64)
+        has_x86_64=1
+        ;;
+      *)
+        echo "Unsupported app executable architecture from lipo: $arch" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  if [[ "$has_arm64" == "1" && "$has_x86_64" == "1" ]]; then
+    printf '%s\n' "universal"
+  elif [[ "$has_arm64" == "1" ]]; then
+    printf '%s\n' "arm64"
+  elif [[ "$has_x86_64" == "1" ]]; then
+    printf '%s\n' "x86_64"
+  else
+    echo "Unable to determine a supported app executable architecture" >&2
+    return 1
+  fi
+}
+
+detect_app_dmg_arch() {
+  local app_bundle="$1"
+  local executable_path
+  local archs
+  executable_path="$(bundle_executable_path "$app_bundle")"
+  if [[ ! -x "$executable_path" ]]; then
+    echo "Missing executable app binary: $executable_path" >&2
+    return 1
+  fi
+  if ! archs="$(/usr/bin/lipo -archs "$executable_path" 2>/dev/null)"; then
+    echo "Unable to inspect app executable architecture: $executable_path" >&2
+    return 1
+  fi
+  dmg_arch_from_lipo_archs "$archs"
+}
+
+if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   "$ROOT_DIR/packaging/macos/make-app.sh"
+elif [[ ! -d "$APP_BUNDLE" ]]; then
+  echo "SKIP_BUILD=1 was set but $APP_BUNDLE does not exist" >&2
+  exit 1
 fi
 
-# Detach any leftover Sniper volumes
-for vol in /Volumes/"$VOLUME_NAME"*; do
-  hdiutil detach "$vol" 2>/dev/null || true
-done
+if ! DMG_ARCH="$(detect_app_dmg_arch "$APP_BUNDLE")"; then
+  exit 1
+fi
 
-rm -rf "$STAGING_DIR" "$DMG_PATH" "$DMG_TMP"
+if [[ -n "$REQUESTED_DMG_ARCH" ]]; then
+  if ! NORMALIZED_REQUESTED_DMG_ARCH="$(normalize_dmg_arch "$REQUESTED_DMG_ARCH")"; then
+    echo "Unsupported DMG_ARCH value: $REQUESTED_DMG_ARCH" >&2
+    exit 1
+  fi
+  if [[ "$NORMALIZED_REQUESTED_DMG_ARCH" != "$DMG_ARCH" || "$REQUESTED_DMG_ARCH" != "$DMG_ARCH" ]]; then
+    echo "DMG_ARCH=$REQUESTED_DMG_ARCH does not match bundled app executable architecture: $DMG_ARCH. Use the canonical label $DMG_ARCH." >&2
+    exit 1
+  fi
+fi
+
+DMG_PATH="$ROOT_DIR/dist/${APP_NAME}-${VERSION}-${DMG_ARCH}.dmg"
+
+if [[ ! -f "$BG_IMG" ]]; then
+  echo "Missing DMG background image: $BG_IMG" >&2
+  exit 1
+fi
+
+mkdir -p "$ROOT_DIR/dist"
+TMP_ROOT="$(mktemp -d "$ROOT_DIR/dist/.dmg-build.XXXXXX")"
+DMG_TMP="$TMP_ROOT/${APP_NAME}-tmp.dmg"
+DMG_FINAL_TMP="$TMP_ROOT/${APP_NAME}-${VERSION}-${DMG_ARCH}.dmg"
+STAGING_DIR="$TMP_ROOT/dmg-root"
+
 mkdir -p "$STAGING_DIR/.background"
 cp -R "$APP_BUNDLE" "$STAGING_DIR/"
 ln -s /Applications "$STAGING_DIR/Applications"
-
-if [[ -f "$BG_IMG" ]]; then
-  cp "$BG_IMG" "$STAGING_DIR/.background/background.png"
-fi
+cp "$BG_IMG" "$STAGING_DIR/.background/background.png"
 
 VOLUME_ICON="$ROOT_DIR/packaging/macos/AppIcon.icns"
 if [[ -f "$VOLUME_ICON" ]]; then
@@ -98,9 +234,10 @@ done
 sync
 sleep 1
 hdiutil detach "$DEVICE" -quiet || hdiutil detach "$DEVICE" -force
+DEVICE=""
 
 # Convert to compressed read-only DMG
-hdiutil convert "$DMG_TMP" -format UDZO -imagekey zlib-level=9 -o "$DMG_PATH"
-rm -f "$DMG_TMP"
+hdiutil convert "$DMG_TMP" -format UDZO -imagekey zlib-level=9 -o "$DMG_FINAL_TMP"
+mv -f "$DMG_FINAL_TMP" "$DMG_PATH"
 
 echo "Created DMG: $DMG_PATH"
