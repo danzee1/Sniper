@@ -2364,7 +2364,7 @@ fn normalize_target_inputs(
     let mut parsed_host_port = None;
     let mut host_url_without_port = false;
 
-    if host.starts_with("http://") || host.starts_with("https://") {
+    if is_absolute_http_url(&host) {
         let parsed =
             Url::parse(&host).with_context(|| format!("invalid replay target URL: {host}"))?;
         if !parsed.username().is_empty()
@@ -2959,15 +2959,13 @@ enum RawRequestBody {
 }
 
 impl RawRequestBody {
-    fn wire_len(&self, fallback_encoding: Option<&BodyEncoding>, label: &str) -> Result<usize> {
+    fn wire_len(&self, body_encoding: Option<&BodyEncoding>, label: &str) -> Result<usize> {
         match self {
             Self::Bytes(value) => Ok(value.len()),
-            Self::Text(value) if matches!(fallback_encoding, Some(BodyEncoding::Base64)) => {
-                STANDARD
-                    .decode(value)
-                    .map(|body| body.len())
-                    .with_context(|| format!("{label} body is not valid base64"))
-            }
+            Self::Text(value) if matches!(body_encoding, Some(BodyEncoding::Base64)) => STANDARD
+                .decode(value)
+                .map(|body| body.len())
+                .with_context(|| format!("{label} body is not valid base64")),
             Self::Text(value) => Ok(value.len()),
         }
     }
@@ -3054,7 +3052,7 @@ fn parse_editable_raw_request_parts(
     let mut path;
     let mut absolute_form = false;
 
-    if target.starts_with("http://") || target.starts_with("https://") {
+    if is_absolute_http_url(target) {
         let parsed = Url::parse(target)
             .with_context(|| format!("request target is not a valid URL: {target}"))?;
         if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -3102,16 +3100,20 @@ fn parse_editable_raw_request_parts(
         .into_iter()
         .flatten()
         .collect();
-    let body_len = raw_body.wire_len(fallback.map(|request| &request.body_encoding), "request")?;
+    validate_raw_request_host_headers(&headers)?;
+    let inferred_text_encoding = match &raw_body {
+        RawRequestBody::Text(body) => infer_text_body_encoding(
+            &headers,
+            body,
+            fallback.map(|request| &request.body_encoding),
+        )?,
+        RawRequestBody::Bytes(_) => None,
+    };
+    let body_len = raw_body.wire_len(inferred_text_encoding.as_ref(), "request")?;
     validate_raw_http_body_framing(&headers, body_len)?;
 
     let (body, body_encoding) = match raw_body {
-        RawRequestBody::Text(body) => (
-            body,
-            fallback
-                .map(|request| request.body_encoding.clone())
-                .unwrap_or(BodyEncoding::Utf8),
-        ),
+        RawRequestBody::Text(body) => (body, inferred_text_encoding.unwrap_or(BodyEncoding::Utf8)),
         RawRequestBody::Bytes(body) => {
             let content_type = headers
                 .iter()
@@ -3197,6 +3199,52 @@ fn is_http_token_byte(byte: u8) -> bool {
         )
 }
 
+fn is_absolute_http_url(value: &str) -> bool {
+    let value = value.trim_start();
+    value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || value
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn validate_raw_request_host_headers(headers: &[HeaderRecord]) -> Result<()> {
+    let host_count = headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("host"))
+        .count();
+    if host_count > 1 {
+        bail!("raw request must not include multiple Host headers");
+    }
+    Ok(())
+}
+
+fn infer_text_body_encoding(
+    headers: &[HeaderRecord],
+    body: &str,
+    fallback_encoding: Option<&BodyEncoding>,
+) -> Result<Option<BodyEncoding>> {
+    if matches!(fallback_encoding, Some(BodyEncoding::Base64)) {
+        return Ok(Some(BodyEncoding::Base64));
+    }
+
+    let Some(expected_len) = declared_content_length(headers)? else {
+        return Ok(fallback_encoding.cloned());
+    };
+    if expected_len == body.len() {
+        return Ok(fallback_encoding.cloned());
+    }
+    if fallback_encoding.is_none() {
+        if let Ok(decoded) = STANDARD.decode(body) {
+            if decoded.len() == expected_len {
+                return Ok(Some(BodyEncoding::Base64));
+            }
+        }
+    }
+    Ok(fallback_encoding.cloned())
+}
+
 fn validate_raw_http_body_framing(headers: &[HeaderRecord], body_len: usize) -> Result<()> {
     if headers.iter().any(|header| {
         header.name.eq_ignore_ascii_case("transfer-encoding")
@@ -3208,6 +3256,15 @@ fn validate_raw_http_body_framing(headers: &[HeaderRecord], body_len: usize) -> 
         bail!("raw HTTP input with Transfer-Encoding: chunked is not supported");
     }
 
+    if let Some(expected) = declared_content_length(headers)? {
+        if expected != body_len {
+            bail!("Content-Length {expected} does not match raw body length {body_len}");
+        }
+    }
+    Ok(())
+}
+
+fn declared_content_length(headers: &[HeaderRecord]) -> Result<Option<usize>> {
     let mut content_length: Option<usize> = None;
     for header in headers
         .iter()
@@ -3225,13 +3282,7 @@ fn validate_raw_http_body_framing(headers: &[HeaderRecord], body_len: usize) -> 
         }
         content_length = Some(parsed);
     }
-
-    if let Some(expected) = content_length {
-        if expected != body_len {
-            bail!("Content-Length {expected} does not match raw body length {body_len}");
-        }
-    }
-    Ok(())
+    Ok(content_length)
 }
 
 fn split_raw_http_message(text: &str) -> (String, String) {
@@ -3458,12 +3509,22 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
         bail!("select at least one destination with --codex, --claude, or --all");
     }
 
-    let mut installed = Vec::new();
-    if install_codex {
-        let root = args
-            .codex_dir
+    let codex_root = install_codex.then(|| {
+        args.codex_dir
             .clone()
-            .unwrap_or_else(skills::default_codex_skills_dir);
+            .unwrap_or_else(skills::default_codex_skills_dir)
+    });
+    let claude_root = install_claude.then(|| {
+        args.claude_dir
+            .clone()
+            .unwrap_or_else(skills::default_claude_skills_dir)
+    });
+    if let (Some(codex_root), Some(claude_root)) = (&codex_root, &claude_root) {
+        ensure_distinct_skill_install_targets(codex_root, claude_root)?;
+    }
+
+    let mut installed = Vec::new();
+    if let Some(root) = codex_root {
         let path =
             skills::install_skill_folder(&root, skills::SKILL_NAME, skills::CODEX_SKILL_TEMPLATE)?;
         installed.push(skills::InstalledSkill {
@@ -3471,11 +3532,7 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
             path: path.display().to_string(),
         });
     }
-    if install_claude {
-        let root = args
-            .claude_dir
-            .clone()
-            .unwrap_or_else(skills::default_claude_skills_dir);
+    if let Some(root) = claude_root {
         let path =
             skills::install_skill_folder(&root, skills::SKILL_NAME, skills::CLAUDE_SKILL_TEMPLATE)?;
         installed.push(skills::InstalledSkill {
@@ -3485,6 +3542,42 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
     }
 
     Ok(skills::SkillsInstallResult { installed })
+}
+
+fn ensure_distinct_skill_install_targets(
+    codex_root: &PathBuf,
+    claude_root: &PathBuf,
+) -> Result<()> {
+    let codex_target = codex_root.join(skills::SKILL_NAME).join("SKILL.md");
+    let claude_target = claude_root.join(skills::SKILL_NAME).join("SKILL.md");
+    let canonical_conflict = match (
+        canonicalize_if_exists(&codex_target),
+        canonicalize_if_exists(&claude_target),
+    ) {
+        (Some(codex_target), Some(claude_target)) => codex_target == claude_target,
+        _ => false,
+    };
+    let canonical_root_conflict = match (
+        canonicalize_if_exists(codex_root),
+        canonicalize_if_exists(claude_root),
+    ) {
+        (Some(codex_root), Some(claude_root)) => {
+            codex_root.join(skills::SKILL_NAME).join("SKILL.md")
+                == claude_root.join(skills::SKILL_NAME).join("SKILL.md")
+        }
+        _ => false,
+    };
+    if codex_target == claude_target || canonical_conflict || canonical_root_conflict {
+        bail!(
+            "codex and claude skill destinations resolve to the same SKILL.md path: {}",
+            codex_target.display()
+        );
+    }
+    Ok(())
+}
+
+fn canonicalize_if_exists(path: &PathBuf) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
 }
 
 struct NormalizedTarget {
@@ -3601,7 +3694,7 @@ mod tests {
         build_editable_raw_request_with_version, default_editable_request,
         ensure_json_status_not_failed, explicit_or_active_session_id,
         fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
-        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
+        install_skills, normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
         oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
@@ -3611,7 +3704,7 @@ mod tests {
         session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
         strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path, Cli, Command,
         HistoryCommand, HistoryListResponse, SequenceCommand, SequenceCreateInput,
-        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
+        SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3926,6 +4019,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_request_parser_accepts_mixed_case_absolute_form_url() {
+        let request = parse_editable_raw_request(
+            "GET HtTpS://target.example/admin HTTP/1.1\nHost: target.example\n\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.scheme, "https");
+        assert_eq!(request.host, "target.example");
+        assert_eq!(request.path, "/admin");
+    }
+
+    #[test]
     fn raw_request_parser_accepts_absolute_form_default_port_equivalence() {
         let request = parse_editable_raw_request(
             "GET http://target.example/admin HTTP/1.1\nHost: target.example:80\n\n",
@@ -3960,6 +4066,17 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("does not match Host header"));
+    }
+
+    #[test]
+    fn raw_request_parser_rejects_duplicate_host_headers() {
+        let error = parse_editable_raw_request(
+            "GET /dup HTTP/1.1\nHost: first.example\nHost: second.example\n\n",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("multiple Host headers"));
     }
 
     #[test]
@@ -4235,8 +4352,8 @@ mod tests {
             parsed.http_version.as_deref(),
         );
         assert!(text.contains("Content-Length: 2"));
-        let reparsed = parse_editable_raw_request_with_version(&text, Some(&parsed.request))
-            .expect("rebuilt binary request should parse");
+        let reparsed = parse_editable_raw_request_with_version(&text, None)
+            .expect("rebuilt binary request should parse without hidden fallback state");
 
         assert_eq!(reparsed.request.body_encoding, BodyEncoding::Base64);
         assert_eq!(reparsed.request.try_body_bytes().unwrap(), vec![0xff, 0x00]);
@@ -4368,6 +4485,17 @@ mod tests {
         assert_eq!(target.scheme, "http");
         assert_eq!(target.host, "other.example");
         assert_eq!(target.port, "80");
+
+        let target = normalize_target_inputs(
+            None,
+            Some("HtTpS://mixed.example:9443".to_string()),
+            None,
+            Some(&fallback),
+        )
+        .unwrap();
+        assert_eq!(target.scheme, "https");
+        assert_eq!(target.host, "mixed.example");
+        assert_eq!(target.port, "9443");
     }
 
     #[test]
@@ -5193,5 +5321,21 @@ mod tests {
             "keep me"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skills_install_all_rejects_same_destination() {
+        let root = std::env::temp_dir().join(format!("sniper-skill-same-{}", Uuid::new_v4()));
+        let error = install_skills(SkillsInstallArgs {
+            all: true,
+            codex_dir: Some(root.clone()),
+            claude_dir: Some(root.clone()),
+            ..SkillsInstallArgs::default()
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("same SKILL.md path"));
+        assert!(!root.join(skills::SKILL_NAME).join("SKILL.md").exists());
+        let _ = fs::remove_dir_all(root);
     }
 }

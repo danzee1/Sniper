@@ -78,10 +78,12 @@ if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "${ALLOW_EXISTING_RELEASE_VERSION:-0}" !=
 fi
 REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
 BRIDGE_REQUIRES_UNIVERSAL=0
-if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$VERSION" == "0.2.5" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
+LEGACY_UPDATER_COMPAT="${LEGACY_UPDATER_COMPAT:-1}"
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$LEGACY_UPDATER_COMPAT" != "0" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
   BRIDGE_REQUIRES_UNIVERSAL=1
   if [[ -n "$REQUESTED_DMG_ARCH" && "$REQUESTED_DMG_ARCH" != "universal" ]]; then
-    echo "Sniper 0.2.5 is the bridge release from the v0.2.4 updater and must use DMG_ARCH=universal." >&2
+    echo "Sniper releases must use DMG_ARCH=universal while legacy v0.2.4 updater clients may select the latest DMG without arch filtering." >&2
+    echo "Set LEGACY_UPDATER_COMPAT=0 only after legacy updater migration is intentionally complete." >&2
     exit 1
   fi
   REQUESTED_DMG_ARCH="universal"
@@ -167,9 +169,9 @@ if [[ "${#DMG_CANDIDATES[@]}" -ne 1 ]]; then
 fi
 
 DMG_PATH="${DMG_CANDIDATES[0]}"
-if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$VERSION" == "0.2.5" && "$DMG_PATH" != *"-universal.dmg" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
-  echo "Sniper 0.2.5 is the bridge release from the v0.2.4 updater, which is not arch-aware." >&2
-  echo "Build/upload a universal legacy DMG first, or set ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE=1 if this is intentional." >&2
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$LEGACY_UPDATER_COMPAT" != "0" && "$DMG_PATH" != *"-universal.dmg" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
+  echo "Sniper legacy updater-compatible releases must upload a universal DMG because v0.2.4 clients are not arch-aware." >&2
+  echo "Build/upload a universal DMG, or set LEGACY_UPDATER_COMPAT=0 if this is intentional." >&2
   exit 1
 fi
 

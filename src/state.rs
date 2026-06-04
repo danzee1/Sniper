@@ -37,6 +37,7 @@ const APP_RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_RELEASE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPECTED_APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
 const EXPECTED_APP_EXECUTABLE: &str = "Sniper";
+const EXPECTED_BUNDLED_CLI_EXECUTABLE: &str = "sniper-cli";
 const HDIUTIL_PATH: &str = "/usr/bin/hdiutil";
 const DITTO_PATH: &str = "/usr/bin/ditto";
 const CODESIGN_PATH: &str = "/usr/bin/codesign";
@@ -246,7 +247,6 @@ impl AppState {
                     "dropped pending intercepts before switching sessions"
                 );
             }
-            self.ws_replay.disconnect_all().await;
             *active_session = session.clone();
             return Ok(session.summary(metadata.id == self.sessions.active_session_id()));
         }
@@ -1359,35 +1359,35 @@ fn verify_app_executable_arch_for_release_asset(
     asset_name: &str,
     label: &str,
 ) -> Result<()> {
-    let executable_path = app_path
-        .join("Contents/MacOS")
-        .join(EXPECTED_APP_EXECUTABLE);
-    let output = std::process::Command::new(LIPO_PATH)
-        .args(["-archs"])
-        .arg(&executable_path)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to inspect {label} executable architecture at {}",
-                executable_path.display()
-            )
-        })?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to inspect {label} executable architecture: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    for executable in [EXPECTED_APP_EXECUTABLE, EXPECTED_BUNDLED_CLI_EXECUTABLE] {
+        let executable_path = app_path.join("Contents/MacOS").join(executable);
+        let output = std::process::Command::new(LIPO_PATH)
+            .args(["-archs"])
+            .arg(&executable_path)
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to inspect {label} {executable} architecture at {}",
+                    executable_path.display()
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to inspect {label} {executable} architecture: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let archs = String::from_utf8_lossy(&output.stdout);
+        let archs: Vec<&str> = archs.split_whitespace().collect();
+        if !release_asset_archs_match_binary_archs(asset_name, &archs) {
+            anyhow::bail!(
+                "{label} {executable} architecture {:?} does not match release asset {}",
+                archs,
+                asset_name
+            );
+        }
     }
-    let archs = String::from_utf8_lossy(&output.stdout);
-    let archs: Vec<&str> = archs.split_whitespace().collect();
-    if release_asset_archs_match_binary_archs(asset_name, &archs) {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "{label} executable architecture {:?} does not match release asset {}",
-        archs,
-        asset_name
-    );
+    Ok(())
 }
 
 fn release_asset_archs_match_binary_archs(asset_name: &str, binary_archs: &[&str]) -> bool {
@@ -1921,6 +1921,45 @@ mod tests {
         state.activate_session(original_id).await.unwrap();
         let active = state.session().await;
         assert!(std::sync::Arc::ptr_eq(&first, &active));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn activating_session_preserves_unrelated_session_ws_replay_state() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-activate-preserve-ws-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+        let ws_id = uuid::Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(ws_id, original_id)
+            .await;
+
+        state
+            .create_session(Some("Third".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.ws_replay.belongs_to_session(ws_id, original_id).await,
+            Some(true)
+        );
+        assert!(state.ws_replay.snapshot(ws_id).await.is_some());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -554,6 +554,7 @@ fn validate_editable_request(request: &EditableRequest) -> std::result::Result<(
     for header in &request.headers {
         validate_editable_header(header)?;
     }
+    validate_unique_host_header(&request.headers)?;
     let body = request
         .try_body_bytes()
         .map_err(|_| "request body is not valid base64".to_string())?;
@@ -756,6 +757,17 @@ fn validate_editable_header(header: &HeaderRecord) -> std::result::Result<(), St
         .map_err(|_| format!("invalid request header name: {}", header.name))?;
     HeaderValue::from_str(&header.value)
         .map_err(|_| format!("invalid request header value for {name}"))?;
+    Ok(())
+}
+
+fn validate_unique_host_header(headers: &[HeaderRecord]) -> std::result::Result<(), String> {
+    let host_count = headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("host"))
+        .count();
+    if host_count > 1 {
+        return Err("request must not include multiple Host headers".to_string());
+    }
     Ok(())
 }
 
@@ -4750,6 +4762,21 @@ mod tests {
 
         request.method = "CONNECT".to_string();
         assert!(super::validate_editable_request(&request).is_err());
+
+        request.method = "GET".to_string();
+        request.headers = vec![
+            HeaderRecord {
+                name: "Host".to_string(),
+                value: "first.example".to_string(),
+            },
+            HeaderRecord {
+                name: "host".to_string(),
+                value: "second.example".to_string(),
+            },
+        ];
+        assert!(super::validate_editable_request(&request)
+            .unwrap_err()
+            .contains("multiple Host headers"));
     }
 
     #[test]

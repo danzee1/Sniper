@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 APP_NAME="${APP_NAME:-Sniper}"
+EXPECTED_BUNDLE_IDENTIFIER="${EXPECTED_BUNDLE_IDENTIFIER:-com.sm1ee.sniper}"
+REQUIRED_EXECUTABLES=("$APP_NAME" "sniper-cli")
 
 validate_path_component() {
   local label="$1"
@@ -94,9 +96,16 @@ validate_app_bundle_metadata() {
   local info_plist="$app_bundle/Contents/Info.plist"
   local bundle_version
   local executable_name
+  local bundle_identifier
 
   if [[ ! -f "$info_plist" ]]; then
     echo "Missing app Info.plist: $info_plist" >&2
+    return 1
+  fi
+
+  bundle_identifier="$(plist_value "$info_plist" "CFBundleIdentifier")"
+  if [[ "$bundle_identifier" != "$EXPECTED_BUNDLE_IDENTIFIER" ]]; then
+    echo "App bundle identifier $bundle_identifier does not match expected identifier $EXPECTED_BUNDLE_IDENTIFIER" >&2
     return 1
   fi
 
@@ -111,6 +120,15 @@ validate_app_bundle_metadata() {
     echo "App bundle executable $executable_name does not match APP_NAME $APP_NAME" >&2
     return 1
   fi
+}
+
+executable_archs() {
+  local executable_path="$1"
+  if [[ ! -x "$executable_path" ]]; then
+    echo "Missing executable app binary: $executable_path" >&2
+    return 1
+  fi
+  /usr/bin/lipo -archs "$executable_path" 2>/dev/null
 }
 
 dmg_arch_from_lipo_archs() {
@@ -151,15 +169,66 @@ detect_app_dmg_arch() {
   local executable_path
   local archs
   executable_path="$(bundle_executable_path "$app_bundle")"
-  if [[ ! -x "$executable_path" ]]; then
-    echo "Missing executable app binary: $executable_path" >&2
-    return 1
-  fi
-  if ! archs="$(/usr/bin/lipo -archs "$executable_path" 2>/dev/null)"; then
+  if ! archs="$(executable_archs "$executable_path")"; then
     echo "Unable to inspect app executable architecture: $executable_path" >&2
     return 1
   fi
   dmg_arch_from_lipo_archs "$archs"
+}
+
+executable_supports_dmg_arch() {
+  local dmg_arch="$1"
+  local archs="$2"
+  local has_arm64=0
+  local has_x86_64=0
+  local arch
+
+  for arch in $archs; do
+    case "$arch" in
+      arm64 | aarch64)
+        has_arm64=1
+        ;;
+      x86_64)
+        has_x86_64=1
+        ;;
+    esac
+  done
+
+  case "$dmg_arch" in
+    arm64)
+      [[ "$has_arm64" == "1" ]]
+      ;;
+    x86_64)
+      [[ "$has_x86_64" == "1" ]]
+      ;;
+    universal)
+      [[ "$has_arm64" == "1" && "$has_x86_64" == "1" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+validate_required_executable_archs() {
+  local app_bundle="$1"
+  local dmg_arch="$2"
+  local executable_name
+  local executable_path
+  local archs
+
+  for executable_name in "${REQUIRED_EXECUTABLES[@]}"; do
+    validate_path_component "required executable" "$executable_name"
+    executable_path="$app_bundle/Contents/MacOS/$executable_name"
+    if ! archs="$(executable_archs "$executable_path")"; then
+      echo "Unable to inspect required executable architecture: $executable_path" >&2
+      return 1
+    fi
+    if ! executable_supports_dmg_arch "$dmg_arch" "$archs"; then
+      echo "Required executable $executable_name architectures [$archs] do not support DMG_ARCH=$dmg_arch" >&2
+      return 1
+    fi
+  done
 }
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
@@ -174,6 +243,9 @@ if ! validate_app_bundle_metadata "$APP_BUNDLE"; then
 fi
 
 if ! DMG_ARCH="$(detect_app_dmg_arch "$APP_BUNDLE")"; then
+  exit 1
+fi
+if ! validate_required_executable_archs "$APP_BUNDLE" "$DMG_ARCH"; then
   exit 1
 fi
 

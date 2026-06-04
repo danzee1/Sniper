@@ -2480,7 +2480,7 @@ function hydrateReplayTab(tab) {
       wsMessageType: normalizeWsMessageType(tab.ws_message_type),
       wsEditorBodyEncoded: !!tab.ws_editor_body_encoded,
       wsSetupQueue: Array.isArray(tab.ws_setup_queue)
-        ? tab.ws_setup_queue.map((item) => normalizeWsSetupItem(item))
+        ? tab.ws_setup_queue.map((item) => ({ ...normalizeWsSetupItem(item), sent: false }))
         : [],
       wsStatus: "disconnected",
       wsFrames: normalizeWebsocketFrames(tab.ws_frames),
@@ -2611,7 +2611,6 @@ function snapshotWorkspaceState(options = {}) {
               kind: normalizeWsMessageType(item.kind),
               body_encoded: !!item.bodyEncoded,
               autoSend: !!item.autoSend,
-              sent: !!item.sent,
             })),
             ws_frames: snapshotWsReplayFrames(tab, wsFrameBudget),
           };
@@ -5123,16 +5122,26 @@ function showFindingDetail(finding, record) {
     const resText = buildFindingsRawMessage(record, "response");
     // CM path
     if (els.findingsReqCM) {
-      updateCodePaneCM("findingsReq", els.findingsReqCM, reqText, { mode: "http" });
-      const reqSearchMeta = els.findingsReqSearchMeta;
-      if (reqSearchMeta) reqSearchMeta.innerHTML = buildSearchMeta(countLines(reqText), "raw", 0);
-      if (els.findingsReqSearchInput) els.findingsReqSearchInput.value = "";
+      updateFindingsCodePaneCM(
+        "findingsReq",
+        els.findingsReqCM,
+        reqText,
+        evidence,
+        finding,
+        els.findingsReqSearchInput,
+        els.findingsReqSearchMeta,
+      );
     }
     if (els.findingsResCM) {
-      updateCodePaneCM("findingsRes", els.findingsResCM, resText, { mode: "http" });
-      const resSearchMeta = els.findingsResSearchMeta;
-      if (resSearchMeta) resSearchMeta.innerHTML = buildSearchMeta(countLines(resText), "raw", 0);
-      if (els.findingsResSearchInput) els.findingsResSearchInput.value = "";
+      updateFindingsCodePaneCM(
+        "findingsRes",
+        els.findingsResCM,
+        resText,
+        evidence,
+        finding,
+        els.findingsResSearchInput,
+        els.findingsResSearchMeta,
+      );
     }
     // Legacy fallback
     if (!els.findingsReqCM) {
@@ -5155,6 +5164,13 @@ function showFindingDetail(finding, record) {
       if (els.findingsResLines) els.findingsResLines.textContent = "";
     }
   }
+}
+
+function updateFindingsCodePaneCM(key, container, text, evidence, finding, searchInput, searchMeta) {
+  const highlightQuery = findingHighlightQuery(evidence, finding);
+  const result = updateCodePaneCM(key, container, text, { mode: "http", search: highlightQuery });
+  if (searchInput) searchInput.value = "";
+  if (searchMeta) searchMeta.innerHTML = buildSearchMeta(result.lineCount, "raw", result.matchCount);
 }
 
 function renderFindingsCodePane(viewEl, lineEl, text, evidence, target, finding) {
@@ -5181,6 +5197,21 @@ function renderFindingsCodePane(viewEl, lineEl, text, evidence, target, finding)
 
   // Scroll sync
   viewEl.addEventListener("scroll", () => { lineEl.scrollTop = viewEl.scrollTop; });
+}
+
+function findingHighlightQuery(evidence, finding) {
+  const evidenceQuery = firstUsableFindingQuery(evidence);
+  if (evidenceQuery) return evidenceQuery;
+  return extractFindingKeywords(finding).find((keyword) => keyword.length >= 3) || "";
+}
+
+function firstUsableFindingQuery(value) {
+  const normalized = String(value || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length >= 3);
+  if (!normalized) return "";
+  return normalized.length > 512 ? normalized.slice(0, 512) : normalized;
 }
 
 function highlightFindingLines(container, evidence, finding) {
@@ -5280,6 +5311,7 @@ function jumpToTransaction(recordId) {
       if (state.selectedId === recordId) {
         state.selectedId = null;
         state.selectedRecord = null;
+        renderEmptyDetail();
         renderHistory();
       }
       return;
@@ -6369,13 +6401,32 @@ function scrollHistoryToId(targetId) {
 }
 
 async function moveHistorySelection(offset) {
-  const visibleEntries = getVisibleEntries();
+  let visibleEntries = getVisibleEntries();
   if (!visibleEntries.length) {
     return;
   }
 
   const currentIndex = visibleEntries.findIndex((entry) => entry.item.id === state.selectedId);
   const fallbackIndex = offset > 0 ? 0 : visibleEntries.length - 1;
+  if (offset > 0
+    && currentIndex === visibleEntries.length - 1
+    && state.historyPaging?.hasMore
+    && !state.historyPaging.loading
+    && state.historyPaging.fullyLoaded !== true) {
+    const selectedIdBeforeLoad = state.selectedId;
+    const added = await loadMoreTransactions();
+    if (added <= 0) return;
+    visibleEntries = getVisibleEntries();
+    const loadedIndex = visibleEntries.findIndex((entry) => entry.item.id === selectedIdBeforeLoad);
+    const loadedNextId = loadedIndex >= 0 ? visibleEntries[loadedIndex + 1]?.item.id : null;
+    if (loadedNextId) {
+      state.selectedId = loadedNextId;
+      updateHistorySelection(loadedNextId);
+      scrollSelectedHistoryRowIntoView();
+      await loadTransactionDetail(loadedNextId);
+    }
+    return;
+  }
   const nextIndex = clamp(
     currentIndex === -1 ? fallbackIndex : currentIndex + offset,
     0,
@@ -10340,11 +10391,19 @@ async function followRedirect() {
   const requestText = buildEditableRawRequest(newRequest);
   tab.requestText = requestText;
   tab.baseRequest = cloneEditableRequest(newRequest);
+  tab.responseRecord = null;
+  tab.notice = "Following redirect...";
   if (getCMView("replayReq")) {
     getCMView("replayReq").setContent(requestText);
   } else if (els.replayRequestEditor) {
     els.replayRequestEditor.value = requestText;
     renderReplayRequestHighlight(requestText);
+  }
+  scheduleWorkspaceStateSave();
+  if (state.activeReplayTabId === tab.id) {
+    renderReplayResponseOnly(tab);
+    syncReplayToolbar(tab);
+    renderReplayViewTabs();
   }
 
   // Send the follow request

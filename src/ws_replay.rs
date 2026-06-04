@@ -213,6 +213,24 @@ impl WsReplayStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn remember_disconnected_connection_for_test(
+        &self,
+        id: Uuid,
+        owner_session_id: Uuid,
+    ) {
+        let conn = Arc::new(RwLock::new(WsReplayConnection {
+            owner_session_id,
+            status: WsReplayStatus::Disconnected,
+            frames: Vec::new(),
+            frame_counter: 0,
+            sender: None,
+            task_abort: None,
+            error: None,
+        }));
+        self.connections.write().await.insert(id, conn);
+    }
+
     /// Connect to a WebSocket server.
     pub async fn connect(
         &self,
