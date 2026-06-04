@@ -1163,6 +1163,18 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                 provider: runtime.oast_provider.clone(),
             };
             session.oast.update_config(config.clone()).await;
+            let operation_lock = state.session_operation_lock(session.id()).await;
+            let operation_guard = operation_lock.lock().await;
+            if !state.sessions.contains_session(session.id()) {
+                prev_session_id = None;
+                prev_provider = None;
+                prev_url = None;
+                prev_token = None;
+                prev_store = None;
+                drop(operation_guard);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
 
             let session_changed = prev_session_id != Some(session.id());
             let same_session_as_previous = !session_changed;
@@ -1172,10 +1184,14 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                     && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
                 {
                     if let Some(store) = prev_store.as_deref() {
+                        let _mutation_guard = session.mutation_guard().await;
                         deregister_current_interactsh(store, &prev_url, &client).await;
-                    }
-                    if let Err(error) = state.persist_session_context(&session).await {
-                        warn!(?error, session_id = %session.id(), "failed to persist OAST registration clear");
+                        if let Err(error) = state
+                            .persist_session_context_mutation_locked(&session)
+                            .await
+                        {
+                            warn!(?error, session_id = %session.id(), "failed to persist OAST registration clear");
+                        }
                     }
                 }
                 prev_session_id = None;
@@ -1183,6 +1199,7 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                 prev_url = None;
                 prev_token = None;
                 prev_store = None;
+                drop(operation_guard);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -1202,6 +1219,7 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                     && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
                 {
                     if let Some(store) = prev_store.as_deref() {
+                        let _mutation_guard = session.mutation_guard().await;
                         deregister_current_interactsh(store, &prev_url, &client).await;
                     }
                 }
@@ -1224,6 +1242,7 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                                     correlation_id = %reg.correlation_id,
                                     "Interactsh auto-registration complete"
                                 );
+                                let _mutation_guard = session.mutation_guard().await;
                                 session
                                     .oast
                                     .set_registration(RegistrationState::Interactsh {
@@ -1238,12 +1257,14 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                             }
                             Err(error) => {
                                 warn!(%error, "Interactsh auto-registration failed");
+                                let _mutation_guard = session.mutation_guard().await;
                                 session.oast.clear_registration().await;
                                 registration_changed = true;
                             }
                         }
                     }
                 } else {
+                    let _mutation_guard = session.mutation_guard().await;
                     session.oast.clear_registration().await;
                     registration_changed = true;
                 }
@@ -1255,7 +1276,11 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                 prev_store = Some(session.oast.clone());
 
                 if registration_changed {
-                    if let Err(error) = state.persist_session_context(&session).await {
+                    let _mutation_guard = session.mutation_guard().await;
+                    if let Err(error) = state
+                        .persist_session_context_mutation_locked(&session)
+                        .await
+                    {
                         warn!(?error, session_id = %session.id(), "failed to persist OAST registration");
                     }
                 }
@@ -1276,6 +1301,7 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                     session_id = %session.id(),
                     "OAST callbacks received"
                 );
+                let mutation_guard = session.mutation_guard().await;
                 let mut inserted = 0usize;
                 for callback in callbacks {
                     if session.oast.push(callback).await {
@@ -1288,14 +1314,20 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                         session_id = %session.id(),
                         "OAST poll returned only duplicate callbacks"
                     );
+                    drop(mutation_guard);
+                    drop(operation_guard);
                     tokio::time::sleep(interval).await;
                     continue;
                 }
-                if let Err(error) = state.persist_session_context(&session).await {
+                if let Err(error) = state
+                    .persist_session_context_mutation_locked(&session)
+                    .await
+                {
                     warn!(?error, session_id = %session.id(), "failed to persist OAST callbacks");
                 }
             }
 
+            drop(operation_guard);
             tokio::time::sleep(interval).await;
         }
     })

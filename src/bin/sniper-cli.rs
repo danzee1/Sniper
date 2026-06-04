@@ -915,6 +915,42 @@ impl ApiClient {
         self.request_json(Method::POST, path, Some(body)).await
     }
 
+    async fn send_replay(&self, payload: &ReplaySendPayload) -> Result<ReplaySendApiResult> {
+        let path = "/api/replay/send";
+        let response = self
+            .client
+            .post(self.url(path))
+            .json(payload)
+            .send()
+            .await
+            .with_context(|| format!("failed to POST {}", path))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<TransactionRecord>()
+                .await
+                .map(ReplaySendApiResult::Success)
+                .with_context(|| format!("failed to decode JSON response from {}", path));
+        }
+        if status == StatusCode::BAD_REQUEST {
+            let body = response
+                .json::<ReplaySendErrorBody>()
+                .await
+                .with_context(|| format!("failed to decode replay error response from {}", path))?;
+            if body.record.is_some() {
+                return Ok(ReplaySendApiResult::StoredError(body));
+            }
+            bail!("request to {} failed ({}): {}", path, status, body.error);
+        }
+        let message = response.text().await.unwrap_or_else(|_| String::new());
+        let detail = if message.trim().is_empty() {
+            status.to_string()
+        } else {
+            message
+        };
+        bail!("request to {} failed ({}): {}", path, status, detail);
+    }
+
     async fn post_status<B: Serialize>(&self, path: &str, body: &B) -> Result<StatusCode> {
         let response = self
             .client
@@ -1051,6 +1087,17 @@ struct ReplaySendPayload {
     target: Option<RequestTargetOverride>,
     source_transaction_id: Option<Uuid>,
     http_version: Option<String>,
+}
+
+enum ReplaySendApiResult {
+    Success(TransactionRecord),
+    StoredError(ReplaySendErrorBody),
+}
+
+#[derive(Deserialize)]
+struct ReplaySendErrorBody {
+    error: String,
+    record: Option<TransactionRecord>,
 }
 
 #[derive(Serialize)]
@@ -1472,18 +1519,24 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             let http_version = replay_send_http_version(&tab, &parsed_request);
             let request = parsed_request.request;
             let target = replay_send_target_for_tab(&tab, &request)?;
-            let record: TransactionRecord = api
-                .post_json(
-                    "/api/replay/send",
-                    &ReplaySendPayload {
-                        session_id: workspace.session_id,
-                        request: request.clone(),
-                        target: target.clone(),
-                        source_transaction_id: tab.source_transaction_id,
-                        http_version,
-                    },
-                )
+            let replay_result = api
+                .send_replay(&ReplaySendPayload {
+                    session_id: workspace.session_id,
+                    request: request.clone(),
+                    target: target.clone(),
+                    source_transaction_id: tab.source_transaction_id,
+                    http_version,
+                })
                 .await?;
+            let (record, replay_error) = match replay_result {
+                ReplaySendApiResult::Success(record) => (record, None),
+                ReplaySendApiResult::StoredError(body) => {
+                    let record = body
+                        .record
+                        .context("replay failed without a stored transaction record")?;
+                    (record, Some(body.error))
+                }
+            };
 
             let tab_mut = find_replay_tab_mut(&mut workspace.replay, &args.tab_id)?;
             tab_mut.base_request = Some(request.clone());
@@ -1493,13 +1546,13 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 tab_mut.target_port = target.port.clone();
             }
             tab_mut.response_record = Some(record.clone());
-            tab_mut.notice.clear();
+            tab_mut.notice = replay_error.clone().unwrap_or_default();
             let history_entry = ReplayHistoryEntryState {
                 request: Some(request),
                 request_text: tab_mut.request_text.clone(),
                 http_version_mode: tab_mut.http_version_mode.clone(),
                 response_record: Some(record.clone()),
-                notice: String::new(),
+                notice: replay_error.clone().unwrap_or_default(),
                 target_scheme: tab_mut.target_scheme.clone(),
                 target_host: tab_mut.target_host.clone(),
                 target_port: tab_mut.target_port.clone(),
@@ -1509,7 +1562,11 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             if let Err(error) = post_workspace_state(&api, &mut workspace).await {
                 eprintln!("warning: replay was sent, but workspace state was not saved: {error}");
             }
-            print_json(&record)
+            if let Some(error) = replay_error {
+                print_json(&json!({ "error": error, "record": record }))
+            } else {
+                print_json(&record)
+            }
         }
     }
 }

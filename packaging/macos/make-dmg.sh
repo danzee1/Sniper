@@ -9,7 +9,7 @@ APP_NAME="${APP_NAME:-Sniper}"
 validate_path_component() {
   local label="$1"
   local name="$2"
-  if [[ -z "$name" || "$name" == "." || "$name" == ".." || "$name" == *"/"* || "$name" == *"\\"* || "$name" == *"'"* || "$name" == *"\""* || "$name" == *$'\n'* || "$name" == *$'\r'* || "$name" == *$'\t'* ]]; then
+  if [[ -z "$name" || "$name" == "." || "$name" == ".." || "$name" == *"/"* || "$name" == *"\\"* || "$name" == *"'"* || "$name" == *"\""* || "$name" == *'$'* || "$name" == *'`'* || "$name" == *$'\n'* || "$name" == *$'\r'* || "$name" == *$'\t'* ]]; then
     echo "Invalid $label: must be a single safe path component" >&2
     exit 1
   fi

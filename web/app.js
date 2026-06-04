@@ -4003,12 +4003,12 @@ async function loadMoreTransactions({ background = false } = {}) {
 }
 
 let _historyBackfillTimer = 0;
-function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS) {
+function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS, options = {}) {
   const paging = state.historyPaging;
   if (!paging || paging.loading || paging.backfillScheduled || !paging.hasMore || paging.fullyLoaded) {
     return;
   }
-  if (state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
+  if (!options.allowAtCap && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
     return;
   }
   paging.backfillScheduled = true;
@@ -6154,7 +6154,7 @@ function renderHistory() {
       </tr>
     `;
     if (paging.hasMore && !paging.loading && !paging.fullyLoaded) {
-      scheduleHistoryBackfill(0);
+      scheduleHistoryBackfill(0, { allowAtCap: true });
     }
     return;
   }
@@ -6182,7 +6182,7 @@ function renderHistoryVirtual() {
   const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - HISTORY_BUFFER_ROWS);
   const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / rowHeight) + HISTORY_BUFFER_ROWS);
   if (totalCount - endIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS) {
-    scheduleHistoryBackfill(0);
+    scheduleHistoryBackfill(0, { allowAtCap: true });
   }
 
   const topPadding = startIdx * rowHeight;
@@ -15821,20 +15821,26 @@ function parseCurlCommand(text) {
   const headers = [];
   const bodyParts = [];
   let bodyProvided = false;
-  const addBodyPart = (flag, value) => {
+  let needsDefaultFormContentType = false;
+  const addBodyPart = (flag, value, options = {}) => {
     if (flag === "--data-urlencode") {
       const encoded = encodeCurlDataUrlencode(value);
       if (encoded.error) return encoded.error;
       bodyParts.push(encoded.value);
       bodyProvided = true;
+      if (options.defaultContentType !== false) needsDefaultFormContentType = true;
       if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
       return "";
+    }
+    if (flag === "--data-binary" && !curlDataBinaryBodyIsPlainText(value)) {
+      return "cURL --data-binary imports are only supported for plain text bodies. Use --data-raw for text bodies.";
     }
     if (flag !== "--data-raw" && value.startsWith("@")) {
       return "cURL @file body imports are not supported. Use --data-raw for literal @ bodies.";
     }
     bodyParts.push(value);
     bodyProvided = true;
+    if (options.defaultContentType !== false) needsDefaultFormContentType = true;
     if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
     return "";
   };
@@ -15848,7 +15854,7 @@ function parseCurlCommand(text) {
     if (raw.startsWith("@")) {
       return "cURL --json @file imports are not supported.";
     }
-    const error = addBodyPart("--data-raw", raw);
+    const error = addBodyPart("--data-raw", raw, { defaultContentType: false });
     if (error) return error;
     ensureHeader("Content-Type", "application/json");
     ensureHeader("Accept", "application/json");
@@ -15987,18 +15993,33 @@ function parseCurlCommand(text) {
   }
   let scheme = "https";
   let host = "";
+  let port = "";
   let path = "/";
   try {
     const parsed = new URL(url);
     scheme = parsed.protocol.replace(":", "");
     host = parsed.host;
+    port = parsed.port || defaultHttpPortForScheme(scheme);
     path = pathAsIs ? rawPathFromUrlString(url) : `${parsed.pathname || "/"}${parsed.search || ""}`;
   } catch (_) { return null; }
+  if (needsDefaultFormContentType && !getMode) {
+    ensureHeader("Content-Type", "application/x-www-form-urlencoded");
+  }
   const hasHost = normalizedHeaders(headers).some((h) => headerNameEquals(h, "host"));
   if (!hasHost) headers.unshift({ name: "Host", value: host });
   const headerText = headers.map((h) => `${h.name}: ${h.value}`).join("\n");
   const requestText = bodyProvided ? `${method} ${path} HTTP/1.1\n${headerText}\n\n${body}` : `${method} ${path} HTTP/1.1\n${headerText}`;
-  return { scheme, host, port: "", method, path, headers, body, requestText };
+  return { scheme, host, port, method, path, headers, body, requestText };
+}
+
+function curlDataBinaryBodyIsPlainText(value) {
+  const text = String(value ?? "");
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0x09 || code === 0x0a || code === 0x0d) continue;
+    if (code < 0x20 || code > 0x7e) return false;
+  }
+  return true;
 }
 
 function encodeCurlDataUrlencode(value) {
@@ -16176,7 +16197,7 @@ function applyCurlImport() {
     return;
   }
   const tab = createReplayTab();
-  const target = authorityToTargetState(result.host, result.scheme || "https");
+  const target = normalizeRepeaterTargetInput(result.host, result.port || "", result.scheme || "https");
   tab.requestText = result.requestText;
   tab.targetScheme = result.scheme;
   tab.targetHost = target.host;

@@ -1535,7 +1535,10 @@ async fn update_workspace_state(
         current.session_id = Some(active_session.id());
         return (StatusCode::CONFLICT, Json(current)).into_response();
     } else {
-        match state.session_context_for_id(target_session_id).await {
+        match state
+            .session_context_for_id_operation_locked(target_session_id)
+            .await
+        {
             Ok(session) => session,
             Err(error) => return session_load_failure_response(target_session_id, error),
         }

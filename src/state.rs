@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    env,
+    net::{IpAddr, SocketAddr},
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -143,6 +144,18 @@ impl AppState {
             return Ok(active);
         }
 
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
+        let operation_lock = self.session_operation_lock(id).await;
+        let _operation_guard = operation_lock.lock().await;
+        self.session_context_for_id_operation_locked(id).await
+    }
+
+    pub async fn session_context_for_id_operation_locked(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Arc<SessionContext>> {
         let mut contexts = self.session_contexts.lock().await;
         if let Some(session) = contexts.get(&id) {
             if self.sessions.contains_session(id) {
@@ -463,14 +476,7 @@ impl AppState {
     }
 
     async fn fetch_latest_release_info(&self) -> Result<AppVersionInfo> {
-        let client = reqwest::Client::builder()
-            .user_agent(format!(
-                "Sniper/{} (+{})",
-                env!("CARGO_PKG_VERSION"),
-                APP_RELEASES_URL
-            ))
-            .build()
-            .context("failed to build GitHub releases client")?;
+        let client = app_release_http_client("failed to build GitHub releases client")?;
 
         let response = client
             .get(APP_LATEST_RELEASE_API_URL)
@@ -512,14 +518,7 @@ impl AppState {
             .await
             .ok();
 
-        let client = reqwest::Client::builder()
-            .user_agent(format!(
-                "Sniper/{} (+{})",
-                env!("CARGO_PKG_VERSION"),
-                APP_RELEASES_URL
-            ))
-            .build()
-            .context("failed to build HTTP client")?;
+        let client = app_release_http_client("failed to build HTTP client")?;
 
         let release: GitHubRelease = client
             .get(APP_LATEST_RELEASE_API_URL)
@@ -1405,14 +1404,67 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
+fn app_release_http_client(error_context: &'static str) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().user_agent(format!(
+        "Sniper/{} (+{})",
+        env!("CARGO_PKG_VERSION"),
+        APP_RELEASES_URL
+    ));
+    let builder = if release_proxy_env_targets_loopback() {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder.build().context(error_context)
+}
+
+fn release_proxy_env_targets_loopback() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .filter_map(|key| env::var(key).ok())
+    .any(|value| proxy_url_targets_loopback(&value))
+}
+
+fn proxy_url_targets_loopback(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let parsed = if value.contains("://") {
+        url::Url::parse(value)
+    } else {
+        url::Url::parse(&format!("http://{value}"))
+    };
+    let Ok(parsed) = parsed else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ensure_release_is_newer, native_release_asset_arch, parse_codesign_team_identifier,
-        release_asset_matches_arch, select_release_dmg_asset, self_update_bundle_is_writable,
-        update_installer_script, verify_app_identity, AppState, GitHubAsset, UpdateArtifactGuard,
-        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
-        HDIUTIL_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+        proxy_url_targets_loopback, release_asset_matches_arch, select_release_dmg_asset,
+        self_update_bundle_is_writable, update_installer_script, verify_app_identity, AppState,
+        GitHubAsset, UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH,
+        EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, PLIST_BUDDY_PATH,
+        SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
     use std::path::Path;
@@ -1594,6 +1646,17 @@ mod tests {
     }
 
     #[test]
+    fn updater_proxy_loopback_detection_accepts_common_local_forms() {
+        assert!(proxy_url_targets_loopback("http://127.0.0.1:8080"));
+        assert!(proxy_url_targets_loopback("localhost:8080"));
+        assert!(proxy_url_targets_loopback("http://[::1]:8080"));
+        assert!(!proxy_url_targets_loopback(
+            "http://proxy.example.test:8080"
+        ));
+        assert!(!proxy_url_targets_loopback(""));
+    }
+
+    #[test]
     fn self_update_guard_rejects_concurrent_updates() {
         let data_dir =
             std::env::temp_dir().join(format!("sniper-update-guard-{}", uuid::Uuid::new_v4()));
@@ -1726,6 +1789,46 @@ mod tests {
 
         drop(operation_guard);
         state.delete_session(original_id).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn session_context_for_id_waits_for_session_operation_lock() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-session-load-lock-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let load_result = tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            state.session_context_for_id(original_id),
+        )
+        .await;
+        assert!(load_result.is_err());
+
+        drop(operation_guard);
+        assert_eq!(
+            state
+                .session_context_for_id(original_id)
+                .await
+                .unwrap()
+                .id(),
+            original_id
+        );
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
