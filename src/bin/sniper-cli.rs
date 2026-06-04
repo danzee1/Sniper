@@ -37,6 +37,7 @@ use url::Url;
 use uuid::Uuid;
 
 const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
+const MAX_CLI_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.")]
@@ -2712,36 +2713,55 @@ fn read_lines_input(
 }
 
 fn read_text_input(file: Option<PathBuf>, stdin: bool) -> Result<String> {
+    let bytes = read_bytes_input(file, stdin)?;
+    String::from_utf8(bytes).context("input is not valid UTF-8")
+}
+
+fn read_bytes_input(file: Option<PathBuf>, stdin: bool) -> Result<Vec<u8>> {
     if let Some(file) = file {
-        return fs::read_to_string(&file)
-            .with_context(|| format!("failed to read {}", file.display()));
+        return read_file_bytes_limited(&file);
     }
 
     if stdin {
-        let mut buf = String::new();
-        io::stdin()
-            .read_to_string(&mut buf)
-            .context("failed to read stdin")?;
-        return Ok(buf);
+        let mut stdin = io::stdin();
+        return read_limited_to_end(&mut stdin, "stdin", MAX_CLI_INPUT_BYTES);
     }
 
     bail!("expected --file or --stdin")
 }
 
-fn read_bytes_input(file: Option<PathBuf>, stdin: bool) -> Result<Vec<u8>> {
-    if let Some(file) = file {
-        return fs::read(&file).with_context(|| format!("failed to read {}", file.display()));
+fn read_file_bytes_limited(file: &PathBuf) -> Result<Vec<u8>> {
+    let metadata =
+        fs::metadata(file).with_context(|| format!("failed to inspect {}", file.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", file.display());
     }
-
-    if stdin {
-        let mut buf = Vec::new();
-        io::stdin()
-            .read_to_end(&mut buf)
-            .context("failed to read stdin")?;
-        return Ok(buf);
+    if metadata.len() > MAX_CLI_INPUT_BYTES as u64 {
+        bail!(
+            "{} cannot exceed {} bytes",
+            file.display(),
+            MAX_CLI_INPUT_BYTES
+        );
     }
+    let mut handle =
+        fs::File::open(file).with_context(|| format!("failed to read {}", file.display()))?;
+    read_limited_to_end(
+        &mut handle,
+        &format!("{}", file.display()),
+        MAX_CLI_INPUT_BYTES,
+    )
+}
 
-    bail!("expected --file or --stdin")
+fn read_limited_to_end<R: Read>(reader: &mut R, label: &str, limit: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("failed to read {label}"))?;
+    if buf.len() > limit {
+        bail!("{label} cannot exceed {limit} bytes");
+    }
+    Ok(buf)
 }
 
 fn read_raw_request_input(
@@ -3664,13 +3684,14 @@ mod tests {
         oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
-        push_replay_history_entry, read_payloads_input, read_raw_request_input,
-        read_raw_response_input, replay_send_http_version, replay_tab_target_as_request,
-        replay_tab_target_matches_request, replay_update_should_preserve_current_port,
-        session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
-        strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path, Cli, Command,
-        HistoryCommand, HistoryListResponse, SequenceCommand, SequenceCreateInput,
-        SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
+        push_replay_history_entry, read_limited_to_end, read_payloads_input,
+        read_raw_request_input, read_raw_response_input, read_text_input, replay_send_http_version,
+        replay_tab_target_as_request, replay_tab_target_matches_request,
+        replay_update_should_preserve_current_port, session_query_path,
+        sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
+        sync_replay_tab_target_to_request, transaction_detail_path, Cli, Command, HistoryCommand,
+        HistoryListResponse, SequenceCommand, SequenceCreateInput, SkillsInstallArgs,
+        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3740,6 +3761,41 @@ mod tests {
         ];
 
         assert_eq!(active_session_id_from_summaries(&sessions), Some(active));
+    }
+
+    #[test]
+    fn read_text_input_rejects_oversized_regular_file() {
+        let dir = std::env::temp_dir().join(format!("sniper-cli-input-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.txt");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((MAX_CLI_INPUT_BYTES + 1) as u64).unwrap();
+
+        let error = read_text_input(Some(path), false).unwrap_err();
+
+        assert!(error.to_string().contains("cannot exceed"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_text_input_rejects_non_regular_file() {
+        let dir =
+            std::env::temp_dir().join(format!("sniper-cli-input-dir-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let error = read_text_input(Some(dir.clone()), false).unwrap_err();
+
+        assert!(error.to_string().contains("not a regular file"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_limited_to_end_rejects_streams_over_limit() {
+        let mut reader = std::io::Cursor::new(vec![1, 2, 3, 4]);
+
+        let error = read_limited_to_end(&mut reader, "fixture", 3).unwrap_err();
+
+        assert!(error.to_string().contains("cannot exceed 3 bytes"));
     }
 
     #[test]

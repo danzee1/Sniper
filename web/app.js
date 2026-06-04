@@ -14377,8 +14377,6 @@ async function wsConnect() {
   tab.wsPath = wsPath;
 
   tab.wsStatus = "connecting";
-  tab.wsFrames = [];
-  tab.wsSelectedFrameIndex = -1;
   tab.wsError = null;
   tab.wsSetupPending = Array.isArray(tab.wsSetupQueue)
     && tab.wsSetupQueue.some((item) => item.autoSend && !item.sent);
@@ -14414,6 +14412,10 @@ async function wsConnect() {
       const text = await resp.text().catch(() => "Connection failed");
       throw new Error(text);
     }
+    tab.wsFrames = [];
+    tab.wsSelectedFrameIndex = -1;
+    scheduleWorkspaceStateSave();
+    renderWsFrameList();
     startWsPoll(tab);
     renderReplayTabs();
 
@@ -15768,7 +15770,7 @@ function replayRequestToCurl() {
   const parsed = parseRequestForExport(
     tab.requestText ?? "",
     target.scheme || "https",
-    target.host || "localhost",
+    target.host || "",
     target.port || "",
   );
   return requestToCurl(parsed);
@@ -15812,7 +15814,6 @@ function parseRequestForExport(rawText, scheme, host, port) {
   const method = match[1];
   const path = match[2];
   const httpVersion = normalizeReplayHttpVersion(match[3] || "");
-  const url = buildUrlFromTarget(scheme, host, port, path);
   let bodyIdx = rest.indexOf("");
   if (bodyIdx === -1) {
     for (let i = 0; i < rest.length; i++) {
@@ -15824,11 +15825,37 @@ function parseRequestForExport(rawText, scheme, host, port) {
   const headerLines = bodyIdx === -1 ? rest : rest.slice(0, bodyIdx);
   const body = bodyIdx === -1 ? "" : (rest[bodyIdx] === "" ? rest.slice(bodyIdx + 1) : rest.slice(bodyIdx)).join("\n");
   const bodyProvided = bodyIdx !== -1;
-  const headers = headerLines.map((h) => {
-    const idx = h.indexOf(":");
-    return idx === -1 ? null : { name: h.slice(0, idx).trim(), value: h.slice(idx + 1).trim() };
-  }).filter(Boolean);
-  return { method, url, headers, body, bodyProvided, httpVersion };
+  const headers = headerLines.map((h) => parseHeaderLineForExport(h)).filter(Boolean);
+  const authority = exportHeaderValue(headers, ":authority");
+  const exportHost = host || exportHeaderValue(headers, "host") || authority || "localhost";
+  return { method, url: buildUrlFromTarget(scheme, exportHost, port, path), headers, body, bodyProvided, httpVersion };
+}
+
+function parseHeaderLineForExport(line) {
+  const text = String(line || "");
+  if (text.startsWith(":")) {
+    const idx = text.indexOf(":", 1);
+    return idx > 1 ? { name: text.slice(0, idx).trim(), value: text.slice(idx + 1).trim() } : null;
+  }
+  const idx = text.indexOf(":");
+  return idx > 0 ? { name: text.slice(0, idx).trim(), value: text.slice(idx + 1).trim() } : null;
+}
+
+function exportHeaderValue(headers, name) {
+  return exportableHeaderCandidates(headers).find((header) => headerNameEquals(header, name))?.value || "";
+}
+
+function exportableHeaderCandidates(headers) {
+  return (Array.isArray(headers) ? headers : [])
+    .map((header) => ({
+      name: String(header?.name || "").trim(),
+      value: String(header?.value ?? ""),
+    }))
+    .filter((header) => header.name);
+}
+
+function isHttpPseudoHeaderName(name) {
+  return String(name || "").trim().startsWith(":");
 }
 
 function requestToPython(parsed) {
@@ -15862,11 +15889,12 @@ function exportableHeaders(headers, url = "") {
 }
 
 function exportableHeadersForUrl(headers, url = "") {
-  const normalized = normalizedHeaders(headers);
+  const normalized = exportableHeaderCandidates(headers);
   const hostHeader = normalized.find((h) => headerNameEquals(h, "host"));
   const preserveHost = hostHeader && hostHeaderDiffersFromUrl(hostHeader.value, url);
   return normalized
     .filter((h) => {
+      if (isHttpPseudoHeaderName(h.name)) return false;
       if (headerNameEquals(h, "content-length")) return false;
       if (headerNameEquals(h, "host")) return !!preserveHost;
       return true;
@@ -15975,7 +16003,7 @@ function replayRequestToFormat(format) {
   const parsed = parseRequestForExport(
     tab.requestText,
     target.scheme || "https",
-    target.host || "localhost",
+    target.host || "",
     target.port || "",
   );
   if (format === "fetch") {
@@ -16034,7 +16062,8 @@ function selectedRecordToFormat(format) {
   const rawText = buildRawRequest(record);
   const scheme = record.scheme || "https";
   const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
-  const host = record.host || hostHeader?.value || "";
+  const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
+  const host = record.host || hostHeader?.value || authorityHeader?.value || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
   if (format === "fetch") {
@@ -16066,7 +16095,8 @@ async function historyRequestToFormat(transactionId, format) {
   const rawText = buildRawRequest(record);
   const scheme = record.scheme || "https";
   const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
-  const host = record.host || hostHeader?.value || "";
+  const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
+  const host = record.host || hostHeader?.value || authorityHeader?.value || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
   if (format === "fetch") {

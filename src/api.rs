@@ -53,6 +53,17 @@ const MAX_WORKSPACE_WS_FRAMES: usize = 1_000;
 const MAX_WORKSPACE_WS_FRAME_BODY_BYTES: usize = 16 * 1024;
 const MAX_WORKSPACE_WS_TOTAL_FRAMES: usize = 2_000;
 const MAX_WORKSPACE_WS_TOTAL_FRAME_BODY_BYTES: usize = 24 * 1024 * 1024;
+const MAX_WORKSPACE_REPLAY_TABS: usize = 128;
+const MAX_WORKSPACE_REPLAY_HISTORY_ENTRIES_PER_TAB: usize = 500;
+const MAX_WORKSPACE_TEXT_FIELD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WORKSPACE_FUZZER_PAYLOAD_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WORKSPACE_FUZZER_PAYLOAD_LINES: usize = 5_000;
+const MAX_WORKSPACE_WS_SETUP_QUEUE_ITEMS: usize = 250;
+const MAX_WORKSPACE_WS_SETUP_ITEM_BYTES: usize = 64 * 1024;
+const MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WORKSPACE_EMBEDDED_RECORD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WORKSPACE_FUZZER_ATTACK_RESULTS: usize = 5_000;
+const MAX_WORKSPACE_STORED_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(RustEmbed)]
 #[folder = "web/decoder/"]
@@ -784,6 +795,13 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
     let mut tab_ids = HashSet::new();
     let mut ws_frame_total = 0usize;
     let mut ws_frame_body_total = 0usize;
+    let mut stored_bytes_total = 0usize;
+    if snapshot.replay.tabs.len() > MAX_WORKSPACE_REPLAY_TABS {
+        return Err(format!(
+            "workspace has too many replay tabs: {}",
+            snapshot.replay.tabs.len()
+        ));
+    }
     for tab in &snapshot.replay.tabs {
         if tab.id.trim().is_empty() {
             return Err("replay tab id is required".to_string());
@@ -794,10 +812,55 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
         if tab.custom_label.chars().count() > 80 {
             return Err(format!("replay tab {} custom label is too long", tab.id));
         }
+        add_workspace_text_bytes(
+            &mut stored_bytes_total,
+            "replay tab request text",
+            &tab.request_text,
+            MAX_WORKSPACE_TEXT_FIELD_BYTES,
+        )?;
+        add_workspace_text_bytes(
+            &mut stored_bytes_total,
+            "replay tab notice",
+            &tab.notice,
+            MAX_WORKSPACE_TEXT_FIELD_BYTES,
+        )?;
+        add_workspace_text_bytes(
+            &mut stored_bytes_total,
+            "websocket handshake text",
+            &tab.ws_handshake_text,
+            MAX_WORKSPACE_TEXT_FIELD_BYTES,
+        )?;
+        add_workspace_text_bytes(
+            &mut stored_bytes_total,
+            "websocket editor text",
+            &tab.ws_editor_text,
+            MAX_WORKSPACE_TEXT_FIELD_BYTES,
+        )?;
+        if tab.history_entries.len() > MAX_WORKSPACE_REPLAY_HISTORY_ENTRIES_PER_TAB {
+            return Err(format!(
+                "replay tab {} has too many history entries: {}",
+                tab.id,
+                tab.history_entries.len()
+            ));
+        }
         if let Some(index) = tab.history_index {
             if index >= tab.history_entries.len() {
                 return Err(format!("invalid replay history index for tab {}", tab.id));
             }
+        }
+        if tab.ws_setup_queue.len() > MAX_WORKSPACE_WS_SETUP_QUEUE_ITEMS {
+            return Err(format!(
+                "WebSocket setup queue has too many items: {}",
+                tab.ws_setup_queue.len()
+            ));
+        }
+        for item in &tab.ws_setup_queue {
+            add_workspace_json_bytes(
+                &mut stored_bytes_total,
+                "WebSocket setup item",
+                item,
+                MAX_WORKSPACE_WS_SETUP_ITEM_BYTES,
+            )?;
         }
         if tab.tab_type == "websocket" {
             let ws_stats = validate_workspace_ws_tab(tab)
@@ -818,13 +881,53 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
         if let Some(request) = &tab.base_request {
             validate_workspace_draft_request(request)
                 .map_err(|error| format!("invalid replay base request: {error}"))?;
+            add_workspace_json_bytes(
+                &mut stored_bytes_total,
+                "replay base request",
+                request,
+                MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES,
+            )?;
+        }
+        if let Some(record) = &tab.response_record {
+            add_workspace_json_bytes(
+                &mut stored_bytes_total,
+                "replay response record",
+                record,
+                MAX_WORKSPACE_EMBEDDED_RECORD_BYTES,
+            )?;
         }
         validate_workspace_target_fields(&tab.target_scheme, &tab.target_host, &tab.target_port)
             .map_err(|error| format!("invalid replay target: {error}"))?;
         for entry in &tab.history_entries {
+            add_workspace_text_bytes(
+                &mut stored_bytes_total,
+                "replay history request text",
+                &entry.request_text,
+                MAX_WORKSPACE_TEXT_FIELD_BYTES,
+            )?;
+            add_workspace_text_bytes(
+                &mut stored_bytes_total,
+                "replay history notice",
+                &entry.notice,
+                MAX_WORKSPACE_TEXT_FIELD_BYTES,
+            )?;
             if let Some(request) = &entry.request {
                 validate_editable_request(request)
                     .map_err(|error| format!("invalid replay history request: {error}"))?;
+                add_workspace_json_bytes(
+                    &mut stored_bytes_total,
+                    "replay history request",
+                    request,
+                    MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES,
+                )?;
+            }
+            if let Some(record) = &entry.response_record {
+                add_workspace_json_bytes(
+                    &mut stored_bytes_total,
+                    "replay history response record",
+                    record,
+                    MAX_WORKSPACE_EMBEDDED_RECORD_BYTES,
+                )?;
             }
             validate_workspace_target_fields(
                 &entry.target_scheme,
@@ -842,10 +945,95 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
     if let Some(request) = &snapshot.fuzzer.base_request {
         validate_workspace_draft_request(request)
             .map_err(|error| format!("invalid fuzzer base request: {error}"))?;
+        add_workspace_json_bytes(
+            &mut stored_bytes_total,
+            "fuzzer base request",
+            request,
+            MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES,
+        )?;
     }
     if let Some(target) = &snapshot.fuzzer.target {
         validate_request_target_override(target)
             .map_err(|error| format!("invalid fuzzer target: {error}"))?;
+    }
+    add_workspace_text_bytes(
+        &mut stored_bytes_total,
+        "fuzzer notice",
+        &snapshot.fuzzer.notice,
+        MAX_WORKSPACE_TEXT_FIELD_BYTES,
+    )?;
+    add_workspace_text_bytes(
+        &mut stored_bytes_total,
+        "fuzzer request text",
+        &snapshot.fuzzer.request_text,
+        MAX_WORKSPACE_TEXT_FIELD_BYTES,
+    )?;
+    add_workspace_text_bytes(
+        &mut stored_bytes_total,
+        "fuzzer payload text",
+        &snapshot.fuzzer.payloads_text,
+        MAX_WORKSPACE_FUZZER_PAYLOAD_TEXT_BYTES,
+    )?;
+    if snapshot.fuzzer.payloads_text.lines().count() > MAX_WORKSPACE_FUZZER_PAYLOAD_LINES {
+        return Err(format!(
+            "fuzzer payload text cannot contain more than {MAX_WORKSPACE_FUZZER_PAYLOAD_LINES} lines"
+        ));
+    }
+    if let Some(record) = &snapshot.fuzzer.attack_record {
+        if record.results.len() > MAX_WORKSPACE_FUZZER_ATTACK_RESULTS {
+            return Err(format!(
+                "fuzzer attack record has too many results: {}",
+                record.results.len()
+            ));
+        }
+        add_workspace_json_bytes(
+            &mut stored_bytes_total,
+            "fuzzer attack record",
+            record,
+            MAX_WORKSPACE_EMBEDDED_RECORD_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn add_workspace_text_bytes(
+    total: &mut usize,
+    label: &str,
+    value: &str,
+    field_limit: usize,
+) -> std::result::Result<(), String> {
+    let bytes = value.len();
+    if bytes > field_limit {
+        return Err(format!("{label} cannot exceed {field_limit} bytes"));
+    }
+    add_workspace_stored_bytes(total, label, bytes)
+}
+
+fn add_workspace_json_bytes<T: Serialize>(
+    total: &mut usize,
+    label: &str,
+    value: &T,
+    field_limit: usize,
+) -> std::result::Result<(), String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("failed to measure {label}: {error}"))?
+        .len();
+    if bytes > field_limit {
+        return Err(format!("{label} cannot exceed {field_limit} stored bytes"));
+    }
+    add_workspace_stored_bytes(total, label, bytes)
+}
+
+fn add_workspace_stored_bytes(
+    total: &mut usize,
+    label: &str,
+    bytes: usize,
+) -> std::result::Result<(), String> {
+    *total = total.saturating_add(bytes);
+    if *total > MAX_WORKSPACE_STORED_BYTES {
+        return Err(format!(
+            "workspace stored state exceeds {MAX_WORKSPACE_STORED_BYTES} bytes while adding {label}"
+        ));
     }
     Ok(())
 }
@@ -4043,7 +4231,10 @@ mod tests {
         scanner::{CustomRule, FindingSummary, ScannerConfig, ScannerFinding, Severity},
         sequence::{ExtractionRule, ExtractionSource, SequenceDefinition, SequenceStep},
         state::AppState,
-        workspace::{ReplayTabState, ReplayWorkspaceState, WorkspaceStateSnapshot},
+        workspace::{
+            FuzzerWorkspaceState, ReplayHistoryEntryState, ReplayTabState, ReplayWorkspaceState,
+            WorkspaceStateSnapshot,
+        },
         ws_replay::WsReplayFrame,
     };
 
@@ -4802,6 +4993,56 @@ mod tests {
         });
 
         assert!(super::validate_workspace_state(&snapshot).is_err());
+    }
+
+    #[test]
+    fn workspace_validation_rejects_oversized_replay_text_state() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "large-tab".to_string(),
+            sequence: 1,
+            request_text: "x".repeat(super::MAX_WORKSPACE_TEXT_FIELD_BYTES + 1),
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("replay tab request text"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_oversized_replay_history_state() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "history-tab".to_string(),
+            sequence: 1,
+            history_entries: vec![
+                ReplayHistoryEntryState::default();
+                super::MAX_WORKSPACE_REPLAY_HISTORY_ENTRIES_PER_TAB + 1
+            ],
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("too many history entries"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_oversized_fuzzer_payload_text_state() {
+        let mut snapshot = WorkspaceStateSnapshot {
+            fuzzer: FuzzerWorkspaceState {
+                payloads_text: "x\n".repeat(super::MAX_WORKSPACE_FUZZER_PAYLOAD_LINES + 1),
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("fuzzer payload text"));
+
+        snapshot.fuzzer.payloads_text =
+            "x".repeat(super::MAX_WORKSPACE_FUZZER_PAYLOAD_TEXT_BYTES + 1);
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("fuzzer payload text"));
     }
 
     #[test]

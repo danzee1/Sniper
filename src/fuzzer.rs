@@ -7,8 +7,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-static MARKER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$payload\$").expect("valid marker regex"));
+const FUZZER_PAYLOAD_MARKER: &str = "$payload$";
+const MAX_FUZZER_PAYLOADS: usize = 5_000;
+const MAX_FUZZER_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_FUZZER_TOTAL_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FUZZER_MARKERS_PER_REQUEST: usize = 128;
+const MAX_FUZZER_EXPANDED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+static MARKER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(regex::escape(FUZZER_PAYLOAD_MARKER).as_str()).expect("valid marker regex")
+});
 
 use crate::{
     event_log::{EventLevel, EventLogEntry},
@@ -115,7 +123,7 @@ impl FuzzerStore {
     }
 
     pub fn from_attacks(max_entries: usize, records: Vec<FuzzerAttackRecord>) -> Self {
-        let mut attacks = VecDeque::with_capacity(max_entries);
+        let mut attacks = VecDeque::with_capacity(records.len().min(max_entries));
         attacks.extend(records.into_iter().take(max_entries));
         Self {
             max_entries,
@@ -237,11 +245,14 @@ pub async fn run_attack_for_session(
     if marker_count == 0 {
         return Err(anyhow!("Request template is missing $payload$ markers."));
     }
+    validate_marker_count(marker_count)?;
 
     let normalized_payloads = normalize_payloads(payloads);
     if normalized_payloads.is_empty() {
         return Err(anyhow!("Fuzzer needs at least one payload"));
     }
+    validate_fuzzer_payloads(&normalized_payloads)?;
+    validate_fuzzer_expanded_request_budget(&template, &normalized_payloads)?;
 
     let (started_event, started_evicted_events) = session
         .event_log
@@ -402,6 +413,78 @@ fn count_request_markers(request: &EditableRequest) -> usize {
     count
 }
 
+fn validate_marker_count(marker_count: usize) -> Result<()> {
+    if marker_count > MAX_FUZZER_MARKERS_PER_REQUEST {
+        return Err(anyhow!(
+            "Fuzzer request templates cannot contain more than {MAX_FUZZER_MARKERS_PER_REQUEST} $payload$ markers"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fuzzer_payloads(payloads: &[String]) -> Result<()> {
+    if payloads.len() > MAX_FUZZER_PAYLOADS {
+        return Err(anyhow!(
+            "Fuzzer payload count cannot exceed {MAX_FUZZER_PAYLOADS}"
+        ));
+    }
+
+    let mut total_bytes = 0usize;
+    for (index, payload) in payloads.iter().enumerate() {
+        let payload_bytes = payload.len();
+        if payload_bytes > MAX_FUZZER_PAYLOAD_BYTES {
+            return Err(anyhow!(
+                "Fuzzer payload {index} cannot exceed {MAX_FUZZER_PAYLOAD_BYTES} bytes"
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(payload_bytes);
+        if total_bytes > MAX_FUZZER_TOTAL_PAYLOAD_BYTES {
+            return Err(anyhow!(
+                "Fuzzer payloads cannot exceed {MAX_FUZZER_TOTAL_PAYLOAD_BYTES} total bytes"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fuzzer_expanded_request_budget(
+    template: &EditableRequest,
+    payloads: &[String],
+) -> Result<()> {
+    for (index, payload) in payloads.iter().enumerate() {
+        let request_bytes = expanded_request_size(template, payload.len());
+        if request_bytes > MAX_FUZZER_EXPANDED_REQUEST_BYTES {
+            return Err(anyhow!(
+                "Fuzzer payload {index} expands the request to {request_bytes} bytes, above the {MAX_FUZZER_EXPANDED_REQUEST_BYTES} byte limit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expanded_request_size(template: &EditableRequest, payload_len: usize) -> usize {
+    let mut bytes = expanded_value_len(&template.scheme, payload_len)
+        .saturating_add(expanded_value_len(&template.host, payload_len))
+        .saturating_add(expanded_value_len(&template.method, payload_len))
+        .saturating_add(expanded_value_len(&template.path, payload_len))
+        .saturating_add(expanded_value_len(&template.body, payload_len));
+
+    for header in &template.headers {
+        bytes = bytes
+            .saturating_add(expanded_value_len(&header.name, payload_len))
+            .saturating_add(expanded_value_len(&header.value, payload_len));
+    }
+    bytes
+}
+
+fn expanded_value_len(value: &str, payload_len: usize) -> usize {
+    let marker_count = count_markers(value);
+    value
+        .len()
+        .saturating_sub(marker_count.saturating_mul(FUZZER_PAYLOAD_MARKER.len()))
+        .saturating_add(marker_count.saturating_mul(payload_len))
+}
+
 fn apply_payload_to_request(template: &EditableRequest, payload: &str) -> Result<EditableRequest> {
     let mut request = template.clone();
     request.host = replace_markers(&request.host, payload)?;
@@ -514,6 +597,61 @@ mod tests {
         let payloads = normalize_payloads(vec!["".to_string(), "admin\r".to_string()]);
 
         assert_eq!(payloads, vec!["".to_string(), "admin".to_string()]);
+    }
+
+    #[test]
+    fn fuzzer_rejects_oversized_payload_sets() {
+        let too_many = vec!["x".to_string(); MAX_FUZZER_PAYLOADS + 1];
+        assert!(validate_fuzzer_payloads(&too_many)
+            .unwrap_err()
+            .to_string()
+            .contains("payload count"));
+
+        let too_large = vec!["x".repeat(MAX_FUZZER_PAYLOAD_BYTES + 1)];
+        assert!(validate_fuzzer_payloads(&too_large)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot exceed"));
+
+        let too_many_bytes = vec!["x".repeat(MAX_FUZZER_PAYLOAD_BYTES); 65];
+        assert!(validate_fuzzer_payloads(&too_many_bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("total bytes"));
+    }
+
+    #[test]
+    fn fuzzer_rejects_marker_and_expansion_amplification() {
+        let mut request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: FUZZER_PAYLOAD_MARKER.repeat(MAX_FUZZER_MARKERS_PER_REQUEST + 1),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        assert!(validate_marker_count(count_request_markers(&request))
+            .unwrap_err()
+            .to_string()
+            .contains("markers"));
+
+        let marker_count = (MAX_FUZZER_EXPANDED_REQUEST_BYTES / MAX_FUZZER_PAYLOAD_BYTES) + 1;
+        assert!(marker_count <= MAX_FUZZER_MARKERS_PER_REQUEST);
+        request.body = FUZZER_PAYLOAD_MARKER.repeat(marker_count);
+        let payloads = vec!["x".repeat(MAX_FUZZER_PAYLOAD_BYTES)];
+        assert!(validate_fuzzer_expanded_request_budget(&request, &payloads)
+            .unwrap_err()
+            .to_string()
+            .contains("expands the request"));
+    }
+
+    #[tokio::test]
+    async fn from_attacks_does_not_preallocate_full_retention_for_empty_restore() {
+        let store = FuzzerStore::from_attacks(500_000, Vec::new());
+
+        assert_eq!(store.attacks.read().await.capacity(), 0);
     }
 
     #[test]

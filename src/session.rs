@@ -692,7 +692,9 @@ impl SessionRegistry {
         if !registry.sessions.iter().any(|s| s.id == id) {
             return Err(anyhow!("session {id} was not found"));
         }
-        Ok(session_dir(&self.root_dir, id))
+        let storage_dir = session_dir(&self.root_dir, id);
+        ensure_existing_private_session_dir(&storage_dir)?;
+        Ok(storage_dir)
     }
 
     pub fn load_context(&self, id: Uuid) -> Result<Arc<SessionContext>> {
@@ -787,7 +789,7 @@ fn normalize_registry_snapshot(root_dir: &Path, registry: &mut SessionRegistrySn
     let previous_deleted_len = registry.deleted_session_ids.len();
     let mut deleted_seen = HashSet::new();
     registry.deleted_session_ids.retain(|id| {
-        deleted_seen.insert(*id) && fs::symlink_metadata(session_dir(root_dir, *id)).is_ok()
+        deleted_seen.insert(*id) && deleted_session_storage_still_exists(root_dir, *id)
     });
     changed |= registry.deleted_session_ids.len() != previous_deleted_len;
 
@@ -802,11 +804,75 @@ fn normalize_registry_snapshot(root_dir: &Path, registry: &mut SessionRegistrySn
         if deleted_ids.contains(&session.id) {
             return false;
         }
-        session_seen.insert(session.id)
+        if !session_seen.insert(session.id) {
+            return false;
+        }
+        registered_session_storage_is_valid(root_dir, session.id)
     });
     changed |= registry.sessions.len() != previous_sessions_len;
 
     changed
+}
+
+fn registered_session_storage_is_valid(root_dir: &Path, id: Uuid) -> bool {
+    let storage_dir = session_dir(root_dir, id);
+    match session_storage_metadata(&storage_dir) {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            warn!(
+                session_id = %id,
+                path = %storage_dir.display(),
+                "dropping registered session with missing storage directory"
+            );
+            false
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                session_id = %id,
+                path = %storage_dir.display(),
+                "dropping registered session with invalid storage directory"
+            );
+            false
+        }
+    }
+}
+
+fn deleted_session_storage_still_exists(root_dir: &Path, id: Uuid) -> bool {
+    let path = session_dir(root_dir, id);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            warn!(
+                %error,
+                session_id = %id,
+                path = %path.display(),
+                "failed to inspect tombstoned session storage"
+            );
+            return true;
+        }
+    };
+
+    let removal = if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(&path)
+    } else {
+        fs::remove_dir_all(&path)
+    };
+
+    match removal {
+        Ok(()) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            warn!(
+                %error,
+                session_id = %id,
+                path = %path.display(),
+                "failed to remove tombstoned session storage"
+            );
+            true
+        }
+    }
 }
 
 fn rebuild_registry_from_session_dirs(
@@ -1068,6 +1134,21 @@ fn create_private_session_dir(storage_dir: &Path) -> Result<()> {
     })
 }
 
+fn ensure_existing_private_session_dir(storage_dir: &Path) -> Result<()> {
+    match session_storage_metadata(storage_dir)? {
+        Some(_) => tighten_private_dir(storage_dir).with_context(|| {
+            format!(
+                "failed to set private permissions on session directory {}",
+                storage_dir.display()
+            )
+        }),
+        None => Err(anyhow!(
+            "session storage directory {} was not found",
+            storage_dir.display()
+        )),
+    }
+}
+
 fn create_private_dir_all(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     tighten_private_dir(path)
@@ -1109,7 +1190,7 @@ fn tighten_private_file(_path: &Path) -> io::Result<()> {
 }
 
 fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<StoredSessionSnapshot> {
-    create_private_session_dir(storage_dir)?;
+    ensure_existing_private_session_dir(storage_dir)?;
     let path = snapshot_path(storage_dir);
     let mut snapshot = match fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<StoredSessionSnapshot>(&bytes) {
@@ -1620,6 +1701,14 @@ mod tests {
         assert_eq!(loaded_active.id(), active.id);
         assert!(registry.contains_session(active.id));
         assert!(!registry.contains_session(deleted.id));
+        assert!(!super::session_dir(&root_dir, deleted.id).exists());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root_dir.join(super::REGISTRY_FILE)).unwrap())
+                .unwrap();
+        assert!(saved
+            .get("deleted_session_ids")
+            .and_then(|value| value.as_array())
+            .is_none_or(|ids| ids.is_empty()));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1654,12 +1743,13 @@ mod tests {
         assert_ne!(active.id(), tombstoned.id);
         assert!(!registry.contains_session(tombstoned.id));
         assert_eq!(registry.summaries().len(), 1);
+        assert!(!super::session_dir(&root_dir, tombstoned.id).exists());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
-    fn registry_empty_rebuild_preserves_tombstones() {
+    fn registry_empty_rebuild_removes_tombstoned_storage() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-session-empty-tombstone-test-{}",
             uuid::Uuid::new_v4()
@@ -1688,6 +1778,70 @@ mod tests {
         assert_ne!(active.id(), tombstoned.id);
         assert!(!registry.contains_session(tombstoned.id));
         assert_eq!(registry.summaries().len(), 1);
+        assert!(!super::session_dir(&root_dir, tombstoned.id).exists());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn registry_prunes_registered_session_with_missing_storage() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-missing-storage-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let active = super::default_session_metadata("Active");
+        let missing = super::default_session_metadata("Missing");
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": active.id,
+                "sessions": [active.clone(), missing.clone()]
+            }),
+        )
+        .expect("registry with missing storage should be written");
+
+        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("registry should repair missing storage");
+
+        assert_eq!(loaded_active.id(), active.id);
+        assert!(registry.contains_session(active.id));
+        assert!(!registry.contains_session(missing.id));
+        assert!(!super::session_dir(&root_dir, missing.id).exists());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn registry_rebuilds_when_active_session_storage_is_missing() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-missing-active-storage-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let missing = super::default_session_metadata("Missing active");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": missing.id,
+                "sessions": [missing.clone()]
+            }),
+        )
+        .expect("registry with missing active storage should be written");
+
+        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("registry should rebuild missing active storage");
+
+        assert_ne!(loaded_active.id(), missing.id);
+        assert_eq!(registry.summaries().len(), 1);
+        assert!(!registry.contains_session(missing.id));
+        assert!(!super::session_dir(&root_dir, missing.id).exists());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1825,11 +1979,56 @@ mod tests {
             }),
         )
         .expect("registry pointing at symlink should be written");
-        let error = match SessionRegistry::load_or_create(&data_dir, 32, 32) {
-            Ok(_) => panic!("registered uuid symlink should not be loaded"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("session storage directory"));
+        let (registry, repaired_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("registered uuid symlink should be pruned and repaired");
+        assert_ne!(repaired_active.id(), linked.id);
+        assert!(!registry.contains_session(linked.id));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&external_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_prunes_inactive_uuid_symlink_session_dir() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-inactive-symlink-registry-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let external_dir = std::env::temp_dir().join(format!(
+            "sniper-session-inactive-symlink-target-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let active = super::default_session_metadata("Active");
+        let linked = super::default_session_metadata("Linked");
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        std::fs::create_dir_all(&external_dir).expect("external dir should be created");
+        symlink(&external_dir, root_dir.join(linked.id.to_string()))
+            .expect("uuid symlink should be created");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": active.id,
+                "sessions": [active.clone(), linked.clone()]
+            }),
+        )
+        .expect("registry pointing at inactive symlink should be written");
+
+        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("inactive uuid symlink should be pruned");
+
+        assert_eq!(loaded_active.id(), active.id);
+        assert!(registry.contains_session(active.id));
+        assert!(!registry.contains_session(linked.id));
+        assert!(registry.session_storage_path(linked.id).is_err());
 
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&external_dir);

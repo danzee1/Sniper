@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use crate::model::{WebSocketFrameRecord, WebSocketSessionRecord, WebSocketSessionSummary};
 
+const MAX_WEBSOCKET_BROADCAST_CAPACITY: usize = 4096;
+
 pub struct WebSocketStore {
     max_entries: usize,
     max_frames_per_session: usize,
@@ -31,8 +33,9 @@ impl WebSocketStore {
         max_frames_per_session: usize,
         records: Vec<WebSocketSessionRecord>,
     ) -> Self {
-        let (events, _) = broadcast::channel(max_entries.max(32));
-        let mut sessions = VecDeque::with_capacity(max_entries);
+        let (events, _) =
+            broadcast::channel(max_entries.clamp(32, MAX_WEBSOCKET_BROADCAST_CAPACITY));
+        let mut sessions = VecDeque::with_capacity(records.len().min(max_entries));
         sessions.extend(sessions_with_live_preserved(
             records,
             max_entries,
@@ -296,6 +299,13 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_ne!(snapshot[0].id, first_id);
         assert_eq!(store.list_page(Some(10)).await.total, 1);
+    }
+
+    #[tokio::test]
+    async fn from_sessions_does_not_preallocate_full_retention_for_empty_restore() {
+        let store = WebSocketStore::from_sessions(500_000, 10, Vec::new());
+
+        assert_eq!(store.sessions.read().await.capacity(), 0);
     }
 
     #[tokio::test]

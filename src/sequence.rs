@@ -166,7 +166,7 @@ impl SequenceStore {
         definitions: Vec<SequenceDefinition>,
         runs: Vec<SequenceRunRecord>,
     ) -> Self {
-        let mut run_deque = VecDeque::with_capacity(max_entries);
+        let mut run_deque = VecDeque::with_capacity(runs.len().min(max_entries));
         run_deque.extend(runs.into_iter().take(max_entries));
         Self {
             max_entries,
@@ -724,6 +724,13 @@ mod tests {
 
         assert!(run.step_results.is_empty());
         assert_eq!(run.summary().step_count, 0);
+    }
+
+    #[tokio::test]
+    async fn from_data_does_not_preallocate_full_retention_for_empty_restore() {
+        let store = SequenceStore::from_data(500_000, Vec::new(), Vec::new());
+
+        assert_eq!(store.runs.read().await.capacity(), 0);
     }
 
     #[test]

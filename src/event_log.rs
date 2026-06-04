@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
+const MAX_EVENT_LOG_BROADCAST_CAPACITY: usize = 4096;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventLevel {
@@ -35,8 +37,9 @@ impl EventLogStore {
     }
 
     pub fn from_entries(max_entries: usize, records: Vec<EventLogEntry>) -> Self {
-        let (events, _) = broadcast::channel(max_entries.max(64));
-        let mut entries = VecDeque::with_capacity(max_entries);
+        let (events, _) =
+            broadcast::channel(max_entries.clamp(64, MAX_EVENT_LOG_BROADCAST_CAPACITY));
+        let mut entries = VecDeque::with_capacity(records.len().min(max_entries));
         entries.extend(records.into_iter().take(max_entries));
         Self {
             max_entries,
@@ -152,5 +155,12 @@ mod tests {
             entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             vec![old.id]
         );
+    }
+
+    #[tokio::test]
+    async fn from_entries_does_not_preallocate_full_retention_for_empty_restore() {
+        let store = EventLogStore::from_entries(500_000, Vec::new());
+
+        assert_eq!(store.entries.read().await.capacity(), 0);
     }
 }

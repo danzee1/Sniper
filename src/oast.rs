@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
+const MAX_OAST_BROADCAST_CAPACITY: usize = 4096;
+
 // ── Provider enum ──
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -166,7 +168,7 @@ impl OastStore {
     }
 
     pub fn new_with_config(max_entries: usize, config: OastConfig) -> Self {
-        let (events, _) = broadcast::channel(max_entries.max(64));
+        let (events, _) = broadcast::channel(max_entries.clamp(64, MAX_OAST_BROADCAST_CAPACITY));
         Self {
             max_entries,
             entries: RwLock::new(VecDeque::new()),

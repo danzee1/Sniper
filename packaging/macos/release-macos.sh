@@ -64,16 +64,14 @@ if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/
     exit 1
   fi
 fi
-if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "${ALLOW_EXISTING_RELEASE_VERSION:-0}" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   HEAD_COMMIT="$(git rev-parse HEAD)"
   TAG_COMMIT=""
   if git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null; then
     TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG")"
-    if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
-      echo "$RELEASE_TAG already points to $TAG_COMMIT, not current HEAD $HEAD_COMMIT." >&2
-      echo "Bump Cargo.toml before creating release artifacts for a new commit." >&2
-      exit 1
-    fi
+    echo "$RELEASE_TAG already exists locally at $TAG_COMMIT." >&2
+    echo "Bump Cargo.toml before creating release artifacts for a new version." >&2
+    exit 1
   fi
   REMOTE_TAG_COMMIT=""
   if remote_tag="$(git ls-remote --tags origin "$RELEASE_TAG" 2>/dev/null)"; then
@@ -85,8 +83,12 @@ if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "${ALLOW_EXISTING_RELEASE_VERSION:-0}" !=
     fi
   else
     echo "Unable to verify whether $RELEASE_TAG exists on origin." >&2
-    echo "Refusing to create release artifacts without a remote tag check. Set ALLOW_EXISTING_RELEASE_VERSION=1 to override." >&2
-    exit 1
+    if [[ "${ALLOW_EXISTING_RELEASE_VERSION:-0}" == "1" ]]; then
+      echo "Continuing because ALLOW_EXISTING_RELEASE_VERSION=1 only overrides remote tag check failures." >&2
+    else
+      echo "Refusing to create release artifacts without a remote tag check. Set ALLOW_EXISTING_RELEASE_VERSION=1 to override only this check failure." >&2
+      exit 1
+    fi
   fi
   if command -v gh >/dev/null 2>&1 && [[ -n "$GITHUB_RELEASE_REPO" ]] \
     && gh release view "$RELEASE_TAG" --repo "$GITHUB_RELEASE_REPO" >/dev/null 2>&1; then

@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
 
+const MAX_SCANNER_BROADCAST_CAPACITY: usize = 4096;
+
 // ── Scanner config ──
 
 /// Built-in rule identifiers.
@@ -150,7 +152,7 @@ pub struct ScannerStore {
 
 impl ScannerStore {
     pub fn new(max_entries: usize) -> Self {
-        let (events, _) = broadcast::channel(max_entries.max(64));
+        let (events, _) = broadcast::channel(max_entries.clamp(64, MAX_SCANNER_BROADCAST_CAPACITY));
         Self {
             max_entries,
             entries: RwLock::new(VecDeque::new()),
@@ -252,7 +254,7 @@ impl ScannerStore {
         findings: Vec<ScannerFinding>,
         config: ScannerConfig,
     ) -> Self {
-        let (events, _) = broadcast::channel(max_entries.max(64));
+        let (events, _) = broadcast::channel(max_entries.clamp(64, MAX_SCANNER_BROADCAST_CAPACITY));
         let findings: Vec<_> = findings.into_iter().take(max_entries).collect();
         let seen = findings.iter().map(finding_dedup_key).collect();
         Self {
