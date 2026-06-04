@@ -3992,7 +3992,6 @@ function replaceHistoryItemsForGap(items) {
 }
 
 function trimHistoryCache(prefer = "recent") {
-  if (!canUseSequenceCursorForHistoryPaging()) return 0;
   const overflow = state.items.length - HTTP_HISTORY_MAX_LOADED_ITEMS;
   if (overflow <= 0) {
     refreshHistoryPagingCursorFromItems();
@@ -4013,8 +4012,18 @@ function trimHistoryCache(prefer = "recent") {
   }
 
   state._connectCount = state.items.reduce((count, item) => count + (item.method === "CONNECT" ? 1 : 0), 0);
+  reconcileHistorySelectionAfterTrim(removed);
   refreshHistoryPagingCursorFromItems();
   return removed.length;
+}
+
+function reconcileHistorySelectionAfterTrim(removedItems = []) {
+  if (!state.selectedId || !removedItems.some((item) => item?.id === state.selectedId)) {
+    return;
+  }
+  state.selectedId = null;
+  state.selectedRecord = null;
+  renderEmptyDetail();
 }
 
 function adjustHistoryScrollAfterHeadTrim(removedCount) {

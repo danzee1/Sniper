@@ -2377,9 +2377,8 @@ async fn store_record_and_scan(
     session: &Arc<SessionContext>,
     record: TransactionRecord,
 ) {
-    if !insert_transaction_quiet(session, record.clone(), "captured transaction").await {
-        return;
-    }
+    let needs_snapshot_fallback =
+        insert_transaction_quiet(session, record.clone(), "captured transaction").await;
     {
         let scanner = session.scanner.clone();
         let scan_generation = scanner.clear_generation();
@@ -2398,7 +2397,9 @@ async fn store_record_and_scan(
             }
         });
     }
-    persist_session_quiet(state, session).await;
+    if needs_snapshot_fallback {
+        persist_session_quiet(state, session).await;
+    }
 }
 
 async fn insert_transaction_quiet(
@@ -2406,8 +2407,7 @@ async fn insert_transaction_quiet(
     record: TransactionRecord,
     _context: &'static str,
 ) -> bool {
-    session.store.insert(record).await;
-    true
+    session.store.insert(record).await
 }
 
 async fn should_stream_upstream_response(
@@ -4320,7 +4320,7 @@ fn binary_frame_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::HeaderRecord;
+    use crate::model::{HeaderRecord, TransactionRecord};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn record(name: &str, value: &str) -> HeaderRecord {
@@ -4358,6 +4358,27 @@ mod tests {
             content_type: None,
             content_decoded,
         }
+    }
+
+    fn captured_transaction(host: &str) -> TransactionRecord {
+        TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            host.to_string(),
+            "/".to_string(),
+            Some(200),
+            5,
+            MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+            Some(MessageRecord::from_headers_and_body(
+                &HeaderMap::new(),
+                b"ok",
+                1024,
+            )),
+            Vec::new(),
+            None,
+            None,
+        )
     }
 
     async fn response_from_raw(raw_response: &'static [u8]) -> reqwest::Response {
@@ -4456,6 +4477,38 @@ mod tests {
             new_generation
         ));
         assert!(pending_session_context(session_id).is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn journaled_capture_does_not_schedule_full_session_persist() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-proxy-journaled-capture-no-full-persist-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let mut scanner_config = session.scanner.get_config().await;
+        scanner_config.enabled = false;
+        session.scanner.update_config(scanner_config).await;
+
+        let record = captured_transaction("journaled.example");
+        let record_id = record.id;
+        store_record_and_scan(&state, &session, record).await;
+        drain_proxy_connections(Duration::from_secs(1)).await;
+
+        assert!(session.store.get(record_id).await.is_some());
+        assert!(pending_session_context(session_id).is_none());
+        assert!(!session_has_pending_persist(session_id));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

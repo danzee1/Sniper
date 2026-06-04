@@ -314,25 +314,31 @@ impl TransactionStore {
         store
     }
 
-    pub async fn insert(&self, mut record: TransactionRecord) {
+    pub async fn insert(&self, mut record: TransactionRecord) -> bool {
         let _insert_guard = self.insert_lock.lock().await;
         record.sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let journal_line = self
-            .journal_tx
-            .as_ref()
-            .and_then(|_| encode_transaction_insert_journal_line(&record));
-        if let (Some(tx), Some(line)) = (&self.journal_tx, journal_line) {
-            if let Err(error) = append_transaction_journal(tx, line).await {
-                warn!(
-                    ?error,
-                    "failed to append transaction insert journal entry before storing; record will rely on full snapshot persistence"
-                );
-            }
-        } else if self.journal_tx.is_some() {
-            warn!(
-                "failed to encode transaction insert journal entry before storing; record will rely on full snapshot persistence"
-            );
-        }
+        let needs_snapshot_fallback = match &self.journal_tx {
+            Some(tx) => match encode_transaction_insert_journal_line(&record) {
+                Some(line) => {
+                    if let Err(error) = append_transaction_journal(tx, line).await {
+                        warn!(
+                            ?error,
+                            "failed to append transaction insert journal entry before storing; record will rely on full snapshot persistence"
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => {
+                    warn!(
+                        "failed to encode transaction insert journal entry before storing; record will rely on full snapshot persistence"
+                    );
+                    true
+                }
+            },
+            None => false,
+        };
         let summary = record.summary();
         let mut inner = self.inner.write().await;
         inner.push(record, summary.clone());
@@ -341,6 +347,7 @@ impl TransactionStore {
         }
         drop(inner);
         let _ = self.events.send(summary);
+        needs_snapshot_fallback
     }
 
     pub async fn list(&self, filters: &ListFilters) -> Vec<TransactionSummary> {
@@ -1597,7 +1604,8 @@ mod tests {
         store.journal_tx = Some(tx);
 
         let record = test_record("lost.example");
-        store.insert(record).await;
+        let needs_snapshot_fallback = store.insert(record).await;
+        assert!(needs_snapshot_fallback);
 
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed.len(), 1);
@@ -1622,9 +1630,7 @@ mod tests {
 
         let insert_task = {
             let store = store.clone();
-            tokio::spawn(async move {
-                store.insert(test_record("pending.example")).await;
-            })
+            tokio::spawn(async move { store.insert(test_record("pending.example")).await })
         };
 
         let command = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(1)))
@@ -1654,7 +1660,7 @@ mod tests {
             .expect_err("snapshot compaction should wait for pending journaled insert");
 
         ack.send(Ok(())).unwrap();
-        insert_task.await.unwrap();
+        assert!(!insert_task.await.unwrap());
 
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed.len(), 2);
