@@ -1130,6 +1130,13 @@ struct SequenceUpsertPayload<'a> {
     definition: &'a SequenceDefinition,
 }
 
+#[derive(Deserialize)]
+struct SequenceCreateInput {
+    session_id: Option<Uuid>,
+    #[serde(flatten)]
+    definition: SequenceDefinition,
+}
+
 #[derive(Serialize)]
 struct InterceptForwardPayload {
     request: EditableRequest,
@@ -1571,7 +1578,8 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 eprintln!("warning: replay was sent, but workspace state was not saved: {error}");
             }
             if let Some(error) = replay_error {
-                print_json(&json!({ "error": error, "record": record }))
+                print_json(&json!({ "error": error, "record": record }))?;
+                bail!("replay failed after storing transaction record: {error}");
             } else {
                 print_json(&record)
             }
@@ -1660,10 +1668,12 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                     "async_requested": true,
                     "message": "Fuzzer attack completed. The current Sniper API creates attacks synchronously, so the CLI waits until the server returns the attack record.",
                     "attack": record,
-                }))
+                }))?;
             } else {
-                print_json(&record)
+                print_json(&record)?;
             }
+            ensure_cli_record_not_failed("fuzzer attack", &record)?;
+            Ok(())
         }
         FuzzerCommand::Status(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -1959,9 +1969,15 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
                 session_id,
             } = args;
             let raw = read_text_input(file, stdin)?;
-            let def: SequenceDefinition =
+            let input: SequenceCreateInput =
                 serde_json::from_str(&raw).context("failed to parse sequence JSON")?;
-            let session_id = resolve_session_id_arg(&api, session_id).await?;
+            if session_id.is_some() && input.session_id.is_some() && session_id != input.session_id
+            {
+                bail!("sequence JSON session_id conflicts with --session-id");
+            }
+            let target_session_id = session_id.or(input.session_id);
+            let session_id = resolve_session_id_arg(&api, target_session_id).await?;
+            let def = input.definition;
             api.post_status(
                 "/api/sequences",
                 &SequenceUpsertPayload {
@@ -1980,7 +1996,9 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
                     &SessionIdPayload { session_id },
                 )
                 .await?;
-            print_json(&result)
+            print_json(&result)?;
+            ensure_json_status_not_failed("sequence run", &result)?;
+            Ok(())
         }
         SequenceCommand::Delete(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -3254,9 +3272,10 @@ fn replay_send_http_version(
     tab: &ReplayTabState,
     parsed_request: &ParsedEditableRequest,
 ) -> Option<String> {
-    normalize_http_version(Some(&tab.http_version_mode))
-        .map(str::to_string)
-        .or_else(|| parsed_request.http_version.clone())
+    parsed_request
+        .http_version
+        .clone()
+        .or_else(|| normalize_http_version(Some(&tab.http_version_mode)).map(str::to_string))
 }
 
 fn encode_query(params: Vec<(String, String)>) -> String {
@@ -3271,6 +3290,18 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     let mut stdout = io::stdout().lock();
     serde_json::to_writer_pretty(&mut stdout, value).context("failed to encode JSON output")?;
     stdout.write_all(b"\n").context("failed to write stdout")
+}
+
+fn ensure_cli_record_not_failed<T: Serialize>(label: &str, value: &T) -> Result<()> {
+    let value = serde_json::to_value(value).context("failed to inspect JSON status")?;
+    ensure_json_status_not_failed(label, &value)
+}
+
+fn ensure_json_status_not_failed(label: &str, value: &Value) -> Result<()> {
+    if value.get("status").and_then(Value::as_str) == Some("failed") {
+        bail!("{label} failed");
+    }
+    Ok(())
 }
 
 fn find_replay_tab<'a>(
@@ -3527,9 +3558,10 @@ mod tests {
     use super::{
         active_session_id_from_summaries, build_annotations_payload, build_editable_raw_request,
         build_editable_raw_request_with_version, default_editable_request,
-        explicit_or_active_session_id, fuzzer_active_target_for_request,
-        fuzzer_target_request_authority_for_request, normalize_api_base_url, normalize_replay_port,
-        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
+        ensure_json_status_not_failed, explicit_or_active_session_id,
+        fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
+        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
+        oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
         push_replay_history_entry, read_payloads_input, read_raw_request_input,
@@ -3537,8 +3569,8 @@ mod tests {
         replay_tab_target_matches_request, replay_update_should_preserve_current_port,
         session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
         strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path, Cli, Command,
-        HistoryCommand, HistoryListResponse, SequenceCommand, WebSocketListResponse,
-        CLI_REPEATER_HISTORY_LIMIT,
+        HistoryCommand, HistoryListResponse, SequenceCommand, SequenceCreateInput,
+        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3732,7 +3764,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_send_prefers_saved_http_version_mode() {
+    fn replay_send_prefers_request_line_http_version() {
         let parsed = parse_editable_raw_request_with_version(
             "GET /hello HTTP/1.1\nHost: example.com\n\n",
             None,
@@ -3745,8 +3777,38 @@ mod tests {
 
         assert_eq!(
             replay_send_http_version(&tab, &parsed).as_deref(),
-            Some("HTTP/2")
+            Some("HTTP/1.1")
         );
+    }
+
+    #[test]
+    fn cli_status_helper_rejects_failed_records() {
+        assert!(ensure_json_status_not_failed(
+            "sequence run",
+            &serde_json::json!({ "status": "completed" }),
+        )
+        .is_ok());
+        assert!(ensure_json_status_not_failed(
+            "sequence run",
+            &serde_json::json!({ "status": "failed" }),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sequence_create_input_preserves_api_session_id() {
+        let session_id = Uuid::new_v4();
+        let sequence_id = Uuid::new_v4();
+        let input: SequenceCreateInput = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "id": sequence_id,
+            "name": "demo",
+            "steps": [],
+        }))
+        .unwrap();
+
+        assert_eq!(input.session_id, Some(session_id));
+        assert_eq!(input.definition.id, sequence_id);
     }
 
     #[test]

@@ -33,6 +33,8 @@ const APP_LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/sm1ee/Sniper/releases/latest";
 const APP_VERSION_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const APP_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+const APP_RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const APP_RELEASE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPECTED_APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
 const EXPECTED_APP_EXECUTABLE: &str = "Sniper";
 const HDIUTIL_PATH: &str = "/usr/bin/hdiutil";
@@ -40,6 +42,7 @@ const DITTO_PATH: &str = "/usr/bin/ditto";
 const CODESIGN_PATH: &str = "/usr/bin/codesign";
 const SPCTL_PATH: &str = "/usr/sbin/spctl";
 const PLIST_BUDDY_PATH: &str = "/usr/libexec/PlistBuddy";
+const LIPO_PATH: &str = "/usr/bin/lipo";
 const SH_PATH: &str = "/bin/sh";
 
 #[derive(Clone)]
@@ -674,6 +677,14 @@ impl AppState {
             cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
             return Err(error);
         }
+        if let Err(error) = verify_app_executable_arch_for_release_asset(
+            &new_app_path,
+            &dmg_asset.name,
+            "downloaded app",
+        ) {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            return Err(error);
+        }
         if let Err(error) = verify_app_signing_team_matches(&new_app_path, &app_bundle) {
             cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
             return Err(error);
@@ -705,6 +716,12 @@ impl AppState {
             return Err(error);
         }
         if let Err(error) = verify_app_identity(&staged_app, &release.tag_name, "staged app") {
+            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            return Err(error);
+        }
+        if let Err(error) =
+            verify_app_executable_arch_for_release_asset(&staged_app, &dmg_asset.name, "staged app")
+        {
             cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
             return Err(error);
         }
@@ -1329,6 +1346,59 @@ fn verify_app_identity(app_path: &Path, expected_version: &str, label: &str) -> 
     Ok(())
 }
 
+fn verify_app_executable_arch_for_release_asset(
+    app_path: &Path,
+    asset_name: &str,
+    label: &str,
+) -> Result<()> {
+    let executable_path = app_path
+        .join("Contents/MacOS")
+        .join(EXPECTED_APP_EXECUTABLE);
+    let output = std::process::Command::new(LIPO_PATH)
+        .args(["-archs"])
+        .arg(&executable_path)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to inspect {label} executable architecture at {}",
+                executable_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to inspect {label} executable architecture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let archs = String::from_utf8_lossy(&output.stdout);
+    let archs: Vec<&str> = archs.split_whitespace().collect();
+    if release_asset_archs_match_binary_archs(asset_name, &archs) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{label} executable architecture {:?} does not match release asset {}",
+        archs,
+        asset_name
+    );
+}
+
+fn release_asset_archs_match_binary_archs(asset_name: &str, binary_archs: &[&str]) -> bool {
+    let Some(asset_arch) = release_asset_arch_tag(asset_name) else {
+        return false;
+    };
+    let has_arm64 = binary_archs
+        .iter()
+        .any(|arch| release_asset_arch_tag_from_alias(arch) == Some(ReleaseAssetArchTag::Arm64));
+    let has_x86_64 = binary_archs
+        .iter()
+        .any(|arch| release_asset_arch_tag_from_alias(arch) == Some(ReleaseAssetArchTag::X86_64));
+    match asset_arch {
+        ReleaseAssetArchTag::Arm64 => has_arm64,
+        ReleaseAssetArchTag::X86_64 => has_x86_64,
+        ReleaseAssetArchTag::Universal => has_arm64 && has_x86_64,
+    }
+}
+
 fn verify_app_signing_team_matches(downloaded_app: &Path, current_app: &Path) -> Result<()> {
     let current_team = app_signing_team_identifier(current_app, "current app")?;
     let downloaded_team = app_signing_team_identifier(downloaded_app, "downloaded app")?;
@@ -1424,11 +1494,14 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
 }
 
 fn app_release_http_client(error_context: &'static str) -> Result<reqwest::Client> {
-    let builder = reqwest::Client::builder().user_agent(format!(
-        "Sniper/{} (+{})",
-        env!("CARGO_PKG_VERSION"),
-        APP_RELEASES_URL
-    ));
+    let builder = reqwest::Client::builder()
+        .connect_timeout(APP_RELEASE_CONNECT_TIMEOUT)
+        .read_timeout(APP_RELEASE_READ_TIMEOUT)
+        .user_agent(format!(
+            "Sniper/{} (+{})",
+            env!("CARGO_PKG_VERSION"),
+            APP_RELEASES_URL
+        ));
     let builder = if release_proxy_env_targets_loopback() {
         builder.no_proxy()
     } else {
@@ -1479,11 +1552,12 @@ fn proxy_url_targets_loopback(value: &str) -> bool {
 mod tests {
     use super::{
         ensure_release_is_newer, native_release_asset_arch, parse_codesign_team_identifier,
-        proxy_url_targets_loopback, release_asset_matches_arch, release_update_available,
-        select_release_dmg_asset, self_update_bundle_is_writable, update_installer_script,
-        verify_app_identity, AppState, GitHubAsset, GitHubRelease, UpdateArtifactGuard,
-        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
-        HDIUTIL_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+        proxy_url_targets_loopback, release_asset_archs_match_binary_archs,
+        release_asset_matches_arch, release_update_available, select_release_dmg_asset,
+        self_update_bundle_is_writable, update_installer_script, verify_app_identity, AppState,
+        GitHubAsset, GitHubRelease, UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH,
+        EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH,
+        PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
     use std::path::Path;
@@ -1563,10 +1637,39 @@ mod tests {
             CODESIGN_PATH,
             SPCTL_PATH,
             PLIST_BUDDY_PATH,
+            LIPO_PATH,
             SH_PATH,
         ] {
             assert!(path.starts_with('/'), "{path} should be absolute");
         }
+    }
+
+    #[test]
+    fn release_asset_arch_matching_requires_binary_arch_compatibility() {
+        assert!(release_asset_archs_match_binary_archs(
+            "Sniper-0.2.5-arm64.dmg",
+            &["arm64"]
+        ));
+        assert!(release_asset_archs_match_binary_archs(
+            "Sniper-0.2.5-arm64.dmg",
+            &["x86_64", "arm64"]
+        ));
+        assert!(!release_asset_archs_match_binary_archs(
+            "Sniper-0.2.5-arm64.dmg",
+            &["x86_64"]
+        ));
+        assert!(release_asset_archs_match_binary_archs(
+            "Sniper-0.2.5-universal.dmg",
+            &["x86_64", "arm64"]
+        ));
+        assert!(!release_asset_archs_match_binary_archs(
+            "Sniper-0.2.5-universal.dmg",
+            &["arm64"]
+        ));
+        assert!(!release_asset_archs_match_binary_archs(
+            "Sniper-0.2.5.dmg",
+            &["x86_64", "arm64"]
+        ));
     }
 
     #[test]

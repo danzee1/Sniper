@@ -3610,17 +3610,6 @@ fn remember_persist_context(session: &Arc<SessionContext>) -> u64 {
     generation
 }
 
-fn forget_persist_context(session_id: Uuid) {
-    let mut pending = PERSIST_PENDING_CONTEXTS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    pending.remove(&session_id);
-    let mut generations = PERSIST_CONTEXT_GENERATIONS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    generations.remove(&session_id);
-}
-
 fn forget_persist_context_if_generation(session_id: Uuid, generation: u64) -> bool {
     let mut pending = PERSIST_PENDING_CONTEXTS
         .lock()
@@ -3904,14 +3893,25 @@ pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
         let pending = PERSIST_PENDING_CONTEXTS
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        pending.values().cloned().collect::<Vec<_>>()
+        let generations = PERSIST_CONTEXT_GENERATIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pending
+            .iter()
+            .filter_map(|(session_id, session)| {
+                generations
+                    .get(session_id)
+                    .copied()
+                    .map(|generation| (Arc::clone(session), generation))
+            })
+            .collect::<Vec<_>>()
     };
     let mut failures = Vec::new();
 
-    for session in sessions {
+    for (session, generation) in sessions {
         let session_id = session.id();
         if !state.sessions.contains_session(session_id) {
-            forget_persist_context(session_id);
+            forget_persist_context_if_generation(session_id, generation);
             continue;
         }
         wait_for_session_proxy_work_to_finish(session_id, PENDING_PERSIST_FLUSH_PROXY_WAIT).await;
@@ -3929,7 +3929,7 @@ pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
             ));
             continue;
         }
-        forget_persist_context(session_id);
+        forget_persist_context_if_generation(session_id, generation);
     }
     if failures.is_empty() {
         Ok(())
@@ -4369,6 +4369,46 @@ mod tests {
             session_id,
             old_generation
         ));
+        assert!(pending_session_context(session_id).is_some());
+        assert!(forget_persist_context_if_generation(
+            session_id,
+            new_generation
+        ));
+        assert!(pending_session_context(session_id).is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_persist_does_not_forget_new_generation() {
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: std::env::temp_dir().join(format!(
+                "sniper-proxy-flush-persist-generation-{}",
+                Uuid::new_v4()
+            )),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let mutation_guard = session.mutation_guard().await;
+
+        let old_generation = remember_persist_context(&session);
+        let flush_state = Arc::clone(&state);
+        let flush_task =
+            tokio::spawn(async move { flush_pending_session_persists(flush_state.as_ref()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(current_persist_generation(session_id), Some(old_generation));
+
+        let new_generation = remember_persist_context(&session);
+        drop(mutation_guard);
+        flush_task.await.unwrap().unwrap();
+
+        assert_eq!(current_persist_generation(session_id), Some(new_generation));
         assert!(pending_session_context(session_id).is_some());
         assert!(forget_persist_context_if_generation(
             session_id,

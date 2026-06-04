@@ -2493,6 +2493,7 @@ function hydrateReplayTab(tab) {
     tab.target_port ?? fallbackTarget.port,
     tab.target_scheme || fallbackTarget.scheme,
   );
+  const requestText = tab.request_text ?? buildEditableRawRequest(fallbackRequest);
   return {
     id: typeof tab.id === "string" && tab.id ? tab.id : crypto.randomUUID(),
     sequence: Number.isFinite(tab.sequence) ? tab.sequence : state.replayTabSequence + 1,
@@ -2501,8 +2502,8 @@ function hydrateReplayTab(tab) {
     baseRequest: fallbackRequest,
     sourceTransactionId: tab.source_transaction_id || null,
     notice: tab.notice || "",
-    requestText: tab.request_text ?? buildEditableRawRequest(fallbackRequest),
-    httpVersionMode: normalizeReplayHttpVersion(tab.http_version_mode || ""),
+    requestText,
+    httpVersionMode: replayHttpVersionState(fallbackRequest, requestText, tab.http_version_mode),
     responseRecord: tab.response_record || null,
     targetScheme: normalizedTarget.scheme,
     targetHost: normalizedTarget.host,
@@ -2528,8 +2529,11 @@ function hydrateRepeaterHistoryEntry(entry, fallbackRequest) {
   return {
     request,
     requestText: entry.request_text ?? buildEditableRawRequest(request),
-    httpVersionMode: normalizeReplayHttpVersion(entry.http_version_mode || "")
-      || replayHttpVersionFromText(entry.request_text || ""),
+    httpVersionMode: replayHttpVersionState(
+      request,
+      entry.request_text ?? buildEditableRawRequest(request),
+      entry.http_version_mode,
+    ),
     responseRecord: entry.response_record || null,
     notice: entry.notice || "",
     targetScheme: normalizedTarget.scheme,
@@ -2612,7 +2616,7 @@ function snapshotWorkspaceState(options = {}) {
           source_transaction_id: tab.sourceTransactionId || null,
           notice: tab.notice || "",
           request_text: tab.requestText || "",
-          http_version_mode: normalizeReplayHttpVersion(tab.httpVersionMode || ""),
+          http_version_mode: replayHttpVersionState(tab.baseRequest, tab.requestText, tab.httpVersionMode),
           response_record: tab.responseRecord || null,
           target_scheme: tab.targetScheme || "https",
           target_host: tab.targetHost || "",
@@ -2621,8 +2625,7 @@ function snapshotWorkspaceState(options = {}) {
           history_entries: historyEntries.map((entry) => ({
             request: cloneEditableRequest(entry.request),
             request_text: entry.requestText || "",
-            http_version_mode: normalizeReplayHttpVersion(entry.httpVersionMode || "")
-              || replayHttpVersionFromText(entry.requestText || ""),
+            http_version_mode: replayHttpVersionState(entry.request, entry.requestText, entry.httpVersionMode),
             response_record: entry.responseRecord || null,
             notice: entry.notice || "",
             target_scheme: entry.targetScheme || "https",
@@ -3864,9 +3867,11 @@ function scheduleRefresh(options = {}) {
 function mergeHistoryItems(items, { prepend = false } = {}) {
   applyPendingAnnotationsToItems(items);
   const newItems = [];
+  const seen = new Set();
   let connectCount = 0;
   for (const item of items) {
-    if (getHistoryItem(item.id)) continue;
+    if (!item?.id || seen.has(item.id) || getHistoryItem(item.id)) continue;
+    seen.add(item.id);
     prepareHistoryItem(item);
     if (item.method === "CONNECT") connectCount++;
     newItems.push(item);
@@ -4115,10 +4120,12 @@ function flushTransactionDeltas() {
   }
 
   const fresh = [];
+  const seenIds = new Set();
   let totalAdded = 0;
   let hiddenConnectAdded = 0;
   for (const { summary } of pending) {
-    if (!summary?.id || getHistoryItem(summary.id)) continue;
+    if (!summary?.id || seenIds.has(summary.id) || getHistoryItem(summary.id)) continue;
+    seenIds.add(summary.id);
     totalAdded += 1;
     if (String(summary.method || "").toUpperCase() === "CONNECT") {
       if (summaryMatchesActiveHistoryFilters(summary, { includeConnect: true })) hiddenConnectAdded += 1;
@@ -7782,6 +7789,12 @@ function replayHttpVersionFromText(text) {
   return normalizeReplayHttpVersion(match ? match[1] : "");
 }
 
+function replayHttpVersionState(request, requestText, mode) {
+  return replayHttpVersionFromText(requestText || "")
+    || normalizeReplayHttpVersion(request?.http_version || "")
+    || normalizeReplayHttpVersion(mode || "");
+}
+
 function parseReplayHttpVersionToken(token) {
   if (!token) return undefined;
   const normalized = normalizeReplayHttpVersion(token);
@@ -10062,10 +10075,8 @@ function applyReplaySentDraftIfUnchanged(tab, request, requestText, target) {
   if (!replaySentDraftUnchanged(tab, requestText, target)) {
     return;
   }
-  const httpVersion = normalizeReplayHttpVersion(request.http_version || "")
-    || replayHttpVersionFromText(requestText || "");
   tab.baseRequest = cloneEditableRequest(request);
-  tab.httpVersionMode = httpVersion;
+  tab.httpVersionMode = replayHttpVersionState(request, requestText, tab.httpVersionMode);
   tab.targetScheme = target.scheme;
   tab.targetHost = target.host;
   tab.targetPort = target.port;
@@ -10349,12 +10360,6 @@ function duplicateActiveReplayTab() {
 
   const target = getRepeaterTargetConfig(tab, request);
 
-  tab.baseRequest = cloneEditableRequest(request);
-  tab.requestText = requestText;
-  tab.targetScheme = target.scheme;
-  tab.targetHost = target.host;
-  tab.targetPort = target.port;
-
   const historyEntries = Array.isArray(tab.historyEntries)
     ? tab.historyEntries.map(cloneRepeaterHistoryEntry)
     : [];
@@ -10363,7 +10368,7 @@ function duplicateActiveReplayTab() {
     sourceTransactionId: tab.sourceTransactionId,
     notice: tab.notice,
     requestText,
-    httpVersionMode: tab.httpVersionMode || "",
+    httpVersionMode: replayHttpVersionState(request, requestText, tab.httpVersionMode),
     customLabel: tab.customLabel || "",
     responseRecord: cloneTransactionRecord(tab.responseRecord),
     targetScheme: target.scheme,
@@ -10383,6 +10388,7 @@ function duplicateActiveReplayTab() {
 function createReplayTab(seed = {}) {
   state.replayTabSequence += 1;
   const baseRequest = seed.baseRequest ? cloneEditableRequest(seed.baseRequest) : createDefaultEditableRequest();
+  const requestText = seed.requestText ?? buildEditableRawRequest(baseRequest);
   const target = authorityToTargetState(baseRequest.host, baseRequest.scheme);
   const normalizedTarget = normalizeRepeaterTargetInput(
     seed.targetHost ?? target.host,
@@ -10397,8 +10403,8 @@ function createReplayTab(seed = {}) {
     baseRequest,
     sourceTransactionId: seed.sourceTransactionId || null,
     notice: seed.notice || "",
-    requestText: seed.requestText ?? buildEditableRawRequest(baseRequest),
-    httpVersionMode: normalizeReplayHttpVersion(seed.httpVersionMode || ""),
+    requestText,
+    httpVersionMode: replayHttpVersionState(baseRequest, requestText, seed.httpVersionMode),
     responseRecord: cloneTransactionRecord(seed.responseRecord),
     targetScheme: normalizedTarget.scheme,
     targetHost: normalizedTarget.host,
@@ -11036,9 +11042,7 @@ function cloneRepeaterHistoryEntry(entry) {
   return {
     request: cloneEditableRequest(entry.request),
     requestText: entry.requestText || "",
-    httpVersionMode: normalizeReplayHttpVersion(entry.request?.http_version || "")
-      || replayHttpVersionFromText(entry.requestText || "")
-      || normalizeReplayHttpVersion(entry.httpVersionMode || ""),
+    httpVersionMode: replayHttpVersionState(entry.request, entry.requestText, entry.httpVersionMode),
     responseRecord: cloneTransactionRecord(entry.responseRecord),
     notice: entry.notice || "",
     targetScheme: normalizedTarget.scheme,
@@ -11052,9 +11056,11 @@ function recordRepeaterHistory(tab, snapshot) {
   const entry = {
     request: cloneEditableRequest(snapshot.request),
     requestText,
-    httpVersionMode: normalizeReplayHttpVersion(snapshot.request?.http_version || "")
-      || replayHttpVersionFromText(requestText)
-      || normalizeReplayHttpVersion(snapshot.httpVersionMode || tab.httpVersionMode || ""),
+    httpVersionMode: replayHttpVersionState(
+      snapshot.request,
+      requestText,
+      snapshot.httpVersionMode || tab.httpVersionMode,
+    ),
     responseRecord: cloneTransactionRecord(snapshot.responseRecord),
     notice: snapshot.notice || "",
     targetScheme: snapshot.target.scheme || "https",
@@ -11092,8 +11098,7 @@ function restoreRepeaterHistoryEntry(tab, entry) {
   );
   tab.baseRequest = cloneEditableRequest(entry.request);
   tab.requestText = entry.requestText || buildEditableRawRequest(entry.request);
-  tab.httpVersionMode = normalizeReplayHttpVersion(entry.httpVersionMode || "")
-    || replayHttpVersionFromText(tab.requestText);
+  tab.httpVersionMode = replayHttpVersionState(entry.request, tab.requestText, entry.httpVersionMode);
   tab.responseRecord = entry.responseRecord || null;
   tab.notice = entry.notice || "";
   tab.targetScheme = normalizedTarget.scheme;

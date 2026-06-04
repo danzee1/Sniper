@@ -28,6 +28,7 @@ use indexmap::IndexMap;
 use regex::RegexBuilder;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
 use crate::{
@@ -1618,6 +1619,9 @@ fn active_session_conflict_response(state: &AppState) -> Response {
 }
 
 fn session_load_failure_response(session_id: Uuid, error: anyhow::Error) -> Response {
+    if error.to_string().contains("was not found") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     tracing::warn!(
         %error,
         session_id = %session_id,
@@ -1657,6 +1661,18 @@ async fn resolve_session_for_optional_id(
         .session_context_for_id(target_session_id)
         .await
         .map_err(|error| session_load_failure_response(target_session_id, error))
+}
+
+async fn guard_session_write_operation(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+) -> std::result::Result<OwnedMutexGuard<()>, Response> {
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let guard = operation_lock.lock_owned().await;
+    if !state.sessions.contains_session(session.id()) {
+        return Err(action_session_conflict_response(session));
+    }
+    Ok(guard)
 }
 
 async fn resolve_session_for_required_id(
@@ -1952,6 +1968,10 @@ async fn clear_findings(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session
         .scanner
@@ -1990,6 +2010,10 @@ async fn update_scanner_config(
     }
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
         Err(response) => return response,
     };
     let _mutation_guard = session.mutation_guard().await;
@@ -2048,6 +2072,10 @@ async fn update_match_replace_rules(
     }
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
         Err(response) => return response,
     };
     let _mutation_guard = session.mutation_guard().await;
@@ -2230,6 +2258,10 @@ async fn update_transaction_annotations(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     match session
         .store
@@ -2322,6 +2354,10 @@ async fn forward_intercept(
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
 
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2366,6 +2402,10 @@ async fn drop_intercept(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2399,6 +2439,10 @@ async fn forward_all_intercepts(
 ) -> Response {
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
         Err(response) => return response,
     };
     let _mutation_guard = session.mutation_guard().await;
@@ -2448,6 +2492,10 @@ async fn upsert_intercept_rule(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.intercept_rules.snapshot().await;
     session.intercept_rules.upsert(rule).await;
@@ -2473,6 +2521,10 @@ async fn delete_intercept_rule(
     };
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
         Err(response) => return response,
     };
     let _mutation_guard = session.mutation_guard().await;
@@ -2542,6 +2594,10 @@ async fn forward_response_intercept(
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
 
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2590,6 +2646,10 @@ async fn drop_response_intercept(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2623,6 +2683,10 @@ async fn forward_all_response_intercepts(
 ) -> Response {
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = match guard_session_write_operation(&state, &session).await {
+        Ok(guard) => guard,
         Err(response) => return response,
     };
     let _mutation_guard = session.mutation_guard().await;

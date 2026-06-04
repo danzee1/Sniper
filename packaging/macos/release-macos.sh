@@ -28,6 +28,19 @@ if [[ "${ALLOW_EXISTING_RELEASE_VERSION:-0}" != "1" ]] && git rev-parse --is-ins
       exit 1
     fi
   fi
+  REMOTE_TAG_COMMIT=""
+  if remote_tag="$(git ls-remote --tags origin "$RELEASE_TAG" 2>/dev/null)"; then
+    REMOTE_TAG_COMMIT="$(printf '%s\n' "$remote_tag" | awk 'NF >= 2 { print $1; exit }')"
+    if [[ -n "$REMOTE_TAG_COMMIT" ]]; then
+      echo "$RELEASE_TAG already exists on origin at $REMOTE_TAG_COMMIT." >&2
+      echo "Bump Cargo.toml before creating release artifacts for a published version." >&2
+      exit 1
+    fi
+  else
+    echo "Unable to verify whether $RELEASE_TAG exists on origin." >&2
+    echo "Refusing to create release artifacts without a remote tag check. Set ALLOW_EXISTING_RELEASE_VERSION=1 to override." >&2
+    exit 1
+  fi
   if command -v gh >/dev/null 2>&1 && [[ -n "$GITHUB_RELEASE_REPO" ]] \
     && gh release view "$RELEASE_TAG" --repo "$GITHUB_RELEASE_REPO" >/dev/null 2>&1; then
     echo "GitHub release $RELEASE_TAG already exists in $GITHUB_RELEASE_REPO." >&2
