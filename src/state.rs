@@ -580,7 +580,8 @@ impl AppState {
             .error_for_status()
             .context("DMG download failed")?;
 
-        let content_length = response.content_length().or(total_size).unwrap_or(0);
+        let response_content_length = response.content_length();
+        let progress_total = response_content_length.or(total_size).unwrap_or(0);
 
         let mut file = tokio::fs::File::create(&dmg_path).await?;
         let mut stream = response.bytes_stream();
@@ -591,15 +592,17 @@ impl AppState {
             let chunk = chunk.context("download interrupted")?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
-            if content_length > 0 {
-                let pct = ((downloaded as f64 / content_length as f64) * 100.0) as u8;
-                tx.send(UpdateProgress::download(pct, downloaded, content_length))
+            if progress_total > 0 {
+                let pct = (((downloaded as f64 / progress_total as f64) * 100.0).round() as u64)
+                    .min(100) as u8;
+                tx.send(UpdateProgress::download(pct, downloaded, progress_total))
                     .await
                     .ok();
             }
         }
         file.flush().await?;
         drop(file);
+        validate_downloaded_update_size(downloaded, response_content_length, total_size)?;
 
         // Mount the DMG (no -quiet so we get stdout with mount point)
         tx.send(UpdateProgress::step("Installing update..."))
@@ -1026,6 +1029,28 @@ fn select_release_dmg_asset<'a>(
 fn release_update_available(current_version: &str, release: &GitHubRelease) -> bool {
     is_newer_version(current_version, &release.tag_name)
         && select_release_dmg_asset(&release.assets, &release.tag_name).is_some()
+}
+
+fn validate_downloaded_update_size(
+    downloaded: u64,
+    response_content_length: Option<u64>,
+    asset_size: Option<u64>,
+) -> Result<()> {
+    if let Some(expected) = response_content_length {
+        if downloaded != expected {
+            anyhow::bail!(
+                "downloaded DMG size mismatch: expected {expected} bytes from Content-Length, got {downloaded}"
+            );
+        }
+    }
+    if let Some(expected) = asset_size {
+        if downloaded != expected {
+            anyhow::bail!(
+                "downloaded DMG size mismatch: expected {expected} bytes from release metadata, got {downloaded}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn native_release_asset_arch() -> &'static str {
@@ -1562,10 +1587,10 @@ mod tests {
         ensure_release_is_newer, native_release_asset_arch, parse_codesign_team_identifier,
         proxy_url_targets_loopback, release_asset_archs_match_binary_archs,
         release_asset_matches_arch, release_update_available, select_release_dmg_asset,
-        self_update_bundle_is_writable, update_installer_script, verify_app_identity, AppState,
-        GitHubAsset, GitHubRelease, UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH,
-        EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH,
-        PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+        self_update_bundle_is_writable, update_installer_script, validate_downloaded_update_size,
+        verify_app_identity, AppState, GitHubAsset, GitHubRelease, UpdateArtifactGuard,
+        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
+        HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
     use std::path::Path;
@@ -1808,6 +1833,25 @@ mod tests {
             "0.2.4",
             &release("v0.2.5", vec![asset("Sniper-0.2.5-universal.dmg")])
         ));
+    }
+
+    #[test]
+    fn self_update_download_size_validation_rejects_mismatches() {
+        validate_downloaded_update_size(100, Some(100), Some(100)).unwrap();
+        validate_downloaded_update_size(100, None, Some(100)).unwrap();
+
+        assert!(validate_downloaded_update_size(99, Some(100), Some(99))
+            .unwrap_err()
+            .to_string()
+            .contains("Content-Length"));
+        assert!(validate_downloaded_update_size(101, Some(100), Some(101))
+            .unwrap_err()
+            .to_string()
+            .contains("Content-Length"));
+        assert!(validate_downloaded_update_size(100, None, Some(101))
+            .unwrap_err()
+            .to_string()
+            .contains("release metadata"));
     }
 
     #[test]

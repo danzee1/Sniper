@@ -2158,13 +2158,10 @@ async fn get_target_site_map(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let records = session.store.snapshot(Some(state.config.max_entries)).await;
+    let records = session.store.site_map_records().await;
     let mut hosts = IndexMap::<String, TargetHostAccumulator>::new();
 
-    for record in records
-        .into_iter()
-        .filter(|record| record.method != "CONNECT" && !record.host.is_empty())
-    {
+    for record in records {
         let host = hosts
             .entry(record.host.clone())
             .or_insert_with(|| TargetHostAccumulator {
@@ -2186,15 +2183,15 @@ async fn get_target_site_map(
                 last_seen: record.started_at,
                 status: record.status,
                 note_count: 0,
-                is_websocket: record.is_websocket(),
+                is_websocket: record.is_websocket,
             });
         push_unique(&mut path.methods, record.method.clone());
         if record.started_at > path.last_seen {
             path.last_seen = record.started_at;
             path.status = record.status;
         }
-        path.note_count += record.notes.len() + usize::from(record.user_note.is_some());
-        path.is_websocket = path.is_websocket || record.is_websocket();
+        path.note_count += record.note_count;
+        path.is_websocket = path.is_websocket || record.is_websocket;
     }
 
     let mut site_map = Vec::with_capacity(hosts.len());

@@ -18,13 +18,27 @@ fi
 RELEASE_TAG="v$VERSION"
 GITHUB_RELEASE_REPO="${GITHUB_RELEASE_REPO:-${GITHUB_REPOSITORY:-sm1ee/Sniper}}"
 ALLOW_ADHOC_RELEASE="${ALLOW_ADHOC_RELEASE:-0}"
+
+canonical_github_repo() {
+  local value="$1"
+  value="${value%.git}"
+  value="${value#git@github.com:}"
+  value="${value#ssh://git@github.com/}"
+  value="${value#https://github.com/}"
+  value="${value#http://github.com/}"
+  value="${value%/}"
+  printf '%s' "$value" | tr '[:upper:]' '[:lower:]'
+}
+
 if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
-  if [[ "$CURRENT_BRANCH" != "main" ]]; then
-    echo "Release artifacts must be built from the main branch; current branch is ${CURRENT_BRANCH:-detached}." >&2
-    echo "For local-only unsigned testing, set ALLOW_ADHOC_RELEASE=1." >&2
+  EXPECTED_RELEASE_REPO="$(canonical_github_repo "$GITHUB_RELEASE_REPO")"
+  ORIGIN_RELEASE_REPO="$(canonical_github_repo "$(git remote get-url origin 2>/dev/null || true)")"
+  if [[ -z "$ORIGIN_RELEASE_REPO" || "$ORIGIN_RELEASE_REPO" != "$EXPECTED_RELEASE_REPO" ]]; then
+    echo "Release artifacts must be built with origin pointing at $GITHUB_RELEASE_REPO; origin is ${ORIGIN_RELEASE_REPO:-unavailable}." >&2
+    echo "Set ALLOW_ADHOC_RELEASE=1 for local-only unsigned testing." >&2
     exit 1
   fi
+  CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
   if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
     echo "Release artifacts require a clean worktree." >&2
     git status --short --untracked-files=all >&2
@@ -38,6 +52,11 @@ if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/
   fi
   if [[ -z "$REMOTE_MAIN_COMMIT" ]]; then
     echo "Unable to verify origin/main before building release artifacts." >&2
+    exit 1
+  fi
+  if [[ -n "$CURRENT_BRANCH" && "$CURRENT_BRANCH" != "main" ]]; then
+    echo "Release artifacts must be built from the main branch or detached origin/main; current branch is ${CURRENT_BRANCH:-detached}." >&2
+    echo "For local-only unsigned testing, set ALLOW_ADHOC_RELEASE=1." >&2
     exit 1
   fi
   if [[ "$HEAD_COMMIT" != "$REMOTE_MAIN_COMMIT" ]]; then

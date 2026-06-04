@@ -92,27 +92,60 @@ pub fn user_home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn ensure_distinct_skill_install_targets(codex_root: &Path, claude_root: &Path) -> Result<()> {
+    let codex_target = codex_root.join(SKILL_NAME).join("SKILL.md");
+    let claude_target = claude_root.join(SKILL_NAME).join("SKILL.md");
+    let canonical_conflict = match (
+        canonicalize_if_exists(&codex_target),
+        canonicalize_if_exists(&claude_target),
+    ) {
+        (Some(codex_target), Some(claude_target)) => codex_target == claude_target,
+        _ => false,
+    };
+    let canonical_root_conflict = match (
+        canonicalize_if_exists(codex_root),
+        canonicalize_if_exists(claude_root),
+    ) {
+        (Some(codex_root), Some(claude_root)) => {
+            codex_root.join(SKILL_NAME).join("SKILL.md")
+                == claude_root.join(SKILL_NAME).join("SKILL.md")
+        }
+        _ => false,
+    };
+    if codex_target == claude_target || canonical_conflict || canonical_root_conflict {
+        bail!(
+            "codex and claude skill destinations resolve to the same SKILL.md path: {}",
+            codex_target.display()
+        );
+    }
+    Ok(())
+}
+
+fn canonicalize_if_exists(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
+}
+
 /// Install both Claude and Codex skills silently.
 /// Returns the list of installed skills, or an empty vec if nothing was installed.
 pub fn auto_install_all() -> Vec<InstalledSkill> {
+    auto_install_all_to(default_claude_skills_dir(), default_codex_skills_dir())
+}
+
+fn auto_install_all_to(claude_root: PathBuf, codex_root: PathBuf) -> Vec<InstalledSkill> {
     let mut installed = Vec::new();
 
-    if let Ok(path) = install_skill_folder(
-        &default_claude_skills_dir(),
-        SKILL_NAME,
-        CLAUDE_SKILL_TEMPLATE,
-    ) {
+    if ensure_distinct_skill_install_targets(&codex_root, &claude_root).is_err() {
+        return installed;
+    }
+
+    if let Ok(path) = install_skill_folder(&claude_root, SKILL_NAME, CLAUDE_SKILL_TEMPLATE) {
         installed.push(InstalledSkill {
             agent: "claude",
             path: path.display().to_string(),
         });
     }
 
-    if let Ok(path) = install_skill_folder(
-        &default_codex_skills_dir(),
-        SKILL_NAME,
-        CODEX_SKILL_TEMPLATE,
-    ) {
+    if let Ok(path) = install_skill_folder(&codex_root, SKILL_NAME, CODEX_SKILL_TEMPLATE) {
         installed.push(InstalledSkill {
             agent: "codex",
             path: path.display().to_string(),
@@ -124,7 +157,7 @@ pub fn auto_install_all() -> Vec<InstalledSkill> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_home_dir, install_skill_folder};
+    use super::{agent_home_dir, auto_install_all_to, install_skill_folder};
 
     #[test]
     fn install_skill_folder_rejects_path_like_names() {
@@ -166,5 +199,20 @@ mod tests {
             agent_home_dir(Some("/tmp/sniper-agent-home".into())),
             Some("/tmp/sniper-agent-home".into())
         );
+    }
+
+    #[test]
+    fn auto_install_all_skips_same_claude_and_codex_destination() {
+        let root = std::env::temp_dir().join(format!("sniper-skill-same-{}", uuid::Uuid::new_v4()));
+
+        let installed = auto_install_all_to(root.join("skills"), root.join("skills"));
+
+        assert!(installed.is_empty());
+        assert!(!root
+            .join("skills")
+            .join(super::SKILL_NAME)
+            .join("SKILL.md")
+            .exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

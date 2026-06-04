@@ -68,7 +68,7 @@ cargo_bin_path() {
 
 build_native_binaries() {
   echo "Building release binaries..."
-  if ! cargo build --release --bin sniper-desktop --bin sniper-cli --message-format=json-render-diagnostics > "$CARGO_BUILD_LOG"; then
+  if ! cargo build --locked --release --bin sniper-desktop --bin sniper-cli --message-format=json-render-diagnostics > "$CARGO_BUILD_LOG"; then
     cat "$CARGO_BUILD_LOG" >&2
     exit 1
   fi
@@ -110,8 +110,8 @@ build_universal_binaries() {
   require_rust_target "$intel_target"
 
   echo "Building universal release binaries..."
-  cargo build --release --target "$arm_target" --bin sniper-desktop --bin sniper-cli
-  cargo build --release --target "$intel_target" --bin sniper-desktop --bin sniper-cli
+  cargo build --locked --release --target "$arm_target" --bin sniper-desktop --bin sniper-cli
+  cargo build --locked --release --target "$intel_target" --bin sniper-desktop --bin sniper-cli
 
   /usr/bin/lipo -create \
     "$(target_binary_path "$arm_target" sniper-desktop)" \

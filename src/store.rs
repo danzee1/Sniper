@@ -64,6 +64,18 @@ pub struct TransactionListPage {
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct SiteMapRecord {
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub method: String,
+    pub scheme: String,
+    pub host: String,
+    pub path: String,
+    pub status: Option<u16>,
+    pub note_count: usize,
+    pub is_websocket: bool,
+}
+
 pub struct TransactionStore {
     inner: RwLock<StoreInner>,
     insert_lock: AsyncMutex<()>,
@@ -366,14 +378,12 @@ impl TransactionStore {
         };
         let advanced_matcher = AdvancedSearchMatcher::new(filters);
 
-        let summaries = {
-            let inner = self.inner.read().await;
-            inner.summaries.clone()
-        };
+        let inner = self.inner.read().await;
+        let summaries = &inner.summaries;
         let total = summaries.len();
 
         if can_stream_in_storage_order(filters) {
-            let scan_end = newest_scan_end(&summaries, before_sequence);
+            let scan_end = newest_scan_end(summaries, before_sequence);
             let mut matched_count = 0usize;
             let mut hidden_connect_count = 0usize;
             let mut exhausted = true;
@@ -517,6 +527,25 @@ impl TransactionStore {
             offset,
             limit,
         }
+    }
+
+    pub async fn site_map_records(&self) -> Vec<SiteMapRecord> {
+        let inner = self.inner.read().await;
+        inner
+            .entries
+            .iter()
+            .filter(|record| record.method != "CONNECT" && !record.host.is_empty())
+            .map(|record| SiteMapRecord {
+                started_at: record.started_at,
+                method: record.method.clone(),
+                scheme: record.scheme.clone(),
+                host: record.host.clone(),
+                path: record.path.clone(),
+                status: record.status,
+                note_count: record.notes.len() + usize::from(record.user_note.is_some()),
+                is_websocket: record.is_websocket(),
+            })
+            .collect()
     }
 
     pub async fn get(&self, id: Uuid) -> Option<TransactionRecord> {
@@ -1787,6 +1816,22 @@ mod tests {
         assert_eq!(page.hidden_connect_total, Some(1));
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].host, "http.example:443");
+    }
+
+    #[tokio::test]
+    async fn site_map_records_project_only_metadata_without_body_previews() {
+        let mut record = test_record("site.example");
+        record.request.body_preview = "x".repeat(1024);
+        record.response.as_mut().unwrap().body_preview = "y".repeat(1024);
+        record.notes.push("scanner note".to_string());
+        record.user_note = Some("user note".to_string());
+        let store = TransactionStore::from_records(vec![record]);
+
+        let site_map_records = store.site_map_records().await;
+
+        assert_eq!(site_map_records.len(), 1);
+        assert_eq!(site_map_records[0].host, "site.example");
+        assert_eq!(site_map_records[0].note_count, 2);
     }
 
     #[tokio::test]

@@ -3520,7 +3520,7 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
             .unwrap_or_else(skills::default_claude_skills_dir)
     });
     if let (Some(codex_root), Some(claude_root)) = (&codex_root, &claude_root) {
-        ensure_distinct_skill_install_targets(codex_root, claude_root)?;
+        skills::ensure_distinct_skill_install_targets(codex_root, claude_root)?;
     }
 
     let mut installed = Vec::new();
@@ -3542,42 +3542,6 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
     }
 
     Ok(skills::SkillsInstallResult { installed })
-}
-
-fn ensure_distinct_skill_install_targets(
-    codex_root: &PathBuf,
-    claude_root: &PathBuf,
-) -> Result<()> {
-    let codex_target = codex_root.join(skills::SKILL_NAME).join("SKILL.md");
-    let claude_target = claude_root.join(skills::SKILL_NAME).join("SKILL.md");
-    let canonical_conflict = match (
-        canonicalize_if_exists(&codex_target),
-        canonicalize_if_exists(&claude_target),
-    ) {
-        (Some(codex_target), Some(claude_target)) => codex_target == claude_target,
-        _ => false,
-    };
-    let canonical_root_conflict = match (
-        canonicalize_if_exists(codex_root),
-        canonicalize_if_exists(claude_root),
-    ) {
-        (Some(codex_root), Some(claude_root)) => {
-            codex_root.join(skills::SKILL_NAME).join("SKILL.md")
-                == claude_root.join(skills::SKILL_NAME).join("SKILL.md")
-        }
-        _ => false,
-    };
-    if codex_target == claude_target || canonical_conflict || canonical_root_conflict {
-        bail!(
-            "codex and claude skill destinations resolve to the same SKILL.md path: {}",
-            codex_target.display()
-        );
-    }
-    Ok(())
-}
-
-fn canonicalize_if_exists(path: &PathBuf) -> Option<PathBuf> {
-    fs::canonicalize(path).ok()
 }
 
 struct NormalizedTarget {
@@ -3640,16 +3604,18 @@ fn parse_editable_raw_response_parts(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let body_len =
-        raw_body.wire_len(fallback.map(|response| &response.body_encoding), "response")?;
+    let inferred_text_encoding = match &raw_body {
+        RawRequestBody::Text(body) => infer_text_body_encoding(
+            &headers,
+            body,
+            fallback.map(|response| &response.body_encoding),
+        )?,
+        RawRequestBody::Bytes(_) => None,
+    };
+    let body_len = raw_body.wire_len(inferred_text_encoding.as_ref(), "response")?;
     validate_raw_http_body_framing(&headers, body_len)?;
     let (body, body_encoding) = match raw_body {
-        RawRequestBody::Text(body) => (
-            body,
-            fallback
-                .map(|f| f.body_encoding.clone())
-                .unwrap_or(BodyEncoding::Utf8),
-        ),
+        RawRequestBody::Text(body) => (body, inferred_text_encoding.unwrap_or(BodyEncoding::Utf8)),
         RawRequestBody::Bytes(body) => {
             let content_type = headers
                 .iter()
@@ -4405,6 +4371,19 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.body_encoding, BodyEncoding::Base64);
         assert_eq!(response.body, "/wA=");
+        assert_eq!(response.try_body_bytes().unwrap(), vec![0xff, 0x00]);
+    }
+
+    #[test]
+    fn binary_raw_response_parser_infers_base64_from_content_length() {
+        let response = parse_editable_raw_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 2\r\n\r\n/wA=",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body_encoding, BodyEncoding::Base64);
         assert_eq!(response.try_body_bytes().unwrap(), vec![0xff, 0x00]);
     }
 

@@ -4014,6 +4014,47 @@ async function loadMoreTransactions({ background = false } = {}) {
   }
 }
 
+async function loadNewerTransactions({ background = false } = {}) {
+  const paging = state.historyPaging || (state.historyPaging = createHistoryPagingState());
+  if (paging.loading || !canUseSequenceCursorForHistoryPaging() || paging.trimmedHeadCount <= 0) {
+    return 0;
+  }
+
+  let shouldRenderAfterLoad = !background;
+  const generation = paging.generation;
+  paging.loading = true;
+  if (!background) renderHistory();
+  try {
+    const page = await fetchTransactionPage(0);
+    if (!page) {
+      return 0;
+    }
+    if (state.historyPaging !== paging || state.historyPaging.generation !== generation) {
+      return 0;
+    }
+    const pageItems = jsonArray(page.items);
+    const trimmedHeadBeforeLoad = paging.trimmedHeadCount || 0;
+    const added = mergeHistoryItems(pageItems, { prepend: true });
+    paging.trimmedHeadCount = Math.max(0, trimmedHeadBeforeLoad - added);
+    paging.offset = state.items.length;
+    paging.total = page.total ?? paging.total;
+    paging.filteredTotal = page.filtered_total ?? paging.filteredTotal;
+    if (page.hidden_connect_total != null) paging.hiddenConnectTotal = page.hidden_connect_total;
+    paging.hasMore = Boolean(page.has_more) || paging.trimmedTailCount > 0;
+    paging.fullyLoaded = !paging.hasMore;
+    if (added || !background) {
+      shouldRenderAfterLoad = true;
+    }
+    return added;
+  } catch (error) {
+    console.error("Failed to load newer transactions:", error);
+    return 0;
+  } finally {
+    paging.loading = false;
+    if (shouldRenderAfterLoad) renderHistory();
+  }
+}
+
 let _historyBackfillTimer = 0;
 function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS, options = {}) {
   const paging = state.historyPaging;
@@ -4889,6 +4930,7 @@ function clearFindingDetail() {
   if (getCMView("findingsRes")) updateCodePaneCM("findingsRes", els.findingsResCM, "", { mode: "http" });
   if (els.findingsReqView) els.findingsReqView.innerHTML = "";
   if (els.findingsResView) els.findingsResView.innerHTML = "";
+  resetFindingsSearchUi();
 }
 
 function resetFindingsUiState() {
@@ -4897,6 +4939,21 @@ function resetFindingsUiState() {
   clearFindingDetail();
   renderFindings();
   updateFindingsBadge();
+}
+
+function resetFindingsSearchUi(options = {}) {
+  const lineCount = Number.isFinite(Number(options.lineCount)) ? Number(options.lineCount) : 0;
+  const pairs = [
+    ["findingsReq", els.findingsReqSearchInput, els.findingsReqSearchMeta, els.findingsReqView],
+    ["findingsRes", els.findingsResSearchInput, els.findingsResSearchMeta, els.findingsResView],
+  ];
+  for (const [key, input, meta, legacyView] of pairs) {
+    if (input) input.value = "";
+    const cv = getCMView(key);
+    if (cv) cv.applySearch("");
+    else if (legacyView) clearSearchHighlights(legacyView);
+    if (meta) meta.innerHTML = buildSearchMeta(lineCount, "raw", 0);
+  }
 }
 
 function severityClass(severity) {
@@ -5163,6 +5220,7 @@ function showFindingDetail(finding, record) {
       els.findingsResView.innerHTML = '<span class="code-line code-line-empty">Transaction not available.</span>';
       if (els.findingsResLines) els.findingsResLines.textContent = "";
     }
+    resetFindingsSearchUi({ lineCount: 1 });
   }
 }
 
@@ -6424,6 +6482,26 @@ async function moveHistorySelection(offset) {
       updateHistorySelection(loadedNextId);
       scrollSelectedHistoryRowIntoView();
       await loadTransactionDetail(loadedNextId);
+    }
+    return;
+  }
+  if (offset < 0
+    && currentIndex === 0
+    && state.historyPaging?.trimmedHeadCount > 0
+    && !state.historyPaging.loading) {
+    const selectedIdBeforeLoad = state.selectedId;
+    const added = await loadNewerTransactions();
+    if (added <= 0) return;
+    visibleEntries = getVisibleEntries();
+    const loadedIndex = visibleEntries.findIndex((entry) => entry.item.id === selectedIdBeforeLoad);
+    const loadedPreviousId = loadedIndex >= 0
+      ? visibleEntries[loadedIndex - 1]?.item.id
+      : visibleEntries[visibleEntries.length - 1]?.item.id;
+    if (loadedPreviousId) {
+      state.selectedId = loadedPreviousId;
+      updateHistorySelection(loadedPreviousId);
+      scrollSelectedHistoryRowIntoView();
+      await loadTransactionDetail(loadedPreviousId);
     }
     return;
   }
@@ -14310,6 +14388,7 @@ async function wsConnect() {
   }
   scheduleWorkspaceStateSave();
   renderWsStatus();
+  renderWsSetupQueue();
   renderWsFrameList();
 
   try {
@@ -16043,6 +16122,48 @@ function parseCurlCommand(text) {
   const bodyParts = [];
   let bodyProvided = false;
   let needsDefaultFormContentType = false;
+  const curlOptionsWithValue = new Set([
+    "--abstract-unix-socket",
+    "--cacert",
+    "--capath",
+    "--cert",
+    "--cert-type",
+    "--ciphers",
+    "--connect-timeout",
+    "--connect-to",
+    "--cookie-jar",
+    "--dns-interface",
+    "--dns-ipv4-addr",
+    "--dns-ipv6-addr",
+    "--dns-servers",
+    "--interface",
+    "--key",
+    "--key-type",
+    "--limit-rate",
+    "--local-port",
+    "--max-filesize",
+    "--max-redirs",
+    "--max-time",
+    "--output",
+    "--proxy",
+    "--proxy-header",
+    "--proxy-user",
+    "--request-target",
+    "--resolve",
+    "--socks5",
+    "--socks5-hostname",
+    "--tls-max",
+    "--unix-socket",
+  ]);
+  const curlShortOptionsWithValue = new Set(["-E", "-m", "-o", "-x", "-y", "-Y"]);
+  const addHeader = (rawHeader) => {
+    const hVal = String(rawHeader || "");
+    const ci = hVal.indexOf(":");
+    if (ci <= 0) return;
+    const name = hVal.slice(0, ci).trim();
+    if (headerNameEquals({ name }, "content-length")) return;
+    headers.push({ name, value: hVal.slice(ci + 1).trim() });
+  };
   const addBodyPart = (flag, value, options = {}) => {
     if (flag === "--data-urlencode") {
       const encoded = encodeCurlDataUrlencode(value);
@@ -16116,19 +16237,13 @@ function parseCurlCommand(text) {
       return { error: "cURL HTTP/3 imports are not supported by Replay." };
     }
     else if (tok === "-H" || tok === "--header") {
-      const hVal = tokens[++t] || "";
-      const ci = hVal.indexOf(":");
-      if (ci > 0) headers.push({ name: hVal.slice(0, ci).trim(), value: hVal.slice(ci + 1).trim() });
+      addHeader(tokens[++t] || "");
     }
     else if (tok.startsWith("-H") && tok.length > 2) {
-      const hVal = tok.slice(2);
-      const ci = hVal.indexOf(":");
-      if (ci > 0) headers.push({ name: hVal.slice(0, ci).trim(), value: hVal.slice(ci + 1).trim() });
+      addHeader(tok.slice(2));
     }
     else if (tok.startsWith("--header=")) {
-      const hVal = tok.slice("--header=".length);
-      const ci = hVal.indexOf(":");
-      if (ci > 0) headers.push({ name: hVal.slice(0, ci).trim(), value: hVal.slice(ci + 1).trim() });
+      addHeader(tok.slice("--header=".length));
     }
     else if (tok === "-d" || tok === "--data" || tok === "--data-raw" || tok === "--data-binary" || tok === "--data-urlencode") {
       const error = addBodyPart(tok, tokens[++t] || "");
@@ -16207,8 +16322,8 @@ function parseCurlCommand(text) {
       pathAsIs = true;
     }
     else if (tok === "--compressed" || tok === "-k" || tok === "--insecure" || tok === "-s" || tok === "--silent" || tok === "-v" || tok === "--verbose" || tok === "-L" || tok === "--location") { /* skip flags */ }
-    else if (["-o", "--output", "-x", "--proxy", "--connect-timeout", "--max-time"].includes(tok)) { t++; }
-    else if (/^--(?:output|proxy|connect-timeout|max-time)=/.test(tok)) { /* skip option=value */ }
+    else if (curlShortOptionsWithValue.has(tok) || curlOptionsWithValue.has(tok)) { t++; }
+    else if (/^--[^=]+=.*/.test(tok) && curlOptionsWithValue.has(tok.slice(0, tok.indexOf("=")))) { /* skip option=value */ }
     else if (!tok.startsWith("-") && !url) { url = tok; }
   }
   if (!url) return null;
@@ -16231,6 +16346,9 @@ function parseCurlCommand(text) {
   try {
     const parsed = new URL(url);
     scheme = parsed.protocol.replace(":", "");
+    if (scheme !== "http" && scheme !== "https") {
+      return { error: "cURL import requires an http:// or https:// URL." };
+    }
     host = parsed.host;
     port = parsed.port || defaultHttpPortForScheme(scheme);
     path = pathAsIs ? rawPathFromUrlString(url) : `${parsed.pathname || "/"}${parsed.search || ""}`;
