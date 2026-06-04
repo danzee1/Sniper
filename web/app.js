@@ -845,6 +845,7 @@ async function init() {
     loadTransactions(false),
     loadIntercepts(false),
     loadResponseIntercepts(false),
+    loadInterceptRules(),
     loadWebsockets(false),
     loadEventLog(),
     loadMatchReplaceRules(),
@@ -954,6 +955,9 @@ function bindEvents() {
       }
       if (state.activeProxyTab === "replace") {
         loadMatchReplaceRules().catch((error) => console.error(error));
+      }
+      if (state.activeProxyTab === "oast") {
+        loadOastCallbacks().catch((error) => console.error(error));
       }
     });
   });
@@ -2913,11 +2917,16 @@ function resetSessionScopedUiState() {
   invalidateVisibleEntriesCache();
   state.intercepts = [];
   state.responseIntercepts = [];
+  state.interceptRules = [];
   state.selectedInterceptId = null;
   state.selectedInterceptRecord = null;
   state.selectedResponseInterceptId = null;
   state.selectedResponseInterceptRecord = null;
   state.responseInterceptEditorSeedId = null;
+  renderIntercepts();
+  renderResponseIntercepts();
+  renderInterceptRules();
+  updateInterceptQueueBadges();
   state.websocketSessions = [];
   state.websocketPaging = createWebsocketPagingState();
   state.selectedWebsocketId = null;
@@ -2928,6 +2937,7 @@ function resetSessionScopedUiState() {
   state.matchReplaceRules = [];
   state.selectedMatchReplaceRuleId = null;
   state.targetSiteMap = [];
+  resetOastUiState();
   state.targetScopeDraft = "";
   state.targetScopeDirty = false;
   state.targetScopeEditorSessionId = null;
@@ -2984,11 +2994,15 @@ async function reloadSessionWorkspace() {
   await loadTransactions(false);
   await loadIntercepts(false);
   await loadResponseIntercepts(false);
+  await loadInterceptRules();
   await loadWebsockets(false);
   await loadEventLog();
   await loadMatchReplaceRules();
   await loadSequences();
   await loadTargetSiteMap(true);
+  if (state.activeTool === "proxy" && state.activeProxyTab === "oast") {
+    await loadOastCallbacks();
+  }
   await refreshScannerQuickToggle();
   connectEvents();
   renderToolPanels();
@@ -3719,7 +3733,7 @@ function connectEvents() {
     eventSource.close();
   }
   const eventSessionId = currentSessionId();
-  eventSource = new EventSource("/api/events");
+  eventSource = new EventSource(sessionQueryPath("/api/events", eventSessionId));
 
   eventSource.addEventListener("transaction", (event) => {
     if (eventSessionId !== currentSessionId()) {
@@ -3748,6 +3762,13 @@ function connectEvents() {
     } else {
       els.eventLogStatus.textContent = "New activity";
     }
+  });
+
+  eventSource.addEventListener("event_log_gap", () => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
+    loadEventLog().catch((error) => console.error(error));
   });
 
   eventSource.addEventListener("session_changed", () => {
@@ -5545,6 +5566,21 @@ function updateOastBadge() {
 function clearOastDetail() {
   if (els.oastDetailView) els.oastDetailView.textContent = "Select an OAST callback to view details.";
   if (els.oastDetailTitle) els.oastDetailTitle.textContent = "Select a callback";
+}
+
+function resetOastUiState() {
+  state.oastCallbacks = [];
+  state.selectedOastId = null;
+  state.oastTokenClearPending = false;
+  if (els.oastPayloadText) els.oastPayloadText.value = "";
+  renderOastCallbacks();
+  updateOastBadge();
+  clearOastDetail();
+  const status = document.getElementById("oastStatusText");
+  if (status) {
+    status.textContent = "Not configured";
+    status.className = "oast-status-text not-registered";
+  }
 }
 
 function handleOastActionError(error) {

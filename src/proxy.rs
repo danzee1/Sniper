@@ -3567,6 +3567,7 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>) {
     tokio::spawn(async move {
         if let Err(error) = state.persist_session_context(&session).await {
             warn!(?error, session_id = %session.id(), "failed to persist session snapshot");
+            mark_persist_dirty(&session);
         }
         PERSIST_IN_FLIGHT.store(false, Ordering::Release);
         if has_persist_dirty(session.id()) {
@@ -3856,6 +3857,8 @@ pub async fn flush_pending_session_persists(state: &AppState) {
                 session_id = %session_id,
                 "failed to flush pending session snapshot"
             );
+            mark_persist_dirty(&session);
+            continue;
         }
         forget_persist_context(session_id);
     }

@@ -1300,6 +1300,11 @@ struct EventLogQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct EventsQuery {
+    session_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
 struct FuzzerQuery {
     session_id: Option<Uuid>,
     limit: Option<usize>,
@@ -3325,9 +3330,13 @@ async fn ws_replay_frames(
 
 async fn events(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<EventsQuery>,
     headers: HeaderMap,
-) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
-    let session = state.session().await;
+) -> Response {
+    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
     let last_event_sequence = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -3341,7 +3350,7 @@ async fn events(
         let mut session_check = tokio::time::interval(Duration::from_millis(500));
         session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         if last_event_sequence.is_some_and(|last_sequence| latest_sequence > last_sequence) {
-            yield Ok(Event::default()
+            yield Ok::<Event, Infallible>(Event::default()
                 .event("transactions_gap")
                 .data("reconnect"));
         }
@@ -3373,7 +3382,12 @@ async fn events(
                                 yield Ok(Event::default().event("event_log").data(payload));
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok(Event::default()
+                                .event("event_log_gap")
+                                .data("lagged"));
+                            continue;
+                        },
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -3389,11 +3403,13 @@ async fn events(
         }
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(10))
-            .text("keepalive"),
-    )
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(10))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 async fn index() -> Response {
@@ -4878,6 +4894,26 @@ mod tests {
         )
         .await;
         assert_eq!(oast_status["provider"], "boast");
+
+        let events_response = super::events(
+            State(state.clone()),
+            Query(super::EventsQuery {
+                session_id: Some(inactive.id()),
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(events_response.status(), StatusCode::OK);
+
+        let missing_events_response = super::events(
+            State(state.clone()),
+            Query(super::EventsQuery {
+                session_id: Some(Uuid::new_v4()),
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(missing_events_response.status(), StatusCode::NOT_FOUND);
 
         let clear_response = super::clear_event_log(
             State(state.clone()),
