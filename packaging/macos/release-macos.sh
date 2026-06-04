@@ -154,6 +154,11 @@ if [[ "${#DMG_CANDIDATES[@]}" -ne 1 ]]; then
 fi
 
 DMG_PATH="${DMG_CANDIDATES[0]}"
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$VERSION" == "0.2.5" && "$DMG_PATH" != *"-universal.dmg" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
+  echo "Sniper 0.2.5 is the bridge release from the v0.2.4 updater, which is not arch-aware." >&2
+  echo "Build/upload a universal legacy DMG first, or set ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE=1 if this is intentional." >&2
+  exit 1
+fi
 
 if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$HAS_APPLE_CREDS" == "1" ]]; then
   xcrun notarytool submit "$DMG_PATH" \

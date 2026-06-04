@@ -25,7 +25,7 @@ use sniper::{
     },
     runtime::RuntimeSettingsSnapshot,
     runtime_state::load_runtime_state,
-    sequence::{SequenceDefinition, SequenceRunSummary},
+    sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     session::SessionSummary,
     skills,
     workspace::{
@@ -715,6 +715,8 @@ enum SequenceCommand {
     Get(SequenceGetArgs),
     Create(SequenceCreateArgs),
     Run(SequenceRunArgs),
+    #[command(name = "run-get")]
+    RunGet(SequenceRunGetArgs),
     Delete(SequenceDeleteArgs),
     Runs(SequenceRunsArgs),
 }
@@ -750,6 +752,14 @@ struct SequenceCreateArgs {
 
 #[derive(Args, Debug)]
 struct SequenceRunArgs {
+    #[arg(long)]
+    id: Uuid,
+    #[arg(long)]
+    session_id: Option<Uuid>,
+}
+
+#[derive(Args, Debug)]
+struct SequenceRunGetArgs {
     #[arg(long)]
     id: Uuid,
     #[arg(long)]
@@ -1574,14 +1584,21 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             };
             push_replay_history_entry(tab_mut, history_entry);
 
-            if let Err(error) = post_workspace_state(&api, &mut workspace).await {
-                eprintln!("warning: replay was sent, but workspace state was not saved: {error}");
-            }
+            let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
             if let Some(error) = replay_error {
                 print_json(&json!({ "error": error, "record": record }))?;
+                if let Some(save_error) = workspace_save_error {
+                    bail!(
+                        "replay failed after storing transaction record: {error}; workspace state was not saved: {save_error}"
+                    );
+                }
                 bail!("replay failed after storing transaction record: {error}");
             } else {
-                print_json(&record)
+                print_json(&record)?;
+                if let Some(save_error) = workspace_save_error {
+                    bail!("replay was sent, but workspace state was not saved: {save_error}");
+                }
+                Ok(())
             }
         }
     }
@@ -1657,11 +1674,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 .await?;
             workspace.fuzzer.attack_record = Some(record.clone());
             workspace.fuzzer.notice.clear();
-            if let Err(error) = post_workspace_state(&api, &mut workspace).await {
-                eprintln!(
-                    "warning: fuzzer attack completed, but workspace state was not saved: {error}"
-                );
-            }
+            let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
 
             if args.r#async {
                 print_json(&json!({
@@ -1671,6 +1684,9 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 }))?;
             } else {
                 print_json(&record)?;
+            }
+            if let Some(save_error) = workspace_save_error {
+                bail!("fuzzer attack completed, but workspace state was not saved: {save_error}");
             }
             ensure_cli_record_not_failed("fuzzer attack", &record)?;
             Ok(())
@@ -1999,6 +2015,12 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             print_json(&result)?;
             ensure_json_status_not_failed("sequence run", &result)?;
             Ok(())
+        }
+        SequenceCommand::RunGet(args) => {
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let path = session_query_path(&format!("/api/sequence-runs/{}", args.id), session_id);
+            let run: SequenceRunRecord = api.get_json(&path).await?;
+            print_json(&run)
         }
         SequenceCommand::Delete(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -2532,13 +2554,14 @@ fn fuzzer_active_target_for_request(
     request: &EditableRequest,
 ) -> Option<RequestTargetOverride> {
     let target = fuzzer.target.as_ref()?;
-    let (saved_scheme, saved_authority) =
-        parse_saved_fuzzer_target_authority(fuzzer.target_request_authority.as_deref()?)?;
-    if !saved_scheme.eq_ignore_ascii_case(&request.scheme) {
-        return None;
-    }
-    if !request_authorities_equivalent(&saved_authority, &request.host, &request.scheme) {
-        return None;
+    if let Some(saved_authority) = fuzzer.target_request_authority.as_deref() {
+        let (saved_scheme, saved_authority) = parse_saved_fuzzer_target_authority(saved_authority)?;
+        if !saved_scheme.eq_ignore_ascii_case(&request.scheme) {
+            return None;
+        }
+        if !request_authorities_equivalent(&saved_authority, &request.host, &request.scheme) {
+            return None;
+        }
     }
     let target_normalized = normalize_target_inputs(
         Some(target.scheme.clone()),
@@ -4015,6 +4038,82 @@ mod tests {
 
         let target = fuzzer_active_target_for_request(&fuzzer, &request).unwrap();
         assert_eq!(target.host, "override.example");
+    }
+
+    #[test]
+    fn fuzzer_target_survives_missing_saved_authority_for_legacy_workspace() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "current.example".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let fuzzer = FuzzerWorkspaceState {
+            target: Some(RequestTargetOverride {
+                scheme: "https".to_string(),
+                host: "override.example".to_string(),
+                port: "443".to_string(),
+            }),
+            target_request_authority: None,
+            ..Default::default()
+        };
+
+        let target = fuzzer_active_target_for_request(&fuzzer, &request).unwrap();
+        assert_eq!(target.host, "override.example");
+    }
+
+    #[test]
+    fn fuzzer_target_with_missing_saved_authority_still_skips_equivalent_target() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "current.example:443".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let fuzzer = FuzzerWorkspaceState {
+            target: Some(RequestTargetOverride {
+                scheme: "https".to_string(),
+                host: "current.example".to_string(),
+                port: "443".to_string(),
+            }),
+            target_request_authority: None,
+            ..Default::default()
+        };
+
+        assert!(fuzzer_active_target_for_request(&fuzzer, &request).is_none());
+    }
+
+    #[test]
+    fn fuzzer_target_is_cleared_when_saved_authority_is_invalid() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "current.example".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let fuzzer = FuzzerWorkspaceState {
+            target: Some(RequestTargetOverride {
+                scheme: "https".to_string(),
+                host: "override.example".to_string(),
+                port: "443".to_string(),
+            }),
+            target_request_authority: Some("not a url".to_string()),
+            ..Default::default()
+        };
+
+        assert!(fuzzer_active_target_for_request(&fuzzer, &request).is_none());
     }
 
     #[test]

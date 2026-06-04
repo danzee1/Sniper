@@ -1107,7 +1107,7 @@ function bindEvents() {
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     state.filterSettings.inScopeOnly = e.currentTarget.classList.contains("active");
-    scheduleRefresh();
+    scheduleRefresh({ resetScroll: true });
   });
   document.getElementById("interceptInScopeToggle")?.addEventListener("click", async (e) => {
     const toggle = e.currentTarget;
@@ -1150,7 +1150,7 @@ function bindEvents() {
 
   els.methodFilter.addEventListener("change", () => {
     state.method = els.methodFilter.value;
-    scheduleRefresh();
+    scheduleRefresh({ resetScroll: true });
   });
 
   els.colorTagFilter.addEventListener("click", (event) => {
@@ -1164,7 +1164,7 @@ function bindEvents() {
       state.filterSettings.colorTags.add(color);
       btn.classList.add("active");
     }
-    scheduleRefresh();
+    scheduleRefresh({ resetScroll: true });
   });
 
   els.openDisplaySettingsButton.addEventListener("click", openDisplaySettingsModal);
@@ -1562,6 +1562,7 @@ function bindEvents() {
     state._replayLastSnapshot = text;
     els.replayRequestEditor.value = text;
     tab.requestText = text;
+    clearReplayResponseForDraftChange(tab);
     // Debounce re-render so syntax highlighting refreshes without losing cursor
     clearTimeout(els.replayRequestHighlight._renderTimer);
     els.replayRequestHighlight._renderTimer = setTimeout(() => {
@@ -1594,7 +1595,10 @@ function bindEvents() {
       restoreContentEditableCaret(els.replayRequestHighlight, clampedPos);
       els.replayRequestEditor.value = restored;
       const tab = getActiveReplayTab();
-      if (tab) tab.requestText = restored;
+      if (tab) {
+        tab.requestText = restored;
+        clearReplayResponseForDraftChange(tab);
+      }
       updateReplaySearchPane("request", restored);
       syncReplayToolbar(tab);
       renderReplayTabs();
@@ -1698,6 +1702,7 @@ function bindEvents() {
       tab.requestText = newText;
       tab.requestBytes = null;
       tab.requestOriginalBytes = null;
+      clearReplayResponseForDraftChange(tab);
       syncReplayToolbar(tab);
       renderReplayTabs();
       scheduleWorkspaceStateSave();
@@ -1726,6 +1731,7 @@ function bindEvents() {
       hl.innerText = newText;
       hl.dispatchEvent(new Event("input"));
       tab.requestText = newText;
+      clearReplayResponseForDraftChange(tab);
       updateReplaySearchPane("request", newText);
       syncReplayToolbar(tab);
       renderReplayTabs();
@@ -5057,6 +5063,9 @@ function renderFindingsVirtual() {
 
 async function loadFindingDetail(id) {
   const sessionId = currentSessionId();
+  if (selectedFindingId === id && els.findingsDetailJump) {
+    delete els.findingsDetailJump.dataset.recordId;
+  }
   try {
     const res = await fetch(sessionQueryPath(`/api/findings/${encodeURIComponent(id)}`, sessionId));
     if (selectedFindingId !== id) return;
@@ -5078,6 +5087,9 @@ async function loadFindingDetail(id) {
     showFindingDetail(finding, record);
   } catch (error) {
     console.error("Failed to load finding detail:", error);
+    if (selectedFindingId === id && sessionId === currentSessionId()) {
+      clearFindingDetail();
+    }
   }
 }
 
@@ -7584,10 +7596,21 @@ function syncReplayRequestTextFromEditor(newText) {
   activeTab.httpVersionMode = httpVersion;
   activeTab.requestBytes = null;
   activeTab.requestOriginalBytes = null;
+  clearReplayResponseForDraftChange(activeTab);
   syncReplayToolbar(activeTab);
   refreshReplayTabLabel(activeTab.id);
   updateReplaySearchPane("request", newText, { scrollToFirst: false });
   scheduleWorkspaceStateSave();
+}
+
+function clearReplayResponseForDraftChange(tab) {
+  if (!tab || tab.type === "websocket") return;
+  const hadResponseState = !!tab.responseRecord || !!tab.notice;
+  tab.responseRecord = null;
+  tab.notice = "";
+  if (hadResponseState && state.activeTool === "replay" && state.activeReplayTabId === tab.id) {
+    renderReplayEmptyResponse(tab);
+  }
 }
 
 function syncReplayRequestHighlightScroll() {
@@ -12346,6 +12369,7 @@ function startHexByteEdit(span, tab, container) {
     // Sync text
     tab.requestText = new TextDecoder().decode(tab.requestBytes);
     if (els.replayRequestEditor) els.replayRequestEditor.value = tab.requestText;
+    clearReplayResponseForDraftChange(tab);
     renderReplayTabs();
     updateReplaySearchPane("request", tab.requestText);
     scheduleWorkspaceStateSave();
@@ -15556,6 +15580,7 @@ function changeReplayMethod(newMethod) {
   const text = cv ? cv.getContent() : (tab.requestText || (els.replayRequestEditor ? els.replayRequestEditor.value : "") || "");
   const updated = text.replace(/^[A-Z]+(\s)/i, newMethod + "$1");
   tab.requestText = updated;
+  clearReplayResponseForDraftChange(tab);
   if (cv) {
     cv.setContent(updated);
   } else if (els.replayRequestEditor) {
@@ -16391,6 +16416,7 @@ function initReplayContextMenu() {
           els.replayRequestEditor.value = tab.requestText;
           renderReplayRequestHighlight(tab.requestText);
         }
+        clearReplayResponseForDraftChange(tab);
         scheduleWorkspaceStateSave();
       } else if (action === "add-content-type-json") {
         setReplayHeader("Content-Type", "application/json");
@@ -16442,6 +16468,7 @@ function setReplayHeader(name, value) {
   }
 
   tab.requestText = lines.join("\n") + body;
+  clearReplayResponseForDraftChange(tab);
   const cv = getCMView("replayReq");
   if (cv) {
     cv.setContent(tab.requestText);

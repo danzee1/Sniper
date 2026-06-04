@@ -1501,7 +1501,7 @@ async fn get_runtime_settings(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RuntimeQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -1512,7 +1512,7 @@ async fn get_workspace_state(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WorkspaceStateQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -1645,14 +1645,14 @@ async fn resolve_session_for_optional_id(
     if target_session_id == active_session.id() {
         return Ok(active_session);
     }
+    if proxy::session_has_active_proxy_work(target_session_id) {
+        return Err(active_session_conflict_response(state));
+    }
     if let Some(session) = proxy::live_websocket_session_context(target_session_id) {
         return Ok(session);
     }
     if let Some(session) = proxy::pending_session_context(target_session_id) {
         return Ok(session);
-    }
-    if proxy::session_has_active_proxy_work(target_session_id) {
-        return Err(active_session_conflict_response(state));
     }
     if !state.sessions.contains_session(target_session_id) {
         return Err(StatusCode::NOT_FOUND.into_response());
@@ -2133,7 +2133,7 @@ async fn get_target_site_map(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TargetSiteMapQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2333,7 +2333,7 @@ async fn list_intercepts(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2349,7 +2349,7 @@ async fn get_intercept(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2502,7 +2502,7 @@ async fn list_intercept_rules(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2573,7 +2573,7 @@ async fn list_response_intercepts(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2589,7 +2589,7 @@ async fn get_response_intercept(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2771,7 +2771,7 @@ async fn list_sequences(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SequenceSessionQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2787,7 +2787,7 @@ async fn get_sequence(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2895,7 +2895,7 @@ async fn list_sequence_runs(
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2911,7 +2911,7 @@ async fn get_sequence_run(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3005,7 +3005,7 @@ async fn list_fuzzer_attacks(
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3021,7 +3021,7 @@ async fn get_fuzzer_attack(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3079,7 +3079,7 @@ async fn list_websockets(
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3102,7 +3102,7 @@ async fn get_websocket(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3498,7 +3498,7 @@ async fn events(
     headers: HeaderMap,
 ) -> Response {
     let explicit_event_session = query.session_id.is_some();
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3836,7 +3836,7 @@ async fn list_oast_callbacks(
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3852,7 +3852,7 @@ async fn get_oast_callback(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3904,7 +3904,7 @@ async fn generate_oast_payload(
     State(state): State<Arc<AppState>>,
     Query(query): Query<OastQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3960,7 +3960,7 @@ async fn oast_status(
     State(state): State<Arc<AppState>>,
     Query(query): Query<OastQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -5161,6 +5161,32 @@ mod tests {
         assert!(runtime.oast_enabled);
         assert_eq!(runtime.oast_provider, OastProvider::Boast);
 
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(inactive.id());
+
+        let runtime_read: RuntimeSettingsSnapshot = response_json(
+            super::get_runtime_settings(
+                State(state.clone()),
+                Query(super::RuntimeQuery {
+                    session_id: Some(inactive.id()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(runtime_read.oast_provider, OastProvider::Boast);
+
+        let workspace_read: WorkspaceStateSnapshot = response_json(
+            super::get_workspace_state(
+                State(state.clone()),
+                Query(super::WorkspaceStateQuery {
+                    session_id: Some(inactive.id()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(workspace_read.session_id, Some(inactive.id()));
+
         let inactive_events: Vec<crate::event_log::EventLogEntry> = response_json(
             super::list_event_log(
                 State(state.clone()),
@@ -5208,6 +5234,20 @@ mod tests {
         let callback_id_text = callback_id.to_string();
         assert_eq!(callbacks[0]["id"].as_str(), Some(callback_id_text.as_str()));
 
+        let callback: serde_json::Value = response_json(
+            super::get_oast_callback(
+                State(state.clone()),
+                Path(callback_id_text.clone()),
+                Query(super::OastQuery {
+                    session_id: Some(inactive.id()),
+                    limit: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(callback["id"].as_str(), Some(callback_id_text.as_str()));
+
         let oast_status: serde_json::Value = response_json(
             super::oast_status(
                 State(state.clone()),
@@ -5220,6 +5260,16 @@ mod tests {
         )
         .await;
         assert_eq!(oast_status["provider"], "boast");
+
+        let payload_response = super::generate_oast_payload(
+            State(state.clone()),
+            Query(super::OastQuery {
+                session_id: Some(inactive.id()),
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(payload_response.status(), StatusCode::OK);
 
         let events_response = super::events(
             State(state.clone()),
@@ -5252,6 +5302,18 @@ mod tests {
         )
         .await;
         assert_eq!(missing_events_response.status(), StatusCode::NOT_FOUND);
+
+        let blocked_clear_response = super::clear_event_log(
+            State(state.clone()),
+            Query(super::EventLogQuery {
+                session_id: Some(inactive.id()),
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(blocked_clear_response.status(), StatusCode::CONFLICT);
+
+        drop(active_proxy_owner);
 
         let clear_response = super::clear_event_log(
             State(state.clone()),
@@ -5386,6 +5448,20 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(inactive_id);
+
+        let inactive_config: ScannerConfig = response_json(
+            super::get_scanner_config(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(!inactive_config.enabled);
+
         let inactive_rules: Vec<MatchReplaceRule> = response_json(
             super::list_match_replace_rules(
                 State(state.clone()),
@@ -5440,6 +5516,8 @@ mod tests {
         )
         .await;
         assert_eq!(finding.id, inactive_finding.id);
+
+        drop(active_proxy_owner);
 
         let reloaded = state.sessions.load_context(inactive_id).unwrap();
         assert!(!reloaded.scanner.get_config().await.enabled);
@@ -6415,6 +6493,8 @@ mod tests {
             active_fuzzer_response.status(),
             super::StatusCode::NOT_FOUND
         );
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+
         let pinned_fuzzer_response = super::get_fuzzer_attack(
             State(state.clone()),
             Path(attack_id.to_string()),
@@ -6473,6 +6553,7 @@ mod tests {
             response_json(pinned_websocket_list).await;
         assert_eq!(pinned_websocket_page.items.len(), 1);
         assert_eq!(pinned_websocket_page.items[0].id, websocket_id);
+        drop(active_proxy_owner);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -6796,6 +6877,8 @@ mod tests {
         .await;
         assert_eq!(active_response.status(), super::StatusCode::NOT_FOUND);
 
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(inactive_id);
+
         let pinned_response = super::get_sequence(
             State(state.clone()),
             Path(inactive_definition.id.to_string()),
@@ -6805,6 +6888,34 @@ mod tests {
         )
         .await;
         assert_eq!(pinned_response.status(), super::StatusCode::OK);
+
+        let pinned_definitions: Vec<SequenceDefinition> = response_json(
+            super::list_sequences(
+                State(state.clone()),
+                Query(super::SequenceSessionQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(pinned_definitions.len(), 1);
+        assert_eq!(pinned_definitions[0].id, inactive_definition.id);
+
+        let pinned_runs: Vec<crate::sequence::SequenceRunRecord> = response_json(
+            super::list_sequence_runs(
+                State(state.clone()),
+                Query(super::SequenceQuery {
+                    session_id: Some(inactive_id),
+                    limit: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(pinned_runs.is_empty());
+
+        drop(active_proxy_owner);
 
         let active_definition = SequenceDefinition {
             id: uuid::Uuid::new_v4(),
