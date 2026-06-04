@@ -662,6 +662,10 @@ impl AppState {
             cleanup_update_artifacts(None, &tmp_dir).await;
             return Err(error.context("failed to persist active session before self-update"));
         }
+        if let Err(error) = crate::proxy::flush_pending_session_persists(self).await {
+            cleanup_update_artifacts(None, &tmp_dir).await;
+            return Err(error.context("failed to flush pending sessions before self-update"));
+        }
 
         if let Err(error) = spawn_update_installer_after_exit(
             std::process::id(),
@@ -707,7 +711,12 @@ impl AppState {
         )
         .await;
         crate::proxy::drain_proxy_connections(Duration::from_secs(1)).await;
-        crate::proxy::flush_pending_session_persists(self).await;
+        if let Err(error) = crate::proxy::flush_pending_session_persists(self).await {
+            tracing::warn!(
+                ?error,
+                "failed to flush pending session snapshots before self-update restart"
+            );
+        }
         if let Err(error) = self.persist_active_session().await {
             tracing::warn!(
                 ?error,

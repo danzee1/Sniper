@@ -3333,6 +3333,7 @@ async fn events(
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let explicit_event_session = query.session_id.is_some();
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
@@ -3392,7 +3393,7 @@ async fn events(
                     }
                 }
                 _ = session_check.tick() => {
-                    if state.sessions.active_session_id() != session_id {
+                    if !explicit_event_session && state.sessions.active_session_id() != session_id {
                         yield Ok(Event::default()
                             .event("session_changed")
                             .data(state.sessions.active_session_id().to_string()));
@@ -3810,7 +3811,9 @@ mod tests {
         Json,
     };
     use chrono::Utc;
+    use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
+    use std::time::Duration;
     use uuid::Uuid;
 
     use super::{
@@ -4904,6 +4907,18 @@ mod tests {
         )
         .await;
         assert_eq!(events_response.status(), StatusCode::OK);
+        let mut events_body = events_response.into_body();
+        let maybe_event =
+            tokio::time::timeout(Duration::from_millis(150), events_body.frame()).await;
+        if let Ok(Some(Ok(frame))) = maybe_event {
+            if let Ok(bytes) = frame.into_data() {
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !text.contains("session_changed"),
+                    "explicit inactive session event stream must not emit session_changed: {text}"
+                );
+            }
+        }
 
         let missing_events_response = super::events(
             State(state.clone()),

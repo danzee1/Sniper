@@ -200,7 +200,9 @@ async fn flush_pending_persists_waits_for_streaming_body_pump_store() {
     .expect("proxy should stream response bytes before upstream EOF");
 
     let session = state.session().await;
-    flush_pending_session_persists(state.as_ref()).await;
+    flush_pending_session_persists(state.as_ref())
+        .await
+        .unwrap();
 
     let records = session.store.snapshot(Some(10)).await;
     let record = records

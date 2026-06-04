@@ -2891,6 +2891,7 @@ function hasPendingWorkspaceStateSave() {
 
 function resetSessionScopedUiState() {
   clearReplaySendInFlight();
+  closeContextMenu();
   window.clearTimeout(refreshTimer);
   refreshTimer = null;
   window.clearTimeout(workspaceSaveTimer);
@@ -15026,9 +15027,15 @@ function openContextMenu(x, y, transactionId) {
 }
 
 function closeContextMenu() {
+  window.clearTimeout(contextMenuNoteTimer);
+  contextMenuNoteTimer = null;
   els.contextMenu.classList.add("hidden");
   contextMenuTargetId = null;
   contextMenuSessionId = null;
+}
+
+function contextMenuSessionIsCurrent() {
+  return !!contextMenuSessionId && contextMenuSessionId === currentSessionId();
 }
 
 async function loadUserNote(transactionId) {
@@ -15068,7 +15075,6 @@ async function flushPendingAnnotations(transactionId) {
   const { sessionId, payload } = entry;
 
   state._annotationInFlight.add(transactionId);
-  let saved = false;
   let failureMessage = "";
   try {
     const response = await fetch(sessionQueryPath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, sessionId), {
@@ -15082,7 +15088,7 @@ async function flushPendingAnnotations(transactionId) {
     }
     const summary = await response.json();
     if (currentSessionId() !== sessionId) {
-      saved = true;
+      return;
     } else if (pending.get(transactionId) === entry) {
       const index = getHistoryItemIndex(transactionId);
       if (index !== -1) {
@@ -15115,16 +15121,16 @@ async function flushPendingAnnotations(transactionId) {
         }
         renderDetail(state.selectedRecord, { preserveOriginalToggles: true });
       }
-      saved = true;
     }
   } catch (error) {
     console.error("Failed to update annotations:", error);
     if (currentSessionId() === sessionId) {
       showToast(failureMessage || error.message || "Failed to save annotation", "error");
+      loadTransactions(true).catch((reloadError) => console.error(reloadError));
     }
   } finally {
     state._annotationInFlight.delete(transactionId);
-    if (saved && pending.get(transactionId) === entry) {
+    if (pending.get(transactionId) === entry) {
       pending.delete(transactionId);
     } else if (pending.get(transactionId) !== entry) {
       flushPendingAnnotations(transactionId);
@@ -15147,6 +15153,10 @@ document.addEventListener("keydown", (event) => {
 els.contextMenu.querySelectorAll(".color-dot").forEach((dot) => {
   dot.addEventListener("click", () => {
     if (!contextMenuTargetId) return;
+    if (!contextMenuSessionIsCurrent()) {
+      closeContextMenu();
+      return;
+    }
     const color = dot.dataset.color || null;
     updateAnnotations(contextMenuTargetId, { color_tag: color }, contextMenuSessionId);
     els.contextMenu.querySelectorAll(".color-dot").forEach((d) => {
@@ -15160,6 +15170,10 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
     const action = item.dataset.action;
     const targetId = contextMenuTargetId;
     if (!targetId) return;
+    if (!contextMenuSessionIsCurrent()) {
+      closeContextMenu();
+      return;
+    }
     state.selectedId = targetId;
     closeContextMenu();
     if (action === "send-to-replay") {
@@ -15199,6 +15213,10 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
 
 els.contextMenuNote.addEventListener("input", () => {
   if (!contextMenuTargetId) return;
+  if (!contextMenuSessionIsCurrent()) {
+    closeContextMenu();
+    return;
+  }
   clearTimeout(contextMenuNoteTimer);
   const id = contextMenuTargetId;
   const sessionId = contextMenuSessionId;
@@ -15212,6 +15230,10 @@ els.contextMenuNote.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     if (!contextMenuTargetId) return;
+    if (!contextMenuSessionIsCurrent()) {
+      closeContextMenu();
+      return;
+    }
     const id = contextMenuTargetId;
     const sessionId = contextMenuSessionId;
     const value = els.contextMenuNote.value;

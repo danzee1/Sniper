@@ -222,7 +222,14 @@ fn main() -> Result<()> {
             runtime.block_on(proxy::drain_proxy_connections(
                 std::time::Duration::from_secs(1),
             ));
-            runtime.block_on(proxy::flush_pending_session_persists(close_state.as_ref()));
+            if let Err(error) =
+                runtime.block_on(proxy::flush_pending_session_persists(close_state.as_ref()))
+            {
+                warn!(
+                    ?error,
+                    "failed to flush pending session snapshots before desktop shutdown"
+                );
+            }
             if let Err(error) = runtime.block_on(close_state.persist_active_session()) {
                 warn!(
                     ?error,

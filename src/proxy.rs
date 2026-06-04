@@ -3838,16 +3838,21 @@ pub fn session_has_pending_persist(session_id: Uuid) -> bool {
     pending.contains_key(&session_id)
 }
 
-pub async fn flush_pending_session_persists(state: &AppState) {
+pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
     let sessions = {
         let pending = PERSIST_PENDING_CONTEXTS
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         pending.values().cloned().collect::<Vec<_>>()
     };
+    let mut failures = Vec::new();
 
     for session in sessions {
         let session_id = session.id();
+        if !state.sessions.contains_session(session_id) {
+            forget_persist_context(session_id);
+            continue;
+        }
         wait_for_session_proxy_work_to_finish(session_id, PENDING_PERSIST_FLUSH_PROXY_WAIT).await;
         clear_trailing_persist(session_id);
         take_persist_dirty(session_id);
@@ -3858,9 +3863,25 @@ pub async fn flush_pending_session_persists(state: &AppState) {
                 "failed to flush pending session snapshot"
             );
             mark_persist_dirty(&session);
+            failures.push(anyhow!(
+                "failed to persist pending session {session_id}: {error}"
+            ));
             continue;
         }
         forget_persist_context(session_id);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} pending session persist(s) failed: {}",
+            failures.len(),
+            failures
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
     }
 }
 

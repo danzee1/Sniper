@@ -141,7 +141,12 @@ async fn shutdown_headless_runtime(state: &AppState, oast_task: tokio::task::Joi
     )
     .await;
     proxy::drain_proxy_connections(Duration::from_secs(1)).await;
-    proxy::flush_pending_session_persists(state).await;
+    if let Err(error) = proxy::flush_pending_session_persists(state).await {
+        warn!(
+            ?error,
+            "failed to flush pending session snapshots before headless shutdown"
+        );
+    }
     if let Err(error) = state.persist_active_session().await {
         warn!(
             ?error,
