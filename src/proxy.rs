@@ -3610,6 +3610,11 @@ fn remember_persist_context(session: &Arc<SessionContext>) -> u64 {
     generation
 }
 
+#[cfg(test)]
+pub(crate) fn remember_pending_persist_context_for_test(session: &Arc<SessionContext>) -> u64 {
+    remember_persist_context(session)
+}
+
 fn forget_persist_context_if_generation(session_id: Uuid, generation: u64) -> bool {
     let mut pending = PERSIST_PENDING_CONTEXTS
         .lock()
@@ -3623,6 +3628,11 @@ fn forget_persist_context_if_generation(session_id: Uuid, generation: u64) -> bo
     pending.remove(&session_id);
     generations.remove(&session_id);
     true
+}
+
+#[cfg(test)]
+pub(crate) fn forget_pending_persist_context_for_test(session_id: Uuid, generation: u64) -> bool {
+    forget_persist_context_if_generation(session_id, generation)
 }
 
 fn current_persist_generation(session_id: Uuid) -> Option<u64> {

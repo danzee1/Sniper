@@ -282,12 +282,16 @@ struct TargetSessionArgs {
 #[derive(Args, Debug, Default)]
 #[command(group(
     ArgGroup::new("scope_source")
-        .args(["patterns", "file", "stdin"])
+        .args(["patterns", "file", "stdin", "clear"])
         .multiple(false)
+        .required(true)
 ))]
 struct TargetSetScopeArgs {
     #[arg(long)]
     session_id: Option<Uuid>,
+    /// Clear all scope patterns.
+    #[arg(long)]
+    clear: bool,
     #[arg(long = "pattern", action = ArgAction::Append)]
     patterns: Vec<String>,
     #[arg(long)]
@@ -686,11 +690,20 @@ struct InterceptRuleSessionArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("matcher")
+        .args(["host_pattern", "path_pattern", "method_filter", "all"])
+        .multiple(true)
+        .required(true)
+))]
 struct InterceptRuleCreateArgs {
     #[arg(long)]
     session_id: Option<Uuid>,
     #[arg(long, default_value = "both", value_parser = ["request", "response", "both"])]
     scope: String,
+    /// Create a rule that matches all traffic. Required when no matcher is supplied.
+    #[arg(long)]
+    all: bool,
     #[arg(long)]
     host_pattern: Option<String>,
     #[arg(long)]
@@ -1435,7 +1448,11 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
         }
         TargetCommand::SetScope(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let scope_patterns = read_lines_input(args.patterns, args.file, args.stdin)?;
+            let scope_patterns = if args.clear {
+                Vec::new()
+            } else {
+                read_lines_input(args.patterns, args.file, args.stdin)?
+            };
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
@@ -1943,6 +1960,7 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
         }
         InterceptRuleCommand::Create(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let _explicit_all = args.all;
             let rule = json!({
                 "id": Uuid::new_v4(),
                 "enabled": args.enabled.unwrap_or(true),
@@ -4909,6 +4927,44 @@ mod tests {
             "--stdin",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn cli_requires_scope_source_for_set_scope() {
+        assert!(Cli::try_parse_from(["sniper-cli", "scope", "set-scope"]).is_err());
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "scope",
+            "set-scope",
+            "--pattern",
+            "*.example.com",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["sniper-cli", "scope", "set-scope", "--clear"]).is_ok());
+    }
+
+    #[test]
+    fn cli_requires_explicit_matcher_for_intercept_rule_create() {
+        assert!(
+            Cli::try_parse_from(["sniper-cli", "capture", "intercept-rule", "create",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "intercept-rule",
+            "create",
+            "--host-pattern",
+            "*.example.com",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "intercept-rule",
+            "create",
+            "--all",
+        ])
+        .is_ok());
     }
 
     #[test]

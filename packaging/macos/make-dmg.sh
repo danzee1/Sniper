@@ -83,6 +83,36 @@ bundle_executable_path() {
   printf '%s\n' "$app_bundle/Contents/MacOS/$executable_name"
 }
 
+plist_value() {
+  local info_plist="$1"
+  local key="$2"
+  /usr/libexec/PlistBuddy -c "Print :$key" "$info_plist" 2>/dev/null || true
+}
+
+validate_app_bundle_metadata() {
+  local app_bundle="$1"
+  local info_plist="$app_bundle/Contents/Info.plist"
+  local bundle_version
+  local executable_name
+
+  if [[ ! -f "$info_plist" ]]; then
+    echo "Missing app Info.plist: $info_plist" >&2
+    return 1
+  fi
+
+  bundle_version="$(plist_value "$info_plist" "CFBundleShortVersionString")"
+  if [[ "$bundle_version" != "$VERSION" ]]; then
+    echo "App bundle version $bundle_version does not match DMG version $VERSION" >&2
+    return 1
+  fi
+
+  executable_name="$(plist_value "$info_plist" "CFBundleExecutable")"
+  if [[ "$executable_name" != "$APP_NAME" ]]; then
+    echo "App bundle executable $executable_name does not match APP_NAME $APP_NAME" >&2
+    return 1
+  fi
+}
+
 dmg_arch_from_lipo_archs() {
   local archs="$1"
   local has_arm64=0
@@ -136,6 +166,10 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   "$ROOT_DIR/packaging/macos/make-app.sh"
 elif [[ ! -d "$APP_BUNDLE" ]]; then
   echo "SKIP_BUILD=1 was set but $APP_BUNDLE does not exist" >&2
+  exit 1
+fi
+
+if ! validate_app_bundle_metadata "$APP_BUNDLE"; then
   exit 1
 fi
 

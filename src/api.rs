@@ -1547,13 +1547,15 @@ async fn update_workspace_state(
     let active_session = state.session().await;
     let session = if target_session_id == active_session.id() {
         active_session
+    } else if proxy::session_has_active_proxy_work(target_session_id) {
+        let mut current = active_session.workspace.snapshot().await;
+        current.session_id = Some(active_session.id());
+        return (StatusCode::CONFLICT, Json(current)).into_response();
     } else if let Some(session) = proxy::live_websocket_session_context(target_session_id) {
         session
     } else if let Some(session) = proxy::pending_session_context(target_session_id) {
         session
-    } else if proxy::session_has_active_proxy_work(target_session_id)
-        || !state.sessions.contains_session(target_session_id)
-    {
+    } else if !state.sessions.contains_session(target_session_id) {
         let mut current = active_session.workspace.snapshot().await;
         current.session_id = Some(active_session.id());
         return (StatusCode::CONFLICT, Json(current)).into_response();
@@ -1692,11 +1694,15 @@ async fn resolve_read_session_for_optional_id(
 async fn guard_session_write_operation(
     state: &Arc<AppState>,
     session: &Arc<SessionContext>,
+    require_still_active: bool,
 ) -> std::result::Result<OwnedMutexGuard<()>, Response> {
     let operation_lock = state.session_operation_lock(session.id()).await;
     let guard = operation_lock.lock_owned().await;
     if !state.sessions.contains_session(session.id()) {
         return Err(action_session_conflict_response(session));
+    }
+    if require_still_active && state.sessions.active_session_id() != session.id() {
+        return Err(active_session_conflict_response(state));
     }
     Ok(guard)
 }
@@ -1742,11 +1748,11 @@ async fn update_runtime_settings(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, target_session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.runtime.snapshot().await;
     let previous_events = session
@@ -1923,11 +1929,11 @@ async fn clear_event_log(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session
         .event_log
@@ -1994,10 +2000,11 @@ async fn clear_findings(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session
         .scanner
@@ -2038,10 +2045,11 @@ async fn update_scanner_config(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.scanner.get_config().await;
     session.scanner.update_config(config).await;
@@ -2100,10 +2108,11 @@ async fn update_match_replace_rules(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous_rules = session.match_replace.snapshot().await;
     let previous_events = session
@@ -2284,10 +2293,11 @@ async fn update_transaction_annotations(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     match session
         .store
@@ -2380,10 +2390,11 @@ async fn forward_intercept(
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
 
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2428,10 +2439,11 @@ async fn drop_intercept(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2467,10 +2479,11 @@ async fn forward_all_intercepts(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2518,10 +2531,11 @@ async fn upsert_intercept_rule(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.intercept_rules.snapshot().await;
     session.intercept_rules.upsert(rule).await;
@@ -2549,10 +2563,11 @@ async fn delete_intercept_rule(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.intercept_rules.snapshot().await;
     if session.intercept_rules.delete(id).await {
@@ -2620,10 +2635,11 @@ async fn forward_response_intercept(
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
 
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2672,10 +2688,11 @@ async fn drop_response_intercept(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -2711,10 +2728,11 @@ async fn forward_all_response_intercepts(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session).await {
-        Ok(guard) => guard,
-        Err(response) => return response,
-    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -3870,11 +3888,11 @@ async fn clear_oast_callbacks(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.oast.snapshot().await;
     let previous_cleared_keys = session.oast.snapshot_cleared_keys().await;
@@ -5013,6 +5031,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn implicit_runtime_update_rejects_active_session_change_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-runtime-active-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let operation_lock = state.session_operation_lock(original.id()).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut update_future = Box::pin(super::update_runtime_settings(
+            State(state.clone()),
+            Json(RuntimeSettingsUpdate {
+                session_id: None,
+                intercept_enabled: Some(true),
+                ..RuntimeSettingsUpdate::default()
+            }),
+        ));
+
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut update_future).await;
+        assert!(blocked.is_err());
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        drop(operation_guard);
+
+        let response = update_future.await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(!original.runtime.snapshot().await.intercept_enabled);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn oast_clear_waits_for_session_operation_lock() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-oast-clear-op-lock-{}",
@@ -5865,6 +5925,71 @@ mod tests {
                 .as_deref(),
             Some("inactive-tab")
         );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_update_rejects_inactive_session_with_pending_active_proxy_work() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-workspace-active-proxy-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let inactive = state.session().await;
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let pending_generation = crate::proxy::remember_pending_persist_context_for_test(&inactive);
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(inactive.id());
+
+        let read_response = super::get_workspace_state(
+            State(state.clone()),
+            Query(super::WorkspaceStateQuery {
+                session_id: Some(inactive.id()),
+            }),
+        )
+        .await;
+        assert_eq!(read_response.status(), super::StatusCode::OK);
+
+        let mut snapshot = WorkspaceStateSnapshot {
+            session_id: Some(inactive.id()),
+            client_id: Some("test-ui".to_string()),
+            client_version: 1,
+            ..WorkspaceStateSnapshot::default()
+        };
+        snapshot.replay.active_tab_id = Some("blocked-inactive-tab".to_string());
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "blocked-inactive-tab".to_string(),
+            sequence: 1,
+            ..ReplayTabState::default()
+        });
+
+        let response = super::update_workspace_state(State(state.clone()), Json(snapshot)).await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(inactive
+            .workspace
+            .snapshot()
+            .await
+            .replay
+            .active_tab_id
+            .is_none());
+
+        drop(active_proxy_owner);
+        assert!(crate::proxy::forget_pending_persist_context_for_test(
+            inactive.id(),
+            pending_generation
+        ));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

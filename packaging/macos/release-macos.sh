@@ -77,6 +77,15 @@ if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "${ALLOW_EXISTING_RELEASE_VERSION:-0}" !=
   fi
 fi
 REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
+BRIDGE_REQUIRES_UNIVERSAL=0
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$VERSION" == "0.2.5" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
+  BRIDGE_REQUIRES_UNIVERSAL=1
+  if [[ -n "$REQUESTED_DMG_ARCH" && "$REQUESTED_DMG_ARCH" != "universal" ]]; then
+    echo "Sniper 0.2.5 is the bridge release from the v0.2.4 updater and must use DMG_ARCH=universal." >&2
+    exit 1
+  fi
+  REQUESTED_DMG_ARCH="universal"
+fi
 SIGN_IDENTITY="${DEVELOPER_ID_APP:-${SIGN_IDENTITY:-}}"
 HAS_APPLE_CREDS=0
 HAS_PARTIAL_APPLE_CREDS=0
@@ -120,7 +129,11 @@ cleanup_release_marker() {
 }
 trap cleanup_release_marker EXIT
 
-"$ROOT_DIR/packaging/macos/make-app.sh"
+if [[ "$BRIDGE_REQUIRES_UNIVERSAL" == "1" ]]; then
+  UNIVERSAL_APP=1 "$ROOT_DIR/packaging/macos/make-app.sh"
+else
+  "$ROOT_DIR/packaging/macos/make-app.sh"
+fi
 
 APP_BUNDLE="$ROOT_DIR/dist/${APP_NAME}.app"
 if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$HAS_APPLE_CREDS" == "1" ]]; then

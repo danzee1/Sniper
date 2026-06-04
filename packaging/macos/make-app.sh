@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 APP_NAME="${APP_NAME:-Sniper}"
+UNIVERSAL_APP="${UNIVERSAL_APP:-0}"
 
 validate_app_name() {
   local name="$1"
@@ -51,12 +52,6 @@ plist_sed_replacement() {
 rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
-echo "Building release binaries..."
-if ! cargo build --release --bin sniper-desktop --bin sniper-cli --message-format=json-render-diagnostics > "$CARGO_BUILD_LOG"; then
-  cat "$CARGO_BUILD_LOG" >&2
-  exit 1
-fi
-
 cargo_bin_path() {
   local bin_name="$1"
   local path
@@ -71,13 +66,79 @@ cargo_bin_path() {
   printf '%s\n' "$path"
 }
 
-BIN_PATH="$(cargo_bin_path sniper-desktop)"
-cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
-chmod +x "$MACOS_DIR/$APP_NAME"
+build_native_binaries() {
+  echo "Building release binaries..."
+  if ! cargo build --release --bin sniper-desktop --bin sniper-cli --message-format=json-render-diagnostics > "$CARGO_BUILD_LOG"; then
+    cat "$CARGO_BUILD_LOG" >&2
+    exit 1
+  fi
 
-CLI_BIN_PATH="$(cargo_bin_path sniper-cli)"
-cp "$CLI_BIN_PATH" "$MACOS_DIR/sniper-cli"
-chmod +x "$MACOS_DIR/sniper-cli"
+  BIN_PATH="$(cargo_bin_path sniper-desktop)"
+  cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
+  chmod +x "$MACOS_DIR/$APP_NAME"
+
+  CLI_BIN_PATH="$(cargo_bin_path sniper-cli)"
+  cp "$CLI_BIN_PATH" "$MACOS_DIR/sniper-cli"
+  chmod +x "$MACOS_DIR/sniper-cli"
+}
+
+require_rust_target() {
+  local target="$1"
+  if ! rustup target list --installed | grep -qx "$target"; then
+    echo "Rust target $target is required for UNIVERSAL_APP=1." >&2
+    echo "Install it with: rustup target add $target" >&2
+    exit 1
+  fi
+}
+
+target_binary_path() {
+  local target="$1"
+  local bin_name="$2"
+  local path="$ROOT_DIR/target/$target/release/$bin_name"
+  if [[ ! -x "$path" ]]; then
+    echo "Cargo did not produce an executable for $bin_name at $path" >&2
+    exit 1
+  fi
+  printf '%s\n' "$path"
+}
+
+build_universal_binaries() {
+  local arm_target="aarch64-apple-darwin"
+  local intel_target="x86_64-apple-darwin"
+
+  require_rust_target "$arm_target"
+  require_rust_target "$intel_target"
+
+  echo "Building universal release binaries..."
+  cargo build --release --target "$arm_target" --bin sniper-desktop --bin sniper-cli
+  cargo build --release --target "$intel_target" --bin sniper-desktop --bin sniper-cli
+
+  /usr/bin/lipo -create \
+    "$(target_binary_path "$arm_target" sniper-desktop)" \
+    "$(target_binary_path "$intel_target" sniper-desktop)" \
+    -output "$MACOS_DIR/$APP_NAME"
+  chmod +x "$MACOS_DIR/$APP_NAME"
+
+  /usr/bin/lipo -create \
+    "$(target_binary_path "$arm_target" sniper-cli)" \
+    "$(target_binary_path "$intel_target" sniper-cli)" \
+    -output "$MACOS_DIR/sniper-cli"
+  chmod +x "$MACOS_DIR/sniper-cli"
+}
+
+case "$UNIVERSAL_APP" in
+  0)
+    build_native_binaries
+    ;;
+  1)
+    build_universal_binaries
+    ;;
+  *)
+    echo "UNIVERSAL_APP must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+
 sed \
   -e "s/__SNIPER_VERSION__/$(plist_sed_replacement "$VERSION")/g" \
   -e "s/__APP_NAME__/$(plist_sed_replacement "$APP_NAME")/g" \

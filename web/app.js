@@ -2431,7 +2431,13 @@ function applyWorkspaceState(snapshot) {
   state.fuzzerBaseRequest = fuzzerWS.base_request ? cloneEditableRequest(fuzzerWS.base_request) : null;
   state.fuzzerSourceTransactionId = fuzzerWS.source_transaction_id || null;
   state.fuzzerTarget = normalizeFuzzerTargetOverride(fuzzerWS.target);
-  state.fuzzerTargetRequestText = state.fuzzerTarget ? normalizeFuzzerTargetAuthority(fuzzerWS.target_request_authority) : null;
+  const savedFuzzerTargetAuthority = fuzzerWS.target_request_authority;
+  state.fuzzerTargetRequestText = state.fuzzerTarget ? normalizeFuzzerTargetAuthority(savedFuzzerTargetAuthority) : null;
+  if (state.fuzzerTarget && !state.fuzzerTargetRequestText && !String(savedFuzzerTargetAuthority || "").trim()) {
+    state.fuzzerTargetRequestText =
+      fuzzerTargetAuthorityFromRequestText(fuzzerWS.request_text || "", state.fuzzerBaseRequest)
+      || fuzzerTargetAuthorityFromEditableRequest(state.fuzzerBaseRequest);
+  }
   if (state.fuzzerTarget && !state.fuzzerTargetRequestText) {
     state.fuzzerTarget = null;
   }
@@ -5269,7 +5275,15 @@ function jumpToTransaction(recordId) {
   renderProxyPanels();
   loadTransactionDetail(recordId).then(async (record) => {
     if (!record || state.selectedId !== recordId) return;
-    await ensureHistoryWindowContainsRecord(record);
+    const revealed = await ensureHistoryWindowContainsRecord(record);
+    if (!revealed) {
+      if (state.selectedId === recordId) {
+        state.selectedId = null;
+        state.selectedRecord = null;
+        renderHistory();
+      }
+      return;
+    }
     focusHistoryRecord(recordId);
   }).catch((error) => console.error(error));
 }
@@ -8616,11 +8630,11 @@ function invalidateFuzzerRun() {
   state.fuzzerRunning = false;
 }
 
-function fuzzerRequestAuthorityFromText(requestText) {
+function fuzzerRequestAuthorityFromText(requestText, fallbackRequest = state.fuzzerBaseRequest || createDefaultEditableRequest()) {
   try {
     const request = parseEditableRawRequest(
       requestText,
-      state.fuzzerBaseRequest || createDefaultEditableRequest(),
+      fallbackRequest || createDefaultEditableRequest(),
     );
     return { scheme: request.scheme || "https", host: request.host || "" };
   } catch (_error) {
@@ -8664,12 +8678,23 @@ function activeFuzzerTargetForRequest(requestText) {
   return normalizeFuzzerTargetOverride(state.fuzzerTarget);
 }
 
-function fuzzerTargetAuthorityFromRequestText(requestText) {
-  const authority = fuzzerRequestAuthorityFromText(requestText || "");
+function fuzzerTargetAuthorityFromRequestText(requestText, fallbackRequest) {
+  const authority = fuzzerRequestAuthorityFromText(requestText || "", fallbackRequest);
   if (!authority || !authority.host) {
     return null;
   }
   return `${authority.scheme}://${authority.host}`;
+}
+
+function fuzzerTargetAuthorityFromEditableRequest(request) {
+  if (!request || !request.host) {
+    return null;
+  }
+  const scheme = String(request.scheme || "https").toLowerCase();
+  if (scheme !== "http" && scheme !== "https") {
+    return null;
+  }
+  return `${scheme}://${request.host}`;
 }
 
 function normalizeFuzzerTargetAuthority(value) {
