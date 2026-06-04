@@ -21,7 +21,12 @@ validate_app_name() {
 
 validate_app_name "$APP_NAME"
 
-VERSION="${VERSION:-$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)}"
+CARGO_VERSION="$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)"
+VERSION="${VERSION:-$CARGO_VERSION}"
+if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+  echo "VERSION=$VERSION does not match Cargo.toml version $CARGO_VERSION" >&2
+  exit 1
+fi
 APP_BUNDLE="$ROOT_DIR/dist/${APP_NAME}.app"
 REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
 DMG_ARCH=""

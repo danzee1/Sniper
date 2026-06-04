@@ -3019,6 +3019,18 @@ async fn ws_replay_connect(
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
 
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
+    if let Some(false) = state
+        .ws_replay
+        .belongs_to_session(payload.id, session.id())
+        .await
+    {
+        return active_session_conflict_response(&state);
+    }
     let upstream_insecure = session.runtime.upstream_insecure().await;
 
     match state

@@ -236,8 +236,6 @@ impl WsReplayStore {
             }
         }
 
-        self.close_existing_connection(id).await;
-
         let (task_abort, abort_registration) = AbortHandle::new_pair();
 
         // Create connection entry
@@ -250,7 +248,12 @@ impl WsReplayStore {
             task_abort: Some(task_abort),
             error: None,
         }));
-        self.connections.write().await.insert(id, conn.clone());
+        let previous = self
+            .replace_connection_for_owner(id, owner_session_id, conn.clone())
+            .await?;
+        if let Some(previous) = previous {
+            disconnect_connection_handle(previous).await;
+        }
 
         // Connect in the background
         let connections = Arc::clone(&self.connections);
@@ -407,25 +410,40 @@ impl WsReplayStore {
         };
 
         if let Some(conn) = existing {
-            let mut c = conn.write().await;
-            let graceful_close = if let Some(sender) = c.sender.take() {
-                sender
-                    .send(WsReplayOutboundMessage::Close {
-                        recorded_index: None,
-                    })
-                    .is_ok()
-            } else {
-                false
-            };
-            if let Some(abort) = c.task_abort.take() {
-                abort_connection_after_close(abort, graceful_close);
-            }
-            c.status = WsReplayStatus::Disconnected;
+            disconnect_connection_handle(conn).await;
         }
     }
 
     async fn connection(&self, id: Uuid) -> Option<WsReplayConnectionHandle> {
         self.connections.read().await.get(&id).cloned()
+    }
+
+    async fn replace_connection_for_owner(
+        &self,
+        id: Uuid,
+        owner_session_id: Uuid,
+        conn: WsReplayConnectionHandle,
+    ) -> Result<Option<WsReplayConnectionHandle>> {
+        loop {
+            let expected = self.connection(id).await;
+            if let Some(existing) = expected.as_ref() {
+                let existing = existing.read().await;
+                if existing.owner_session_id != owner_session_id {
+                    anyhow::bail!("WS replay connection belongs to another session");
+                }
+            }
+
+            let mut connections = self.connections.write().await;
+            match (expected.as_ref(), connections.get(&id)) {
+                (None, None) => return Ok(connections.insert(id, conn.clone())),
+                (Some(expected), Some(current)) if Arc::ptr_eq(expected, current) => {
+                    return Ok(connections.insert(id, conn.clone()));
+                }
+                _ => {}
+            }
+            drop(connections);
+            tokio::task::yield_now().await;
+        }
     }
 
     pub async fn belongs_to_session(&self, id: Uuid, session_id: Uuid) -> Option<bool> {
@@ -604,6 +622,23 @@ async fn connection_is_current(
         .await
         .get(&id)
         .is_some_and(|current| Arc::ptr_eq(current, conn))
+}
+
+async fn disconnect_connection_handle(conn: WsReplayConnectionHandle) {
+    let mut c = conn.write().await;
+    let graceful_close = if let Some(sender) = c.sender.take() {
+        sender
+            .send(WsReplayOutboundMessage::Close {
+                recorded_index: None,
+            })
+            .is_ok()
+    } else {
+        false
+    };
+    if let Some(abort) = c.task_abort.take() {
+        abort_connection_after_close(abort, graceful_close);
+    }
+    c.status = WsReplayStatus::Disconnected;
 }
 
 impl Default for WsReplayStore {
@@ -823,16 +858,19 @@ mod tests {
     async fn connect_replacement_disconnects_previous_connection() {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let previous = Arc::new(RwLock::new(test_connection(
-            WsReplayStatus::Connected,
-            Some(tx),
-        )));
+        let mut previous_connection = test_connection(WsReplayStatus::Connected, Some(tx));
+        previous_connection.owner_session_id = owner;
+        let previous = Arc::new(RwLock::new(previous_connection));
         store.connections.write().await.insert(id, previous.clone());
 
-        store.close_existing_connection(id).await;
+        store
+            .connect(id, owner, "ws://127.0.0.1:1/", Vec::new(), false)
+            .await
+            .unwrap();
 
-        assert!(!store.connections.read().await.contains_key(&id));
+        assert!(store.connections.read().await.contains_key(&id));
         assert_eq!(previous.read().await.status, WsReplayStatus::Disconnected);
         assert!(matches!(
             rx.recv().await,
@@ -840,6 +878,29 @@ mod tests {
                 recorded_index: None
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_connection_id_owned_by_another_session() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let other_owner = Uuid::new_v4();
+        let mut existing = test_connection(WsReplayStatus::Connected, None);
+        existing.owner_session_id = owner;
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(existing)));
+
+        let error = store
+            .connect(id, other_owner, "ws://127.0.0.1:1/", Vec::new(), false)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("another session"));
+        assert_eq!(store.belongs_to_session(id, owner).await, Some(true));
     }
 
     #[tokio::test]

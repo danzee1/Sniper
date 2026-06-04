@@ -23,7 +23,12 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 PLIST_TEMPLATE="$ROOT_DIR/packaging/macos/Info.plist"
 PLIST_OUT="$CONTENTS_DIR/Info.plist"
 ENTITLEMENTS="$ROOT_DIR/packaging/macos/entitlements.plist"
-VERSION="${VERSION:-$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)}"
+CARGO_VERSION="$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)"
+VERSION="${VERSION:-$CARGO_VERSION}"
+if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+  echo "VERSION=$VERSION does not match Cargo.toml version $CARGO_VERSION" >&2
+  exit 1
+fi
 CARGO_BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/sniper-cargo-build.XXXXXX")"
 trap 'rm -f "$CARGO_BUILD_LOG"' EXIT
 

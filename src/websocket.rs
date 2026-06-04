@@ -50,7 +50,7 @@ impl WebSocketStore {
         let summary = session.summary();
         let mut sessions = self.sessions.write().await;
         sessions.push_front(session);
-        trim_closed_overflow(&mut sessions, self.max_entries);
+        trim_overflow(&mut sessions, self.max_entries);
         let _ = self.events.send(summary);
     }
 
@@ -85,7 +85,7 @@ impl WebSocketStore {
             }
             let summary = session.summary();
             let _ = self.events.send(summary);
-            trim_closed_overflow(&mut sessions, self.max_entries);
+            trim_overflow(&mut sessions, self.max_entries);
             true
         } else {
             false
@@ -213,6 +213,13 @@ fn trim_closed_overflow(sessions: &mut VecDeque<WebSocketSessionRecord>, max_ent
     }
 }
 
+fn trim_overflow(sessions: &mut VecDeque<WebSocketSessionRecord>, max_entries: usize) {
+    trim_closed_overflow(sessions, max_entries);
+    while sessions.len() > max_entries {
+        sessions.pop_back();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,7 +275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_does_not_evict_live_sessions_before_close() {
+    async fn open_evicts_oldest_live_session_when_all_entries_are_live() {
         let store = WebSocketStore::new(1, 10);
         let first = session(Vec::new());
         let first_id = first.id;
@@ -277,18 +284,18 @@ mod tests {
         let second = session(Vec::new());
         store.open(second).await;
 
-        assert!(store.get(first_id).await.is_some());
-        assert!(store.append_frame(first_id, frame(1)).await);
+        assert!(store.get(first_id).await.is_none());
+        assert!(!store.append_frame(first_id, frame(1)).await);
         assert!(
-            store
+            !store
                 .close(first_id, Utc::now(), 10, Some("closed".to_string()))
                 .await
         );
 
-        assert!(store.get(first_id).await.is_none());
         let snapshot = store.snapshot(Some(10)).await;
         assert_eq!(snapshot.len(), 1);
         assert_ne!(snapshot[0].id, first_id);
+        assert_eq!(store.list_page(Some(10)).await.total, 1);
     }
 
     #[tokio::test]

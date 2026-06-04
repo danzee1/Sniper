@@ -31,7 +31,7 @@ const APP_RELEASES_URL: &str = "https://github.com/sm1ee/Sniper/releases";
 const APP_LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/sm1ee/Sniper/releases/latest";
 const APP_VERSION_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const APP_VERSION_FETCH_TIMEOUT: Duration = Duration::from_millis(1500);
+const APP_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 const EXPECTED_APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
 const EXPECTED_APP_EXECUTABLE: &str = "Sniper";
 const HDIUTIL_PATH: &str = "/usr/bin/hdiutil";
@@ -469,7 +469,6 @@ impl AppState {
                 env!("CARGO_PKG_VERSION"),
                 APP_RELEASES_URL
             ))
-            .no_proxy()
             .build()
             .context("failed to build GitHub releases client")?;
 
@@ -519,7 +518,6 @@ impl AppState {
                 env!("CARGO_PKG_VERSION"),
                 APP_RELEASES_URL
             ))
-            .no_proxy()
             .build()
             .context("failed to build HTTP client")?;
 

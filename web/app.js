@@ -15735,7 +15735,7 @@ function selectedRecordToFormat(format) {
   const rawText = buildRawRequest(record);
   const scheme = record.scheme || "https";
   const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
-  const host = hostHeader?.value || record.host || "";
+  const host = record.host || hostHeader?.value || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
   if (format === "fetch") {
@@ -15767,7 +15767,7 @@ async function historyRequestToFormat(transactionId, format) {
   const rawText = buildRawRequest(record);
   const scheme = record.scheme || "https";
   const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
-  const host = hostHeader?.value || record.host || "";
+  const host = record.host || hostHeader?.value || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
   if (format === "fetch") {
@@ -15911,6 +15911,13 @@ function parseCurlCommand(text) {
     else if (tok.startsWith("--json=")) {
       const error = addJsonBody(tok.slice("--json=".length));
       if (error) return { error };
+    }
+    else if (tok === "-F" || tok === "--form" || tok === "--form-string") {
+      t++;
+      return { error: "cURL multipart form imports are not supported yet." };
+    }
+    else if ((tok.startsWith("-F") && tok.length > 2) || tok.startsWith("--form=") || tok.startsWith("--form-string=")) {
+      return { error: "cURL multipart form imports are not supported yet." };
     }
     else if (tok === "-u" || tok === "--user") {
       const cred = tokens[++t] || "";

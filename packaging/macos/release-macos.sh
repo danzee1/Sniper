@@ -9,7 +9,12 @@ if [[ "$APP_NAME" != "Sniper" ]]; then
   echo "release-macos.sh only supports APP_NAME=Sniper; self-update pins the Sniper executable." >&2
   exit 1
 fi
-VERSION="${VERSION:-$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)}"
+CARGO_VERSION="$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)"
+VERSION="${VERSION:-$CARGO_VERSION}"
+if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+  echo "VERSION=$VERSION does not match Cargo.toml version $CARGO_VERSION" >&2
+  exit 1
+fi
 REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
 SIGN_IDENTITY="${DEVELOPER_ID_APP:-${SIGN_IDENTITY:-}}"
 ALLOW_ADHOC_RELEASE="${ALLOW_ADHOC_RELEASE:-0}"
