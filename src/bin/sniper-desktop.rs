@@ -120,7 +120,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let oast_task = sniper::oast::start_oast_poller_for_state(state.clone());
+    let oast_task = runtime.spawn(sniper::oast::run_oast_poller_for_state(state.clone()));
 
     let event_loop = EventLoop::new();
     install_platform_app_menu();

@@ -1142,197 +1142,197 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
 /// into that session's store, and persists callbacks into the same session that
 /// received them.
 pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
+    tokio::spawn(run_oast_poller_for_state(state))
+}
 
-        let mut prev_session_id: Option<Uuid> = None;
-        let mut prev_provider: Option<OastProvider> = None;
-        let mut prev_url: Option<String> = None;
-        let mut prev_token: Option<String> = None;
-        let mut prev_store: Option<Arc<OastStore>> = None;
+pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
 
-        loop {
-            let session = state.session().await;
-            let operation_lock = state.session_operation_lock(session.id()).await;
-            let operation_guard = operation_lock.lock().await;
-            if !state.sessions.contains_session(session.id()) {
-                prev_session_id = None;
-                prev_provider = None;
-                prev_url = None;
-                prev_token = None;
-                prev_store = None;
-                drop(operation_guard);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-            let runtime = session.runtime.snapshot().await;
-            let config = OastConfig {
-                enabled: runtime.oast_enabled,
-                server_url: runtime.oast_server_url.clone(),
-                token: runtime.oast_token.clone(),
-                polling_interval_secs: runtime.oast_polling_interval_secs,
-                provider: runtime.oast_provider.clone(),
-            };
-            session.oast.update_config(config.clone()).await;
+    let mut prev_session_id: Option<Uuid> = None;
+    let mut prev_provider: Option<OastProvider> = None;
+    let mut prev_url: Option<String> = None;
+    let mut prev_token: Option<String> = None;
+    let mut prev_store: Option<Arc<OastStore>> = None;
 
-            let session_changed = prev_session_id != Some(session.id());
-            let same_session_as_previous = !session_changed;
+    loop {
+        let session = state.session().await;
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let operation_guard = operation_lock.lock().await;
+        if !state.sessions.contains_session(session.id()) {
+            prev_session_id = None;
+            prev_provider = None;
+            prev_url = None;
+            prev_token = None;
+            prev_store = None;
+            drop(operation_guard);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        let runtime = session.runtime.snapshot().await;
+        let config = OastConfig {
+            enabled: runtime.oast_enabled,
+            server_url: runtime.oast_server_url.clone(),
+            token: runtime.oast_token.clone(),
+            polling_interval_secs: runtime.oast_polling_interval_secs,
+            provider: runtime.oast_provider.clone(),
+        };
+        session.oast.update_config(config.clone()).await;
 
-            if !config.enabled || config.server_url.is_empty() {
-                if same_session_as_previous
-                    && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
-                {
-                    if let Some(store) = prev_store.as_deref() {
-                        let _mutation_guard = session.mutation_guard().await;
-                        deregister_current_interactsh(store, &prev_url, &client).await;
-                        if let Err(error) = state
-                            .persist_session_context_mutation_locked(&session)
-                            .await
-                        {
-                            warn!(?error, session_id = %session.id(), "failed to persist OAST registration clear");
-                        }
-                    }
-                }
-                prev_session_id = None;
-                prev_provider = None;
-                prev_url = None;
-                prev_token = None;
-                prev_store = None;
-                drop(operation_guard);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
+        let session_changed = prev_session_id != Some(session.id());
+        let same_session_as_previous = !session_changed;
 
-            let interval = Duration::from_secs(config.polling_interval_secs.max(1));
-            let config_changed = session_changed
-                || prev_provider.as_ref() != Some(&config.provider)
-                || prev_url.as_deref() != Some(&config.server_url)
-                || prev_token.as_deref() != Some(&config.token);
-
-            if config_changed {
-                let registration_config_changed = prev_provider.as_ref() != Some(&config.provider)
-                    || prev_url.as_deref() != Some(&config.server_url)
-                    || prev_token.as_deref() != Some(&config.token);
-                if same_session_as_previous
-                    && registration_config_changed
-                    && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
-                {
-                    if let Some(store) = prev_store.as_deref() {
-                        let _mutation_guard = session.mutation_guard().await;
-                        deregister_current_interactsh(store, &prev_url, &client).await;
-                    }
-                }
-
-                let mut registration_changed = false;
-                if config.provider == OastProvider::Interactsh {
-                    let has_existing_registration =
-                        session.oast.registration_matches_config(&config).await;
-                    if has_existing_registration && session_changed {
-                        debug!(
-                            session_id = %session.id(),
-                            "Reusing persisted Interactsh registration"
-                        );
-                    } else {
-                        match register_interactsh(&config.server_url, &config.token, &client).await
-                        {
-                            Ok(reg) => {
-                                info!(
-                                    session_id = %session.id(),
-                                    correlation_id = %reg.correlation_id,
-                                    "Interactsh auto-registration complete"
-                                );
-                                let _mutation_guard = session.mutation_guard().await;
-                                session
-                                    .oast
-                                    .set_registration(RegistrationState::Interactsh {
-                                        server_url: config.server_url.clone(),
-                                        token: config.token.clone(),
-                                        correlation_id: reg.correlation_id,
-                                        secret_key: reg.secret_key,
-                                        private_key: reg.private_key,
-                                    })
-                                    .await;
-                                registration_changed = true;
-                            }
-                            Err(error) => {
-                                warn!(%error, "Interactsh auto-registration failed");
-                                let _mutation_guard = session.mutation_guard().await;
-                                session.oast.clear_registration().await;
-                                registration_changed = true;
-                            }
-                        }
-                    }
-                } else {
+        if !config.enabled || config.server_url.is_empty() {
+            if same_session_as_previous && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
+            {
+                if let Some(store) = prev_store.as_deref() {
                     let _mutation_guard = session.mutation_guard().await;
-                    session.oast.clear_registration().await;
-                    registration_changed = true;
-                }
-
-                prev_session_id = Some(session.id());
-                prev_provider = Some(config.provider.clone());
-                prev_url = Some(config.server_url.clone());
-                prev_token = Some(config.token.clone());
-                prev_store = Some(session.oast.clone());
-
-                if registration_changed {
-                    let _mutation_guard = session.mutation_guard().await;
+                    deregister_current_interactsh(store, &prev_url, &client).await;
                     if let Err(error) = state
                         .persist_session_context_mutation_locked(&session)
                         .await
                     {
-                        warn!(?error, session_id = %session.id(), "failed to persist OAST registration");
+                        warn!(?error, session_id = %session.id(), "failed to persist OAST registration clear");
                     }
                 }
             }
+            prev_session_id = None;
+            prev_provider = None;
+            prev_url = None;
+            prev_token = None;
+            prev_store = None;
+            drop(operation_guard);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
 
-            let callbacks = match config.provider {
-                OastProvider::Interactsh => {
-                    poll_interactsh_from_store(&session.oast, &config, &client).await
+        let interval = Duration::from_secs(config.polling_interval_secs.max(1));
+        let config_changed = session_changed
+            || prev_provider.as_ref() != Some(&config.provider)
+            || prev_url.as_deref() != Some(&config.server_url)
+            || prev_token.as_deref() != Some(&config.token);
+
+        if config_changed {
+            let registration_config_changed = prev_provider.as_ref() != Some(&config.provider)
+                || prev_url.as_deref() != Some(&config.server_url)
+                || prev_token.as_deref() != Some(&config.token);
+            if same_session_as_previous
+                && registration_config_changed
+                && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
+            {
+                if let Some(store) = prev_store.as_deref() {
+                    let _mutation_guard = session.mutation_guard().await;
+                    deregister_current_interactsh(store, &prev_url, &client).await;
                 }
-                OastProvider::Boast => poll_boast(&config.server_url, &client).await,
-                OastProvider::Custom => poll_custom(&config, &client).await,
-            };
+            }
 
-            if !callbacks.is_empty() {
-                info!(
-                    count = callbacks.len(),
-                    provider = %config.provider,
-                    session_id = %session.id(),
-                    "OAST callbacks received"
-                );
-                let mutation_guard = session.mutation_guard().await;
-                let mut inserted = 0usize;
-                for callback in callbacks {
-                    if session.oast.push(callback).await {
-                        inserted += 1;
+            let mut registration_changed = false;
+            if config.provider == OastProvider::Interactsh {
+                let has_existing_registration =
+                    session.oast.registration_matches_config(&config).await;
+                if has_existing_registration && session_changed {
+                    debug!(
+                        session_id = %session.id(),
+                        "Reusing persisted Interactsh registration"
+                    );
+                } else {
+                    match register_interactsh(&config.server_url, &config.token, &client).await {
+                        Ok(reg) => {
+                            info!(
+                                session_id = %session.id(),
+                                correlation_id = %reg.correlation_id,
+                                "Interactsh auto-registration complete"
+                            );
+                            let _mutation_guard = session.mutation_guard().await;
+                            session
+                                .oast
+                                .set_registration(RegistrationState::Interactsh {
+                                    server_url: config.server_url.clone(),
+                                    token: config.token.clone(),
+                                    correlation_id: reg.correlation_id,
+                                    secret_key: reg.secret_key,
+                                    private_key: reg.private_key,
+                                })
+                                .await;
+                            registration_changed = true;
+                        }
+                        Err(error) => {
+                            warn!(%error, "Interactsh auto-registration failed");
+                            let _mutation_guard = session.mutation_guard().await;
+                            session.oast.clear_registration().await;
+                            registration_changed = true;
+                        }
                     }
                 }
-                if inserted == 0 {
-                    debug!(
-                        provider = %config.provider,
-                        session_id = %session.id(),
-                        "OAST poll returned only duplicate callbacks"
-                    );
-                    drop(mutation_guard);
-                    drop(operation_guard);
-                    tokio::time::sleep(interval).await;
-                    continue;
-                }
+            } else {
+                let _mutation_guard = session.mutation_guard().await;
+                session.oast.clear_registration().await;
+                registration_changed = true;
+            }
+
+            prev_session_id = Some(session.id());
+            prev_provider = Some(config.provider.clone());
+            prev_url = Some(config.server_url.clone());
+            prev_token = Some(config.token.clone());
+            prev_store = Some(session.oast.clone());
+
+            if registration_changed {
+                let _mutation_guard = session.mutation_guard().await;
                 if let Err(error) = state
                     .persist_session_context_mutation_locked(&session)
                     .await
                 {
-                    warn!(?error, session_id = %session.id(), "failed to persist OAST callbacks");
+                    warn!(?error, session_id = %session.id(), "failed to persist OAST registration");
                 }
             }
-
-            drop(operation_guard);
-            tokio::time::sleep(interval).await;
         }
-    })
+
+        let callbacks = match config.provider {
+            OastProvider::Interactsh => {
+                poll_interactsh_from_store(&session.oast, &config, &client).await
+            }
+            OastProvider::Boast => poll_boast(&config.server_url, &client).await,
+            OastProvider::Custom => poll_custom(&config, &client).await,
+        };
+
+        if !callbacks.is_empty() {
+            info!(
+                count = callbacks.len(),
+                provider = %config.provider,
+                session_id = %session.id(),
+                "OAST callbacks received"
+            );
+            let mutation_guard = session.mutation_guard().await;
+            let mut inserted = 0usize;
+            for callback in callbacks {
+                if session.oast.push(callback).await {
+                    inserted += 1;
+                }
+            }
+            if inserted == 0 {
+                debug!(
+                    provider = %config.provider,
+                    session_id = %session.id(),
+                    "OAST poll returned only duplicate callbacks"
+                );
+                drop(mutation_guard);
+                drop(operation_guard);
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+            if let Err(error) = state
+                .persist_session_context_mutation_locked(&session)
+                .await
+            {
+                warn!(?error, session_id = %session.id(), "failed to persist OAST callbacks");
+            }
+        }
+
+        drop(operation_guard);
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Poll Interactsh using the registration state stored in OastStore.
