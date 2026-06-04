@@ -462,6 +462,39 @@ fn validate_fuzzer_expanded_request_budget(
     Ok(())
 }
 
+pub(crate) fn validate_expanded_requests<F>(
+    template: &EditableRequest,
+    payloads: &[String],
+    mut validate_request: F,
+) -> Result<()>
+where
+    F: FnMut(&EditableRequest) -> std::result::Result<(), String>,
+{
+    let marker_count = count_request_markers(template);
+    if marker_count == 0 {
+        return Err(anyhow!("Request template is missing $payload$ markers."));
+    }
+    validate_marker_count(marker_count)?;
+
+    let normalized_payloads = normalize_payloads(payloads.to_vec());
+    if normalized_payloads.is_empty() {
+        return Err(anyhow!("Fuzzer needs at least one payload"));
+    }
+    validate_fuzzer_payloads(&normalized_payloads)?;
+    validate_fuzzer_expanded_request_budget(template, &normalized_payloads)?;
+
+    for (index, payload) in normalized_payloads.iter().enumerate() {
+        let request = apply_payload_to_request(template, payload)?;
+        if let Err(error) = validate_request(&request) {
+            return Err(anyhow!(
+                "Fuzzer payload {index} expands to an invalid request: {error}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn expanded_request_size(template: &EditableRequest, payload_len: usize) -> usize {
     let mut bytes = expanded_value_len(&template.scheme, payload_len)
         .saturating_add(expanded_value_len(&template.host, payload_len))

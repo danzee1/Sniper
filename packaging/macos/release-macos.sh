@@ -30,6 +30,12 @@ canonical_github_repo() {
   printf '%s' "$value" | tr '[:upper:]' '[:lower:]'
 }
 
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Release artifacts must be built from a git worktree so origin/main and tag provenance can be verified." >&2
+  echo "Set ALLOW_ADHOC_RELEASE=1 for local-only unsigned testing." >&2
+  exit 1
+fi
+
 if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   EXPECTED_RELEASE_REPO="$(canonical_github_repo "$GITHUB_RELEASE_REPO")"
   ORIGIN_RELEASE_REPO="$(canonical_github_repo "$(git remote get-url origin 2>/dev/null || true)")"

@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
 const MAX_CLI_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
 #[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.")]
@@ -915,12 +916,13 @@ impl ApiClient {
     async fn discover(cli_api: Option<String>) -> Result<Self> {
         let probe_client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(CLI_API_TIMEOUT)
             .build()
             .context("failed to build sniper-cli discovery HTTP client")?;
         let base_url = discover_api_base_url(cli_api, &probe_client).await?;
         let client = reqwest::Client::builder()
             .no_proxy()
+            .timeout(CLI_API_TIMEOUT)
             .build()
             .context("failed to build sniper-cli HTTP client")?;
         Ok(Self { base_url, client })

@@ -7678,6 +7678,8 @@ function renderReplay() {
     renderReplayResponseView("Send a request from Replay to capture the response here.");
     updateReplaySearchPane("request", "");
     updateReplaySearchPane("response", "Send a request from Replay to capture the response here.");
+    els.sendReplayButton.disabled = true;
+    els.cancelReplayButton.disabled = true;
     els.replayBackButton.disabled = true;
     els.replayForwardButton.disabled = true;
     els.replayFollowRedirectButton.classList.add("hidden");
@@ -8120,8 +8122,14 @@ function syncReplayToolbar(tab) {
   if (versionSelect && document.activeElement !== versionSelect) {
     versionSelect.value = normalizeReplayHttpVersion(tab.httpVersionMode || "");
   }
-  els.replayBackButton.disabled = !canNavigateReplayHistory(tab, -1);
-  els.replayForwardButton.disabled = !canNavigateReplayHistory(tab, 1);
+  const sending = isReplayTabSending(tab.id);
+  els.sendReplayButton.disabled = sending;
+  els.cancelReplayButton.disabled = !sending;
+  if (els.replayFollowRedirectButton) {
+    els.replayFollowRedirectButton.disabled = sending;
+  }
+  els.replayBackButton.disabled = sending || !canNavigateReplayHistory(tab, -1);
+  els.replayForwardButton.disabled = sending || !canNavigateReplayHistory(tab, 1);
   return target;
 }
 
@@ -10154,6 +10162,9 @@ function resetReplay() {
   if (!tab || tab.type === "websocket") {
     return;
   }
+  if (isReplayTabSending(tab.id)) {
+    return;
+  }
 
   const activeHistoryEntry = getActiveRepeaterHistoryEntry(tab);
   if (activeHistoryEntry) {
@@ -10172,39 +10183,37 @@ function resetReplay() {
   renderReplay();
 }
 
-let _replayAbortController = null;
-let _replaySendingTabId = null;
+const _replaySendControllers = new Map();
+
+function isReplayTabSending(tabId) {
+  return Boolean(tabId && _replaySendControllers.has(tabId));
+}
 
 function setReplaySending(sending) {
-  els.sendReplayButton.disabled = sending;
-  els.cancelReplayButton.disabled = !sending;
+  const tab = getActiveReplayTab();
+  if (tab && tab.type !== "websocket") {
+    syncReplayToolbar(tab);
+    return;
+  }
+  els.sendReplayButton.disabled = true;
+  els.cancelReplayButton.disabled = true;
   if (els.replayFollowRedirectButton) {
-    els.replayFollowRedirectButton.disabled = sending;
+    els.replayFollowRedirectButton.disabled = true;
   }
-  if (sending) {
-    els.replayBackButton.disabled = true;
-    els.replayForwardButton.disabled = true;
-  } else {
-    const tab = getActiveReplayTab();
-    if (tab && tab.type !== "websocket") {
-      syncReplayToolbar(tab);
-    } else {
-      els.replayBackButton.disabled = true;
-      els.replayForwardButton.disabled = true;
-    }
-  }
+  els.replayBackButton.disabled = true;
+  els.replayForwardButton.disabled = true;
 }
 
 function cancelReplaySend() {
-  const sendingTabId = _replaySendingTabId;
-  if (_replayAbortController) {
-    _replayAbortController.abort();
-    _replayAbortController = null;
+  const tab = getActiveReplayTab();
+  const sendingTabId = tab?.id || null;
+  const controller = sendingTabId ? _replaySendControllers.get(sendingTabId) : null;
+  if (!controller) {
+    setReplaySending(false);
+    return;
   }
-  _replaySendingTabId = null;
-  const tab = sendingTabId
-    ? state.replayTabs.find((item) => item.id === sendingTabId)
-    : getActiveReplayTab();
+  _replaySendControllers.delete(sendingTabId);
+  controller.abort();
   if (tab && tab.type !== "websocket") {
     tab.responseRecord = null;
     tab.notice = "Cancelled.";
@@ -10212,18 +10221,15 @@ function cancelReplaySend() {
     renderReplayTabs();
   }
   setReplaySending(false);
-  if (!sendingTabId || state.activeReplayTabId === sendingTabId) {
-    els.replayResponseMeta.textContent = "Cancelled.";
-    renderReplayResponseView("");
-  }
+  els.replayResponseMeta.textContent = "Cancelled.";
+  renderReplayResponseView("");
 }
 
 function clearReplaySendInFlight() {
-  if (_replayAbortController) {
-    _replayAbortController.abort();
-    _replayAbortController = null;
+  for (const controller of _replaySendControllers.values()) {
+    controller.abort();
   }
-  _replaySendingTabId = null;
+  _replaySendControllers.clear();
   setReplaySending(false);
 }
 
@@ -10239,6 +10245,9 @@ function isReplayTabStillCurrent(tab, tabId, sessionId) {
 async function sendReplay() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type === "websocket") {
+    return;
+  }
+  if (isReplayTabSending(tab.id)) {
     return;
   }
 
@@ -10271,7 +10280,6 @@ async function sendReplay() {
   tab.notice = "";
   els.replayResponseMeta.textContent = "";
   renderReplayResponseView("");
-  setReplaySending(true);
   const sendingTabId = tab.id;
   const sendingSessionId = state.activeSession?.id || null;
 
@@ -10281,8 +10289,8 @@ async function sendReplay() {
     || undefined;
 
   const replayController = new AbortController();
-  _replayAbortController = replayController;
-  _replaySendingTabId = sendingTabId;
+  _replaySendControllers.set(sendingTabId, replayController);
+  setReplaySending(true);
 
   let response;
   try {
@@ -10326,9 +10334,8 @@ async function sendReplay() {
     showToast(notice, "error");
     return;
   } finally {
-    if (_replayAbortController === replayController && _replaySendingTabId === sendingTabId) {
-      _replayAbortController = null;
-      _replaySendingTabId = null;
+    if (_replaySendControllers.get(sendingTabId) === replayController) {
+      _replaySendControllers.delete(sendingTabId);
       setReplaySending(false);
     }
   }
@@ -10451,7 +10458,7 @@ function applyReplaySentDraftIfUnchanged(tab, request, requestText, target) {
 async function followRedirect() {
   const tab = getActiveReplayTab();
   if (!tab || !tab.responseRecord) return;
-  if (_replaySendingTabId) return;
+  if (isReplayTabSending(tab.id)) return;
 
   const resp = tab.responseRecord.response;
   if (!resp) return;
@@ -10589,10 +10596,9 @@ async function followRedirect() {
   const target = { scheme: newScheme, host: newHost, port: newPort };
   const followingTabId = tab.id;
   const followingSessionId = state.activeSession?.id || null;
-  setReplaySending(true);
   const replayController = new AbortController();
-  _replayAbortController = replayController;
-  _replaySendingTabId = followingTabId;
+  _replaySendControllers.set(followingTabId, replayController);
+  setReplaySending(true);
   let response;
   try {
     response = await fetch("/api/replay/send", {
@@ -10626,9 +10632,8 @@ async function followRedirect() {
     showToast(notice, "error");
     return;
   } finally {
-    if (_replayAbortController === replayController && _replaySendingTabId === followingTabId) {
-      _replayAbortController = null;
-      _replaySendingTabId = null;
+    if (_replaySendControllers.get(followingTabId) === replayController) {
+      _replaySendControllers.delete(followingTabId);
       setReplaySending(false);
     }
   }
@@ -10826,7 +10831,7 @@ function renderReplayTabs() {
       const pinBtn = `<button class="replay-tab-pin-btn ${pinBtnState}" type="button" aria-label="${pinLabel}" title="${pinLabel}" aria-pressed="${tab.pinned ? "true" : "false"}" ${pinHiddenAttrs}>\uD83D\uDCCC</button>`;
       const autoLabel = replayTabAutoLabel(tab);
       const label = replayTabLabel(tab);
-      const title = tab.customLabel ? `${label} / ${autoLabel}` : label;
+      const title = label;
       const labelControl = state.replayRenamingTabId === tab.id
         ? `<input class="replay-tab-name-input" type="text" value="${escapeHtml(tab.customLabel || "")}" placeholder="${escapeHtml(autoLabel)}" maxlength="80" aria-label="Replay tab name">`
         : `<button class="replay-tab-button" type="button" title="${escapeHtml(title)}">${escapeHtml(label)}</button>`;
@@ -10899,7 +10904,7 @@ function refreshReplayTabLabel(id) {
 
   const autoLabel = replayTabAutoLabel(tab);
   const label = replayTabLabel(tab);
-  const title = tab.customLabel ? `${label} / ${autoLabel}` : label;
+  const title = label;
   const button = tabElement.querySelector(".replay-tab-button");
   if (button) {
     button.textContent = label;
@@ -10986,13 +10991,10 @@ function closeRepeaterTab(id) {
   if (closingTab.type === "websocket") {
     cleanupWsReplayTab(closingTab);
   }
-  if (_replaySendingTabId === id) {
-    const controller = _replayAbortController;
-    _replayAbortController = null;
-    _replaySendingTabId = null;
-    if (controller) {
-      controller.abort();
-    }
+  const controller = _replaySendControllers.get(id);
+  if (controller) {
+    _replaySendControllers.delete(id);
+    controller.abort();
     setReplaySending(false);
   }
   if (state.replayRenamingTabId === id) {

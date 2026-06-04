@@ -66,6 +66,9 @@ use crate::{
     state::AppState,
 };
 
+const REPLAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REPLAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 type ProxyClient = Client;
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const MAX_PROXY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -515,7 +518,9 @@ async fn build_replay_client(
 ) -> Result<ProxyClient> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
-        .danger_accept_invalid_certs(upstream_insecure);
+        .danger_accept_invalid_certs(upstream_insecure)
+        .timeout(REPLAY_REQUEST_TIMEOUT)
+        .connect_timeout(REPLAY_CONNECT_TIMEOUT);
 
     // Force HTTP version if specified
     match http_version {

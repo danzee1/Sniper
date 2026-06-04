@@ -74,6 +74,7 @@ const MAX_SCANNER_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MATCH_REPLACE_RULES: usize = 500;
 const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
 const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
+const OPEN_PATH: &str = "/usr/bin/open";
 
 #[derive(RustEmbed)]
 #[folder = "web/decoder/"]
@@ -1828,7 +1829,7 @@ async fn reveal_session_folder(
 
     match state.session_storage_path(id) {
         Ok(path) => {
-            let _ = std::process::Command::new("open").arg(&path).spawn();
+            let _ = std::process::Command::new(OPEN_PATH).arg(&path).spawn();
             Json(serde_json::json!({ "ok": true, "path": path.display().to_string() }))
                 .into_response()
         }
@@ -2418,7 +2419,7 @@ async fn download_root_der(State(state): State<Arc<AppState>>) -> Response {
 
 async fn reveal_certificate_folder(State(state): State<Arc<AppState>>) -> StatusCode {
     let export = state.certificates.export();
-    let _ = std::process::Command::new("open")
+    let _ = std::process::Command::new(OPEN_PATH)
         .args(["-R", &export.pem_path])
         .spawn();
     StatusCode::NO_CONTENT
@@ -3404,6 +3405,13 @@ async fn run_fuzzer_attack(
         if let Err(error) = validate_request_target_override(target) {
             return (StatusCode::BAD_REQUEST, error).into_response();
         }
+    }
+    if let Err(error) = fuzzer::validate_expanded_requests(
+        &payload.template,
+        &payload.payloads,
+        validate_editable_request,
+    ) {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
     let operation_lock = state.session_operation_lock(session.id()).await;
     let _operation_guard = operation_lock.lock().await;
@@ -6810,6 +6818,53 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), super::StatusCode::CONFLICT);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn fuzzer_run_rejects_payload_expansion_that_invalidates_request() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-fuzzer-expanded-request-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+
+        let response = super::run_fuzzer_attack(
+            State(state.clone()),
+            Json(crate::fuzzer::FuzzerAttackPayload {
+                session_id: Some(session.id()),
+                template: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "POST".to_string(),
+                    path: "/".to_string(),
+                    headers: vec![HeaderRecord {
+                        name: "Content-Length".to_string(),
+                        value: "9".to_string(),
+                    }],
+                    body: "$payload$".to_string(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                payloads: vec!["abc".to_string()],
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
+        assert!(session.fuzzer.list(Some(10)).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
