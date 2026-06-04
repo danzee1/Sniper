@@ -138,6 +138,11 @@ impl AppState {
         self.session_operation_lock(id).await
     }
 
+    #[cfg(test)]
+    async fn session_operation_lock_count(&self) -> usize {
+        self.session_operation_locks.lock().await.len()
+    }
+
     pub async fn session_context_for_id(&self, id: uuid::Uuid) -> Result<Arc<SessionContext>> {
         let active = self.session().await;
         if id == active.id() {
@@ -241,8 +246,16 @@ impl AppState {
     }
 
     pub async fn delete_session(&self, id: uuid::Uuid) -> Result<()> {
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
         let operation_lock = self.session_operation_lock(id).await;
         let operation_guard = operation_lock.lock().await;
+        if !self.sessions.contains_session(id) {
+            drop(operation_guard);
+            self.session_operation_locks.lock().await.remove(&id);
+            anyhow::bail!("session {id} was not found");
+        }
         if crate::proxy::session_has_live_websocket_relays(id) {
             anyhow::bail!("cannot delete a session while live captures are active");
         }
@@ -497,9 +510,10 @@ impl AppState {
             .context("failed to decode GitHub latest release response")?;
 
         let mut info = AppVersionInfo::current_only();
+        let update_available = release_update_available(&info.current_version, &release);
         info.latest_version = Some(release.tag_name.clone());
         info.latest_release_url = Some(release.html_url);
-        info.update_available = is_newer_version(&info.current_version, &release.tag_name);
+        info.update_available = update_available;
         Ok(info)
     }
 
@@ -984,6 +998,11 @@ fn select_release_dmg_asset<'a>(
         })
 }
 
+fn release_update_available(current_version: &str, release: &GitHubRelease) -> bool {
+    is_newer_version(current_version, &release.tag_name)
+        && select_release_dmg_asset(&release.assets, &release.tag_name).is_some()
+}
+
 fn native_release_asset_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -1460,11 +1479,11 @@ fn proxy_url_targets_loopback(value: &str) -> bool {
 mod tests {
     use super::{
         ensure_release_is_newer, native_release_asset_arch, parse_codesign_team_identifier,
-        proxy_url_targets_loopback, release_asset_matches_arch, select_release_dmg_asset,
-        self_update_bundle_is_writable, update_installer_script, verify_app_identity, AppState,
-        GitHubAsset, UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH,
-        EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, PLIST_BUDDY_PATH,
-        SH_PATH, SPCTL_PATH,
+        proxy_url_targets_loopback, release_asset_matches_arch, release_update_available,
+        select_release_dmg_asset, self_update_bundle_is_writable, update_installer_script,
+        verify_app_identity, AppState, GitHubAsset, GitHubRelease, UpdateArtifactGuard,
+        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
+        HDIUTIL_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
     use std::path::Path;
@@ -1474,6 +1493,14 @@ mod tests {
             name: name.to_string(),
             browser_download_url: format!("https://example.test/{name}"),
             size: Some(1),
+        }
+    }
+
+    fn release(tag_name: &str, assets: Vec<GitHubAsset>) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag_name.to_string(),
+            html_url: format!("https://example.test/releases/{tag_name}"),
+            assets,
         }
     }
 
@@ -1646,6 +1673,33 @@ mod tests {
     }
 
     #[test]
+    fn update_available_requires_newer_native_compatible_dmg() {
+        let native = native_release_asset_arch();
+        let other = if native == "arm64" { "x86_64" } else { "arm64" };
+
+        assert!(!release_update_available(
+            "0.2.4",
+            &release("v0.2.5", vec![asset(&format!("Sniper-0.2.5-{other}.dmg"))])
+        ));
+        assert!(!release_update_available(
+            "0.2.4",
+            &release("v0.2.5", vec![asset("Sniper-0.2.5.zip")])
+        ));
+        assert!(!release_update_available(
+            "0.2.4",
+            &release("v0.2.4", vec![asset(&format!("Sniper-0.2.4-{native}.dmg"))])
+        ));
+        assert!(release_update_available(
+            "0.2.4",
+            &release("v0.2.5", vec![asset(&format!("Sniper-0.2.5-{native}.dmg"))])
+        ));
+        assert!(release_update_available(
+            "0.2.4",
+            &release("v0.2.5", vec![asset("Sniper-0.2.5-universal.dmg")])
+        ));
+    }
+
+    #[test]
     fn updater_proxy_loopback_detection_accepts_common_local_forms() {
         assert!(proxy_url_targets_loopback("http://127.0.0.1:8080"));
         assert!(proxy_url_targets_loopback("localhost:8080"));
@@ -1789,6 +1843,33 @@ mod tests {
 
         drop(operation_guard);
         state.delete_session(original_id).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_missing_session_does_not_create_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-missing-delete-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let before = state.session_operation_lock_count().await;
+
+        let error = state
+            .delete_session(uuid::Uuid::new_v4())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("was not found"));
+        assert_eq!(state.session_operation_lock_count().await, before);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

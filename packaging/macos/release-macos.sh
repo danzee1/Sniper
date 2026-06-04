@@ -15,6 +15,26 @@ if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
   echo "VERSION=$VERSION does not match Cargo.toml version $CARGO_VERSION" >&2
   exit 1
 fi
+RELEASE_TAG="v$VERSION"
+GITHUB_RELEASE_REPO="${GITHUB_RELEASE_REPO:-${GITHUB_REPOSITORY:-sm1ee/Sniper}}"
+if [[ "${ALLOW_EXISTING_RELEASE_VERSION:-0}" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  HEAD_COMMIT="$(git rev-parse HEAD)"
+  TAG_COMMIT=""
+  if git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null; then
+    TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG")"
+    if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+      echo "$RELEASE_TAG already points to $TAG_COMMIT, not current HEAD $HEAD_COMMIT." >&2
+      echo "Bump Cargo.toml before creating release artifacts for a new commit." >&2
+      exit 1
+    fi
+  fi
+  if command -v gh >/dev/null 2>&1 && [[ -n "$GITHUB_RELEASE_REPO" ]] \
+    && gh release view "$RELEASE_TAG" --repo "$GITHUB_RELEASE_REPO" >/dev/null 2>&1; then
+    echo "GitHub release $RELEASE_TAG already exists in $GITHUB_RELEASE_REPO." >&2
+    echo "Bump Cargo.toml before creating release artifacts for a new commit." >&2
+    exit 1
+  fi
+fi
 REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
 SIGN_IDENTITY="${DEVELOPER_ID_APP:-${SIGN_IDENTITY:-}}"
 ALLOW_ADHOC_RELEASE="${ALLOW_ADHOC_RELEASE:-0}"

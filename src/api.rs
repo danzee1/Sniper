@@ -1356,6 +1356,17 @@ struct ReplaySendErrorResponse {
     record: Option<crate::model::TransactionRecord>,
 }
 
+fn replay_send_error_response(error: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ReplaySendErrorResponse {
+            error: error.into(),
+            record: None,
+        }),
+    )
+        .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateSessionPayload {
     name: Option<String>,
@@ -1519,6 +1530,17 @@ async fn update_workspace_state(
         current.session_id = Some(active_session.id());
         return (StatusCode::CONFLICT, Json(current)).into_response();
     };
+    let active_session = state.session().await;
+    if target_session_id != active_session.id()
+        && proxy::live_websocket_session_context(target_session_id).is_none()
+        && proxy::pending_session_context(target_session_id).is_none()
+        && !proxy::session_has_active_proxy_work(target_session_id)
+        && !state.sessions.contains_session(target_session_id)
+    {
+        let mut current = active_session.workspace.snapshot().await;
+        current.session_id = Some(active_session.id());
+        return (StatusCode::CONFLICT, Json(current)).into_response();
+    }
     let workspace_update_lock = state.workspace_update_lock(target_session_id).await;
     let _workspace_update_guard = workspace_update_lock.lock().await;
     let active_session = state.session().await;
@@ -1678,6 +1700,11 @@ async fn update_runtime_settings(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.runtime.snapshot().await;
     let previous_events = session
@@ -1854,6 +1881,11 @@ async fn clear_event_log(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
     let _mutation_guard = session.mutation_guard().await;
     let previous = session
         .event_log
@@ -2809,15 +2841,15 @@ async fn send_replay(
     };
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
         Ok(value) => value,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        Err(error) => return replay_send_error_response(error),
     };
     if let Some(target) = payload.target.as_ref() {
         if let Err(error) = validate_request_target_override(target) {
-            return (StatusCode::BAD_REQUEST, error).into_response();
+            return replay_send_error_response(error);
         }
     }
     if let Err(error) = validate_editable_request(&payload.request) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
+        return replay_send_error_response(error);
     }
     let operation_lock = state.session_operation_lock(session.id()).await;
     let _operation_guard = operation_lock.lock().await;
@@ -3748,6 +3780,11 @@ async fn clear_oast_callbacks(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.oast.snapshot().await;
     let previous_cleared_keys = session.oast.snapshot_cleared_keys().await;
@@ -3895,6 +3932,13 @@ mod tests {
 
     async fn response_json<T: DeserializeOwned>(response: axum::response::Response) -> T {
         assert!(response.status().is_success());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    async fn response_body_json(response: axum::response::Response) -> serde_json::Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body should be readable");
@@ -4829,6 +4873,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_update_waits_for_session_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-runtime-op-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(30),
+            super::update_runtime_settings(
+                State(state.clone()),
+                Json(RuntimeSettingsUpdate {
+                    session_id: Some(session.id()),
+                    intercept_enabled: Some(true),
+                    ..RuntimeSettingsUpdate::default()
+                }),
+            ),
+        )
+        .await;
+        assert!(blocked.is_err());
+
+        drop(operation_guard);
+        let runtime: RuntimeSettingsSnapshot = response_json(
+            super::update_runtime_settings(
+                State(state.clone()),
+                Json(RuntimeSettingsUpdate {
+                    session_id: Some(session.id()),
+                    intercept_enabled: Some(true),
+                    ..RuntimeSettingsUpdate::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(runtime.intercept_enabled);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn oast_clear_waits_for_session_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-oast-clear-op-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let callback_id = Uuid::new_v4();
+        session
+            .oast
+            .push(OastCallback {
+                id: callback_id,
+                received_at: Utc::now(),
+                protocol: "dns".to_string(),
+                remote_addr: "127.0.0.1".to_string(),
+                raw_data: "callback".to_string(),
+                correlation_id: "correlation".to_string(),
+            })
+            .await;
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(30),
+            super::clear_oast_callbacks(
+                State(state.clone()),
+                Query(super::OastQuery {
+                    session_id: Some(session.id()),
+                    limit: None,
+                }),
+            ),
+        )
+        .await;
+        assert!(blocked.is_err());
+        assert!(session.oast.get(callback_id).await.is_some());
+
+        drop(operation_guard);
+        let response = super::clear_oast_callbacks(
+            State(state.clone()),
+            Query(super::OastQuery {
+                session_id: Some(session.id()),
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(session.oast.list(None).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn runtime_event_oast_and_site_map_can_use_pinned_inactive_session() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-pinned-runtime-event-oast-{}",
@@ -5629,6 +5782,56 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(session.store.snapshot(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_send_validation_errors_use_json_error_body() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-replay-send-json-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+
+        let response = super::send_replay(
+            State(state.clone()),
+            Json(super::ReplaySendPayload {
+                session_id: Some(session.id()),
+                request: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                target: None,
+                source_transaction_id: None,
+                http_version: Some("HTTP/3".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
+        let body = response_body_json(response).await;
+        assert_eq!(body.get("record"), Some(&serde_json::Value::Null));
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("unsupported replay http_version"));
         assert!(session.store.snapshot(Some(10)).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);

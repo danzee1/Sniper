@@ -4008,7 +4008,8 @@ function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS, optio
   if (!paging || paging.loading || paging.backfillScheduled || !paging.hasMore || paging.fullyLoaded) {
     return;
   }
-  if (!options.allowAtCap && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
+  const allowAtCap = !!options.allowAtCap;
+  if (!allowAtCap && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
     return;
   }
   paging.backfillScheduled = true;
@@ -4020,7 +4021,7 @@ function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS, optio
     if (currentPaging.generation !== generation) return;
     currentPaging.backfillScheduled = false;
     if (_searchActiveUntil > Date.now()) {
-      scheduleHistoryBackfill(HTTP_HISTORY_BACKFILL_DELAY_MS);
+      scheduleHistoryBackfill(HTTP_HISTORY_BACKFILL_DELAY_MS, { allowAtCap });
       return;
     }
     await loadMoreTransactions({ background: true });
@@ -6182,7 +6183,8 @@ function renderHistoryVirtual() {
   const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - HISTORY_BUFFER_ROWS);
   const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / rowHeight) + HISTORY_BUFFER_ROWS);
   if (totalCount - endIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS) {
-    scheduleHistoryBackfill(0, { allowAtCap: true });
+    const atLoadedBottom = scrollTop >= maxScrollTop - rowHeight;
+    scheduleHistoryBackfill(0, { allowAtCap: atLoadedBottom });
   }
 
   const topPadding = startIdx * rowHeight;
@@ -7487,7 +7489,9 @@ function syncReplayRequestTextFromEditor(newText) {
   if (!activeTab || activeTab.type === "websocket") {
     return;
   }
+  const httpVersion = replayHttpVersionFromText(newText);
   activeTab.requestText = newText;
+  activeTab.httpVersionMode = httpVersion;
   activeTab.requestBytes = null;
   activeTab.requestOriginalBytes = null;
   syncReplayToolbar(activeTab);
@@ -9897,9 +9901,9 @@ async function sendReplay() {
   const sendingTabId = tab.id;
   const sendingSessionId = state.activeSession?.id || null;
 
-  // HTTP version: prefer dropdown selection, fall back to request line
-  const httpVersion = normalizeReplayHttpVersion(tab.httpVersionMode || "")
+  const httpVersion = normalizeReplayHttpVersion(request.http_version || "")
     || replayHttpVersionFromText(requestText)
+    || normalizeReplayHttpVersion(tab.httpVersionMode || "")
     || undefined;
 
   const replayController = new AbortController();
@@ -10058,7 +10062,10 @@ function applyReplaySentDraftIfUnchanged(tab, request, requestText, target) {
   if (!replaySentDraftUnchanged(tab, requestText, target)) {
     return;
   }
+  const httpVersion = normalizeReplayHttpVersion(request.http_version || "")
+    || replayHttpVersionFromText(requestText || "");
   tab.baseRequest = cloneEditableRequest(request);
+  tab.httpVersionMode = httpVersion;
   tab.targetScheme = target.scheme;
   tab.targetHost = target.host;
   tab.targetPort = target.port;
@@ -10089,8 +10096,9 @@ async function followRedirect() {
   let httpVersion;
   try {
     currentRequest = parseEditableRawRequest(replayReqText, fallback);
-    httpVersion = normalizeReplayHttpVersion(tab.httpVersionMode || "")
+    httpVersion = normalizeReplayHttpVersion(currentRequest.http_version || "")
       || replayHttpVersionFromText(replayReqText)
+      || normalizeReplayHttpVersion(tab.httpVersionMode || "")
       || undefined;
   } catch (e) {
     const message = e?.message || "Failed to parse request.";
@@ -11028,8 +11036,9 @@ function cloneRepeaterHistoryEntry(entry) {
   return {
     request: cloneEditableRequest(entry.request),
     requestText: entry.requestText || "",
-    httpVersionMode: normalizeReplayHttpVersion(entry.httpVersionMode || "")
-      || replayHttpVersionFromText(entry.requestText || ""),
+    httpVersionMode: normalizeReplayHttpVersion(entry.request?.http_version || "")
+      || replayHttpVersionFromText(entry.requestText || "")
+      || normalizeReplayHttpVersion(entry.httpVersionMode || ""),
     responseRecord: cloneTransactionRecord(entry.responseRecord),
     notice: entry.notice || "",
     targetScheme: normalizedTarget.scheme,
@@ -11039,11 +11048,13 @@ function cloneRepeaterHistoryEntry(entry) {
 }
 
 function recordRepeaterHistory(tab, snapshot) {
+  const requestText = snapshot.requestText || "";
   const entry = {
     request: cloneEditableRequest(snapshot.request),
-    requestText: snapshot.requestText || "",
-    httpVersionMode: normalizeReplayHttpVersion(snapshot.httpVersionMode || tab.httpVersionMode || "")
-      || replayHttpVersionFromText(snapshot.requestText || ""),
+    requestText,
+    httpVersionMode: normalizeReplayHttpVersion(snapshot.request?.http_version || "")
+      || replayHttpVersionFromText(requestText)
+      || normalizeReplayHttpVersion(snapshot.httpVersionMode || tab.httpVersionMode || ""),
     responseRecord: cloneTransactionRecord(snapshot.responseRecord),
     notice: snapshot.notice || "",
     targetScheme: snapshot.target.scheme || "https",
@@ -15519,10 +15530,11 @@ function shellQuote(value) {
 function parseRequestForExport(rawText, scheme, host, port) {
   const lines = String(rawText || "").replace(/\r\n/g, "\n").split("\n");
   const [startLine = "GET / HTTP/1.1", ...rest] = lines;
-  const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)/);
+  const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)(?:\s+(HTTP\/[0-9.]+))?$/);
   if (!match) return null;
   const method = match[1];
   const path = match[2];
+  const httpVersion = normalizeReplayHttpVersion(match[3] || "");
   const url = buildUrlFromTarget(scheme, host, port, path);
   let bodyIdx = rest.indexOf("");
   if (bodyIdx === -1) {
@@ -15539,7 +15551,7 @@ function parseRequestForExport(rawText, scheme, host, port) {
     const idx = h.indexOf(":");
     return idx === -1 ? null : { name: h.slice(0, idx).trim(), value: h.slice(idx + 1).trim() };
   }).filter(Boolean);
-  return { method, url, headers, body, bodyProvided };
+  return { method, url, headers, body, bodyProvided, httpVersion };
 }
 
 function requestToPython(parsed) {
@@ -15649,6 +15661,8 @@ function requestToPowerShell(parsed) {
 function requestToCurl(parsed) {
   if (!parsed) return "";
   const parts = [`curl -X ${shellQuote(parsed.method)}`];
+  const versionFlag = curlHttpVersionFlag(parsed.httpVersion);
+  if (versionFlag) parts.push(versionFlag);
   if (urlNeedsPathAsIs(parsed.url)) parts.push("--path-as-is");
   for (const h of exportableHeaders(parsed.headers, parsed.url)) {
     parts.push(`-H ${shellQuote(`${h.name}: ${h.value}`)}`);
@@ -15658,6 +15672,14 @@ function requestToCurl(parsed) {
   }
   parts.push(shellQuote(parsed.url));
   return parts.join(" \\\n  ");
+}
+
+function curlHttpVersionFlag(httpVersion) {
+  const normalized = normalizeReplayHttpVersion(httpVersion || "");
+  if (normalized === "HTTP/1.0") return "--http1.0";
+  if (normalized === "HTTP/1.1") return "--http1.1";
+  if (normalized === "HTTP/2") return "--http2";
+  return "";
 }
 
 function urlNeedsPathAsIs(url) {
@@ -15817,6 +15839,7 @@ function parseCurlCommand(text) {
   let methodExplicit = false;
   let getMode = false;
   let pathAsIs = false;
+  let httpVersion = "";
   let url = "";
   const headers = [];
   const bodyParts = [];
@@ -15881,6 +15904,18 @@ function parseCurlCommand(text) {
     else if (tok === "-G" || tok === "--get") {
       getMode = true;
       if (!methodExplicit) method = "GET";
+    }
+    else if (tok === "--http1.0") {
+      httpVersion = "HTTP/1.0";
+    }
+    else if (tok === "--http1.1") {
+      httpVersion = "HTTP/1.1";
+    }
+    else if (tok === "--http2" || tok === "--http2-prior-knowledge") {
+      httpVersion = "HTTP/2";
+    }
+    else if (tok === "--http3" || tok === "--http3-only") {
+      return { error: "cURL HTTP/3 imports are not supported by Replay." };
     }
     else if (tok === "-H" || tok === "--header") {
       const hVal = tokens[++t] || "";
@@ -15987,7 +16022,7 @@ function parseCurlCommand(text) {
   }
   let body = bodyParts.join("&");
   if (getMode && body) {
-    url += `${url.includes("?") ? "&" : "?"}${body}`;
+    url = appendCurlGetQuery(url, body);
     body = "";
     bodyProvided = false;
   }
@@ -16008,8 +16043,9 @@ function parseCurlCommand(text) {
   const hasHost = normalizedHeaders(headers).some((h) => headerNameEquals(h, "host"));
   if (!hasHost) headers.unshift({ name: "Host", value: host });
   const headerText = headers.map((h) => `${h.name}: ${h.value}`).join("\n");
-  const requestText = bodyProvided ? `${method} ${path} HTTP/1.1\n${headerText}\n\n${body}` : `${method} ${path} HTTP/1.1\n${headerText}`;
-  return { scheme, host, port, method, path, headers, body, requestText };
+  const requestHttpVersion = httpVersion || "HTTP/1.1";
+  const requestText = bodyProvided ? `${method} ${path} ${requestHttpVersion}\n${headerText}\n\n${body}` : `${method} ${path} ${requestHttpVersion}\n${headerText}`;
+  return { scheme, host, port, method, path, headers, body, httpVersion, requestText };
 }
 
 function curlDataBinaryBodyIsPlainText(value) {
@@ -16017,9 +16053,17 @@ function curlDataBinaryBodyIsPlainText(value) {
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
     if (code === 0x09 || code === 0x0a || code === 0x0d) continue;
-    if (code < 0x20 || code > 0x7e) return false;
+    if (code < 0x20) return false;
   }
   return true;
+}
+
+function appendCurlGetQuery(url, query) {
+  const input = String(url || "");
+  const hashIndex = input.indexOf("#");
+  const head = hashIndex >= 0 ? input.slice(0, hashIndex) : input;
+  const fragment = hashIndex >= 0 ? input.slice(hashIndex) : "";
+  return `${head}${head.includes("?") ? "&" : "?"}${query}${fragment}`;
 }
 
 function encodeCurlDataUrlencode(value) {
@@ -16197,6 +16241,7 @@ function applyCurlImport() {
     return;
   }
   const tab = createReplayTab();
+  tab.httpVersionMode = normalizeReplayHttpVersion(result.httpVersion || "");
   const target = normalizeRepeaterTargetInput(result.host, result.port || "", result.scheme || "https");
   tab.requestText = result.requestText;
   tab.targetScheme = result.scheme;
@@ -16211,6 +16256,7 @@ function applyCurlImport() {
     host: result.host,
     method: result.method,
     path: result.path,
+    http_version: normalizeReplayHttpVersion(result.httpVersion || "") || undefined,
     headers: normalizedHeaders(result.headers),
     body: result.body,
     body_encoding: "utf8",

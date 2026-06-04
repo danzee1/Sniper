@@ -933,10 +933,18 @@ impl ApiClient {
                 .with_context(|| format!("failed to decode JSON response from {}", path));
         }
         if status == StatusCode::BAD_REQUEST {
-            let body = response
-                .json::<ReplaySendErrorBody>()
-                .await
-                .with_context(|| format!("failed to decode replay error response from {}", path))?;
+            let message = response.text().await.unwrap_or_else(|_| String::new());
+            let body = match serde_json::from_str::<ReplaySendErrorBody>(&message) {
+                Ok(body) => body,
+                Err(_) => {
+                    let detail = if message.trim().is_empty() {
+                        status.to_string()
+                    } else {
+                        message
+                    };
+                    bail!("request to {} failed ({}): {}", path, status, detail);
+                }
+            };
             if body.record.is_some() {
                 return Ok(ReplaySendApiResult::StoredError(body));
             }

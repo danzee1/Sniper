@@ -1154,15 +1154,6 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
 
         loop {
             let session = state.session().await;
-            let runtime = session.runtime.snapshot().await;
-            let config = OastConfig {
-                enabled: runtime.oast_enabled,
-                server_url: runtime.oast_server_url.clone(),
-                token: runtime.oast_token.clone(),
-                polling_interval_secs: runtime.oast_polling_interval_secs,
-                provider: runtime.oast_provider.clone(),
-            };
-            session.oast.update_config(config.clone()).await;
             let operation_lock = state.session_operation_lock(session.id()).await;
             let operation_guard = operation_lock.lock().await;
             if !state.sessions.contains_session(session.id()) {
@@ -1175,6 +1166,15 @@ pub fn start_oast_poller_for_state(state: Arc<AppState>) -> tokio::task::JoinHan
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
+            let runtime = session.runtime.snapshot().await;
+            let config = OastConfig {
+                enabled: runtime.oast_enabled,
+                server_url: runtime.oast_server_url.clone(),
+                token: runtime.oast_token.clone(),
+                polling_interval_secs: runtime.oast_polling_interval_secs,
+                provider: runtime.oast_provider.clone(),
+            };
+            session.oast.update_config(config.clone()).await;
 
             let session_changed = prev_session_id != Some(session.id());
             let same_session_as_previous = !session_changed;
