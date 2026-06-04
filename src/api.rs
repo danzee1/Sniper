@@ -165,6 +165,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(list_match_replace_rules).post(update_match_replace_rules),
         )
         .route("/api/findings", get(list_findings))
+        .route("/api/findings/count", get(count_findings))
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/clear", post(clear_findings))
         .route(
@@ -2299,6 +2300,11 @@ struct FindingsQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Serialize)]
+struct FindingsCountResponse {
+    count: usize,
+}
+
 async fn list_findings(
     State(state): State<Arc<AppState>>,
     Query(query): Query<FindingsQuery>,
@@ -2311,6 +2317,20 @@ async fn list_findings(
         Err(response) => return response,
     };
     Json(session.scanner.list(query.limit).await).into_response()
+}
+
+async fn count_findings(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionScopedQuery>,
+) -> Response {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    Json(FindingsCountResponse {
+        count: session.scanner.count().await,
+    })
+    .into_response()
 }
 
 async fn get_finding(
@@ -3871,6 +3891,7 @@ async fn events(
     let session_id = session.id();
     let mut transaction_receiver = session.store.subscribe();
     let mut log_receiver = session.event_log.subscribe();
+    let mut finding_receiver = session.scanner.subscribe();
     let latest_sequence = session.store.latest_sequence();
 
     let stream = stream! {
@@ -3912,6 +3933,22 @@ async fn events(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             yield Ok(Event::default()
                                 .event("event_log_gap")
+                                .data("lagged"));
+                            continue;
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                result = finding_receiver.recv() => {
+                    match result {
+                        Ok(summary) => {
+                            if let Ok(payload) = serde_json::to_string(&summary) {
+                                yield Ok(Event::default().event("finding").data(payload));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok(Event::default()
+                                .event("findings_gap")
                                 .data("lagged"));
                             continue;
                         },
@@ -6084,6 +6121,18 @@ mod tests {
         .await;
         assert_eq!(inactive_findings.len(), 1);
         assert_eq!(inactive_findings[0].id, inactive_finding.id);
+
+        let inactive_findings_count = response_json::<serde_json::Value>(
+            super::count_findings(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(inactive_findings_count["count"], 1);
 
         let finding: ScannerFinding = response_json(
             super::get_finding(

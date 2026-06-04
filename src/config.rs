@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use crate::certificate::default_data_dir;
 
 const STARTUP_SETTINGS_FILE: &str = "startup-settings.json";
+const DEFAULT_MAX_ENTRIES: usize = 5_000;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -41,7 +42,7 @@ impl AppConfig {
         Ok(Self {
             proxy_addr: resolve_proxy_addr(&data_dir, &startup)?,
             ui_addr: parse_ui_socket_addr("SNIPER_UI_ADDR", ui_default)?,
-            max_entries: parse_usize_min("SNIPER_MAX_ENTRIES", 500_000, 1)?,
+            max_entries: parse_usize_min("SNIPER_MAX_ENTRIES", DEFAULT_MAX_ENTRIES, 1)?,
             body_preview_bytes: parse_usize("SNIPER_BODY_PREVIEW_BYTES", 10_485_760)?,
             data_dir,
         })
@@ -319,7 +320,7 @@ mod tests {
     fn max_entries_env_rejects_zero_retention() {
         const VAR_NAME: &str = "SNIPER_TEST_MAX_ENTRIES_ZERO";
         std::env::set_var(VAR_NAME, "0");
-        let result = super::parse_usize_min(VAR_NAME, 500_000, 1);
+        let result = super::parse_usize_min(VAR_NAME, super::DEFAULT_MAX_ENTRIES, 1);
         std::env::remove_var(VAR_NAME);
 
         assert!(result.is_err());

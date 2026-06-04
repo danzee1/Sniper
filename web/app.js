@@ -14,6 +14,7 @@ function createDefaultFilterSettings() {
       json: true,
       css: true,
       image: true,
+      websocket: true,
       other: true,
     },
     status: {
@@ -113,6 +114,7 @@ const HTTP_HISTORY_MAX_LOADED_ITEMS = HTTP_HISTORY_PAGE_SIZE;
 const HTTP_HISTORY_BACKFILL_DELAY_MS = 80;
 const HTTP_HISTORY_SCROLL_PREFETCH_ROWS = 120;
 const HTTP_HISTORY_POLL_FALLBACK_MS = 30000;
+const FINDINGS_BADGE_POLL_INTERVAL_MS = 30000;
 const WS_REPLAY_MAX_LOADED_FRAMES = 10000;
 const WS_REPLAY_MAX_RENDERED_FRAMES = 1000;
 const WS_REPLAY_MAX_PERSISTED_FRAMES = 1000;
@@ -611,6 +613,7 @@ const els = {
   filterMimeJson: document.getElementById("filterMimeJson"),
   filterMimeCss: document.getElementById("filterMimeCss"),
   filterMimeImage: document.getElementById("filterMimeImage"),
+  filterMimeWebsocket: document.getElementById("filterMimeWebsocket"),
   filterMimeOther: document.getElementById("filterMimeOther"),
   filterStatus2xx: document.getElementById("filterStatus2xx"),
   filterStatus3xx: document.getElementById("filterStatus3xx"),
@@ -3228,6 +3231,7 @@ function selectedMimeTypes(filters) {
   if (mime.json) selected.push("json");
   if (mime.css) selected.push("css");
   if (mime.image) selected.push("image");
+  if (mime.websocket !== false) selected.push("websocket");
   if (mime.other) selected.push("other");
   return selected;
 }
@@ -3782,6 +3786,7 @@ async function loadTargetSiteMap(forceScopeSync = false) {
 
 async function pollAuxiliaryData() {
   const tasks = [];
+  const now = Date.now();
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "intercept") {
     tasks.push(loadIntercepts(true));
@@ -3793,7 +3798,6 @@ async function pollAuxiliaryData() {
   }
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "http-history") {
-    const now = Date.now();
     if (now - _lastHttpHistoryFallbackPoll >= HTTP_HISTORY_POLL_FALLBACK_MS) {
       _lastHttpHistoryFallbackPoll = now;
       scheduleIncrementalRefresh();
@@ -3810,8 +3814,7 @@ async function pollAuxiliaryData() {
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
     tasks.push(loadFindings());
-  } else {
-    // Always update badge count even when not on Findings tab
+  } else if (shouldPollFindingsBadge(now)) {
     tasks.push(updateFindingsBadgeOnly());
   }
 
@@ -3867,6 +3870,24 @@ function connectEvents() {
       return;
     }
     loadEventLog().catch((error) => console.error(error));
+  });
+
+  eventSource.addEventListener("finding", (event) => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
+    handleFindingEvent(event);
+  });
+
+  eventSource.addEventListener("findings_gap", () => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
+    if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
+      scheduleFindingsListRefresh();
+    } else {
+      scheduleFindingsBadgeRefresh();
+    }
   });
 
   eventSource.addEventListener("session_changed", () => {
@@ -4947,6 +4968,12 @@ function getSortedSessions() {
 // ── Findings (Passive Scanner) ──
 
 let findingsData = [];
+let findingsBadgeCount = 0;
+let findingsLoadPromise = null;
+let findingsLoadSessionId = null;
+let findingsBadgeRefreshTimer = 0;
+let findingsListRefreshTimer = 0;
+let lastFindingsBadgePollAt = 0;
 let scannerConfigCache = null;
 let scannerSettingsSessionId = null;
 let findingsSortKey = "found_at";
@@ -4966,36 +4993,92 @@ let selectedFindingId = null;
 
 async function loadFindings() {
   const sessionId = currentSessionId();
-  try {
-    const response = await fetch(sessionQueryPath("/api/findings?limit=5000", sessionId));
-    if (!response.ok) return;
-    const findings = jsonArray(await response.json());
-    if (sessionId !== currentSessionId()) return;
-    findingsData = findings;
-    renderFindings();
-    updateFindingsBadge();
-  } catch (error) {
-    console.error("Failed to load findings:", error);
+  if (findingsLoadPromise && findingsLoadSessionId === sessionId) {
+    return findingsLoadPromise;
   }
+  findingsLoadSessionId = sessionId;
+  findingsLoadPromise = (async () => {
+    try {
+      const response = await fetch(sessionQueryPath("/api/findings?limit=5000", sessionId));
+      if (!response.ok) return;
+      const findings = jsonArray(await response.json());
+      if (sessionId !== currentSessionId()) return;
+      findingsData = findings;
+      findingsBadgeCount = findings.length;
+      renderFindings();
+      updateFindingsBadge();
+    } catch (error) {
+      console.error("Failed to load findings:", error);
+    } finally {
+      if (findingsLoadSessionId === sessionId) {
+        findingsLoadPromise = null;
+        findingsLoadSessionId = null;
+      }
+    }
+  })();
+  return findingsLoadPromise;
 }
 
 async function updateFindingsBadgeOnly() {
   const sessionId = currentSessionId();
   try {
-    const response = await fetch(sessionQueryPath("/api/findings?limit=5000", sessionId));
+    const response = await fetch(sessionQueryPath("/api/findings/count", sessionId));
     if (!response.ok) return;
-    const findings = jsonArray(await response.json());
+    const payload = await response.json();
     if (sessionId !== currentSessionId()) return;
-    findingsData = findings;
+    const count = Number(payload?.count);
+    findingsBadgeCount = Number.isFinite(count) && count >= 0 ? count : 0;
     updateFindingsBadge();
   } catch (e) { /* silent */ }
 }
 
 function updateFindingsBadge() {
   if (!els.findingsBadge) return;
-  const count = findingsData.length;
+  const count = findingsBadgeCount;
   els.findingsBadge.textContent = count > 0 ? String(count) : "";
   els.findingsBadge.classList.toggle("hidden", count === 0);
+}
+
+function shouldPollFindingsBadge(now = Date.now()) {
+  if (now - lastFindingsBadgePollAt < FINDINGS_BADGE_POLL_INTERVAL_MS) {
+    return false;
+  }
+  lastFindingsBadgePollAt = now;
+  return true;
+}
+
+function scheduleFindingsBadgeRefresh(delay = 250) {
+  if (findingsBadgeRefreshTimer) return;
+  findingsBadgeRefreshTimer = window.setTimeout(() => {
+    findingsBadgeRefreshTimer = 0;
+    lastFindingsBadgePollAt = Date.now();
+    updateFindingsBadgeOnly().catch((error) => console.error(error));
+  }, delay);
+}
+
+function scheduleFindingsListRefresh(delay = 250) {
+  if (findingsListRefreshTimer) return;
+  findingsListRefreshTimer = window.setTimeout(() => {
+    findingsListRefreshTimer = 0;
+    loadFindings().catch((error) => console.error(error));
+  }, delay);
+}
+
+function handleFindingEvent(event) {
+  try {
+    const summary = JSON.parse(event.data || "null");
+    if (summary?.id) {
+      findingsBadgeCount += 1;
+      updateFindingsBadge();
+    }
+  } catch (error) {
+    console.error("Failed to parse finding event:", error);
+  }
+  if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
+    scheduleFindingsListRefresh();
+  } else {
+    scheduleFindingsBadgeRefresh(1000);
+  }
 }
 
 function clearFindingDetail() {
@@ -5021,6 +5104,18 @@ function clearFindingDetail() {
 
 function resetFindingsUiState() {
   findingsData = [];
+  findingsBadgeCount = 0;
+  findingsLoadPromise = null;
+  findingsLoadSessionId = null;
+  lastFindingsBadgePollAt = 0;
+  if (findingsBadgeRefreshTimer) {
+    window.clearTimeout(findingsBadgeRefreshTimer);
+    findingsBadgeRefreshTimer = 0;
+  }
+  if (findingsListRefreshTimer) {
+    window.clearTimeout(findingsListRefreshTimer);
+    findingsListRefreshTimer = 0;
+  }
   state._findingsEntries = [];
   clearFindingDetail();
   renderFindings();
@@ -11981,6 +12076,7 @@ function hydrateFilterForm() {
   els.filterMimeJson.checked = filters.mime.json;
   els.filterMimeCss.checked = filters.mime.css;
   els.filterMimeImage.checked = filters.mime.image;
+  els.filterMimeWebsocket.checked = filters.mime.websocket !== false;
   els.filterMimeOther.checked = filters.mime.other;
   els.filterStatus2xx.checked = filters.status.success;
   els.filterStatus3xx.checked = filters.status.redirect;
@@ -12000,6 +12096,7 @@ function applyFilterSettings() {
     json: els.filterMimeJson.checked,
     css: els.filterMimeCss.checked,
     image: els.filterMimeImage.checked,
+    websocket: els.filterMimeWebsocket.checked,
     other: els.filterMimeOther.checked,
   };
   const nextStatus = {
