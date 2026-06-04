@@ -207,6 +207,14 @@ impl AppState {
     }
 
     pub async fn activate_session(&self, id: uuid::Uuid) -> Result<SessionSummary> {
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
+        let operation_lock = self.session_operation_lock(id).await;
+        let _operation_guard = operation_lock.lock().await;
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
         let mut active_session = self.active_session.write().await;
         let current = active_session.clone();
         let current_id = current.id();
@@ -2011,6 +2019,44 @@ mod tests {
                 .await
                 .unwrap()
                 .id(),
+            original_id
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn activate_session_waits_for_target_session_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-activate-session-op-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let activate_result = tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            state.activate_session(original_id),
+        )
+        .await;
+        assert!(activate_result.is_err());
+
+        drop(operation_guard);
+        assert_eq!(
+            state.activate_session(original_id).await.unwrap().id,
             original_id
         );
 

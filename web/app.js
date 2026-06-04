@@ -3326,21 +3326,22 @@ async function loadTransactionDetail(id) {
   const sessionId = currentSessionId();
   const response = await fetch(transactionPath(id, sessionId));
   if (sessionId !== currentSessionId()) {
-    return;
+    return null;
   }
   if (!response.ok) {
     if (state.selectedId === id) {
       renderEmptyDetail();
     }
-    return;
+    return null;
   }
 
   const record = await response.json();
   if (state.selectedId !== id || sessionId !== currentSessionId()) {
-    return;
+    return null;
   }
   state.selectedRecord = record;
   renderDetail(state.selectedRecord);
+  return record;
 }
 
 async function loadSelectedTransactionRecord() {
@@ -3942,11 +3943,6 @@ function trimHistoryCache(prefer = "recent") {
     state.historyPaging.fullyLoaded = false;
   }
 
-  if (removed.some((item) => item.id === state.selectedId)) {
-    state.selectedId = null;
-    state.selectedRecord = null;
-    renderEmptyDetail();
-  }
   state._connectCount = state.items.reduce((count, item) => count + (item.method === "CONNECT" ? 1 : 0), 0);
   refreshHistoryPagingCursorFromItems();
   return removed.length;
@@ -5006,6 +5002,9 @@ function renderFindings() {
   if (!els.findingsBody) return;
   updateCategoryFilter();
   state._findingsEntries = getFilteredFindings();
+  if (selectedFindingId && !state._findingsEntries.some((finding) => finding.id === selectedFindingId)) {
+    clearFindingDetail();
+  }
 
   if (!state._findingsEntries.length) {
     els.findingsBody.innerHTML = `<tr class="empty-row"><td colspan="6">No findings yet. Browse with the proxy to start scanning.</td></tr>`;
@@ -5061,7 +5060,10 @@ async function loadFindingDetail(id) {
   try {
     const res = await fetch(sessionQueryPath(`/api/findings/${encodeURIComponent(id)}`, sessionId));
     if (selectedFindingId !== id) return;
-    if (!res.ok) return;
+    if (!res.ok) {
+      clearFindingDetail();
+      return;
+    }
     const finding = await res.json();
     if (currentSessionId() !== sessionId) return;
     if (selectedFindingId !== id) return;
@@ -5251,14 +5253,93 @@ function extractFindingKeywords(finding) {
 function jumpToTransaction(recordId) {
   state.activeProxyTab = "http-history";
   state.selectedId = recordId;
+  state.selectedRecord = null;
   renderProxyPanels();
-  loadTransactionDetail(recordId).then(() => {
-    const row = document.querySelector(`.history-row[data-id="${recordId}"]`);
-    if (row) {
-      updateHistorySelection(recordId);
-      row.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
+  loadTransactionDetail(recordId).then(async (record) => {
+    if (!record || state.selectedId !== recordId) return;
+    await ensureHistoryWindowContainsRecord(record);
+    focusHistoryRecord(recordId);
   }).catch((error) => console.error(error));
+}
+
+function sequenceCursorAfter(sequence) {
+  const raw = String(sequence ?? "").trim();
+  if (/^\d+$/.test(raw)) {
+    try {
+      return (BigInt(raw) + 1n).toString();
+    } catch (_error) {
+      // Fall through to Number parsing for older runtimes.
+    }
+  }
+  const numeric = Number(sequence);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return String(Math.trunc(numeric) + 1);
+}
+
+async function ensureHistoryWindowContainsRecord(record) {
+  if (!record?.id || getHistoryItem(record.id)) {
+    return true;
+  }
+  if (!canUseSequenceCursorForHistoryPaging()) {
+    showToast("Use index sort to reveal this older transaction in HTTP History.", "info", 4000);
+    return false;
+  }
+  const beforeSequence = sequenceCursorAfter(record.sequence);
+  if (!beforeSequence) {
+    showToast("This transaction is outside the loaded HTTP History window.", "info", 4000);
+    return false;
+  }
+
+  clearHistoryBackfill();
+  const paging = state.historyPaging || (state.historyPaging = createHistoryPagingState());
+  const generation = ++_historyPagingGeneration;
+  const sessionId = currentSessionId();
+  paging.generation = generation;
+  paging.loading = true;
+  try {
+    const page = await fetchTransactionPage({ beforeSequence });
+    if (!page || sessionId !== currentSessionId() || state.selectedId !== record.id) {
+      return false;
+    }
+    if (state.historyPaging !== paging || paging.generation !== generation) {
+      return false;
+    }
+
+    const pageItems = jsonArray(page.items);
+    if (!pageItems.some((item) => item?.id === record.id)) {
+      showToast("Current HTTP History filters hide this transaction.", "info", 4000);
+      return false;
+    }
+
+    replaceHistoryItemsForGap(pageItems);
+    if (page.total != null) paging.total = page.total;
+    if (page.filtered_total != null) paging.filteredTotal = page.filtered_total;
+    if (page.hidden_connect_total != null) paging.hiddenConnectTotal = page.hidden_connect_total;
+    paging.offset = state.items.length;
+    paging.hasMore = Boolean(page.has_more);
+    paging.fullyLoaded = !paging.hasMore;
+    return true;
+  } catch (error) {
+    console.error("Failed to reveal history transaction:", error);
+    showToast(error?.message || "Failed to reveal transaction in HTTP History.", "error", 5000);
+    return false;
+  } finally {
+    if (state.historyPaging === paging && paging.generation === generation) {
+      paging.loading = false;
+      renderHistory();
+    }
+  }
+}
+
+function focusHistoryRecord(recordId) {
+  if (state.selectedId !== recordId) return;
+  updateHistorySelection(recordId);
+  scrollSelectedHistoryRowIntoView();
+  window.requestAnimationFrame(() => {
+    if (state.selectedId !== recordId || !isHttpHistoryVisible()) return;
+    updateHistorySelection(recordId);
+    scrollSelectedHistoryRowIntoView();
+  });
 }
 
 async function sendFindingToReplay(recordId) {
@@ -6258,7 +6339,7 @@ function scrollHistoryToId(targetId) {
   // Scroll so that target row is near center of viewport
   const targetTop = idx * (measuredHistoryRowHeight || HISTORY_ROW_HEIGHT);
   shell.scrollTop = Math.max(0, targetTop - shell.clientHeight / 2);
-  // renderHistoryVirtual will be called by scroll event
+  renderHistoryVirtual();
 }
 
 async function moveHistorySelection(offset) {
@@ -6304,8 +6385,10 @@ function scrollSelectedHistoryRowIntoView() {
   const viewBottom = viewTop + shell.clientHeight;
   if (rowTop < viewTop) {
     shell.scrollTop = rowTop;
+    renderHistoryVirtual();
   } else if (rowBottom > viewBottom) {
     shell.scrollTop = rowBottom - shell.clientHeight;
+    renderHistoryVirtual();
   }
 }
 
@@ -10699,6 +10782,7 @@ async function applyReplayTargetFields() {
   tab.targetPort = normalizedTarget.port;
   tab.targetManuallyEdited = true;
   tab.responseRecord = null;
+  tab.notice = "";
   scheduleWorkspaceStateSave();
   renderReplay();
 }
@@ -11648,7 +11732,7 @@ function applyFilterSettings() {
     } catch (error) {
       const message = `Invalid regex: ${error.message}`;
       if (els.historyMeta) els.historyMeta.textContent = message;
-      showToast(message);
+      showToast(message, "error");
       return;
     }
   }

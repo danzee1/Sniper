@@ -1663,6 +1663,32 @@ async fn resolve_session_for_optional_id(
         .map_err(|error| session_load_failure_response(target_session_id, error))
 }
 
+async fn resolve_read_session_for_optional_id(
+    state: &Arc<AppState>,
+    target_session_id: Option<Uuid>,
+) -> std::result::Result<Arc<SessionContext>, Response> {
+    let active_session = state.session().await;
+    let Some(target_session_id) = target_session_id else {
+        return Ok(active_session);
+    };
+    if target_session_id == active_session.id() {
+        return Ok(active_session);
+    }
+    if let Some(session) = proxy::live_websocket_session_context(target_session_id) {
+        return Ok(session);
+    }
+    if let Some(session) = proxy::pending_session_context(target_session_id) {
+        return Ok(session);
+    }
+    if !state.sessions.contains_session(target_session_id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    state
+        .session_context_for_id(target_session_id)
+        .await
+        .map_err(|error| session_load_failure_response(target_session_id, error))
+}
+
 async fn guard_session_write_operation(
     state: &Arc<AppState>,
     session: &Arc<SessionContext>,
@@ -1882,7 +1908,7 @@ async fn list_event_log(
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -1934,7 +1960,7 @@ async fn list_findings(
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -1950,7 +1976,7 @@ async fn get_finding(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -1993,7 +2019,7 @@ async fn get_scanner_config(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2055,7 +2081,7 @@ async fn list_match_replace_rules(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2190,7 +2216,7 @@ async fn list_transactions(
     if let Some(limit) = query.limit {
         query.limit = Some(limit.clamp(1, MAX_PAGE_LIMIT));
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2215,7 +2241,7 @@ async fn list_transactions_page(
             .unwrap_or(DEFAULT_PAGE_LIMIT)
             .clamp(1, MAX_PAGE_LIMIT),
     );
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -2234,7 +2260,7 @@ async fn get_transaction(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -6204,16 +6230,6 @@ mod tests {
         .await;
         assert_eq!(active_response.status(), super::StatusCode::NOT_FOUND);
 
-        let pinned_response = super::get_transaction(
-            State(state.clone()),
-            Path(record_id.to_string()),
-            Query(super::TransactionGetQuery {
-                session_id: Some(original_id),
-            }),
-        )
-        .await;
-        assert_eq!(pinned_response.status(), super::StatusCode::OK);
-
         let active_list_response = super::list_transactions(
             State(state.clone()),
             Query(super::TransactionQuery::default()),
@@ -6223,18 +6239,46 @@ mod tests {
             response_json(active_list_response).await;
         assert!(active_list.is_empty());
 
-        let pinned_list_response = super::list_transactions(
-            State(state.clone()),
-            Query(super::TransactionQuery {
-                session_id: Some(original_id),
-                ..super::TransactionQuery::default()
-            }),
-        )
-        .await;
-        let pinned_list: Vec<crate::model::TransactionSummary> =
-            response_json(pinned_list_response).await;
-        assert_eq!(pinned_list.len(), 1);
-        assert_eq!(pinned_list[0].id, record_id);
+        {
+            let _active_proxy_owner =
+                crate::proxy::remember_active_proxy_session_owner(original_id);
+
+            let pinned_response = super::get_transaction(
+                State(state.clone()),
+                Path(record_id.to_string()),
+                Query(super::TransactionGetQuery {
+                    session_id: Some(original_id),
+                }),
+            )
+            .await;
+            assert_eq!(pinned_response.status(), super::StatusCode::OK);
+
+            let pinned_list_response = super::list_transactions(
+                State(state.clone()),
+                Query(super::TransactionQuery {
+                    session_id: Some(original_id),
+                    ..super::TransactionQuery::default()
+                }),
+            )
+            .await;
+            let pinned_list: Vec<crate::model::TransactionSummary> =
+                response_json(pinned_list_response).await;
+            assert_eq!(pinned_list.len(), 1);
+            assert_eq!(pinned_list[0].id, record_id);
+
+            let pinned_page_response = super::list_transactions_page(
+                State(state.clone()),
+                Query(super::TransactionQuery {
+                    session_id: Some(original_id),
+                    ..super::TransactionQuery::default()
+                }),
+            )
+            .await;
+            let pinned_page: super::TransactionPageResponse =
+                response_json(pinned_page_response).await;
+            assert_eq!(pinned_page.items.len(), 1);
+            assert_eq!(pinned_page.items[0].id, record_id);
+        }
 
         let active_annotation_response = super::update_transaction_annotations(
             State(state.clone()),
@@ -6270,7 +6314,7 @@ mod tests {
         assert_eq!(annotated.user_note.as_deref(), Some("inactive note"));
 
         let pinned_page_response = super::list_transactions_page(
-            State(state),
+            State(state.clone()),
             Query(super::TransactionQuery {
                 session_id: Some(original_id),
                 ..super::TransactionQuery::default()

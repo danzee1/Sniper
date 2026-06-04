@@ -17,7 +17,35 @@ if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
 fi
 RELEASE_TAG="v$VERSION"
 GITHUB_RELEASE_REPO="${GITHUB_RELEASE_REPO:-${GITHUB_REPOSITORY:-sm1ee/Sniper}}"
-if [[ "${ALLOW_EXISTING_RELEASE_VERSION:-0}" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+ALLOW_ADHOC_RELEASE="${ALLOW_ADHOC_RELEASE:-0}"
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+  if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    echo "Release artifacts must be built from the main branch; current branch is ${CURRENT_BRANCH:-detached}." >&2
+    echo "For local-only unsigned testing, set ALLOW_ADHOC_RELEASE=1." >&2
+    exit 1
+  fi
+  if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+    echo "Release artifacts require a clean worktree." >&2
+    git status --short --untracked-files=all >&2
+    echo "Commit/stash/remove these files first, or set ALLOW_ADHOC_RELEASE=1 for local-only testing." >&2
+    exit 1
+  fi
+  HEAD_COMMIT="$(git rev-parse HEAD)"
+  REMOTE_MAIN_COMMIT=""
+  if remote_main="$(git ls-remote origin refs/heads/main 2>/dev/null)"; then
+    REMOTE_MAIN_COMMIT="$(printf '%s\n' "$remote_main" | awk 'NF >= 2 { print $1; exit }')"
+  fi
+  if [[ -z "$REMOTE_MAIN_COMMIT" ]]; then
+    echo "Unable to verify origin/main before building release artifacts." >&2
+    exit 1
+  fi
+  if [[ "$HEAD_COMMIT" != "$REMOTE_MAIN_COMMIT" ]]; then
+    echo "Release artifacts must be built from origin/main ($REMOTE_MAIN_COMMIT), not $HEAD_COMMIT." >&2
+    exit 1
+  fi
+fi
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "${ALLOW_EXISTING_RELEASE_VERSION:-0}" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   HEAD_COMMIT="$(git rev-parse HEAD)"
   TAG_COMMIT=""
   if git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null; then
@@ -50,7 +78,6 @@ if [[ "${ALLOW_EXISTING_RELEASE_VERSION:-0}" != "1" ]] && git rev-parse --is-ins
 fi
 REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
 SIGN_IDENTITY="${DEVELOPER_ID_APP:-${SIGN_IDENTITY:-}}"
-ALLOW_ADHOC_RELEASE="${ALLOW_ADHOC_RELEASE:-0}"
 HAS_APPLE_CREDS=0
 HAS_PARTIAL_APPLE_CREDS=0
 if [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
@@ -84,12 +111,30 @@ fi
 
 mkdir -p "$ROOT_DIR/dist"
 DMG_BUILD_MARKER="$(mktemp "$ROOT_DIR/dist/.release-dmg-marker.XXXXXX")"
+APP_NOTARY_ZIP=""
 cleanup_release_marker() {
   rm -f "$DMG_BUILD_MARKER"
+  if [[ -n "$APP_NOTARY_ZIP" ]]; then
+    rm -f "$APP_NOTARY_ZIP"
+  fi
 }
 trap cleanup_release_marker EXIT
 
 "$ROOT_DIR/packaging/macos/make-app.sh"
+
+APP_BUNDLE="$ROOT_DIR/dist/${APP_NAME}.app"
+if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$HAS_APPLE_CREDS" == "1" ]]; then
+  APP_NOTARY_ZIP="$ROOT_DIR/dist/.${APP_NAME}-${VERSION}-app-notary.zip"
+  rm -f "$APP_NOTARY_ZIP"
+  /usr/bin/ditto -c -k --keepParent "$APP_BUNDLE" "$APP_NOTARY_ZIP"
+  xcrun notarytool submit "$APP_NOTARY_ZIP" \
+    --apple-id "$APPLE_ID" \
+    --team-id "$APPLE_TEAM_ID" \
+    --password "$APPLE_APP_PASSWORD" \
+    --wait
+  xcrun stapler staple "$APP_BUNDLE"
+  /usr/sbin/spctl --assess --type execute "$APP_BUNDLE"
+fi
 
 if [[ -n "$REQUESTED_DMG_ARCH" ]]; then
   DMG_ARCH="$REQUESTED_DMG_ARCH" SKIP_BUILD=1 "$ROOT_DIR/packaging/macos/make-dmg.sh"

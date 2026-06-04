@@ -5740,6 +5740,10 @@ button.utility-button.replay-tab-add {
   background: #22863a;
 }
 
+.toast-info {
+  background: #2563eb;
+}
+
 .toast-error {
   background: #cb2431;
 }
