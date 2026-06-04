@@ -69,6 +69,7 @@ use crate::{
 type ProxyClient = Client;
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const MAX_PROXY_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROXY_BUFFERED_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 struct UpstreamResponse {
     status: StatusCode,
@@ -2661,6 +2662,25 @@ fn append_body_preview(preview: &mut Vec<u8>, chunk: &[u8], max_preview: usize) 
     preview.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
 }
 
+async fn read_response_body_limited(response: reqwest::Response, limit: usize) -> Result<Bytes> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("upstream response body exceeds {limit} bytes");
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed to read upstream response body chunk")?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            bail!("upstream response body exceeds {limit} bytes");
+        }
+        body.extend_from_slice(chunk.as_ref());
+    }
+    Ok(body.freeze())
+}
+
 impl StreamedRecordContext {
     async fn store(self, preview: Vec<u8>, body_size: usize) {
         let notes = self.notes.clone();
@@ -2842,7 +2862,8 @@ async fn execute_http_exchange(
             let status = response.status();
             let resp_version = response.version();
             let response_headers = response.headers().clone();
-            match response.bytes().await {
+            match read_response_body_limited(response, MAX_PROXY_BUFFERED_RESPONSE_BODY_BYTES).await
+            {
                 Ok(response_bytes) => {
                     let original_response_capture = {
                         let pre = MessageRecord::from_headers_and_body(
@@ -4285,6 +4306,7 @@ fn binary_frame_record(
 mod tests {
     use super::*;
     use crate::model::HeaderRecord;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn record(name: &str, value: &str) -> HeaderRecord {
         HeaderRecord {
@@ -4321,6 +4343,40 @@ mod tests {
             content_type: None,
             content_decoded,
         }
+    }
+
+    async fn response_from_raw(raw_response: &'static [u8]) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(raw_response).await.unwrap();
+        });
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_response_body_limited_rejects_large_content_length() {
+        let response = response_from_raw(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await;
+
+        let error = read_response_body_limited(response, 3).await.unwrap_err();
+
+        assert!(error.to_string().contains("exceeds 3 bytes"));
+    }
+
+    #[tokio::test]
+    async fn read_response_body_limited_rejects_stream_over_limit() {
+        let response = response_from_raw(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd").await;
+
+        let error = read_response_body_limited(response, 3).await.unwrap_err();
+
+        assert!(error.to_string().contains("exceeds 3 bytes"));
     }
 
     #[test]

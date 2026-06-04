@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env,
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -637,34 +637,17 @@ impl AppState {
         };
         artifact_guard.set_mount_point(mount_point.clone());
 
-        // Find the .app inside the mounted volume
-        let mut new_app_path = None;
-        let mut read_dir = match tokio::fs::read_dir(&mount_point).await {
-            Ok(read_dir) => read_dir,
+        let new_app_path = match find_update_app_bundle(Path::new(&mount_point)) {
+            Ok(path) => path,
             Err(error) => {
                 cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
-                return Err(error).context("failed to read mounted DMG");
+                return Err(error);
             }
         };
-        loop {
-            let entry = match read_dir.next_entry().await {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(error) => {
-                    cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
-                    return Err(error).context("failed to inspect mounted DMG");
-                }
-            };
-            let name = entry.file_name();
-            if name.to_string_lossy().ends_with(".app") {
-                new_app_path = Some(entry.path());
-                break;
-            }
-        }
-        let Some(new_app_path) = new_app_path else {
+        if !new_app_path.exists() {
             cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
-            anyhow::bail!("no .app found in DMG");
-        };
+            anyhow::bail!("downloaded app bundle disappeared from mounted DMG");
+        }
 
         tx.send(UpdateProgress::step("Verifying signature..."))
             .await
@@ -1051,6 +1034,33 @@ fn validate_downloaded_update_size(
         }
     }
     Ok(())
+}
+
+fn find_update_app_bundle(mount_point: &Path) -> Result<PathBuf> {
+    let mut app_entries = Vec::new();
+    for entry in std::fs::read_dir(mount_point).context("failed to read mounted DMG")? {
+        let entry = entry.context("failed to inspect mounted DMG")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".app") {
+            app_entries.push((name.into_owned(), entry.path()));
+        }
+    }
+
+    if app_entries.len() != 1 || app_entries[0].0 != "Sniper.app" {
+        anyhow::bail!("DMG must contain exactly one top-level app named Sniper.app");
+    }
+
+    let app_path = app_entries.remove(0).1;
+    let metadata = std::fs::symlink_metadata(&app_path)
+        .with_context(|| format!("failed to inspect downloaded app {}", app_path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "downloaded app must be a real app directory: {}",
+            app_path.display()
+        );
+    }
+    Ok(app_path)
 }
 
 fn native_release_asset_arch() -> &'static str {
@@ -1584,15 +1594,17 @@ fn proxy_url_targets_loopback(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_release_is_newer, native_release_asset_arch, parse_codesign_team_identifier,
-        proxy_url_targets_loopback, release_asset_archs_match_binary_archs,
-        release_asset_matches_arch, release_update_available, select_release_dmg_asset,
-        self_update_bundle_is_writable, update_installer_script, validate_downloaded_update_size,
-        verify_app_identity, AppState, GitHubAsset, GitHubRelease, UpdateArtifactGuard,
-        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
-        HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+        ensure_release_is_newer, find_update_app_bundle, native_release_asset_arch,
+        parse_codesign_team_identifier, proxy_url_targets_loopback,
+        release_asset_archs_match_binary_archs, release_asset_matches_arch,
+        release_update_available, select_release_dmg_asset, self_update_bundle_is_writable,
+        update_installer_script, validate_downloaded_update_size, verify_app_identity, AppState,
+        GitHubAsset, GitHubRelease, UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH,
+        EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH,
+        PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
+    use std::fs;
     use std::path::Path;
 
     fn asset(name: &str) -> GitHubAsset {
@@ -1852,6 +1864,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("release metadata"));
+    }
+
+    #[test]
+    fn self_update_app_discovery_requires_exactly_one_sniper_app() {
+        let root = std::env::temp_dir().join(format!(
+            "sniper-update-app-discovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sniper_app = root.join("Sniper.app");
+        fs::create_dir_all(&sniper_app).unwrap();
+
+        assert_eq!(find_update_app_bundle(&root).unwrap(), sniper_app);
+
+        fs::create_dir_all(root.join("Other.app")).unwrap();
+        assert!(find_update_app_bundle(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+
+        fs::remove_dir_all(root.join("Other.app")).unwrap();
+        fs::rename(&sniper_app, root.join("Other.app")).unwrap();
+        assert!(find_update_app_bundle(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("Sniper.app"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

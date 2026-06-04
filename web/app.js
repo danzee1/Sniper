@@ -296,6 +296,7 @@ function websocketPagePayload(value) {
 function createHistoryPagingState() {
   return {
     generation: 0,
+    querySignature: "",
     pageSize: HTTP_HISTORY_PAGE_SIZE,
     offset: 0,
     beforeSequence: null,
@@ -3148,38 +3149,69 @@ function transactionPath(id, sessionId = currentSessionId()) {
   return sessionQueryPath(`/api/transactions/${encodeURIComponent(id)}`, sessionId);
 }
 
-function buildTransactionsPageUrl({ limit, offset = 0, beforeSequence = null } = {}) {
+function createHistoryQueryState() {
+  const filters = state.filterSettings || {};
+  const colorTags = filters.colorTags && typeof filters.colorTags[Symbol.iterator] === "function"
+    ? [...filters.colorTags].sort()
+    : [];
+  return {
+    sessionId: currentSessionId() || "",
+    query: state.query || "",
+    method: state.method || "",
+    sortKey: state.sortKey || "index",
+    sortDirection: state.sortDirection || "desc",
+    inScopeOnly: !!filters.inScopeOnly,
+    hideWithoutResponses: !!filters.hideWithoutResponses,
+    onlyParameterized: !!filters.onlyParameterized,
+    onlyNotes: !!filters.onlyNotes,
+    statusClasses: selectedStatusClasses(filters),
+    mimeTypes: selectedMimeTypes(filters),
+    hiddenExtensions: String(filters.hiddenExtensions || "").trim(),
+    port: String(filters.port || "").trim(),
+    colorTags,
+    advancedSearch: String(filters.searchTerm || "").trim(),
+    advancedRegex: !!filters.regex,
+    advancedCaseSensitive: !!filters.caseSensitive,
+    advancedNegative: !!filters.negativeSearch,
+  };
+}
+
+function historyQuerySignature(queryState = createHistoryQueryState()) {
+  return JSON.stringify(queryState);
+}
+
+function isCurrentHistoryQuerySignature(querySignature) {
+  return querySignature === historyQuerySignature();
+}
+
+function buildTransactionsPageUrl({ limit, offset = 0, beforeSequence = null, queryState = createHistoryQueryState() } = {}) {
   const params = new URLSearchParams();
-  const sessionId = currentSessionId();
-  const filters = state.filterSettings;
-  const statusClasses = selectedStatusClasses(filters);
-  const mimeTypes = selectedMimeTypes(filters);
   params.set("limit", String(limit ?? HTTP_HISTORY_PAGE_SIZE));
   if (beforeSequence != null) {
     params.set("before_sequence", String(beforeSequence));
   } else {
     params.set("offset", String(offset));
   }
-  params.set("sort_key", state.sortKey || "index");
-  params.set("sort_direction", state.sortDirection || "desc");
-  if (sessionId) params.set("session_id", sessionId);
+  params.set("sort_key", queryState.sortKey);
+  params.set("sort_direction", queryState.sortDirection);
+  if (queryState.sessionId) params.set("session_id", queryState.sessionId);
   params.set("hide_connect", "true");
-  if (state.query) params.set("q", state.query);
-  if (state.method) params.set("method", state.method);
-  if (filters.inScopeOnly) params.set("in_scope_only", "true");
-  if (filters.hideWithoutResponses) params.set("hide_without_responses", "true");
-  if (filters.onlyParameterized) params.set("only_parameterized", "true");
-  if (filters.onlyNotes) params.set("only_notes", "true");
-  params.set("status_classes", statusClasses.join(","));
-  params.set("mime_types", mimeTypes.join(","));
-  if (filters.hiddenExtensions) params.set("hidden_extensions", filters.hiddenExtensions);
-  if (filters.port) params.set("port", filters.port);
-  if (filters.colorTags?.size) params.set("color_tags", [...filters.colorTags].join(","));
-  if (filters.searchTerm) {
-    params.set("advanced_search", filters.searchTerm);
-    if (filters.regex) params.set("advanced_regex", "true");
-    if (filters.caseSensitive) params.set("advanced_case_sensitive", "true");
-    if (filters.negativeSearch) params.set("advanced_negative", "true");
+  if (queryState.query) params.set("q", queryState.query);
+  if (queryState.method) params.set("method", queryState.method);
+  if (queryState.inScopeOnly) params.set("in_scope_only", "true");
+  if (queryState.hideWithoutResponses) params.set("hide_without_responses", "true");
+  if (queryState.onlyParameterized) params.set("only_parameterized", "true");
+  if (queryState.onlyNotes) params.set("only_notes", "true");
+  params.set("status_classes", queryState.statusClasses.join(","));
+  params.set("mime_types", queryState.mimeTypes.join(","));
+  if (queryState.hiddenExtensions) params.set("hidden_extensions", queryState.hiddenExtensions);
+  if (queryState.port) params.set("port", queryState.port);
+  if (queryState.colorTags.length) params.set("color_tags", queryState.colorTags.join(","));
+  if (queryState.advancedSearch) {
+    params.set("advanced_search", queryState.advancedSearch);
+    if (queryState.advancedRegex) params.set("advanced_regex", "true");
+    if (queryState.advancedCaseSensitive) params.set("advanced_case_sensitive", "true");
+    if (queryState.advancedNegative) params.set("advanced_negative", "true");
   }
   return `/api/transactions-page?${params.toString()}`;
 }
@@ -3208,17 +3240,22 @@ function selectedMimeTypes(filters) {
 }
 
 async function fetchTransactionPage(offsetOrOptions = 0) {
-  const sessionId = currentSessionId();
   const options = typeof offsetOrOptions === "object"
     ? offsetOrOptions
     : { offset: offsetOrOptions };
+  const queryState = options.queryState || createHistoryQueryState();
+  const querySignature = options.querySignature || historyQuerySignature(queryState);
   const response = await fetch(buildTransactionsPageUrl({
     limit: state.historyPaging.pageSize,
     offset: options.offset ?? 0,
     beforeSequence: options.beforeSequence ?? null,
+    queryState,
   }));
   if (!response.ok) {
     const message = await response.text();
+    if (!isCurrentHistoryQuerySignature(querySignature)) {
+      return null;
+    }
     if (els.historyMeta) els.historyMeta.textContent = `HTTP History filter error: ${message}`;
     if (els.liveStatus) {
       els.liveStatus.textContent = "Filter error";
@@ -3227,7 +3264,7 @@ async function fetchTransactionPage(offsetOrOptions = 0) {
     throw new Error(message);
   }
   const page = await response.json();
-  if (sessionId !== currentSessionId()) {
+  if (!isCurrentHistoryQuerySignature(querySignature)) {
     return null;
   }
   return page;
@@ -3279,15 +3316,22 @@ function isKnownCount(value) {
 async function loadTransactions(preserveSelection = true, options = {}) {
   _historyFullLoadInFlight += 1;
   try {
+    const queryState = createHistoryQueryState();
+    const querySignature = historyQuerySignature(queryState);
     clearHistoryBackfill();
     state.historyPaging = createHistoryPagingState();
     state.historyPaging.generation = ++_historyPagingGeneration;
+    state.historyPaging.querySignature = querySignature;
     const generation = state.historyPaging.generation;
-    const page = await fetchTransactionPage(0);
+    const page = await fetchTransactionPage({ offset: 0, queryState, querySignature });
     if (!page) {
       return;
     }
-    if (state.historyPaging.generation !== generation) {
+    if (
+      state.historyPaging.generation !== generation
+      || state.historyPaging.querySignature !== querySignature
+      || !isCurrentHistoryQuerySignature(querySignature)
+    ) {
       return;
     }
     const freshItems = jsonArray(page.items);
@@ -3857,8 +3901,8 @@ function consumeHistoryLoadOptions() {
 
 function scheduleRefresh(options = {}) {
   invalidateVisibleEntriesCache();
+  state.historyDirty = true;
   if (!isHttpHistoryVisible()) {
-    state.historyDirty = true;
     if (options.resetScroll) {
       state.historyResetScrollOnNextLoad = true;
     }
@@ -3970,6 +4014,12 @@ async function loadMoreTransactions({ background = false } = {}) {
   if (paging.loading || !paging.hasMore) {
     return 0;
   }
+  const queryState = createHistoryQueryState();
+  const querySignature = historyQuerySignature(queryState);
+  if (paging.querySignature && paging.querySignature !== querySignature) {
+    return 0;
+  }
+  paging.querySignature = querySignature;
 
   let shouldRenderAfterLoad = !background;
   let shouldBackfillAfterLoad = false;
@@ -3979,12 +4029,17 @@ async function loadMoreTransactions({ background = false } = {}) {
   if (!background) renderHistory();
   try {
     const page = paging.beforeSequence == null
-      ? await fetchTransactionPage(offset)
-      : await fetchTransactionPage({ beforeSequence: paging.beforeSequence });
+      ? await fetchTransactionPage({ offset, queryState, querySignature })
+      : await fetchTransactionPage({ beforeSequence: paging.beforeSequence, queryState, querySignature });
     if (!page) {
       return 0;
     }
-    if (state.historyPaging !== paging || state.historyPaging.generation !== generation) {
+    if (
+      state.historyPaging !== paging
+      || state.historyPaging.generation !== generation
+      || state.historyPaging.querySignature !== querySignature
+      || !isCurrentHistoryQuerySignature(querySignature)
+    ) {
       return 0;
     }
     const pageItems = jsonArray(page.items);
@@ -4008,9 +4063,11 @@ async function loadMoreTransactions({ background = false } = {}) {
     console.error("Failed to load older transactions:", error);
     return 0;
   } finally {
-    paging.loading = false;
-    if (shouldRenderAfterLoad) renderHistory();
-    if (shouldBackfillAfterLoad) scheduleHistoryBackfill();
+    if (state.historyPaging === paging && paging.querySignature === querySignature) {
+      paging.loading = false;
+      if (shouldRenderAfterLoad && isCurrentHistoryQuerySignature(querySignature)) renderHistory();
+      if (shouldBackfillAfterLoad && isCurrentHistoryQuerySignature(querySignature)) scheduleHistoryBackfill();
+    }
   }
 }
 
@@ -4019,17 +4076,28 @@ async function loadNewerTransactions({ background = false } = {}) {
   if (paging.loading || !canUseSequenceCursorForHistoryPaging() || paging.trimmedHeadCount <= 0) {
     return 0;
   }
+  const queryState = createHistoryQueryState();
+  const querySignature = historyQuerySignature(queryState);
+  if (paging.querySignature && paging.querySignature !== querySignature) {
+    return 0;
+  }
+  paging.querySignature = querySignature;
 
   let shouldRenderAfterLoad = !background;
   const generation = paging.generation;
   paging.loading = true;
   if (!background) renderHistory();
   try {
-    const page = await fetchTransactionPage(0);
+    const page = await fetchTransactionPage({ offset: 0, queryState, querySignature });
     if (!page) {
       return 0;
     }
-    if (state.historyPaging !== paging || state.historyPaging.generation !== generation) {
+    if (
+      state.historyPaging !== paging
+      || state.historyPaging.generation !== generation
+      || state.historyPaging.querySignature !== querySignature
+      || !isCurrentHistoryQuerySignature(querySignature)
+    ) {
       return 0;
     }
     const pageItems = jsonArray(page.items);
@@ -4050,8 +4118,10 @@ async function loadNewerTransactions({ background = false } = {}) {
     console.error("Failed to load newer transactions:", error);
     return 0;
   } finally {
-    paging.loading = false;
-    if (shouldRenderAfterLoad) renderHistory();
+    if (state.historyPaging === paging && paging.querySignature === querySignature) {
+      paging.loading = false;
+      if (shouldRenderAfterLoad && isCurrentHistoryQuerySignature(querySignature)) renderHistory();
+    }
   }
 }
 
@@ -4065,14 +4135,19 @@ function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS, optio
   if (!allowAtCap && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
     return;
   }
+  if (!paging.querySignature) {
+    paging.querySignature = historyQuerySignature();
+  }
   paging.backfillScheduled = true;
   const generation = paging.generation;
+  const querySignature = paging.querySignature;
   _historyBackfillTimer = window.setTimeout(async () => {
     _historyBackfillTimer = 0;
     const currentPaging = state.historyPaging;
     if (!currentPaging) return;
-    if (currentPaging.generation !== generation) return;
+    if (currentPaging.generation !== generation || currentPaging.querySignature !== querySignature) return;
     currentPaging.backfillScheduled = false;
+    if (!isCurrentHistoryQuerySignature(querySignature)) return;
     if (_searchActiveUntil > Date.now()) {
       scheduleHistoryBackfill(HTTP_HISTORY_BACKFILL_DELAY_MS, { allowAtCap });
       return;
@@ -4336,14 +4411,27 @@ function scheduleIncrementalRefresh() {
         scheduleRefresh();
         return;
       }
+      const refreshQueryState = createHistoryQueryState();
+      const refreshQuerySignature = historyQuerySignature(refreshQueryState);
+      if (state.historyPaging?.querySignature && state.historyPaging.querySignature !== refreshQuerySignature) {
+        scheduleRefresh();
+        return;
+      }
       const refreshSessionId = state.activeSession?.id || null;
       const refreshItemsVersion = state._itemsVersion;
-      const resp = await fetch(buildTransactionsPageUrl({ limit: 50, offset: 0 }));
-      if (refreshSessionId !== (state.activeSession?.id || null) || refreshItemsVersion !== state._itemsVersion) {
+      const resp = await fetch(buildTransactionsPageUrl({ limit: 50, offset: 0, queryState: refreshQueryState }));
+      if (
+        refreshSessionId !== (state.activeSession?.id || null)
+        || refreshItemsVersion !== state._itemsVersion
+        || !isCurrentHistoryQuerySignature(refreshQuerySignature)
+      ) {
         return;
       }
       if (!resp.ok) {
         const message = await resp.text().catch(() => "");
+        if (!isCurrentHistoryQuerySignature(refreshQuerySignature)) {
+          return;
+        }
         if (els.historyMeta) els.historyMeta.textContent = `HTTP History refresh error: ${message || resp.status}`;
         if (els.liveStatus) {
           els.liveStatus.textContent = "Refresh error";
@@ -4352,7 +4440,12 @@ function scheduleIncrementalRefresh() {
         throw new Error(message || `HTTP History refresh failed: ${resp.status}`);
       }
       const page = await resp.json();
-      if (refreshSessionId !== (state.activeSession?.id || null) || refreshItemsVersion !== state._itemsVersion) {
+      if (
+        refreshSessionId !== (state.activeSession?.id || null)
+        || refreshItemsVersion !== state._itemsVersion
+        || !isCurrentHistoryQuerySignature(refreshQuerySignature)
+        || state.historyPaging?.querySignature !== refreshQuerySignature
+      ) {
         return;
       }
       const recent = jsonArray(page.items);
@@ -5408,16 +5501,24 @@ async function ensureHistoryWindowContainsRecord(record) {
 
   clearHistoryBackfill();
   const paging = state.historyPaging || (state.historyPaging = createHistoryPagingState());
+  const queryState = createHistoryQueryState();
+  const querySignature = historyQuerySignature(queryState);
   const generation = ++_historyPagingGeneration;
   const sessionId = currentSessionId();
   paging.generation = generation;
+  paging.querySignature = querySignature;
   paging.loading = true;
   try {
-    const page = await fetchTransactionPage({ beforeSequence });
+    const page = await fetchTransactionPage({ beforeSequence, queryState, querySignature });
     if (!page || sessionId !== currentSessionId() || state.selectedId !== record.id) {
       return false;
     }
-    if (state.historyPaging !== paging || paging.generation !== generation) {
+    if (
+      state.historyPaging !== paging
+      || paging.generation !== generation
+      || paging.querySignature !== querySignature
+      || !isCurrentHistoryQuerySignature(querySignature)
+    ) {
       return false;
     }
 
@@ -5440,9 +5541,9 @@ async function ensureHistoryWindowContainsRecord(record) {
     showToast(error?.message || "Failed to reveal transaction in HTTP History.", "error", 5000);
     return false;
   } finally {
-    if (state.historyPaging === paging && paging.generation === generation) {
+    if (state.historyPaging === paging && paging.generation === generation && paging.querySignature === querySignature) {
       paging.loading = false;
-      renderHistory();
+      if (isCurrentHistoryQuerySignature(querySignature)) renderHistory();
     }
   }
 }

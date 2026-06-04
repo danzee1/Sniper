@@ -207,4 +207,6 @@ elif [[ "$ALLOW_ADHOC_RELEASE" == "1" ]]; then
   echo "Skipping notarization for explicit local-only release (ALLOW_ADHOC_RELEASE=1)." >&2
 fi
 
+/usr/bin/hdiutil verify "$DMG_PATH"
+
 echo "macOS release artifacts ready in $ROOT_DIR/dist"

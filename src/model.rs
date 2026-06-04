@@ -2,7 +2,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use uuid::Uuid;
+
+const MAX_DECODED_CONTENT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -600,6 +603,14 @@ fn is_false(value: &bool) -> bool {
 }
 
 pub(crate) fn decode_content_encoding(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> {
+    decode_content_encoding_limited(headers, body, MAX_DECODED_CONTENT_BYTES)
+}
+
+fn decode_content_encoding_limited(
+    headers: &HeaderMap,
+    body: &[u8],
+    max_decoded_bytes: usize,
+) -> Option<Vec<u8>> {
     if body.is_empty() {
         return None;
     }
@@ -617,40 +628,84 @@ pub(crate) fn decode_content_encoding(headers: &HeaderMap, body: &[u8]) -> Optio
 
     let mut decoded = body.to_vec();
     for encoding in encodings.iter().rev() {
-        decoded = decode_single_content_encoding(encoding, &decoded)?;
+        decoded = decode_single_content_encoding(encoding, &decoded, max_decoded_bytes)?;
     }
 
     Some(decoded)
 }
 
-fn decode_single_content_encoding(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
+fn decode_single_content_encoding(
+    encoding: &str,
+    body: &[u8],
+    max_decoded_bytes: usize,
+) -> Option<Vec<u8>> {
     match encoding {
         "gzip" | "x-gzip" => {
-            use std::io::Read;
             let mut decoder = flate2::read::GzDecoder::new(body);
-            let mut out = Vec::new();
-            decoder.read_to_end(&mut out).ok()?;
-            Some(out)
+            read_limited_to_end(&mut decoder, max_decoded_bytes)
         }
         "deflate" => {
-            use std::io::Read;
             let mut zlib_decoder = flate2::read::ZlibDecoder::new(body);
-            let mut out = Vec::new();
-            if zlib_decoder.read_to_end(&mut out).is_ok() {
+            if let Some(out) = read_limited_to_end(&mut zlib_decoder, max_decoded_bytes) {
                 return Some(out);
             }
             let mut raw_decoder = flate2::read::DeflateDecoder::new(body);
-            let mut out = Vec::new();
-            raw_decoder.read_to_end(&mut out).ok()?;
-            Some(out)
+            read_limited_to_end(&mut raw_decoder, max_decoded_bytes)
         }
         "br" => {
-            let mut out = Vec::new();
-            brotli::BrotliDecompress(&mut std::io::Cursor::new(body), &mut out).ok()?;
-            Some(out)
+            let mut writer = LimitedVecWriter::new(max_decoded_bytes);
+            brotli::BrotliDecompress(&mut std::io::Cursor::new(body), &mut writer).ok()?;
+            Some(writer.into_inner())
         }
-        "zstd" | "zstandard" => zstd::decode_all(std::io::Cursor::new(body)).ok(),
+        "zstd" | "zstandard" => {
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body)).ok()?;
+            read_limited_to_end(&mut decoder, max_decoded_bytes)
+        }
         _ => None,
+    }
+}
+
+fn read_limited_to_end<R: std::io::Read>(reader: &mut R, limit: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() <= limit).then_some(out)
+}
+
+struct LimitedVecWriter {
+    out: Vec<u8>,
+    limit: usize,
+}
+
+impl LimitedVecWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            out: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.out
+    }
+}
+
+impl std::io::Write for LimitedVecWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.out.len().saturating_add(buf.len()) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded content exceeds limit",
+            ));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -758,6 +813,20 @@ mod tests {
         assert_eq!(record.decoded_body_size, Some(raw.len()));
         assert!(!record.preview_truncated);
         assert!(record.content_decoded);
+    }
+
+    #[test]
+    fn content_encoding_decode_respects_decoded_size_limit() {
+        let raw = b"hello";
+        let compressed = gzip(raw);
+        let headers = compressed_headers(compressed.len());
+
+        assert!(decode_content_encoding_limited(&headers, &compressed, raw.len()).is_some());
+        assert!(decode_content_encoding_limited(&headers, &compressed, raw.len() - 1).is_none());
+
+        let record = MessageRecord::from_headers_and_body(&headers, &compressed, 8);
+        assert!(record.content_decoded);
+        assert_eq!(record.decoded_body_size, Some(raw.len()));
     }
 
     #[test]

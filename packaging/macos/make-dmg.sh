@@ -231,6 +231,30 @@ validate_required_executable_archs() {
   done
 }
 
+validate_no_extra_macos_executables() {
+  local app_bundle="$1"
+  local macos_dir="$app_bundle/Contents/MacOS"
+  local executable_path
+  local executable_name
+  local allowed
+
+  while IFS= read -r executable_path; do
+    executable_name="$(basename "$executable_path")"
+    allowed=0
+    for required in "${REQUIRED_EXECUTABLES[@]}"; do
+      if [[ "$executable_name" == "$required" ]]; then
+        allowed=1
+        break
+      fi
+    done
+    if [[ "$allowed" != "1" ]]; then
+      echo "Unexpected executable in app bundle: $executable_path" >&2
+      echo "Only ${REQUIRED_EXECUTABLES[*]} are allowed under Contents/MacOS." >&2
+      return 1
+    fi
+  done < <(find "$macos_dir" -maxdepth 1 -type f -perm -111 -print)
+}
+
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   "$ROOT_DIR/packaging/macos/make-app.sh"
 elif [[ ! -d "$APP_BUNDLE" ]]; then
@@ -246,6 +270,9 @@ if ! DMG_ARCH="$(detect_app_dmg_arch "$APP_BUNDLE")"; then
   exit 1
 fi
 if ! validate_required_executable_archs "$APP_BUNDLE" "$DMG_ARCH"; then
+  exit 1
+fi
+if ! validate_no_extra_macos_executables "$APP_BUNDLE"; then
   exit 1
 fi
 

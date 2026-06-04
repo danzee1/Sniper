@@ -64,6 +64,16 @@ const MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WORKSPACE_EMBEDDED_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WORKSPACE_FUZZER_ATTACK_RESULTS: usize = 5_000;
 const MAX_WORKSPACE_STORED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEQUENCE_STEPS: usize = 250;
+const MAX_SEQUENCE_EXTRACTIONS_PER_STEP: usize = 50;
+const MAX_SEQUENCE_TEXT_FIELD_BYTES: usize = 64 * 1024;
+const MAX_SEQUENCE_DEFINITION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SCANNER_CUSTOM_RULES: usize = 250;
+const MAX_SCANNER_FIELD_BYTES: usize = 64 * 1024;
+const MAX_SCANNER_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MATCH_REPLACE_RULES: usize = 500;
+const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
+const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(RustEmbed)]
 #[folder = "web/decoder/"]
@@ -1352,7 +1362,47 @@ fn validate_port_text(port: &str, label: &str) -> std::result::Result<(), String
 fn validate_sequence_definition(
     definition: &SequenceDefinition,
 ) -> std::result::Result<(), String> {
+    validate_serialized_size(
+        definition,
+        "sequence definition",
+        MAX_SEQUENCE_DEFINITION_BYTES,
+    )?;
+    validate_text_field(
+        "sequence name",
+        &definition.name,
+        MAX_SEQUENCE_TEXT_FIELD_BYTES,
+    )?;
+    if definition.steps.len() > MAX_SEQUENCE_STEPS {
+        return Err(format!(
+            "sequence cannot contain more than {MAX_SEQUENCE_STEPS} steps"
+        ));
+    }
     for step in &definition.steps {
+        validate_text_field(
+            "sequence step label",
+            &step.label,
+            MAX_SEQUENCE_TEXT_FIELD_BYTES,
+        )?;
+        if let Some(request_text) = &step.request_text {
+            validate_text_field(
+                "sequence step request text",
+                request_text,
+                MAX_SEQUENCE_TEXT_FIELD_BYTES,
+            )?;
+        }
+        if let Some(parse_error) = &step.request_parse_error {
+            validate_text_field(
+                "sequence step parse error",
+                parse_error,
+                MAX_SEQUENCE_TEXT_FIELD_BYTES,
+            )?;
+        }
+        if step.extractions.len() > MAX_SEQUENCE_EXTRACTIONS_PER_STEP {
+            return Err(format!(
+                "sequence step {} cannot contain more than {MAX_SEQUENCE_EXTRACTIONS_PER_STEP} extractions",
+                step.label
+            ));
+        }
         validate_editable_request(&step.request)
             .map_err(|error| format!("invalid request in sequence step {}: {error}", step.label))?;
         normalize_replay_http_version(step.http_version.as_deref()).map_err(|error| {
@@ -1367,6 +1417,16 @@ fn validate_sequence_definition(
             })?;
         }
         for rule in &step.extractions {
+            validate_text_field(
+                "sequence extraction variable name",
+                &rule.variable_name,
+                MAX_SEQUENCE_TEXT_FIELD_BYTES,
+            )?;
+            validate_text_field(
+                "sequence extraction pattern",
+                &rule.pattern,
+                MAX_SEQUENCE_TEXT_FIELD_BYTES,
+            )?;
             if rule.variable_name.trim().is_empty() {
                 return Err(format!(
                     "sequence step {} has an extraction with an empty variable name",
@@ -1406,7 +1466,44 @@ fn validate_sequence_definition(
 fn validate_scanner_config(
     config: &crate::scanner::ScannerConfig,
 ) -> std::result::Result<(), String> {
+    validate_serialized_size(config, "scanner config", MAX_SCANNER_CONFIG_BYTES)?;
+    if config.custom_rules.len() > MAX_SCANNER_CUSTOM_RULES {
+        return Err(format!(
+            "scanner config cannot contain more than {MAX_SCANNER_CUSTOM_RULES} custom rules"
+        ));
+    }
     for rule in &config.custom_rules {
+        validate_text_field("custom scanner rule id", &rule.id, MAX_SCANNER_FIELD_BYTES)?;
+        validate_text_field(
+            "custom scanner rule name",
+            &rule.name,
+            MAX_SCANNER_FIELD_BYTES,
+        )?;
+        validate_text_field(
+            "custom scanner rule target",
+            &rule.target,
+            MAX_SCANNER_FIELD_BYTES,
+        )?;
+        validate_text_field(
+            "custom scanner rule header name",
+            &rule.header_name,
+            MAX_SCANNER_FIELD_BYTES,
+        )?;
+        validate_text_field(
+            "custom scanner rule pattern",
+            &rule.pattern,
+            MAX_SCANNER_FIELD_BYTES,
+        )?;
+        validate_text_field(
+            "custom scanner rule category",
+            &rule.category,
+            MAX_SCANNER_FIELD_BYTES,
+        )?;
+        validate_text_field(
+            "custom scanner rule description",
+            &rule.description,
+            MAX_SCANNER_FIELD_BYTES,
+        )?;
         if rule.id.trim().is_empty() {
             return Err("custom scanner rule id is required".to_string());
         }
@@ -1436,7 +1533,28 @@ fn validate_scanner_config(
 }
 
 fn validate_match_replace_rules(rules: &[MatchReplaceRule]) -> std::result::Result<(), String> {
+    validate_serialized_size(&rules, "match-replace rules", MAX_MATCH_REPLACE_RULES_BYTES)?;
+    if rules.len() > MAX_MATCH_REPLACE_RULES {
+        return Err(format!(
+            "match-replace cannot contain more than {MAX_MATCH_REPLACE_RULES} rules"
+        ));
+    }
     for rule in rules {
+        validate_text_field(
+            "match-replace description",
+            &rule.description,
+            MAX_MATCH_REPLACE_FIELD_BYTES,
+        )?;
+        validate_text_field(
+            "match-replace search",
+            &rule.search,
+            MAX_MATCH_REPLACE_FIELD_BYTES,
+        )?;
+        validate_text_field(
+            "match-replace replacement",
+            &rule.replace,
+            MAX_MATCH_REPLACE_FIELD_BYTES,
+        )?;
         if rule.regex && !rule.search.is_empty() {
             RegexBuilder::new(&rule.search)
                 .case_insensitive(!rule.case_sensitive)
@@ -1448,6 +1566,27 @@ fn validate_match_replace_rules(rules: &[MatchReplaceRule]) -> std::result::Resu
                     )
                 })?;
         }
+    }
+    Ok(())
+}
+
+fn validate_text_field(label: &str, value: &str, limit: usize) -> std::result::Result<(), String> {
+    if value.len() > limit {
+        return Err(format!("{label} cannot exceed {limit} bytes"));
+    }
+    Ok(())
+}
+
+fn validate_serialized_size<T: Serialize>(
+    value: &T,
+    label: &str,
+    limit: usize,
+) -> std::result::Result<(), String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("failed to measure {label}: {error}"))?
+        .len();
+    if bytes > limit {
+        return Err(format!("{label} cannot exceed {limit} stored bytes"));
     }
     Ok(())
 }
@@ -4563,6 +4702,41 @@ mod tests {
     }
 
     #[test]
+    fn match_replace_validation_rejects_oversized_rule_sets() {
+        let rule = MatchReplaceRule {
+            id: uuid::Uuid::new_v4(),
+            enabled: true,
+            description: "large".to_string(),
+            scope: MatchReplaceScope::Request,
+            target: MatchReplaceTarget::Path,
+            search: "x".repeat(super::MAX_MATCH_REPLACE_FIELD_BYTES + 1),
+            replace: String::new(),
+            regex: false,
+            case_sensitive: true,
+        };
+        assert!(validate_match_replace_rules(&[rule])
+            .unwrap_err()
+            .contains("match-replace search"));
+
+        let rules = (0..=super::MAX_MATCH_REPLACE_RULES)
+            .map(|_| MatchReplaceRule {
+                id: uuid::Uuid::new_v4(),
+                enabled: true,
+                description: "rule".to_string(),
+                scope: MatchReplaceScope::Request,
+                target: MatchReplaceTarget::Path,
+                search: "x".to_string(),
+                replace: String::new(),
+                regex: false,
+                case_sensitive: true,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_match_replace_rules(&rules)
+            .unwrap_err()
+            .contains("more than"));
+    }
+
+    #[test]
     fn sequence_validation_rejects_invalid_response_header_extractions() {
         let request = EditableRequest {
             scheme: "https".to_string(),
@@ -4598,6 +4772,47 @@ mod tests {
         assert!(super::validate_sequence_definition(&definition).is_err());
         definition.steps[0].extractions[0].pattern = "x-session".to_string();
         assert!(super::validate_sequence_definition(&definition).is_ok());
+    }
+
+    #[test]
+    fn sequence_validation_rejects_oversized_definitions() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let step = SequenceStep {
+            id: uuid::Uuid::new_v4(),
+            label: "step".to_string(),
+            request,
+            source_transaction_id: None,
+            http_version: None,
+            target: None,
+            request_text: None,
+            request_parse_error: None,
+            extractions: Vec::new(),
+        };
+        let mut definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "sequence".to_string(),
+            steps: vec![step.clone(); super::MAX_SEQUENCE_STEPS + 1],
+        };
+        assert!(super::validate_sequence_definition(&definition)
+            .unwrap_err()
+            .contains("more than"));
+
+        definition.steps = vec![SequenceStep {
+            label: "x".repeat(super::MAX_SEQUENCE_TEXT_FIELD_BYTES + 1),
+            ..step
+        }];
+        assert!(super::validate_sequence_definition(&definition)
+            .unwrap_err()
+            .contains("sequence step label"));
     }
 
     #[test]
@@ -4732,6 +4947,39 @@ mod tests {
         });
 
         assert!(super::validate_scanner_config(&config).is_err());
+    }
+
+    #[test]
+    fn scanner_config_rejects_oversized_custom_rule_sets() {
+        let rule = CustomRule {
+            id: "custom".to_string(),
+            name: "Custom".to_string(),
+            enabled: true,
+            target: "response_body".to_string(),
+            header_name: String::new(),
+            pattern: "x".to_string(),
+            severity: Severity::Info,
+            category: "custom".to_string(),
+            description: String::new(),
+        };
+        let config = ScannerConfig {
+            custom_rules: vec![rule.clone(); super::MAX_SCANNER_CUSTOM_RULES + 1],
+            ..ScannerConfig::default()
+        };
+        assert!(super::validate_scanner_config(&config)
+            .unwrap_err()
+            .contains("custom rules"));
+
+        let config = ScannerConfig {
+            custom_rules: vec![CustomRule {
+                pattern: "x".repeat(super::MAX_SCANNER_FIELD_BYTES + 1),
+                ..rule
+            }],
+            ..ScannerConfig::default()
+        };
+        assert!(super::validate_scanner_config(&config)
+            .unwrap_err()
+            .contains("custom scanner rule pattern"));
     }
 
     #[test]
