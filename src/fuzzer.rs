@@ -776,6 +776,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_connection_failure_marks_fuzzer_result_failed_with_transaction_record() {
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 4096,
+            data_dir: std::env::temp_dir()
+                .join(format!("sniper-fuzzer-upstream-failure-{}", Uuid::new_v4())),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let request = EditableRequest {
+            scheme: "http".to_string(),
+            host: "127.0.0.1:1".to_string(),
+            method: "GET".to_string(),
+            path: "/$payload$".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+
+        let attack = run_attack_for_session(
+            state,
+            session.clone(),
+            request,
+            vec!["payload".to_string()],
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(attack.status, FuzzerAttackStatus::Failed));
+        let result = attack.results.first().unwrap();
+        let transaction_id = result
+            .transaction_id
+            .expect("failed replay result should keep transaction id");
+        assert_eq!(result.status, Some(502));
+        assert!(result
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Upstream request failed"));
+
+        let records = session.store.snapshot(Some(10)).await;
+        assert!(records.iter().any(|record| record.id == transaction_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn registry_metadata_failure_persists_rolled_back_fuzzer_snapshot() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-fuzzer-registry-rollback-{}",

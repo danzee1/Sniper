@@ -255,6 +255,14 @@ validate_no_extra_macos_executables() {
   done < <(find "$macos_dir" -maxdepth 1 -type f -perm -111 -print)
 }
 
+verify_app_bundle_signature() {
+  local app_bundle="$1"
+  if ! /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_bundle"; then
+    echo "App bundle code signature verification failed: $app_bundle" >&2
+    return 1
+  fi
+}
+
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   "$ROOT_DIR/packaging/macos/make-app.sh"
 elif [[ ! -d "$APP_BUNDLE" ]]; then
@@ -273,6 +281,9 @@ if ! validate_required_executable_archs "$APP_BUNDLE" "$DMG_ARCH"; then
   exit 1
 fi
 if ! validate_no_extra_macos_executables "$APP_BUNDLE"; then
+  exit 1
+fi
+if ! verify_app_bundle_signature "$APP_BUNDLE"; then
   exit 1
 fi
 
@@ -302,6 +313,9 @@ STAGING_DIR="$TMP_ROOT/dmg-root"
 
 mkdir -p "$STAGING_DIR/.background"
 cp -R "$APP_BUNDLE" "$STAGING_DIR/"
+if ! verify_app_bundle_signature "$STAGING_DIR/$(basename "$APP_BUNDLE")"; then
+  exit 1
+fi
 ln -s /Applications "$STAGING_DIR/Applications"
 cp "$BG_IMG" "$STAGING_DIR/.background/background.png"
 

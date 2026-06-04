@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use url::{form_urlencoded, Url};
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{session::SessionContext, state::AppState};
 
 const MAX_OAST_BROADCAST_CAPACITY: usize = 4096;
 
@@ -1171,14 +1171,7 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
-        let runtime = session.runtime.snapshot().await;
-        let config = OastConfig {
-            enabled: runtime.oast_enabled,
-            server_url: runtime.oast_server_url.clone(),
-            token: runtime.oast_token.clone(),
-            polling_interval_secs: runtime.oast_polling_interval_secs,
-            provider: runtime.oast_provider.clone(),
-        };
+        let config = oast_config_from_session_runtime(&session).await;
         session.oast.update_config(config.clone()).await;
 
         let session_changed = prev_session_id != Some(session.id());
@@ -1208,7 +1201,6 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             continue;
         }
 
-        let interval = Duration::from_secs(config.polling_interval_secs.max(1));
         let config_changed = session_changed
             || prev_provider.as_ref() != Some(&config.provider)
             || prev_url.as_deref() != Some(&config.server_url)
@@ -1289,6 +1281,7 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             }
         }
 
+        drop(operation_guard);
         let callbacks = match config.provider {
             OastProvider::Interactsh => {
                 poll_interactsh_from_store(&session.oast, &config, &client).await
@@ -1296,6 +1289,31 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             OastProvider::Boast => poll_boast(&config.server_url, &client).await,
             OastProvider::Custom => poll_custom(&config, &client).await,
         };
+        let operation_guard = operation_lock.lock().await;
+        if !state.sessions.contains_session(session.id()) {
+            prev_session_id = None;
+            prev_provider = None;
+            prev_url = None;
+            prev_token = None;
+            prev_store = None;
+            drop(operation_guard);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        let latest_config = oast_config_from_session_runtime(&session).await;
+        session.oast.update_config(latest_config.clone()).await;
+        if !oast_poll_target_still_current(&latest_config, &config) {
+            debug!(
+                session_id = %session.id(),
+                previous_provider = %config.provider,
+                latest_provider = %latest_config.provider,
+                "discarding stale OAST poll result after config changed"
+            );
+            drop(operation_guard);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        let interval = Duration::from_secs(latest_config.polling_interval_secs.max(1));
 
         if !callbacks.is_empty() {
             info!(
@@ -1333,6 +1351,25 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
         drop(operation_guard);
         tokio::time::sleep(interval).await;
     }
+}
+
+async fn oast_config_from_session_runtime(session: &SessionContext) -> OastConfig {
+    let runtime = session.runtime.snapshot().await;
+    OastConfig {
+        enabled: runtime.oast_enabled,
+        server_url: runtime.oast_server_url.clone(),
+        token: runtime.oast_token.clone(),
+        polling_interval_secs: runtime.oast_polling_interval_secs,
+        provider: runtime.oast_provider.clone(),
+    }
+}
+
+fn oast_poll_target_still_current(latest: &OastConfig, polled: &OastConfig) -> bool {
+    latest.enabled
+        && !latest.server_url.is_empty()
+        && latest.provider == polled.provider
+        && latest.server_url == polled.server_url
+        && latest.token == polled.token
 }
 
 /// Poll Interactsh using the registration state stored in OastStore.
@@ -1591,6 +1628,32 @@ mod tests {
         restored.restore_registration_blocking(snapshot);
 
         assert!(restored.registration_matches_config(&config).await);
+    }
+
+    #[test]
+    fn oast_poll_target_matches_only_same_enabled_endpoint() {
+        let config = interactsh_config("token-a");
+        assert!(oast_poll_target_still_current(&config, &config));
+
+        let mut interval_changed = config.clone();
+        interval_changed.polling_interval_secs += 1;
+        assert!(oast_poll_target_still_current(&interval_changed, &config));
+
+        let mut disabled = config.clone();
+        disabled.enabled = false;
+        assert!(!oast_poll_target_still_current(&disabled, &config));
+
+        let mut changed_provider = config.clone();
+        changed_provider.provider = OastProvider::Boast;
+        assert!(!oast_poll_target_still_current(&changed_provider, &config));
+
+        let mut changed_url = config.clone();
+        changed_url.server_url = "https://other.example.test".to_string();
+        assert!(!oast_poll_target_still_current(&changed_url, &config));
+
+        let mut changed_token = config.clone();
+        changed_token.token = "token-b".to_string();
+        assert!(!oast_poll_target_still_current(&changed_token, &config));
     }
 
     #[tokio::test]

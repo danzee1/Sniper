@@ -740,6 +740,11 @@ impl AppState {
             return Err(error.context("failed to flush pending sessions before self-update"));
         }
 
+        if let Err(error) = self.prepare_for_self_update_shutdown().await {
+            cleanup_update_artifacts(None, &tmp_dir).await;
+            return Err(error);
+        }
+
         if let Err(error) = spawn_update_installer_after_exit(
             std::process::id(),
             &staged_app,
@@ -755,7 +760,7 @@ impl AppState {
         artifact_guard.disarm();
         update_guard.keep_latched();
         tx.send(UpdateProgress::step("Restarting...")).await.ok();
-        self.prepare_for_self_update_shutdown().await;
+        self.remove_runtime_state_for_self_update_restart();
 
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -775,7 +780,7 @@ impl AppState {
         })
     }
 
-    async fn prepare_for_self_update_shutdown(&self) {
+    async fn prepare_for_self_update_shutdown(&self) -> Result<()> {
         self.ws_replay.disconnect_all().await;
         self.abort_proxy_task().await;
         crate::proxy::close_live_websocket_relays(
@@ -784,18 +789,16 @@ impl AppState {
         )
         .await;
         crate::proxy::drain_proxy_connections(Duration::from_secs(1)).await;
-        if let Err(error) = crate::proxy::flush_pending_session_persists(self).await {
-            tracing::warn!(
-                ?error,
-                "failed to flush pending session snapshots before self-update restart"
-            );
-        }
-        if let Err(error) = self.persist_active_session().await {
-            tracing::warn!(
-                ?error,
-                "failed to persist active session before self-update restart"
-            );
-        }
+        crate::proxy::flush_pending_session_persists(self)
+            .await
+            .context("failed to flush pending session snapshots before self-update restart")?;
+        self.persist_active_session()
+            .await
+            .context("failed to persist active session before self-update restart")?;
+        Ok(())
+    }
+
+    fn remove_runtime_state_for_self_update_restart(&self) {
         if let Err(error) = crate::runtime_state::remove_runtime_state(&self.config.data_dir) {
             tracing::warn!(
                 ?error,

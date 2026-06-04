@@ -819,13 +819,6 @@ const LAYOUT_TEXTAREA_IDS = [
   "wsHandshakeHeaders",
 ];
 
-init().catch((error) => {
-  console.error(error);
-  els.historyMeta.textContent = "Failed to load Sniper.";
-  els.liveStatus.textContent = "Error";
-  els.liveStatus.classList.remove("online");
-});
-
 async function init() {
   loadDisplaySettings();
   loadHistoryColumnWidths();
@@ -10221,8 +10214,13 @@ function cancelReplaySend() {
     renderReplayTabs();
   }
   setReplaySending(false);
-  els.replayResponseMeta.textContent = "Cancelled.";
-  renderReplayResponseView("");
+  if (tab && tab.type !== "websocket") {
+    renderReplayEmptyResponse(tab);
+  } else {
+    els.replayResponseMeta.textContent = "Cancelled.";
+    els.replayFollowRedirectButton?.classList.add("hidden");
+    renderReplayResponseView("");
+  }
 }
 
 function clearReplaySendInFlight() {
@@ -10278,6 +10276,7 @@ async function sendReplay() {
   // Enter sending state after validation so parse errors do not discard the last response.
   tab.responseRecord = null;
   tab.notice = "";
+  els.replayFollowRedirectButton?.classList.add("hidden");
   els.replayResponseMeta.textContent = "";
   renderReplayResponseView("");
   const sendingTabId = tab.id;
@@ -10831,7 +10830,7 @@ function renderReplayTabs() {
       const pinBtn = `<button class="replay-tab-pin-btn ${pinBtnState}" type="button" aria-label="${pinLabel}" title="${pinLabel}" aria-pressed="${tab.pinned ? "true" : "false"}" ${pinHiddenAttrs}>\uD83D\uDCCC</button>`;
       const autoLabel = replayTabAutoLabel(tab);
       const label = replayTabLabel(tab);
-      const title = label;
+      const title = replayTabTooltipLabel(tab, label, autoLabel);
       const labelControl = state.replayRenamingTabId === tab.id
         ? `<input class="replay-tab-name-input" type="text" value="${escapeHtml(tab.customLabel || "")}" placeholder="${escapeHtml(autoLabel)}" maxlength="80" aria-label="Replay tab name">`
         : `<button class="replay-tab-button" type="button" title="${escapeHtml(title)}">${escapeHtml(label)}</button>`;
@@ -10904,7 +10903,7 @@ function refreshReplayTabLabel(id) {
 
   const autoLabel = replayTabAutoLabel(tab);
   const label = replayTabLabel(tab);
-  const title = label;
+  const title = replayTabTooltipLabel(tab, label, autoLabel);
   const button = tabElement.querySelector(".replay-tab-button");
   if (button) {
     button.textContent = label;
@@ -11023,6 +11022,10 @@ function replayTabLabel(tab) {
     return tab.customLabel;
   }
   return replayTabAutoLabel(tab);
+}
+
+function replayTabTooltipLabel(tab, label = replayTabLabel(tab), autoLabel = replayTabAutoLabel(tab)) {
+  return tab.customLabel ? `${label} / ${autoLabel}` : label;
 }
 
 function replayTabAutoLabel(tab) {
@@ -17316,13 +17319,14 @@ const payloadDecoPlugin = CM.ViewPlugin.fromClass(
   { decorations: (v) => v.decorations },
 );
 
-const cmProgrammaticSetContent = CM.Annotation.define();
+const cmProgrammaticViews = new WeakSet();
 
 /** Add an update listener to a CM EditorView; returns a dispose function. */
 function addCMUpdateListener(view, callback) {
   const listener = CM.EditorView.updateListener.of((update) => {
-    const programmatic = update.transactions.some((tr) => tr.annotation(cmProgrammaticSetContent));
-    if (update.docChanged && !programmatic) callback(update.state.doc.toString());
+    if (update.docChanged && !cmProgrammaticViews.has(update.view)) {
+      callback(update.state.doc.toString());
+    }
   });
   view.dispatch({ effects: CM.StateEffect.appendConfig.of(listener) });
   return () => {}; // CM does not support removing extensions, but the view will be destroyed
@@ -17450,13 +17454,14 @@ class SniperCodeView {
     if (view.state.doc.toString() === nextText) {
       return;
     }
-	view.dispatch({
-	  changes: { from: 0, to: view.state.doc.length, insert: nextText },
-	  annotations: [
-	    cmProgrammaticSetContent.of(true),
-	    CM.Transaction.addToHistory.of(false),
-	  ],
-	});
+    cmProgrammaticViews.add(view);
+    try {
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: nextText },
+      });
+    } finally {
+      cmProgrammaticViews.delete(view);
+    }
   }
 
   /** Apply search highlights and return match info. */
@@ -17548,3 +17553,10 @@ function updateCodePaneCM(key, container, text, options = {}) {
 function getCMView(key) {
   return _cmViews[key] || null;
 }
+
+init().catch((error) => {
+  console.error(error);
+  els.historyMeta.textContent = "Failed to load Sniper.";
+  els.liveStatus.textContent = "Error";
+  els.liveStatus.classList.remove("online");
+});

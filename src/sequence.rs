@@ -866,6 +866,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_connection_failure_marks_sequence_step_failed_with_transaction_record() {
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 4096,
+            data_dir: std::env::temp_dir().join(format!(
+                "sniper-sequence-upstream-failure-{}",
+                Uuid::new_v4()
+            )),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let request = EditableRequest {
+            scheme: "http".to_string(),
+            host: "127.0.0.1:1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let definition = SequenceDefinition {
+            id: Uuid::new_v4(),
+            name: "Upstream failure".to_string(),
+            steps: vec![SequenceStep {
+                id: Uuid::new_v4(),
+                label: "connection refused".to_string(),
+                request,
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+                request_text: None,
+                request_parse_error: None,
+                extractions: Vec::new(),
+            }],
+        };
+
+        let run = run_sequence(state, session.clone(), definition)
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, SequenceRunStatus::Failed);
+        let step = run.step_results.first().unwrap();
+        let transaction_id = step
+            .transaction_id
+            .expect("failed replay step should keep transaction id");
+        assert_eq!(step.status, Some(502));
+        assert!(step
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Upstream request failed"));
+
+        let records = session.store.snapshot(Some(10)).await;
+        assert!(records.iter().any(|record| record.id == transaction_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn registry_metadata_failure_persists_rolled_back_sequence_snapshot() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-sequence-registry-rollback-{}",
