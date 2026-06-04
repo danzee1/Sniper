@@ -23,8 +23,9 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 PLIST_TEMPLATE="$ROOT_DIR/packaging/macos/Info.plist"
 PLIST_OUT="$CONTENTS_DIR/Info.plist"
 ENTITLEMENTS="$ROOT_DIR/packaging/macos/entitlements.plist"
-BIN_PATH="$ROOT_DIR/target/release/sniper-desktop"
 VERSION="${VERSION:-$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)}"
+CARGO_BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/sniper-cargo-build.XXXXXX")"
+trap 'rm -f "$CARGO_BUILD_LOG"' EXIT
 
 sed_escape_replacement() {
   printf '%s' "$1" | sed -e 's/[\/&\\]/\\&/g'
@@ -45,12 +46,31 @@ plist_sed_replacement() {
 rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
-cargo build --release --bin sniper-desktop --bin sniper-cli
+echo "Building release binaries..."
+if ! cargo build --release --bin sniper-desktop --bin sniper-cli --message-format=json-render-diagnostics > "$CARGO_BUILD_LOG"; then
+  cat "$CARGO_BUILD_LOG" >&2
+  exit 1
+fi
 
+cargo_bin_path() {
+  local bin_name="$1"
+  local path
+  path="$(grep '"reason":"compiler-artifact"' "$CARGO_BUILD_LOG" \
+    | grep "\"name\":\"$bin_name\"" \
+    | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' \
+    | tail -n 1 || true)"
+  if [[ -z "$path" || ! -x "$path" ]]; then
+    echo "Cargo did not produce an executable for $bin_name" >&2
+    exit 1
+  fi
+  printf '%s\n' "$path"
+}
+
+BIN_PATH="$(cargo_bin_path sniper-desktop)"
 cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
 
-CLI_BIN_PATH="$ROOT_DIR/target/release/sniper-cli"
+CLI_BIN_PATH="$(cargo_bin_path sniper-cli)"
 cp "$CLI_BIN_PATH" "$MACOS_DIR/sniper-cli"
 chmod +x "$MACOS_DIR/sniper-cli"
 sed \

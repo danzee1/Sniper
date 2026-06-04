@@ -1535,7 +1535,7 @@ async fn update_workspace_state(
         current.session_id = Some(active_session.id());
         return (StatusCode::CONFLICT, Json(current)).into_response();
     } else {
-        match state.sessions.load_context(target_session_id) {
+        match state.session_context_for_id(target_session_id).await {
             Ok(session) => session,
             Err(error) => return session_load_failure_response(target_session_id, error),
         }
@@ -1629,8 +1629,8 @@ async fn resolve_session_for_optional_id(
         return Err(StatusCode::NOT_FOUND.into_response());
     }
     state
-        .sessions
-        .load_context(target_session_id)
+        .session_context_for_id(target_session_id)
+        .await
         .map_err(|error| session_load_failure_response(target_session_id, error))
 }
 
@@ -2740,6 +2740,11 @@ async fn run_sequence(
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
 
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
     match sequence::run_sequence(state, session, definition).await {
         Ok(record) => Json(record).into_response(),
         Err(error) => (sequence_run_error_status(&error), error.to_string()).into_response(),
@@ -2798,6 +2803,11 @@ async fn send_replay(
     }
     if let Err(error) = validate_editable_request(&payload.request) {
         return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
     }
     match proxy::try_send_replay_request_for_session(
         state,
@@ -2903,6 +2913,11 @@ async fn run_fuzzer_attack(
         if let Err(error) = validate_request_target_override(target) {
             return (StatusCode::BAD_REQUEST, error).into_response();
         }
+    }
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
     }
     match fuzzer::run_attack_for_session(
         state,
@@ -3393,6 +3408,12 @@ async fn events(
                     }
                 }
                 _ = session_check.tick() => {
+                    if !state.sessions.contains_session(session_id) {
+                        yield Ok(Event::default()
+                            .event("session_deleted")
+                            .data(session_id.to_string()));
+                        break;
+                    }
                     if !explicit_event_session && state.sessions.active_session_id() != session_id {
                         yield Ok(Event::default()
                             .event("session_changed")
@@ -6100,13 +6121,11 @@ mod tests {
             data_dir: data_dir.clone(),
         };
         let state = Arc::new(AppState::new(config).unwrap());
-        let original = state.session().await;
-        let original_id = original.id();
-        state.persist_session_context(&original).await.unwrap();
-        state
-            .create_session(Some("new active".to_string()))
-            .await
-            .unwrap();
+        let original_id = state
+            .sessions
+            .create_session(Some("corrupt inactive".to_string()))
+            .unwrap()
+            .id;
 
         let storage_dir = state.sessions.session_storage_path(original_id).unwrap();
         std::fs::remove_dir_all(&storage_dir).unwrap();
@@ -6140,13 +6159,11 @@ mod tests {
             data_dir: data_dir.clone(),
         };
         let state = Arc::new(AppState::new(config).unwrap());
-        let original = state.session().await;
-        let original_id = original.id();
-        state.persist_session_context(&original).await.unwrap();
-        state
-            .create_session(Some("new active".to_string()))
-            .await
-            .unwrap();
+        let original_id = state
+            .sessions
+            .create_session(Some("corrupt inactive".to_string()))
+            .unwrap()
+            .id;
 
         let storage_dir = state.sessions.session_storage_path(original_id).unwrap();
         std::fs::remove_dir_all(&storage_dir).unwrap();

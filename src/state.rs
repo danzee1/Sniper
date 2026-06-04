@@ -60,8 +60,10 @@ pub struct AppState {
     proxy_task: Arc<RwLock<Option<JoinHandle<()>>>>,
     /// Serializes runtime proxy rebinds so reported state cannot race the actual listener.
     pub proxy_rebind_lock: Arc<AsyncMutex<()>>,
-    /// Serializes workspace writes per session so inactive-session saves cannot race each other.
-    workspace_update_locks: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<AsyncMutex<()>>>>>,
+    /// Serializes session operations so inactive writes and deletion cannot race each other.
+    session_operation_locks: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<AsyncMutex<()>>>>>,
+    /// Canonical contexts for inactive sessions loaded through the API.
+    session_contexts: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<SessionContext>>>>,
     /// WebSocket replay connections.
     pub ws_replay: Arc<WsReplayStore>,
 }
@@ -96,7 +98,8 @@ impl AppState {
             active_ui_addr: Arc::new(RwLock::new(active_ui_addr)),
             proxy_task: Arc::new(RwLock::new(None)),
             proxy_rebind_lock: Arc::new(AsyncMutex::new(())),
-            workspace_update_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            session_operation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            session_contexts: Arc::new(AsyncMutex::new(HashMap::new())),
             ws_replay: Arc::new(WsReplayStore::new()),
         })
     }
@@ -122,12 +125,37 @@ impl AppState {
         (session, owner)
     }
 
-    pub async fn workspace_update_lock(&self, id: uuid::Uuid) -> Arc<AsyncMutex<()>> {
-        let mut locks = self.workspace_update_locks.lock().await;
+    pub async fn session_operation_lock(&self, id: uuid::Uuid) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.session_operation_locks.lock().await;
         locks
             .entry(id)
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
+    }
+
+    pub async fn workspace_update_lock(&self, id: uuid::Uuid) -> Arc<AsyncMutex<()>> {
+        self.session_operation_lock(id).await
+    }
+
+    pub async fn session_context_for_id(&self, id: uuid::Uuid) -> Result<Arc<SessionContext>> {
+        let active = self.session().await;
+        if id == active.id() {
+            return Ok(active);
+        }
+
+        let mut contexts = self.session_contexts.lock().await;
+        if let Some(session) = contexts.get(&id) {
+            if self.sessions.contains_session(id) {
+                return Ok(session.clone());
+            }
+            contexts.remove(&id);
+        }
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
+        let session = self.sessions.load_context(id)?;
+        contexts.insert(id, session.clone());
+        Ok(session)
     }
 
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
@@ -163,7 +191,20 @@ impl AppState {
         let current_id = current.id();
         if current_id != id {
             self.persist_session_context(&current).await?;
-            let session = self.sessions.load_context(id)?;
+            {
+                let mut contexts = self.session_contexts.lock().await;
+                contexts.insert(current_id, current.clone());
+            }
+            let session = {
+                let mut contexts = self.session_contexts.lock().await;
+                if let Some(session) = contexts.get(&id) {
+                    session.clone()
+                } else {
+                    let session = self.sessions.load_context(id)?;
+                    contexts.insert(id, session.clone());
+                    session
+                }
+            };
             let metadata = self.sessions.activate_session(id)?;
             session.replace_metadata(metadata.clone());
             let dropped_requests = current.intercepts.drop_all().await;
@@ -187,8 +228,8 @@ impl AppState {
     }
 
     pub async fn delete_session(&self, id: uuid::Uuid) -> Result<()> {
-        let workspace_update_lock = self.workspace_update_lock(id).await;
-        let workspace_update_guard = workspace_update_lock.lock().await;
+        let operation_lock = self.session_operation_lock(id).await;
+        let operation_guard = operation_lock.lock().await;
         if crate::proxy::session_has_live_websocket_relays(id) {
             anyhow::bail!("cannot delete a session while live captures are active");
         }
@@ -199,9 +240,10 @@ impl AppState {
             anyhow::bail!("cannot delete a session while capture persistence is pending");
         }
         let result = self.sessions.delete_session(id);
-        drop(workspace_update_guard);
+        drop(operation_guard);
         if result.is_ok() {
-            self.workspace_update_locks.lock().await.remove(&id);
+            self.session_operation_locks.lock().await.remove(&id);
+            self.session_contexts.lock().await.remove(&id);
         }
         result
     }
@@ -1615,6 +1657,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.last_opened_at, touched_last_opened_at);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn inactive_session_contexts_are_canonical_until_activation() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-canonical-session-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+
+        let first = state.session_context_for_id(original_id).await.unwrap();
+        let second = state.session_context_for_id(original_id).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+        state.activate_session(original_id).await.unwrap();
+        let active = state.session().await;
+        assert!(std::sync::Arc::ptr_eq(&first, &active));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn session_operation_lock_blocks_delete_until_released() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-session-op-lock-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let delete_result = tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            state.delete_session(original_id),
+        )
+        .await;
+        assert!(delete_result.is_err());
+
+        drop(operation_guard);
+        state.delete_session(original_id).await.unwrap();
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

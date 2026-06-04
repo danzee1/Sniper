@@ -2800,13 +2800,20 @@ function handleWorkspaceActionError(error) {
 }
 
 async function flushWorkspaceState() {
+  const hasQueuedChanges = !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer);
+  const hasInFlightSave = !!(workspaceSaveInFlight || workspaceSaveLoopPromise);
   window.clearTimeout(wsTranscriptSaveTimer);
   wsTranscriptSaveTimer = null;
   wsTranscriptFirstDirtyAt = 0;
   window.clearTimeout(workspaceSaveTimer);
   workspaceSaveTimer = null;
-  workspaceSaveDirty = true;
-  workspaceSaveVersion += 1;
+  if (!state.activeSession || (!hasQueuedChanges && !hasInFlightSave)) {
+    return;
+  }
+  if (hasQueuedChanges) {
+    workspaceSaveDirty = true;
+    workspaceSaveVersion += 1;
+  }
   await flushQueuedWorkspaceStateSave();
   if (workspaceSaveConflictPending) {
     throw new WorkspaceStateConflictError(null);
@@ -3023,6 +3030,7 @@ async function handleExternalSessionChanged() {
       await flushWorkspaceState();
     } catch (error) {
       handleWorkspaceActionError(error);
+      return;
     }
   }
   await reloadSessionWorkspace();
@@ -3915,6 +3923,7 @@ async function loadMoreTransactions({ background = false } = {}) {
   }
 
   let shouldRenderAfterLoad = !background;
+  let shouldBackfillAfterLoad = false;
   const generation = paging.generation;
   const offset = paging.offset ?? state.items.length;
   paging.loading = true;
@@ -3944,6 +3953,7 @@ async function loadMoreTransactions({ background = false } = {}) {
     if (added || hadMore !== paging.hasMore || !background) {
       shouldRenderAfterLoad = true;
     }
+    shouldBackfillAfterLoad = background && !added && paging.hasMore;
     return added;
   } catch (error) {
     console.error("Failed to load older transactions:", error);
@@ -3951,6 +3961,7 @@ async function loadMoreTransactions({ background = false } = {}) {
   } finally {
     paging.loading = false;
     if (shouldRenderAfterLoad) renderHistory();
+    if (shouldBackfillAfterLoad) scheduleHistoryBackfill();
   }
 }
 
@@ -4600,6 +4611,7 @@ function renderDashboard() {
   Array.from(els.dashboardSessionsBody.querySelectorAll("tr[data-id]")).forEach((row) => {
     row.addEventListener("contextmenu", (event) => {
       event.preventDefault();
+      event.stopPropagation();
       const { id } = row.dataset;
       if (!id) return;
       state.selectedSessionId = id;
@@ -6101,6 +6113,9 @@ function renderHistory() {
         <td colspan="${state.historyColumnOrder.length}">${historyEmptyMessage(hiddenConnectCount, paging)}</td>
       </tr>
     `;
+    if (paging.hasMore && !paging.loading && !paging.fullyLoaded) {
+      scheduleHistoryBackfill(0);
+    }
     return;
   }
 
