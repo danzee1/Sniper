@@ -109,7 +109,7 @@ const HISTORY_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
 });
 const HISTORY_SORT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 const HTTP_HISTORY_PAGE_SIZE = 5000;
-const HTTP_HISTORY_MAX_LOADED_ITEMS = 12000;
+const HTTP_HISTORY_MAX_LOADED_ITEMS = HTTP_HISTORY_PAGE_SIZE;
 const HTTP_HISTORY_BACKFILL_DELAY_MS = 80;
 const HTTP_HISTORY_SCROLL_PREFETCH_ROWS = 120;
 const HTTP_HISTORY_POLL_FALLBACK_MS = 30000;
@@ -1190,7 +1190,7 @@ function bindEvents() {
     state.filterSettings = createDefaultFilterSettings();
     hydrateFilterForm();
     syncHttpInScopePill();
-    scheduleRefresh();
+    scheduleRefresh({ resetScroll: true });
   });
   document.getElementById("closeCompareButton").addEventListener("click", closeCompareModal);
   document.getElementById("compareModal").addEventListener("click", (event) => {
@@ -4006,6 +4006,9 @@ let _historyBackfillTimer = 0;
 function scheduleHistoryBackfill(delayMs = HTTP_HISTORY_BACKFILL_DELAY_MS) {
   const paging = state.historyPaging;
   if (!paging || paging.loading || paging.backfillScheduled || !paging.hasMore || paging.fullyLoaded) {
+    return;
+  }
+  if (state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
     return;
   }
   paging.backfillScheduled = true;
@@ -7488,7 +7491,7 @@ function syncReplayRequestTextFromEditor(newText) {
   activeTab.requestBytes = null;
   activeTab.requestOriginalBytes = null;
   syncReplayToolbar(activeTab);
-  renderReplayTabs();
+  refreshReplayTabLabel(activeTab.id);
   updateReplaySearchPane("request", newText, { scrollToFirst: false });
   scheduleWorkspaceStateSave();
 }
@@ -10501,6 +10504,28 @@ function renderReplayTabs() {
 
   // Scroll active tab into view
   scrollActiveReplayTabIntoView();
+}
+
+function refreshReplayTabLabel(id) {
+  if (!els.replayTabStrip) return;
+  const tab = state.replayTabs.find((item) => item.id === id);
+  if (!tab) return;
+  const tabElement = Array.from(els.replayTabStrip.querySelectorAll(".replay-tab"))
+    .find((element) => element.dataset.replayTabId === id);
+  if (!tabElement) return;
+
+  const autoLabel = replayTabAutoLabel(tab);
+  const label = replayTabLabel(tab);
+  const title = tab.customLabel ? `${label} / ${autoLabel}` : label;
+  const button = tabElement.querySelector(".replay-tab-button");
+  if (button) {
+    button.textContent = label;
+    button.title = title;
+  }
+  const input = tabElement.querySelector(".replay-tab-name-input");
+  if (input) {
+    input.placeholder = autoLabel;
+  }
 }
 
 function beginReplayTabRename(id) {
@@ -15856,6 +15881,11 @@ function parseCurlCommand(text) {
       const ci = hVal.indexOf(":");
       if (ci > 0) headers.push({ name: hVal.slice(0, ci).trim(), value: hVal.slice(ci + 1).trim() });
     }
+    else if (tok.startsWith("-H") && tok.length > 2) {
+      const hVal = tok.slice(2);
+      const ci = hVal.indexOf(":");
+      if (ci > 0) headers.push({ name: hVal.slice(0, ci).trim(), value: hVal.slice(ci + 1).trim() });
+    }
     else if (tok.startsWith("--header=")) {
       const hVal = tok.slice("--header=".length);
       const ci = hVal.indexOf(":");
@@ -15886,6 +15916,10 @@ function parseCurlCommand(text) {
       const cred = tokens[++t] || "";
       headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(cred)}` });
     }
+    else if (tok.startsWith("-u") && tok.length > 2) {
+      const cred = tok.slice(2);
+      headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(cred)}` });
+    }
     else if (tok.startsWith("--user=")) {
       const cred = tok.slice("--user=".length);
       headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(cred)}` });
@@ -15893,17 +15927,26 @@ function parseCurlCommand(text) {
     else if (tok === "-A" || tok === "--user-agent") {
       headers.push({ name: "User-Agent", value: tokens[++t] || "" });
     }
+    else if (tok.startsWith("-A") && tok.length > 2) {
+      headers.push({ name: "User-Agent", value: tok.slice(2) });
+    }
     else if (tok.startsWith("--user-agent=")) {
       headers.push({ name: "User-Agent", value: tok.slice("--user-agent=".length) });
     }
     else if (tok === "-e" || tok === "--referer") {
       headers.push({ name: "Referer", value: tokens[++t] || "" });
     }
+    else if (tok.startsWith("-e") && tok.length > 2) {
+      headers.push({ name: "Referer", value: tok.slice(2) });
+    }
     else if (tok.startsWith("--referer=")) {
       headers.push({ name: "Referer", value: tok.slice("--referer=".length) });
     }
     else if (tok === "-b" || tok === "--cookie") {
       headers.push({ name: "Cookie", value: tokens[++t] || "" });
+    }
+    else if (tok.startsWith("-b") && tok.length > 2) {
+      headers.push({ name: "Cookie", value: tok.slice(2) });
     }
     else if (tok.startsWith("--cookie=")) {
       headers.push({ name: "Cookie", value: tok.slice("--cookie=".length) });
@@ -16009,11 +16052,31 @@ function splitShellWords(input) {
       }
       continue;
     }
+    if (quote === "$'") {
+      if (ch === "'") {
+        quote = null;
+      } else if (ch === "\\" && i + 1 < input.length) {
+        const decoded = decodeAnsiCStringEscape(input, i + 1);
+        token += decoded.value;
+        i = decoded.index;
+        active = true;
+      } else {
+        token += ch;
+        active = true;
+      }
+      continue;
+    }
 
     if (/\s/.test(ch)) {
       if (active || token.length) tokens.push(token);
       token = "";
       active = false;
+      continue;
+    }
+    if (ch === "$" && input[i + 1] === "'") {
+      quote = "$'";
+      active = true;
+      i += 1;
       continue;
     }
     if (ch === "'" || ch === '"') {
@@ -16033,6 +16096,54 @@ function splitShellWords(input) {
   if (quote) return [];
   if (active || token.length) tokens.push(token);
   return tokens;
+}
+
+function decodeAnsiCStringEscape(input, index) {
+  const ch = input[index] || "";
+  const simple = {
+    a: "\x07",
+    b: "\b",
+    e: "\x1b",
+    E: "\x1b",
+    f: "\f",
+    n: "\n",
+    r: "\r",
+    t: "\t",
+    v: "\v",
+    "\\": "\\",
+    "'": "'",
+    "\"": "\"",
+    "?": "?",
+  };
+  if (Object.prototype.hasOwnProperty.call(simple, ch)) {
+    return { value: simple[ch], index };
+  }
+  if (ch === "x") {
+    const hex = input.slice(index + 1).match(/^[0-9a-fA-F]{1,2}/)?.[0] || "";
+    if (hex) {
+      return { value: String.fromCharCode(parseInt(hex, 16)), index: index + hex.length };
+    }
+  }
+  if (ch === "u") {
+    const hex = input.slice(index + 1, index + 5);
+    if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+      return { value: String.fromCharCode(parseInt(hex, 16)), index: index + 4 };
+    }
+  }
+  if (ch === "U") {
+    const hex = input.slice(index + 1, index + 9);
+    if (/^[0-9a-fA-F]{8}$/.test(hex)) {
+      const codePoint = parseInt(hex, 16);
+      if (codePoint <= 0x10ffff) {
+        return { value: String.fromCodePoint(codePoint), index: index + 8 };
+      }
+    }
+  }
+  if (/^[0-7]$/.test(ch)) {
+    const octal = input.slice(index, index + 3).match(/^[0-7]{1,3}/)?.[0] || ch;
+    return { value: String.fromCharCode(parseInt(octal, 8)), index: index + octal.length - 1 };
+  }
+  return { value: ch, index };
 }
 
 function openCurlImportModal() {

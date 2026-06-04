@@ -2684,6 +2684,11 @@ async fn upsert_sequence(
     if let Err(error) = validate_sequence_definition(&definition) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.sequence.snapshot_definitions().await;
     session.sequence.upsert_definition(definition).await;
@@ -2708,6 +2713,11 @@ async fn delete_sequence(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.sequence.snapshot_definitions().await;
     if session.sequence.delete_definition(id).await {
@@ -2735,18 +2745,17 @@ async fn run_sequence(
         Ok(session) => session,
         Err(response) => return response,
     };
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return action_session_conflict_response(&session);
+    }
     let definition = match session.sequence.get_definition(id).await {
         Some(def) => def,
         None => return (StatusCode::NOT_FOUND, "Sequence not found").into_response(),
     };
     if let Err(error) = validate_sequence_definition(&definition) {
         return (StatusCode::BAD_REQUEST, error).into_response();
-    }
-
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
     }
     match sequence::run_sequence(state, session, definition).await {
         Ok(record) => Json(record).into_response(),

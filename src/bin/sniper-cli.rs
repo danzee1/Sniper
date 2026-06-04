@@ -36,6 +36,8 @@ use sniper::{
 use url::Url;
 use uuid::Uuid;
 
+const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
+
 #[derive(Parser, Debug)]
 #[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.")]
 struct Cli {
@@ -1492,7 +1494,7 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             }
             tab_mut.response_record = Some(record.clone());
             tab_mut.notice.clear();
-            tab_mut.history_entries.push(ReplayHistoryEntryState {
+            let history_entry = ReplayHistoryEntryState {
                 request: Some(request),
                 request_text: tab_mut.request_text.clone(),
                 http_version_mode: tab_mut.http_version_mode.clone(),
@@ -1501,8 +1503,8 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 target_scheme: tab_mut.target_scheme.clone(),
                 target_host: tab_mut.target_host.clone(),
                 target_port: tab_mut.target_port.clone(),
-            });
-            tab_mut.history_index = Some(tab_mut.history_entries.len().saturating_sub(1));
+            };
+            push_replay_history_entry(tab_mut, history_entry);
 
             if let Err(error) = post_workspace_state(&api, &mut workspace).await {
                 eprintln!("warning: replay was sent, but workspace state was not saved: {error}");
@@ -2106,6 +2108,21 @@ fn replay_tab_target_as_request(tab: &ReplayTabState) -> Option<EditableRequest>
         body_encoding: BodyEncoding::Utf8,
         preview_truncated: false,
     })
+}
+
+fn push_replay_history_entry(tab: &mut ReplayTabState, entry: ReplayHistoryEntryState) {
+    if let Some(index) = tab.history_index {
+        if !tab.history_entries.is_empty() {
+            let normalized_index = index.min(tab.history_entries.len() - 1);
+            tab.history_entries.truncate(normalized_index + 1);
+        }
+    }
+    tab.history_entries.push(entry);
+    if tab.history_entries.len() > CLI_REPEATER_HISTORY_LIMIT {
+        let overflow = tab.history_entries.len() - CLI_REPEATER_HISTORY_LIMIT;
+        tab.history_entries.drain(0..overflow);
+    }
+    tab.history_index = tab.history_entries.len().checked_sub(1);
 }
 
 fn replay_update_should_preserve_current_port(
@@ -3450,12 +3467,13 @@ mod tests {
         normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
-        read_payloads_input, read_raw_request_input, read_raw_response_input,
-        replay_send_http_version, replay_tab_target_as_request, replay_tab_target_matches_request,
-        replay_update_should_preserve_current_port, session_query_path,
-        sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
-        sync_replay_tab_target_to_request, transaction_detail_path, Cli, Command, HistoryCommand,
-        HistoryListResponse, SequenceCommand, WebSocketListResponse,
+        push_replay_history_entry, read_payloads_input, read_raw_request_input,
+        read_raw_response_input, replay_send_http_version, replay_tab_target_as_request,
+        replay_tab_target_matches_request, replay_update_should_preserve_current_port,
+        session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
+        strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path, Cli, Command,
+        HistoryCommand, HistoryListResponse, SequenceCommand, WebSocketListResponse,
+        CLI_REPEATER_HISTORY_LIMIT,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3464,7 +3482,9 @@ mod tests {
     };
     use sniper::session::SessionSummary;
     use sniper::skills;
-    use sniper::workspace::{FuzzerWorkspaceState, ReplayTabState, WorkspaceStateSnapshot};
+    use sniper::workspace::{
+        FuzzerWorkspaceState, ReplayHistoryEntryState, ReplayTabState, WorkspaceStateSnapshot,
+    };
     use std::fs;
     use uuid::Uuid;
 
@@ -4174,6 +4194,67 @@ mod tests {
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "new.example");
         assert_eq!(target.port, "8443");
+    }
+
+    #[test]
+    fn cli_replay_history_is_capped_like_browser_history() {
+        fn entry(path: &str) -> ReplayHistoryEntryState {
+            ReplayHistoryEntryState {
+                request: Some(EditableRequest {
+                    path: path.to_string(),
+                    ..default_editable_request()
+                }),
+                request_text: format!("GET {path} HTTP/1.1\nHost: example.com"),
+                ..Default::default()
+            }
+        }
+
+        let mut tab = ReplayTabState::default();
+        for index in 0..(CLI_REPEATER_HISTORY_LIMIT + 1) {
+            push_replay_history_entry(&mut tab, entry(&format!("/{index}")));
+        }
+
+        assert_eq!(tab.history_entries.len(), CLI_REPEATER_HISTORY_LIMIT);
+        assert_eq!(tab.history_index, Some(CLI_REPEATER_HISTORY_LIMIT - 1));
+        assert_eq!(
+            tab.history_entries
+                .first()
+                .and_then(|entry| entry.request.as_ref())
+                .map(|request| request.path.as_str()),
+            Some("/1")
+        );
+    }
+
+    #[test]
+    fn cli_replay_history_drops_forward_entries_before_append() {
+        fn entry(path: &str) -> ReplayHistoryEntryState {
+            ReplayHistoryEntryState {
+                request: Some(EditableRequest {
+                    path: path.to_string(),
+                    ..default_editable_request()
+                }),
+                request_text: format!("GET {path} HTTP/1.1\nHost: example.com"),
+                ..Default::default()
+            }
+        }
+
+        let mut tab = ReplayTabState {
+            history_entries: vec![entry("/old-0"), entry("/old-1"), entry("/old-2")],
+            history_index: Some(0),
+            ..Default::default()
+        };
+
+        push_replay_history_entry(&mut tab, entry("/new"));
+
+        assert_eq!(tab.history_entries.len(), 2);
+        assert_eq!(tab.history_index, Some(1));
+        assert_eq!(
+            tab.history_entries
+                .last()
+                .and_then(|entry| entry.request.as_ref())
+                .map(|request| request.path.as_str()),
+            Some("/new")
+        );
     }
 
     #[test]

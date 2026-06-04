@@ -4,7 +4,7 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, LazyLock, Mutex,
     },
     time::{Duration, Instant},
@@ -3458,10 +3458,13 @@ static LAST_PERSIST: Mutex<Option<Instant>> = Mutex::new(None);
 static PERSIST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static PERSIST_DIRTY_SESSIONS: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-static PERSIST_TRAILING_SESSIONS: LazyLock<Mutex<HashSet<Uuid>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static PERSIST_TRAILING_SESSIONS: LazyLock<Mutex<HashMap<Uuid, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static PERSIST_PENDING_CONTEXTS: LazyLock<Mutex<HashMap<Uuid, Arc<SessionContext>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PERSIST_CONTEXT_GENERATIONS: LazyLock<Mutex<HashMap<Uuid, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_PERSIST_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static LIVE_WEBSOCKET_RELAYS: LazyLock<Mutex<HashMap<Uuid, LiveWebSocketRelay>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_STREAMED_RESPONSE_PUMPS: LazyLock<Mutex<HashMap<Uuid, StreamedResponsePump>>> =
@@ -3497,21 +3500,21 @@ impl Drop for ActiveProxySessionGuard {
 }
 
 async fn persist_session_quiet(state: &Arc<AppState>, session: &Arc<SessionContext>) {
-    remember_persist_context(session);
+    let generation = remember_persist_context(session);
 
     if let Some(delay) = persist_debounce_remaining() {
         mark_persist_dirty(session);
-        schedule_delayed_persist(state, session, delay);
+        schedule_delayed_persist(state, session, delay, generation);
         return;
     }
 
     if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         mark_persist_dirty(session);
-        schedule_delayed_persist(state, session, PERSIST_DEBOUNCE);
+        schedule_delayed_persist(state, session, PERSIST_DEBOUNCE, generation);
         return;
     }
 
-    spawn_persist_task(Arc::clone(state), Arc::clone(session));
+    spawn_persist_task(Arc::clone(state), Arc::clone(session), generation);
 }
 
 fn persist_debounce_remaining() -> Option<Duration> {
@@ -3519,46 +3522,61 @@ fn persist_debounce_remaining() -> Option<Duration> {
     last.and_then(|ts| PERSIST_DEBOUNCE.checked_sub(ts.elapsed()))
 }
 
-fn schedule_delayed_persist(state: &Arc<AppState>, session: &Arc<SessionContext>, delay: Duration) {
+fn schedule_delayed_persist(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    delay: Duration,
+    generation: u64,
+) {
     let session_id = session.id();
     {
         let mut scheduled = PERSIST_TRAILING_SESSIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !scheduled.insert(session_id) {
+        if scheduled
+            .get(&session_id)
+            .is_some_and(|existing| *existing >= generation)
+        {
             return;
         }
+        scheduled.insert(session_id, generation);
     }
     let state = Arc::clone(state);
     let session = Arc::clone(session);
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        clear_trailing_persist(session_id);
-        if !take_persist_dirty(session_id) {
-            forget_persist_context(session_id);
+        if !clear_trailing_persist_if_generation(session_id, generation) {
             return;
         }
-        start_persist_or_reschedule(state, session);
+        if !take_persist_dirty(session_id) {
+            forget_persist_context_if_generation(session_id, generation);
+            return;
+        }
+        start_persist_or_reschedule(state, session, generation);
     });
 }
 
-fn start_persist_or_reschedule(state: Arc<AppState>, session: Arc<SessionContext>) {
+fn start_persist_or_reschedule(
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    generation: u64,
+) {
     if let Some(delay) = persist_debounce_remaining() {
         mark_persist_dirty(&session);
-        schedule_delayed_persist(&state, &session, delay);
+        schedule_delayed_persist(&state, &session, delay, generation);
         return;
     }
 
     if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         mark_persist_dirty(&session);
-        schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE);
+        schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE, generation);
         return;
     }
 
-    spawn_persist_task(state, session);
+    spawn_persist_task(state, session, generation);
 }
 
-fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>) {
+fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>, generation: u64) {
     {
         let mut last = LAST_PERSIST.lock().unwrap_or_else(|e| e.into_inner());
         *last = Some(Instant::now());
@@ -3571,18 +3589,25 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>) {
         }
         PERSIST_IN_FLIGHT.store(false, Ordering::Release);
         if has_persist_dirty(session.id()) {
-            schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE);
+            let generation = current_persist_generation(session.id()).unwrap_or(generation);
+            schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE, generation);
         } else {
-            forget_persist_context(session.id());
+            forget_persist_context_if_generation(session.id(), generation);
         }
     });
 }
 
-fn remember_persist_context(session: &Arc<SessionContext>) {
+fn remember_persist_context(session: &Arc<SessionContext>) -> u64 {
+    let generation = NEXT_PERSIST_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     let mut pending = PERSIST_PENDING_CONTEXTS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     pending.insert(session.id(), Arc::clone(session));
+    let mut generations = PERSIST_CONTEXT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    generations.insert(session.id(), generation);
+    generation
 }
 
 fn forget_persist_context(session_id: Uuid) {
@@ -3590,6 +3615,32 @@ fn forget_persist_context(session_id: Uuid) {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     pending.remove(&session_id);
+    let mut generations = PERSIST_CONTEXT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    generations.remove(&session_id);
+}
+
+fn forget_persist_context_if_generation(session_id: Uuid, generation: u64) -> bool {
+    let mut pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut generations = PERSIST_CONTEXT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if generations.get(&session_id).copied() != Some(generation) {
+        return false;
+    }
+    pending.remove(&session_id);
+    generations.remove(&session_id);
+    true
+}
+
+fn current_persist_generation(session_id: Uuid) -> Option<u64> {
+    let generations = PERSIST_CONTEXT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    generations.get(&session_id).copied()
 }
 
 fn remember_live_websocket_relay(
@@ -3835,7 +3886,17 @@ pub fn session_has_pending_persist(session_id: Uuid) -> bool {
     let pending = PERSIST_PENDING_CONTEXTS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    pending.contains_key(&session_id)
+    if pending.contains_key(&session_id) {
+        return true;
+    }
+    drop(pending);
+    if has_persist_dirty(session_id) {
+        return true;
+    }
+    let trailing = PERSIST_TRAILING_SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    trailing.contains_key(&session_id)
 }
 
 pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
@@ -3936,6 +3997,17 @@ fn clear_trailing_persist(session_id: Uuid) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     scheduled.remove(&session_id);
+}
+
+fn clear_trailing_persist_if_generation(session_id: Uuid, generation: u64) -> bool {
+    let mut scheduled = PERSIST_TRAILING_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if scheduled.get(&session_id).copied() != Some(generation) {
+        return false;
+    }
+    scheduled.remove(&session_id);
+    true
 }
 
 async fn relay_websocket_session(
@@ -4271,6 +4343,65 @@ mod tests {
         assert!(has_persist_dirty(session_id));
         assert!(take_persist_dirty(session_id));
         assert!(!has_persist_dirty(session_id));
+    }
+
+    #[tokio::test]
+    async fn stale_persist_generation_does_not_forget_new_context() {
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: std::env::temp_dir().join(format!(
+                "sniper-proxy-persist-generation-{}",
+                Uuid::new_v4()
+            )),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+
+        let old_generation = remember_persist_context(&session);
+        let new_generation = remember_persist_context(&session);
+
+        assert!(!forget_persist_context_if_generation(
+            session_id,
+            old_generation
+        ));
+        assert!(pending_session_context(session_id).is_some());
+        assert!(forget_persist_context_if_generation(
+            session_id,
+            new_generation
+        ));
+        assert!(pending_session_context(session_id).is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn session_pending_persist_guard_includes_dirty_and_trailing_state() {
+        let session_id = Uuid::new_v4();
+        assert!(!session_has_pending_persist(session_id));
+
+        {
+            let mut dirty = PERSIST_DIRTY_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            dirty.insert(session_id);
+        }
+        assert!(session_has_pending_persist(session_id));
+        assert!(take_persist_dirty(session_id));
+
+        {
+            let mut trailing = PERSIST_TRAILING_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            trailing.insert(session_id, 1);
+        }
+        assert!(session_has_pending_persist(session_id));
+        clear_trailing_persist(session_id);
+        assert!(!session_has_pending_persist(session_id));
     }
 
     #[tokio::test]

@@ -125,15 +125,21 @@ impl WebSocketStore {
     pub async fn snapshot(&self, limit: Option<usize>) -> Vec<WebSocketSessionRecord> {
         let sessions = self.sessions.read().await;
         let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
-        let live_count = sessions
-            .iter()
-            .filter(|session| session.closed_at.is_none())
-            .count();
-        let mut closed_remaining = limit.saturating_sub(live_count);
+        let mut live_remaining = limit;
+        let mut closed_remaining = limit.saturating_sub(
+            sessions
+                .iter()
+                .filter(|session| session.closed_at.is_none())
+                .count(),
+        );
         sessions
             .iter()
             .filter(|session| {
                 if session.closed_at.is_none() {
+                    if live_remaining == 0 {
+                        return false;
+                    }
+                    live_remaining -= 1;
                     return true;
                 }
                 if closed_remaining == 0 {
@@ -171,6 +177,7 @@ fn sessions_with_live_preserved(
         .filter(|session| session.closed_at.is_none())
         .count();
     let mut closed_remaining = max_entries.saturating_sub(live_count);
+    let mut live_remaining = max_entries;
     records
         .into_iter()
         .filter_map(|mut session| {
@@ -179,6 +186,10 @@ fn sessions_with_live_preserved(
                 session.frames.drain(..overflow);
             }
             if session.closed_at.is_none() {
+                if live_remaining == 0 {
+                    return None;
+                }
+                live_remaining -= 1;
                 return Some(session);
             }
             if closed_remaining == 0 {
@@ -281,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_preserves_live_sessions_over_cap() {
+    async fn snapshot_caps_live_sessions_at_limit() {
         let store = WebSocketStore::new(1, 10);
         let first = session(vec![frame(1)]);
         let first_id = first.id;
@@ -292,13 +303,13 @@ mod tests {
 
         let snapshot = store.snapshot(Some(1)).await;
 
-        assert_eq!(snapshot.len(), 2);
-        assert!(snapshot.iter().any(|session| session.id == first_id));
+        assert_eq!(snapshot.len(), 1);
+        assert!(!snapshot.iter().any(|session| session.id == first_id));
         assert!(snapshot.iter().any(|session| session.id == second_id));
     }
 
     #[tokio::test]
-    async fn replace_all_preserves_live_sessions_over_cap() {
+    async fn replace_all_caps_live_sessions_at_limit() {
         let first = session(vec![frame(1)]);
         let first_id = first.id;
         let second = session(Vec::new());
@@ -307,8 +318,8 @@ mod tests {
 
         let snapshot = store.snapshot(Some(1)).await;
 
-        assert_eq!(snapshot.len(), 2);
-        assert!(snapshot.iter().any(|session| session.id == first_id));
+        assert_eq!(snapshot.len(), 1);
+        assert!(!snapshot.iter().any(|session| session.id == first_id));
         assert!(snapshot.iter().any(|session| session.id == second_id));
     }
 
