@@ -353,6 +353,16 @@ pub async fn run_attack_for_session(
             started_evicted_events,
         )
         .await;
+        if let Err(rollback_error) = state
+            .persist_session_context_mutation_locked(&session)
+            .await
+        {
+            tracing::warn!(
+                ?rollback_error,
+                session_id = %session.id(),
+                "failed to persist rolled back fuzzer state after attack persist failure"
+            );
+        }
         return Err(FuzzerPersistenceError::new(error).into());
     }
 
@@ -591,6 +601,74 @@ mod tests {
         assert!(records.iter().any(|record| record.id == transaction_id));
 
         upstream_handle.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn registry_metadata_failure_persists_rolled_back_fuzzer_snapshot() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-fuzzer-registry-rollback-{}",
+            Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 32,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let session = state.session().await;
+        let request = EditableRequest {
+            scheme: "http".to_string(),
+            host: "127.0.0.1:1".to_string(),
+            method: "GET".to_string(),
+            path: "/$payload$".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let registry_path = session
+            .storage_dir()
+            .parent()
+            .expect("session dir should have registry parent")
+            .join("registry.json");
+        std::fs::remove_file(&registry_path).unwrap();
+        std::fs::create_dir(&registry_path).unwrap();
+
+        let error = run_attack_for_session(
+            state.clone(),
+            session.clone(),
+            request,
+            vec!["payload".to_string()],
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed to persist session"));
+        assert!(session.fuzzer.snapshot(None).await.is_empty());
+        assert!(session
+            .event_log
+            .snapshot(None)
+            .await
+            .iter()
+            .all(|entry| entry.source != "fuzzer"));
+
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        assert!(reloaded.fuzzer.snapshot(None).await.is_empty());
+        assert!(reloaded
+            .event_log
+            .snapshot(None)
+            .await
+            .iter()
+            .all(|entry| entry.source != "fuzzer"));
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

@@ -10,7 +10,7 @@ if [[ "$APP_NAME" != "Sniper" ]]; then
   exit 1
 fi
 VERSION="${VERSION:-$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)}"
-DMG_ARCH="${DMG_ARCH:-$(uname -m)}"
+REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
 SIGN_IDENTITY="${DEVELOPER_ID_APP:-${SIGN_IDENTITY:-}}"
 ALLOW_ADHOC_RELEASE="${ALLOW_ADHOC_RELEASE:-0}"
 HAS_APPLE_CREDS=0
@@ -44,11 +44,33 @@ elif [[ "$HAS_PARTIAL_APPLE_CREDS" == "1" ]]; then
   echo "Ignoring incomplete Apple notarization credentials for explicit local-only release (ALLOW_ADHOC_RELEASE=1)." >&2
 fi
 
+mkdir -p "$ROOT_DIR/dist"
+DMG_BUILD_MARKER="$(mktemp "$ROOT_DIR/dist/.release-dmg-marker.XXXXXX")"
+cleanup_release_marker() {
+  rm -f "$DMG_BUILD_MARKER"
+}
+trap cleanup_release_marker EXIT
+
 "$ROOT_DIR/packaging/macos/make-app.sh"
 
-SKIP_BUILD=1 "$ROOT_DIR/packaging/macos/make-dmg.sh"
+if [[ -n "$REQUESTED_DMG_ARCH" ]]; then
+  DMG_ARCH="$REQUESTED_DMG_ARCH" SKIP_BUILD=1 "$ROOT_DIR/packaging/macos/make-dmg.sh"
+else
+  SKIP_BUILD=1 "$ROOT_DIR/packaging/macos/make-dmg.sh"
+fi
 
-DMG_PATH="$ROOT_DIR/dist/${APP_NAME}-${VERSION}-${DMG_ARCH}.dmg"
+DMG_CANDIDATES=()
+while IFS= read -r candidate; do
+  DMG_CANDIDATES+=("$candidate")
+done < <(find "$ROOT_DIR/dist" -maxdepth 1 -type f -name "${APP_NAME}-${VERSION}-*.dmg" -newer "$DMG_BUILD_MARKER" -print)
+
+if [[ "${#DMG_CANDIDATES[@]}" -ne 1 ]]; then
+  echo "Expected exactly one freshly built DMG for ${APP_NAME} ${VERSION}, found ${#DMG_CANDIDATES[@]}." >&2
+  printf '  %s\n' "${DMG_CANDIDATES[@]}" >&2
+  exit 1
+fi
+
+DMG_PATH="${DMG_CANDIDATES[0]}"
 
 if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$HAS_APPLE_CREDS" == "1" ]]; then
   xcrun notarytool submit "$DMG_PATH" \

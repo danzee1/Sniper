@@ -435,13 +435,36 @@ fn should_install_cli_path(macos_dir: &std::path::Path) -> bool {
     if macos_dir.starts_with("/Volumes") || path.contains("/AppTranslocation/") {
         return false;
     }
-    let components: Vec<_> = macos_dir
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect();
-    !components
-        .windows(2)
-        .any(|window| window[0] == "target" && (window[1] == "release" || window[1] == "debug"))
+
+    let Some(app_contents_dir) = macos_dir.parent() else {
+        return false;
+    };
+    if macos_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS")
+        || app_contents_dir.file_name().and_then(|name| name.to_str()) != Some("Contents")
+    {
+        return false;
+    }
+
+    let Some(app_bundle) = app_contents_dir.parent() else {
+        return false;
+    };
+    let Some(app_bundle_name) = app_bundle.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !app_bundle_name.ends_with(".app") {
+        return false;
+    }
+
+    let Some(install_dir) = app_bundle.parent() else {
+        return false;
+    };
+    if install_dir == std::path::Path::new("/Applications") {
+        return true;
+    }
+    match env::var("HOME") {
+        Ok(home) => install_dir == std::path::PathBuf::from(home).join("Applications"),
+        Err(_) => false,
+    }
 }
 
 fn load_shell_rc_contents(rc_path: &std::path::Path) -> std::io::Result<String> {
@@ -710,9 +733,21 @@ mod tests {
         assert!(!should_install_cli_path(std::path::Path::new(
             "/Users/kakao/Desktop/git/Sniper/target/release",
         )));
+        assert!(!should_install_cli_path(std::path::Path::new(
+            "/tmp/sniper-build/release/Sniper.app/Contents/MacOS",
+        )));
+        assert!(!should_install_cli_path(std::path::Path::new(
+            "/Users/kakao/Desktop/git/Sniper/dist/Sniper.app/Contents/MacOS",
+        )));
         assert!(should_install_cli_path(std::path::Path::new(
             "/Applications/Sniper.app/Contents/MacOS",
         )));
+        let user_app = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join("Applications")
+            .join("Sniper.app")
+            .join("Contents")
+            .join("MacOS");
+        assert!(should_install_cli_path(&user_app));
     }
 
     #[test]

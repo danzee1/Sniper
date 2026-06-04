@@ -2982,6 +2982,43 @@ function resetSessionScopedUiState() {
   state.sequenceRunResult = null;
   state.sequencePastRuns = [];
   clearCompareState();
+  renderHistory();
+  renderEmptyDetail();
+  renderWebsocketSessions();
+  hideFrameDetail();
+  renderEventLog();
+  renderMatchReplaceRules();
+  renderTarget();
+  renderFindings();
+  renderReplayClearedState();
+  renderFuzzer();
+  renderSequencePanel();
+}
+
+function renderReplayClearedState() {
+  if (els.replayTabStrip) {
+    els.replayTabStrip.innerHTML = "";
+  }
+  if (els.replayRequestCM) {
+    updateCodePaneCM("replayReq", els.replayRequestCM, "", {
+      mode: "http", readOnly: false,
+      placeholder: "Loading session...",
+      onChange: syncReplayRequestTextFromEditor,
+    });
+  } else {
+    if (els.replayRequestEditor) els.replayRequestEditor.value = "";
+    renderReplayRequestHighlight("");
+  }
+  if (els.replayHostInput) els.replayHostInput.value = "";
+  if (els.replayPortInput) els.replayPortInput.value = "";
+  if (els.replaySchemeSelect) els.replaySchemeSelect.value = "https";
+  if (els.replayResponseMeta) els.replayResponseMeta.textContent = "Loading session...";
+  renderReplayResponseView("Loading session...");
+  updateReplaySearchPane("request", "");
+  updateReplaySearchPane("response", "Loading session...");
+  if (els.replayBackButton) els.replayBackButton.disabled = true;
+  if (els.replayForwardButton) els.replayForwardButton.disabled = true;
+  if (els.replayFollowRedirectButton) els.replayFollowRedirectButton.classList.add("hidden");
 }
 
 async function reloadSessionWorkspace() {
@@ -10488,6 +10525,7 @@ function commitReplayTabRename(id, value) {
   tab.customLabel = normalizeReplayTabCustomLabel(value);
   const attemptedLabel = tab.customLabel;
   state.replayRenamingTabId = null;
+  scheduleWorkspaceStateSave();
   flushWorkspaceState().catch((error) => {
     if (tab.customLabel === attemptedLabel) {
       tab.customLabel = previousLabel;
@@ -10509,6 +10547,7 @@ function toggleReplayTabPin(id) {
   tab.pinned = !tab.pinned;
   const attemptedPinned = tab.pinned;
   // Flush immediately so pin state survives quick app quit
+  scheduleWorkspaceStateSave();
   flushWorkspaceState().catch((error) => {
     if (tab.pinned === attemptedPinned) {
       tab.pinned = previousPinned;

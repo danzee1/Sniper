@@ -519,6 +519,23 @@ impl WsReplayStore {
         self.close_existing_connection(id).await;
     }
 
+    /// Remove every replay connection owned by a deleted session.
+    pub async fn remove_session(&self, session_id: Uuid) {
+        let ids = {
+            let connections = self.connections.read().await;
+            let mut ids = Vec::new();
+            for (id, conn) in connections.iter() {
+                if conn.read().await.owner_session_id == session_id {
+                    ids.push(*id);
+                }
+            }
+            ids
+        };
+        for id in ids {
+            self.remove(id).await;
+        }
+    }
+
     /// Disconnect and remove every replay connection.
     pub async fn disconnect_all(&self) {
         let ids = {
@@ -661,6 +678,38 @@ mod tests {
             Some(false)
         );
         assert_eq!(store.belongs_to_session(Uuid::new_v4(), owner).await, None);
+    }
+
+    #[tokio::test]
+    async fn remove_session_closes_only_owned_connections() {
+        let store = WsReplayStore::new();
+        let owner = Uuid::new_v4();
+        let other_owner = Uuid::new_v4();
+        let owned_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let owned = Arc::new(RwLock::new(test_connection(
+            WsReplayStatus::Connected,
+            None,
+        )));
+        owned.write().await.owner_session_id = owner;
+        let other = Arc::new(RwLock::new(test_connection(
+            WsReplayStatus::Connected,
+            None,
+        )));
+        other.write().await.owner_session_id = other_owner;
+        {
+            let mut connections = store.connections.write().await;
+            connections.insert(owned_id, owned);
+            connections.insert(other_id, other);
+        }
+
+        store.remove_session(owner).await;
+
+        assert_eq!(store.belongs_to_session(owned_id, owner).await, None);
+        assert_eq!(
+            store.belongs_to_session(other_id, other_owner).await,
+            Some(true)
+        );
     }
 
     #[test]

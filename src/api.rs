@@ -1656,6 +1656,9 @@ async fn ensure_ws_replay_connection_owner(
     id: Uuid,
     session_id: Uuid,
 ) -> std::result::Result<(), Response> {
+    if !state.sessions.contains_session(session_id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
     match state.ws_replay.belongs_to_session(id, session_id).await {
         Some(true) => Ok(()),
         Some(false) => Err(active_session_conflict_response(state)),
@@ -4303,6 +4306,38 @@ mod tests {
         .expect("headers should default to empty");
 
         assert!(payload.headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ws_replay_owner_check_rejects_deleted_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-ws-replay-deleted-session-{}",
+            Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 32,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let deleted_session_id = state.session().await.id();
+        state
+            .create_session(Some("replacement".to_string()))
+            .await
+            .unwrap();
+        state.delete_session(deleted_session_id).await.unwrap();
+
+        let response =
+            super::ensure_ws_replay_connection_owner(&state, Uuid::new_v4(), deleted_session_id)
+                .await
+                .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

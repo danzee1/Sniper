@@ -536,6 +536,16 @@ pub async fn run_sequence(
             started_evicted_events,
         )
         .await;
+        if let Err(rollback_error) = state
+            .persist_session_context_mutation_locked(&session)
+            .await
+        {
+            tracing::warn!(
+                ?rollback_error,
+                session_id = %session.id(),
+                "failed to persist rolled back sequence state after run persist failure"
+            );
+        }
         return Err(SequencePersistenceError::new(error).into());
     }
 
@@ -845,6 +855,81 @@ mod tests {
         assert!(records.iter().any(|record| record.id == transaction_id));
 
         upstream_handle.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn registry_metadata_failure_persists_rolled_back_sequence_snapshot() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-sequence-registry-rollback-{}",
+            Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 32,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let session = state.session().await;
+        let request = EditableRequest {
+            scheme: "http".to_string(),
+            host: "127.0.0.1:1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let definition = SequenceDefinition {
+            id: Uuid::new_v4(),
+            name: "Registry rollback".to_string(),
+            steps: vec![SequenceStep {
+                id: Uuid::new_v4(),
+                label: "connection refused".to_string(),
+                request,
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+                request_text: None,
+                request_parse_error: None,
+                extractions: Vec::new(),
+            }],
+        };
+        let registry_path = session
+            .storage_dir()
+            .parent()
+            .expect("session dir should have registry parent")
+            .join("registry.json");
+        std::fs::remove_file(&registry_path).unwrap();
+        std::fs::create_dir(&registry_path).unwrap();
+
+        let error = run_sequence(state.clone(), session.clone(), definition)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed to persist sequence run"));
+        assert!(session.sequence.snapshot_runs(None).await.is_empty());
+        assert!(session
+            .event_log
+            .snapshot(None)
+            .await
+            .iter()
+            .all(|entry| entry.source != "sequence"));
+
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        assert!(reloaded.sequence.snapshot_runs(None).await.is_empty());
+        assert!(reloaded
+            .event_log
+            .snapshot(None)
+            .await
+            .iter()
+            .all(|entry| entry.source != "sequence"));
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

@@ -239,9 +239,18 @@ impl AppState {
         if crate::proxy::session_has_pending_persist(id) {
             anyhow::bail!("cannot delete a session while capture persistence is pending");
         }
+        let cached_session = {
+            let contexts = self.session_contexts.lock().await;
+            contexts.get(&id).cloned()
+        };
+        let _mutation_guard = match cached_session.as_ref() {
+            Some(session) => Some(session.mutation_guard().await),
+            None => None,
+        };
         let result = self.sessions.delete_session(id);
         drop(operation_guard);
         if result.is_ok() {
+            self.ws_replay.remove_session(id).await;
             self.session_operation_locks.lock().await.remove(&id);
             self.session_contexts.lock().await.remove(&id);
         }
@@ -1718,6 +1727,39 @@ mod tests {
         assert!(delete_result.is_err());
 
         drop(operation_guard);
+        state.delete_session(original_id).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn session_delete_waits_for_cached_context_mutation_guard() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-delete-mutation-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+        let original = state.session_context_for_id(original_id).await.unwrap();
+        let mutation_guard = original.mutation_guard().await;
+
+        let delete_result = tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            state.delete_session(original_id),
+        )
+        .await;
+        assert!(delete_result.is_err());
+
+        drop(mutation_guard);
         state.delete_session(original_id).await.unwrap();
 
         let _ = std::fs::remove_dir_all(data_dir);
