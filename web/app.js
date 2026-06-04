@@ -367,6 +367,7 @@ const state = {
   filterSettings: createDefaultFilterSettings(),
   targetScopeDraft: "",
   targetScopeDirty: false,
+  targetScopeEditorSessionId: null,
   targetExpandedHosts: new Set(),
   intercepts: [],
   responseIntercepts: [],
@@ -1433,11 +1434,12 @@ function bindEvents() {
   els.saveTargetScopeButton.addEventListener("click", () => {
     saveTargetScope()
       .then(() => showToast("Scope saved"))
-      .catch((error) => { console.error(error); showToast("Failed to save scope", "error"); });
+      .catch((error) => { console.error(error); showToast(error?.message || "Failed to save scope", "error"); });
   });
   els.targetScopeEditor.addEventListener("input", () => {
     state.targetScopeDraft = els.targetScopeEditor.value;
     state.targetScopeDirty = true;
+    state.targetScopeEditorSessionId = currentSessionId();
   });
   els.reloadTargetButton.addEventListener("click", () => {
     loadTargetSiteMap(true).catch((error) => console.error(error));
@@ -2928,7 +2930,14 @@ function resetSessionScopedUiState() {
   state.targetSiteMap = [];
   state.targetScopeDraft = "";
   state.targetScopeDirty = false;
+  state.targetScopeEditorSessionId = null;
   state.targetExpandedHosts = new Set();
+  scannerConfigCache = null;
+  scannerSettingsSessionId = null;
+  if (els.scannerSettingsBackdrop) {
+    closeScannerSettings();
+  }
+  resetFindingsUiState();
   state.replayTabs.forEach((tab) => {
     if (tab.type === "websocket") cleanupWsReplayTab(tab);
   });
@@ -2980,6 +2989,7 @@ async function reloadSessionWorkspace() {
   await loadMatchReplaceRules();
   await loadSequences();
   await loadTargetSiteMap(true);
+  await refreshScannerQuickToggle();
   connectEvents();
   renderToolPanels();
 }
@@ -3631,6 +3641,9 @@ function syncTargetScopeDraft(force = false) {
   if (force || !state.targetScopeDirty) {
     state.targetScopeDraft = runtimeText;
     state.targetScopeDirty = false;
+    if (force) {
+      state.targetScopeEditorSessionId = null;
+    }
   }
 }
 
@@ -3705,21 +3718,31 @@ function connectEvents() {
   if (eventSource) {
     eventSource.close();
   }
+  const eventSessionId = currentSessionId();
   eventSource = new EventSource("/api/events");
 
   eventSource.addEventListener("transaction", (event) => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");
-    if (!applyTransactionDeltaEvent(event)) {
+    if (!applyTransactionDeltaEvent(event, eventSessionId)) {
       scheduleIncrementalRefresh();
     }
   });
 
   eventSource.addEventListener("transactions_gap", () => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
     scheduleRefresh();
   });
 
   eventSource.addEventListener("event_log", () => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
     if (state.activeTool === "logger") {
       loadEventLog().catch((error) => console.error(error));
     } else {
@@ -3962,7 +3985,10 @@ let _transactionDeltaTimer = 0;
 let _historyFullLoadInFlight = 0;
 const _pendingTransactionSummaries = [];
 
-function applyTransactionDeltaEvent(event) {
+function applyTransactionDeltaEvent(event, sessionId = currentSessionId()) {
+  if (sessionId !== currentSessionId()) {
+    return true;
+  }
   if (!isHttpHistoryVisible()) {
     state.historyDirty = true;
     return true;
@@ -3974,7 +4000,7 @@ function applyTransactionDeltaEvent(event) {
   try {
     const summary = JSON.parse(event.data || "null");
     if (!summary || !summary.id) return false;
-    _pendingTransactionSummaries.push(summary);
+    _pendingTransactionSummaries.push({ sessionId, summary });
     scheduleTransactionDeltaFlush();
     return true;
   } catch (error) {
@@ -3993,6 +4019,13 @@ function scheduleTransactionDeltaFlush() {
 
 function flushTransactionDeltas() {
   if (!_pendingTransactionSummaries.length) return;
+  const activeSessionId = currentSessionId();
+  for (let i = _pendingTransactionSummaries.length - 1; i >= 0; i -= 1) {
+    if (_pendingTransactionSummaries[i]?.sessionId !== activeSessionId) {
+      _pendingTransactionSummaries.splice(i, 1);
+    }
+  }
+  if (!_pendingTransactionSummaries.length) return;
   if (_historyFullLoadInFlight) {
     scheduleTransactionDeltaFlush();
     return;
@@ -4010,7 +4043,7 @@ function flushTransactionDeltas() {
   const fresh = [];
   let totalAdded = 0;
   let hiddenConnectAdded = 0;
-  for (const summary of pending) {
+  for (const { summary } of pending) {
     if (!summary?.id || getHistoryItem(summary.id)) continue;
     totalAdded += 1;
     if (String(summary.method || "").toUpperCase() === "CONNECT") {
@@ -4699,6 +4732,7 @@ function getSortedSessions() {
 
 let findingsData = [];
 let scannerConfigCache = null;
+let scannerSettingsSessionId = null;
 let findingsSortKey = "found_at";
 let findingsSortDir = "desc";
 
@@ -4746,6 +4780,34 @@ function updateFindingsBadge() {
   const count = findingsData.length;
   els.findingsBadge.textContent = count > 0 ? String(count) : "";
   els.findingsBadge.classList.toggle("hidden", count === 0);
+}
+
+function clearFindingDetail() {
+  selectedFindingId = null;
+  if (els.findingsDetailJump) {
+    delete els.findingsDetailJump.dataset.recordId;
+  }
+  if (els.findingsDetailContent) {
+    els.findingsDetailContent.classList.add("hidden");
+  }
+  if (els.findingsDetailPlaceholder) {
+    els.findingsDetailPlaceholder.classList.remove("hidden");
+  }
+  if (els.findingsDetailTitle) els.findingsDetailTitle.textContent = "";
+  if (els.findingsDetailCategory) els.findingsDetailCategory.textContent = "";
+  if (els.findingsDetailDesc) els.findingsDetailDesc.textContent = "";
+  if (getCMView("findingsReq")) updateCodePaneCM("findingsReq", els.findingsReqCM, "", { mode: "http" });
+  if (getCMView("findingsRes")) updateCodePaneCM("findingsRes", els.findingsResCM, "", { mode: "http" });
+  if (els.findingsReqView) els.findingsReqView.innerHTML = "";
+  if (els.findingsResView) els.findingsResView.innerHTML = "";
+}
+
+function resetFindingsUiState() {
+  findingsData = [];
+  state._findingsEntries = [];
+  clearFindingDetail();
+  renderFindings();
+  updateFindingsBadge();
 }
 
 function severityClass(severity) {
@@ -5200,8 +5262,7 @@ function handleFindingActionError(error) {
 
 // ── Scanner Settings Modal ──
 
-async function loadScannerConfig() {
-  const sessionId = currentSessionId();
+async function loadScannerConfig(sessionId = currentSessionId()) {
   try {
     const res = await fetch(sessionQueryPath("/api/scanner-config", sessionId));
     await requireOkResponse(res, "Failed to load scanner settings.");
@@ -5218,8 +5279,10 @@ async function loadScannerConfig() {
   }
 }
 
-async function saveScannerConfig(config) {
-  const sessionId = currentSessionId();
+async function saveScannerConfig(config, sessionId = currentSessionId()) {
+  if (sessionId !== currentSessionId()) {
+    return false;
+  }
   const res = await fetch(sessionQueryPath("/api/scanner-config", sessionId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -5234,8 +5297,10 @@ async function saveScannerConfig(config) {
 }
 
 async function openScannerSettings() {
-  const config = await loadScannerConfig();
-  if (!config) return;
+  const sessionId = currentSessionId();
+  const config = await loadScannerConfig(sessionId);
+  if (!config || sessionId !== currentSessionId()) return;
+  scannerSettingsSessionId = sessionId;
 
   // Render built-in rules
   els.scannerBuiltinRules.innerHTML = Object.entries(BUILTIN_RULE_LABELS)
@@ -5322,15 +5387,35 @@ function collectScannerConfig() {
 }
 
 function closeScannerSettings() {
-  els.scannerSettingsBackdrop.classList.add("hidden");
+  scannerSettingsSessionId = null;
+  if (els.scannerSettingsBackdrop) {
+    els.scannerSettingsBackdrop.classList.add("hidden");
+  }
 }
 
 async function saveScannerSettingsFromModal() {
+  const sessionId = scannerSettingsSessionId;
+  if (!sessionId || sessionId !== currentSessionId()) {
+    closeScannerSettings();
+    showToast("Scanner settings changed sessions. Reopen settings and save again.", "error");
+    return;
+  }
   const config = collectScannerConfig();
-  await saveScannerConfig(config);
+  if (!(await saveScannerConfig(config, sessionId))) {
+    return;
+  }
   syncQuickToggle(config.enabled);
   closeScannerSettings();
   showToast("Scanner settings saved");
+}
+
+async function refreshScannerQuickToggle() {
+  if (!els.scannerQuickToggle) return;
+  const sessionId = currentSessionId();
+  const config = await loadScannerConfig(sessionId);
+  if (config && sessionId === currentSessionId()) {
+    syncQuickToggle(config.enabled);
+  }
 }
 
 function syncQuickToggle(enabled) {
@@ -5574,9 +5659,7 @@ function bindFindingsEvents() {
 
   if (els.findingsDetailClose) {
     els.findingsDetailClose.addEventListener("click", () => {
-      if (els.findingsDetailContent) els.findingsDetailContent.classList.add("hidden");
-      if (els.findingsDetailPlaceholder) els.findingsDetailPlaceholder.classList.remove("hidden");
-      selectedFindingId = null;
+      clearFindingDetail();
     });
   }
   if (els.findingsDetailJump) {
@@ -5606,12 +5689,7 @@ function bindFindingsEvents() {
         const response = await fetch(sessionQueryPath("/api/findings/clear", sessionId), { method: "POST" });
         await requireOkResponse(response, "Failed to clear findings.");
         if (sessionId !== currentSessionId()) return;
-        findingsData = [];
-        selectedFindingId = null;
-        renderFindings();
-        updateFindingsBadge();
-        if (els.findingsDetailContent) els.findingsDetailContent.classList.add("hidden");
-        if (els.findingsDetailPlaceholder) els.findingsDetailPlaceholder.classList.remove("hidden");
+        resetFindingsUiState();
       } catch (error) {
         console.error(error);
         showToast(error?.message || "Failed to clear findings.", "error");
@@ -5698,15 +5776,19 @@ function bindFindingsEvents() {
   if (els.scannerQuickToggle) {
     els.scannerQuickToggle.addEventListener("change", async () => {
       const enabled = els.scannerQuickToggle.checked;
+      const sessionId = currentSessionId();
       els.scannerQuickToggle.disabled = true;
       try {
-        const config = await loadScannerConfig();
+        const config = await loadScannerConfig(sessionId);
+        if (sessionId !== currentSessionId()) {
+          return;
+        }
         if (!config) {
           syncQuickToggle(!enabled);
           return;
         }
         config.enabled = enabled;
-        if (!(await saveScannerConfig(config))) {
+        if (!(await saveScannerConfig(config, sessionId))) {
           return;
         }
         syncQuickToggle(enabled);
@@ -5719,9 +5801,7 @@ function bindFindingsEvents() {
       }
     });
     // Sync initial state from server
-    loadScannerConfig().then((config) => {
-      if (config) syncQuickToggle(config.enabled);
-    });
+    refreshScannerQuickToggle();
   }
 
   // Scanner settings modal
@@ -7711,15 +7791,20 @@ function renderMatchReplaceRules() {
 }
 
 function renderTarget() {
+  const sessionId = currentSessionId();
   if (!state.targetScopeDirty) {
     state.targetScopeDraft = formatScopePatternsText(state.runtime?.scope_patterns);
   }
 
+  const editorSessionMismatch = state.targetScopeEditorSessionId !== sessionId;
   if (
-    document.activeElement !== els.targetScopeEditor
+    (editorSessionMismatch || document.activeElement !== els.targetScopeEditor)
     && els.targetScopeEditor.value !== state.targetScopeDraft
   ) {
     els.targetScopeEditor.value = state.targetScopeDraft;
+  }
+  if (editorSessionMismatch || document.activeElement !== els.targetScopeEditor) {
+    state.targetScopeEditorSessionId = sessionId;
   }
 
   const siteMap = Array.isArray(state.targetSiteMap) ? state.targetSiteMap : [];
@@ -8033,6 +8118,10 @@ async function deleteSelectedMatchReplaceRule() {
 
 async function saveTargetScope() {
   const sessionId = currentSessionId();
+  if (state.targetScopeEditorSessionId && state.targetScopeEditorSessionId !== sessionId) {
+    await loadTargetSiteMap(true);
+    throw new Error("Scope editor changed sessions. Review the scope and save again.");
+  }
   const scopePatterns = els.targetScopeEditor.value
     .split("\n")
     .map((line) => line.trim())
@@ -8059,6 +8148,7 @@ async function saveTargetScope() {
   state.runtime = runtime;
   state.targetScopeDraft = formatScopePatternsText(state.runtime?.scope_patterns);
   state.targetScopeDirty = false;
+  state.targetScopeEditorSessionId = sessionId;
   if (els.targetScopeEditor.value !== state.targetScopeDraft) {
     els.targetScopeEditor.value = state.targetScopeDraft;
   }
