@@ -12186,7 +12186,7 @@ function buildMessagePresentation(target, record) {
   const text = target === "request" ? buildRawRequest(record) : buildRawResponse(record);
 
   if (mode === "hex") {
-    return toHexDump(text);
+    return buildMessageHexPresentation(target, record, text);
   }
 
   if (mode === "pretty") {
@@ -12215,6 +12215,13 @@ function buildDiffPresentation(target, record) {
 }
 
 function buildRawRequest(record) {
+  const head = buildRawRequestHead(record);
+  const request = record.request || {};
+  const body = renderBody(request);
+  return body.length > 0 ? `${head}\n\n${body}` : head;
+}
+
+function buildRawRequestHead(record) {
   const httpVer = record.http_version || "HTTP/1.1";
   const startLine = record.kind === "tunnel"
     ? `CONNECT ${record.host} ${httpVer}`
@@ -12229,9 +12236,7 @@ function buildRawRequest(record) {
   const headers = merged
     .map((header) => `${header.name}: ${header.value}`)
     .join("\n");
-  const body = renderBody(request);
-  const head = headers ? `${startLine}\n${headers}` : startLine;
-  return body.length > 0 ? `${head}\n\n${body}` : head;
+  return headers ? `${startLine}\n${headers}` : startLine;
 }
 
 function mergeHeaders(headers) {
@@ -12268,14 +12273,19 @@ function buildRawResponse(record) {
     return "No response was captured for this exchange.";
   }
 
+  const head = buildRawResponseHead(record);
+  const body = renderBody(record.response || {});
+  return body.length > 0 ? `${head}\n\n${body}` : head;
+}
+
+function buildRawResponseHead(record) {
   const response = record.response || {};
   const headers = normalizedHeaders(response.headers)
     .map((header) => `${header.name}: ${header.value}`)
     .join("\n");
-  const body = renderBody(response);
   const httpVer = record.http_version || "HTTP/1.1";
-  const head = headers ? `${httpVer} ${record.status ?? 0}\n${headers}` : `${httpVer} ${record.status ?? 0}`;
-  return body.length > 0 ? `${head}\n\n${body}` : head;
+  const statusLine = `${httpVer} ${record.status ?? 0}`;
+  return headers ? `${statusLine}\n${headers}` : statusLine;
 }
 
 function buildFindingsRawMessage(record, side) {
@@ -12349,6 +12359,60 @@ function renderBody(message) {
   return message.preview_truncated
     ? `${message.body_preview}\n\n[preview truncated]`
     : message.body_preview;
+}
+
+function buildMessageHexPresentation(target, record, fallbackText) {
+  if (target === "request") {
+    return toHexDumpFromHttpParts(buildRawRequestHead(record), record.request, fallbackText);
+  }
+  if (!record.response) {
+    return toHexDump(fallbackText);
+  }
+  return toHexDumpFromHttpParts(buildRawResponseHead(record), record.response, fallbackText);
+}
+
+function toHexDumpFromHttpParts(head, message, fallbackText) {
+  const bodyBytes = messageBodyBytes(message);
+  if (!bodyBytes) {
+    return toHexDump(fallbackText);
+  }
+  const encoder = new TextEncoder();
+  const headBytes = encoder.encode(head || "");
+  if (!bodyBytes.length) {
+    return toHexDumpFromBytes(headBytes);
+  }
+  const separator = encoder.encode("\n\n");
+  const bytes = new Uint8Array(headBytes.length + separator.length + bodyBytes.length);
+  bytes.set(headBytes, 0);
+  bytes.set(separator, headBytes.length);
+  bytes.set(bodyBytes, headBytes.length + separator.length);
+  return toHexDumpFromBytes(bytes);
+}
+
+function messageBodyBytes(message) {
+  if (!message || !message.body_preview) {
+    return new Uint8Array();
+  }
+  if (message.body_encoding === "base64") {
+    return base64ToBytes(message.body_preview);
+  }
+  const text = message.preview_truncated
+    ? `${message.body_preview}\n\n[preview truncated]`
+    : message.body_preview;
+  return new TextEncoder().encode(text);
+}
+
+function base64ToBytes(value) {
+  try {
+    const decoded = atob(value || "");
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index += 1) {
+      bytes[index] = decoded.charCodeAt(index);
+    }
+    return bytes;
+  } catch (_error) {
+    return null;
+  }
 }
 
 function prettyFormat(text, message) {
