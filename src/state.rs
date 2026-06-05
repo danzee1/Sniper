@@ -339,7 +339,7 @@ impl AppState {
                 session.id()
             )));
         }
-        let (snapshot, metadata) = session
+        let snapshot = session
             .replace_workspace_snapshot_checked_and_persist(snapshot)
             .await
             .map_err(|error| match error {
@@ -350,18 +350,6 @@ impl AppState {
                     crate::workspace::WorkspaceReplaceError::Persist(error.to_string())
                 }
             })?;
-        if let Err(error) = self.finalize_session_persist(session, metadata) {
-            tracing::warn!(
-                ?error,
-                session_id = %session.id(),
-                "workspace state snapshot committed but registry metadata update failed"
-            );
-            if !self.sessions.contains_session(session.id()) {
-                return Err(crate::workspace::WorkspaceReplaceError::Persist(
-                    error.to_string(),
-                ));
-            }
-        }
         Ok(snapshot)
     }
 

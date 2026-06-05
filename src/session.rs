@@ -289,17 +289,59 @@ impl SessionContext {
     pub async fn replace_workspace_snapshot_checked_and_persist(
         &self,
         snapshot: WorkspaceStateSnapshot,
-    ) -> std::result::Result<
-        (WorkspaceStateSnapshot, SessionMetadata),
-        WorkspaceReplaceError<anyhow::Error>,
-    > {
+    ) -> std::result::Result<WorkspaceStateSnapshot, WorkspaceReplaceError<anyhow::Error>> {
         let _mutation_guard = self.mutation_lock.lock().await;
         let _persist_guard = self.persist_lock.lock().await;
         self.workspace
             .replace_snapshot_checked_persisting(snapshot, |workspace| async move {
-                self.persist_with_workspace_snapshot_locked(workspace).await
+                self.persist_workspace_snapshot_locked(workspace).await
             })
             .await
+            .map(|(snapshot, ())| snapshot)
+    }
+
+    async fn persist_workspace_snapshot_locked(
+        &self,
+        workspace: WorkspaceStateSnapshot,
+    ) -> Result<()> {
+        let path = snapshot_path(&self.storage_dir);
+        let mut snapshot = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<StoredSessionSnapshot>(&bytes) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        session_id = %self.id,
+                        path = %path.display(),
+                        "falling back to full session persist after workspace snapshot decode failed"
+                    );
+                    self.persist_with_workspace_snapshot_locked(workspace)
+                        .await?;
+                    return Ok(());
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                warn!(
+                    session_id = %self.id,
+                    path = %path.display(),
+                    "falling back to full session persist because workspace snapshot is missing"
+                );
+                self.persist_with_workspace_snapshot_locked(workspace)
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read session snapshot {}", path.display())
+                });
+            }
+        };
+
+        snapshot.workspace = workspace;
+        snapshot.replayed_transaction_journal = false;
+        snapshot.replayed_transaction_ids.clear();
+        write_json(&path, &snapshot)?;
+        Ok(())
     }
 
     async fn persist_with_workspace_snapshot_locked(
@@ -1636,6 +1678,79 @@ mod tests {
             .summaries()
             .iter()
             .any(|session| session.id == created.id));
+    }
+
+    #[tokio::test]
+    async fn workspace_only_persist_keeps_transaction_journal_active() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-workspace-only-{}", uuid::Uuid::new_v4()));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "journal.example:443".to_string(),
+            "/kept-in-journal".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        let record_id = record.id;
+        active.store.insert(record).await;
+
+        let journal_path = super::transaction_journal_path(active.storage_dir());
+        let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
+        assert!(std::fs::metadata(&journal_path).unwrap().len() > 0);
+        assert!(!checkpoint_path.exists());
+
+        let mut workspace = active.workspace.snapshot().await;
+        workspace.client_id = Some("test-ui".to_string());
+        workspace.client_version = 1;
+        workspace.replay = ReplayWorkspaceState {
+            active_tab_id: Some("workspace-only-tab".to_string()),
+            tabs: vec![ReplayTabState {
+                id: "workspace-only-tab".to_string(),
+                sequence: 1,
+                ..ReplayTabState::default()
+            }],
+            ..ReplayWorkspaceState::default()
+        };
+
+        let committed = active
+            .replace_workspace_snapshot_checked_and_persist(workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            committed.replay.active_tab_id.as_deref(),
+            Some("workspace-only-tab")
+        );
+        assert!(!checkpoint_path.exists());
+        assert!(std::fs::metadata(&journal_path).unwrap().len() > 0);
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let durable_workspace = loaded.workspace.snapshot().await;
+        assert_eq!(
+            durable_workspace.replay.active_tab_id.as_deref(),
+            Some("workspace-only-tab")
+        );
+        let records = loaded.store.snapshot(Some(10)).await;
+        assert!(records.iter().any(|restored| restored.id == record_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

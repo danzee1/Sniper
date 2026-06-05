@@ -6328,9 +6328,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_update_returns_committed_snapshot_when_registry_metadata_persist_fails() {
+    async fn workspace_update_persists_without_registry_metadata_rewrite() {
         let data_dir = std::env::temp_dir().join(format!(
-            "sniper-test-workspace-registry-failure-{}",
+            "sniper-test-workspace-registry-bypass-{}",
             uuid::Uuid::new_v4()
         ));
         let config = AppConfig {
