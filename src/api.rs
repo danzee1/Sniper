@@ -3269,6 +3269,8 @@ async fn run_sequence(
     if let Err(error) = validate_sequence_definition(&definition) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
+    let _session_owner = crate::proxy::remember_active_proxy_session_owner(session.id());
+    drop(_operation_guard);
     match sequence::run_sequence(state, session, definition).await {
         Ok(record) => Json(record).into_response(),
         Err(error) => (sequence_run_error_status(&error), error.to_string()).into_response(),
@@ -7664,6 +7666,95 @@ mod tests {
 
         assert_eq!(response.status(), super::StatusCode::CONFLICT);
         assert!(session.sequence.list_runs(None).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn sequence_run_releases_session_operation_lock_while_upstream_is_pending() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-sequence-run-lock-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Lock release".to_string(),
+            steps: vec![SequenceStep {
+                id: uuid::Uuid::new_v4(),
+                label: "Slow upstream".to_string(),
+                request: EditableRequest {
+                    scheme: "http".to_string(),
+                    host: addr.to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+                request_text: None,
+                request_parse_error: None,
+                extractions: Vec::new(),
+            }],
+        };
+        session.sequence.upsert_definition(definition.clone()).await;
+
+        let response_task = tokio::spawn(super::run_sequence(
+            State(state.clone()),
+            Path(definition.id.to_string()),
+            Json(super::SequenceRunPayload {
+                session_id: Some(session_id),
+            }),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("sequence should reach the upstream server")
+            .expect("upstream accept marker should be sent");
+        assert!(crate::proxy::session_has_active_proxy_work(session_id));
+
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard =
+            tokio::time::timeout(Duration::from_millis(200), operation_lock.lock())
+                .await
+                .expect(
+                    "sequence must not hold the session operation lock while waiting on upstream",
+                );
+        drop(operation_guard);
+
+        let _ = release_tx.send(());
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

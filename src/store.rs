@@ -1157,7 +1157,9 @@ fn matches_filters(
         return false;
     }
 
-    if !matches_hidden_extensions(cached.path_extension.as_deref(), &filters.hidden_extensions) {
+    if cached.mime != "websocket"
+        && !matches_hidden_extensions(cached.path_extension.as_deref(), &filters.hidden_extensions)
+    {
         return false;
     }
 
@@ -1273,24 +1275,15 @@ fn infer_summary_mime(summary: &TransactionSummary) -> &'static str {
     if content_type.contains("image") {
         return "image";
     }
-    let path = summary.path.to_ascii_lowercase();
-    if path.ends_with(".js") {
-        return "script";
-    }
-    if path.ends_with(".css") {
-        return "css";
-    }
-    if path.ends_with(".json") {
-        return "json";
-    }
-    if path.ends_with(".html") {
-        return "html";
-    }
-    if [".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
-    {
-        return "image";
+    if let Some(extension) = extract_path_extension(&summary.path) {
+        match extension.as_str() {
+            "js" => return "script",
+            "css" => return "css",
+            "json" => return "json",
+            "html" => return "html",
+            "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" => return "image",
+            _ => {}
+        }
     }
     "other"
 }
@@ -2508,6 +2501,99 @@ mod tests {
 
         assert_eq!(websocket.len(), 1);
         assert!(json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn websocket_mime_filter_ignores_hidden_path_extension() {
+        let store = TransactionStore::new();
+        let request = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "Upgrade".into(),
+                value: "websocket".into(),
+            }],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+
+        store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "ws.local:443".into(),
+                "/socket.css".into(),
+                Some(101),
+                1,
+                request,
+                None,
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+
+        let websocket = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["websocket".into()]),
+                hidden_extensions: vec!["css".into()],
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(websocket.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn path_extension_mime_fallback_ignores_query_string() {
+        let store = TransactionStore::new();
+        let message = MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+
+        store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "assets.local:443".into(),
+                "/app.js?v=1".into(),
+                Some(200),
+                1,
+                message,
+                None,
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+
+        let script = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["script".into()]),
+                ..Default::default()
+            })
+            .await;
+        let other = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["other".into()]),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(script.len(), 1);
+        assert!(other.is_empty());
     }
 
     #[tokio::test]

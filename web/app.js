@@ -4333,7 +4333,7 @@ function summaryMatchesActiveHistoryFilters(item, options = {}) {
   if (filters.onlyNotes && !item.note_count && !item.has_user_note) return false;
   if (!summaryMatchesStatusFilter(item, filters)) return false;
   if (!summaryMatchesMimeFilter(item, filters)) return false;
-  if (!summaryMatchesHiddenExtensions(item, filters)) return false;
+  if (inferMimeType(item) !== "websocket" && !summaryMatchesHiddenExtensions(item, filters)) return false;
   if (!summaryMatchesPortFilter(item, filters)) return false;
   if (!summaryMatchesColorTags(item, filters)) return false;
   if (!summaryMatchesAdvancedSearch(item, filters)) return false;
@@ -14195,12 +14195,12 @@ function inferMimeType(item) {
   if (contentType.includes("css")) return (item._mime = "css");
   if (contentType.includes("json")) return (item._mime = "json");
   if (contentType.includes("image")) return (item._mime = "image");
-  const path = (item.path || "").toLowerCase();
-  if (path.endsWith(".js")) return (item._mime = "script");
-  if (path.endsWith(".css")) return (item._mime = "css");
-  if (path.endsWith(".json")) return (item._mime = "json");
-  if (path.endsWith(".html")) return (item._mime = "html");
-  if (/\.(png|jpg|jpeg|gif|svg|ico)$/i.test(path)) return (item._mime = "image");
+  const extension = extractSummaryPathExtension(item.path || "");
+  if (extension === "js") return (item._mime = "script");
+  if (extension === "css") return (item._mime = "css");
+  if (extension === "json") return (item._mime = "json");
+  if (extension === "html") return (item._mime = "html");
+  if (["png", "jpg", "jpeg", "gif", "svg", "ico"].includes(extension)) return (item._mime = "image");
   return (item._mime = "other");
 }
 
