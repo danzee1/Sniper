@@ -12305,12 +12305,18 @@ function buildFindingsRawMessage(record, side) {
 function findingsBodyPlaceholder(msg) {
   if (!msg || !msg.body_preview) return "";
   if (msg.body_encoding === "base64") {
-    const ct = msg.content_type || "binary";
-    return `[${ct}, ${formatSize(msg.body_size)}]`;
+    return binaryBodyPlaceholder(msg);
   }
   return msg.preview_truncated
     ? `${msg.body_preview}\n\n[preview truncated]`
     : msg.body_preview;
+}
+
+function binaryBodyPlaceholder(msg) {
+  const contentType = msg.content_type || "binary";
+  const decodedSize = msg.decoded_body_size ?? msg.body_size;
+  const size = Number.isFinite(Number(decodedSize)) ? `, ${formatSize(decodedSize)}` : "";
+  return `[${contentType}${size}, base64 preview omitted]`;
 }
 
 function buildRawWebsocketRequest(session) {
@@ -12337,7 +12343,7 @@ function renderBody(message) {
   }
 
   if (message.body_encoding === "base64") {
-    return message.body_preview;
+    return binaryBodyPlaceholder(message);
   }
 
   return message.preview_truncated
@@ -14118,11 +14124,12 @@ function renderProtocolStrip(protocolState) {
 
 function inferMimeType(item) {
   if (item._mime) return item._mime;
+  if (item.is_websocket) return (item._mime = "websocket");
   const contentType = (item.content_type || "").toLowerCase();
   if (contentType.includes("html")) return (item._mime = "html");
-  if (contentType.includes("javascript")) return (item._mime = "script");
+  if (contentType.includes("javascript") || contentType.includes("ecmascript")) return (item._mime = "script");
   if (contentType.includes("css")) return (item._mime = "css");
-  if (contentType.includes("json") || contentType.includes("text")) return (item._mime = "json");
+  if (contentType.includes("json")) return (item._mime = "json");
   if (contentType.includes("image")) return (item._mime = "image");
   const path = (item.path || "").toLowerCase();
   if (path.endsWith(".js")) return (item._mime = "script");
@@ -14130,7 +14137,6 @@ function inferMimeType(item) {
   if (path.endsWith(".json")) return (item._mime = "json");
   if (path.endsWith(".html")) return (item._mime = "html");
   if (/\.(png|jpg|jpeg|gif|svg|ico)$/i.test(path)) return (item._mime = "image");
-  if (item.is_websocket) return (item._mime = "websocket");
   return (item._mime = "other");
 }
 

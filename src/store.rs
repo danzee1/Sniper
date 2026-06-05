@@ -1250,6 +1250,9 @@ fn compare_started_at(left: &CachedSummary, right: &CachedSummary) -> std::cmp::
 }
 
 fn infer_summary_mime(summary: &TransactionSummary) -> &'static str {
+    if summary.is_websocket {
+        return "websocket";
+    }
     let content_type = summary
         .content_type
         .as_deref()
@@ -1258,13 +1261,13 @@ fn infer_summary_mime(summary: &TransactionSummary) -> &'static str {
     if content_type.contains("html") {
         return "html";
     }
-    if content_type.contains("javascript") {
+    if content_type.contains("javascript") || content_type.contains("ecmascript") {
         return "script";
     }
     if content_type.contains("css") {
         return "css";
     }
-    if content_type.contains("json") || content_type.contains("text") {
+    if content_type.contains("json") {
         return "json";
     }
     if content_type.contains("image") {
@@ -1288,9 +1291,6 @@ fn infer_summary_mime(summary: &TransactionSummary) -> &'static str {
         .any(|extension| path.ends_with(extension))
     {
         return "image";
-    }
-    if summary.is_websocket {
-        return "websocket";
     }
     "other"
 }
@@ -1512,7 +1512,7 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
-    use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
+    use crate::model::{BodyEncoding, HeaderRecord, MessageRecord, TransactionRecord};
 
     fn test_record(host: &str) -> TransactionRecord {
         let message = MessageRecord {
@@ -2395,6 +2395,171 @@ mod tests {
 
         assert_eq!(css.len(), 1);
         assert!(json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plain_text_mime_filter_matches_other_not_json() {
+        let store = TransactionStore::new();
+        let request = MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let response = MessageRecord {
+            content_type: Some("text/plain; charset=utf-8".into()),
+            ..request.clone()
+        };
+
+        store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "notes.local:443".into(),
+                "/readme".into(),
+                Some(200),
+                1,
+                request,
+                Some(response),
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+
+        let json = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["json".into()]),
+                ..Default::default()
+            })
+            .await;
+        let other = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["other".into()]),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(json.is_empty());
+        assert_eq!(other.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_mime_filter_takes_priority_over_path_extension() {
+        let store = TransactionStore::new();
+        let request = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "Upgrade".into(),
+                value: "websocket".into(),
+            }],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let response = MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: Some("application/json".into()),
+            content_decoded: false,
+        };
+
+        store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "ws.local:443".into(),
+                "/socket.json".into(),
+                Some(101),
+                1,
+                request,
+                Some(response),
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+
+        let websocket = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["websocket".into()]),
+                ..Default::default()
+            })
+            .await;
+        let json = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["json".into()]),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(websocket.len(), 1);
+        assert!(json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ecmascript_mime_filter_matches_script() {
+        let store = TransactionStore::new();
+        let request = MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let response = MessageRecord {
+            content_type: Some("application/ecmascript".into()),
+            ..request.clone()
+        };
+
+        store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "assets.local:443".into(),
+                "/module".into(),
+                Some(200),
+                1,
+                request,
+                Some(response),
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+
+        let script = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["script".into()]),
+                ..Default::default()
+            })
+            .await;
+        let other = store
+            .list(&ListFilters {
+                mime_types: Some(vec!["other".into()]),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(script.len(), 1);
+        assert!(other.is_empty());
     }
 
     #[tokio::test]
