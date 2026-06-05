@@ -571,7 +571,7 @@ impl TransactionStore {
         limit: Option<usize>,
     ) -> io::Result<Vec<TransactionRecord>> {
         let _insert_guard = self.insert_lock.lock().await;
-        let inner = self.inner.write().await;
+        let inner = self.inner.read().await;
         if let Some(tx) = &self.journal_tx {
             if let Err(error) = rotate_transaction_journal(tx) {
                 if error.kind() == io::ErrorKind::BrokenPipe {

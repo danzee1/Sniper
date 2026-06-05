@@ -910,6 +910,7 @@ impl WebSocketListResponse {
 struct ApiClient {
     base_url: String,
     client: reqwest::Client,
+    long_client: reqwest::Client,
 }
 
 impl ApiClient {
@@ -925,7 +926,15 @@ impl ApiClient {
             .timeout(CLI_API_TIMEOUT)
             .build()
             .context("failed to build sniper-cli HTTP client")?;
-        Ok(Self { base_url, client })
+        let long_client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .context("failed to build sniper-cli long-running HTTP client")?;
+        Ok(Self {
+            base_url,
+            client,
+            long_client,
+        })
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -941,10 +950,19 @@ impl ApiClient {
         self.request_json(Method::POST, path, Some(body)).await
     }
 
+    async fn post_json_long<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.request_json_with_client(&self.long_client, Method::POST, path, Some(body))
+            .await
+    }
+
     async fn send_replay(&self, payload: &ReplaySendPayload) -> Result<ReplaySendApiResult> {
         let path = "/api/replay/send";
         let response = self
-            .client
+            .long_client
             .post(self.url(path))
             .json(payload)
             .send()
@@ -1033,6 +1051,27 @@ impl ApiClient {
         body: Option<B>,
     ) -> Result<T> {
         let request = self.client.request(method.clone(), self.url(path));
+        self.send_json_request(request, method, path, body).await
+    }
+
+    async fn request_json_with_client<B: Serialize, T: DeserializeOwned>(
+        &self,
+        client: &reqwest::Client,
+        method: Method,
+        path: &str,
+        body: Option<B>,
+    ) -> Result<T> {
+        let request = client.request(method.clone(), self.url(path));
+        self.send_json_request(request, method, path, body).await
+    }
+
+    async fn send_json_request<B: Serialize, T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        method: Method,
+        path: &str,
+        body: Option<B>,
+    ) -> Result<T> {
         let response = match body {
             Some(body) => request.json(&body).send().await,
             None => request.send().await,
@@ -1680,7 +1719,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             }
 
             let record: FuzzerAttackRecord = api
-                .post_json(
+                .post_json_long(
                     "/api/fuzzer/attacks",
                     &FuzzerRunPayload {
                         session_id: workspace.session_id,
@@ -2028,7 +2067,7 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
         SequenceCommand::Run(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let result: serde_json::Value = api
-                .post_json(
+                .post_json_long(
                     &format!("/api/sequences/{}/run", args.id),
                     &SessionIdPayload { session_id },
                 )

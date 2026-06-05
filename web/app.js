@@ -1036,6 +1036,7 @@ function bindEvents() {
     clearTimeout(_searchDebounce);
     _searchDebounce = setTimeout(() => {
       state.query = els.searchInput.value.trim();
+      clearHttpHistorySelectionPreview();
       scheduleRefresh({ resetScroll: true });
     }, 60);
   });
@@ -1043,6 +1044,7 @@ function bindEvents() {
     if (event.key === "Enter") {
       clearTimeout(_searchDebounce);
       state.query = els.searchInput.value.trim();
+      clearHttpHistorySelectionPreview();
       scheduleRefresh({ resetScroll: true });
     }
   });
@@ -1050,6 +1052,7 @@ function bindEvents() {
     // Triggered when user clears the search field via the X button
     clearTimeout(_searchDebounce);
     state.query = els.searchInput.value.trim();
+    clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
 
@@ -1104,6 +1107,7 @@ function bindEvents() {
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     state.filterSettings.inScopeOnly = e.currentTarget.classList.contains("active");
+    clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
   document.getElementById("interceptInScopeToggle")?.addEventListener("click", async (e) => {
@@ -1147,6 +1151,7 @@ function bindEvents() {
 
   els.methodFilter.addEventListener("change", () => {
     state.method = els.methodFilter.value;
+    clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
 
@@ -1161,6 +1166,7 @@ function bindEvents() {
       state.filterSettings.colorTags.add(color);
       btn.classList.add("active");
     }
+    clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
 
@@ -1187,6 +1193,7 @@ function bindEvents() {
     state.filterSettings = createDefaultFilterSettings();
     hydrateFilterForm();
     syncHttpInScopePill();
+    clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
   document.getElementById("closeCompareButton").addEventListener("click", closeCompareModal);
@@ -3932,6 +3939,16 @@ function scheduleRefresh(options = {}) {
     refreshTimer = null;
     loadTransactions(true, consumeHistoryLoadOptions()).catch((error) => console.error(error));
   }, 160);
+}
+
+function clearHttpHistorySelectionPreview() {
+  if (!state.selectedId && !state.selectedRecord) {
+    return;
+  }
+  state.selectedId = null;
+  state.selectedRecord = null;
+  updateHistorySelection(null);
+  renderEmptyDetail();
 }
 
 function mergeHistoryItems(items, { prepend = false } = {}) {
@@ -11129,7 +11146,7 @@ function replayTabLabel(tab) {
 }
 
 function replayTabTooltipLabel(tab, label = replayTabLabel(tab), autoLabel = replayTabAutoLabel(tab)) {
-  return tab.customLabel ? `${label} / ${autoLabel}` : label;
+  return tab.customLabel ? label : autoLabel;
 }
 
 function replayTabAutoLabel(tab) {
@@ -12150,6 +12167,7 @@ function applyFilterSettings() {
   };
   closeFilterModal();
   syncHttpInScopePill();
+  clearHttpHistorySelectionPreview();
   scheduleRefresh({ resetScroll: true });
 }
 
@@ -13549,6 +13567,7 @@ function toggleSort(key) {
   }
 
   invalidateVisibleEntriesCache();
+  clearHttpHistorySelectionPreview();
   scheduleRefresh({ resetScroll: true });
 }
 

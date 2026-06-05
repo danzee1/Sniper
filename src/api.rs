@@ -2048,6 +2048,18 @@ async fn guard_session_write_operation(
     Ok(guard)
 }
 
+async fn begin_session_proxy_operation(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+) -> std::result::Result<proxy::ActiveProxySessionGuard, Response> {
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    if !state.sessions.contains_session(session.id()) {
+        return Err(action_session_conflict_response(session));
+    }
+    Ok(proxy::remember_active_proxy_session_owner(session.id()))
+}
+
 async fn resolve_session_for_required_id(
     state: &Arc<AppState>,
     target_session_id: Option<Uuid>,
@@ -3316,11 +3328,12 @@ async fn send_replay(
     if let Err(error) = validate_editable_request(&payload.request) {
         return replay_send_error_response(error);
     }
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _session_owner = match begin_session_proxy_operation(&state, &session).await {
+        Ok(owner) => owner,
+        Err(response) => {
+            return response;
+        }
+    };
     match proxy::try_send_replay_request_for_session(
         state,
         session,
@@ -3433,11 +3446,10 @@ async fn run_fuzzer_attack(
     ) {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _session_owner = match begin_session_proxy_operation(&state, &session).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
     match fuzzer::run_attack_for_session(
         state,
         session,
@@ -4388,6 +4400,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uuid::Uuid;
 
     use super::{
@@ -6696,6 +6709,81 @@ mod tests {
             .unwrap_or_default()
             .contains("unsupported replay http_version"));
         assert!(session.store.snapshot(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_send_releases_session_operation_lock_while_upstream_is_pending() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-replay-send-lock-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let response_task = tokio::spawn(super::send_replay(
+            State(state.clone()),
+            Json(super::ReplaySendPayload {
+                session_id: Some(session_id),
+                request: EditableRequest {
+                    scheme: "http".to_string(),
+                    host: addr.to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                target: None,
+                source_transaction_id: None,
+                http_version: None,
+            }),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("replay should reach the upstream server")
+            .expect("upstream accept marker should be sent");
+        assert!(crate::proxy::session_has_active_proxy_work(session_id));
+
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard =
+            tokio::time::timeout(Duration::from_millis(200), operation_lock.lock())
+                .await
+                .expect(
+                    "replay must not hold the session operation lock while waiting on upstream",
+                );
+        drop(operation_guard);
+
+        let _ = release_tx.send(());
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
