@@ -132,8 +132,6 @@ const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 12 * 1024 * 1024;
 const WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS = 2000;
 const WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS = 5000;
 const WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES = 60 * 1024;
-const WORKSPACE_UNLOAD_COMPACT_TEXT_BYTES = 16 * 1024;
-const WORKSPACE_UNLOAD_MINIMAL_TEXT_BYTES = 4 * 1024;
 const MAX_ANNOTATION_NOTE_BYTES = 32 * 1024;
 const WS_REPLAY_FINAL_POLL_INTERVAL_MS = 100;
 const WS_REPLAY_FINAL_POLL_TIMEOUT_MS = 2200;
@@ -3012,17 +3010,18 @@ function flushWorkspaceStateOnUnload() {
     : (workspaceSaveInFlight && workspaceSaveLastSnapshot
       ? workspaceSaveLastSnapshot
       : snapshotWorkspaceState());
-  const payload = workspaceUnloadPayload(snapshot);
-  if (!payload) {
+  const unloadPayload = workspaceUnloadPayload(snapshot);
+  if (!unloadPayload) {
     workspaceSaveDirty = true;
     console.warn("Skipping unload workspace keepalive save because the full workspace snapshot is too large.");
     return;
   }
+  const { payload, endpoint } = unloadPayload;
   const blob = new Blob([payload], { type: "application/json" });
-  if (navigator.sendBeacon && navigator.sendBeacon("/api/workspace-state", blob)) {
+  if (navigator.sendBeacon && navigator.sendBeacon(endpoint, blob)) {
     return;
   }
-  fetch("/api/workspace-state", {
+  fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: payload,
@@ -3031,24 +3030,16 @@ function flushWorkspaceStateOnUnload() {
 }
 
 function workspaceUnloadPayload(primarySnapshot) {
-  const candidates = [
-    primarySnapshot,
-    compactWorkspaceUnloadSnapshot(primarySnapshot),
-    compactWorkspaceUnloadSnapshot(primarySnapshot, {
-      activeOnly: true,
-      textByteLimit: WORKSPACE_UNLOAD_COMPACT_TEXT_BYTES,
-    }),
-    compactWorkspaceUnloadSnapshot(primarySnapshot, {
-      activeOnly: true,
-      textByteLimit: WORKSPACE_UNLOAD_MINIMAL_TEXT_BYTES,
-      dropFuzzer: true,
-    }),
-  ];
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    const payload = JSON.stringify(candidate);
-    if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
-      return payload;
+  const primaryPayload = JSON.stringify(primarySnapshot);
+  if (utf8ByteLength(primaryPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+    return { payload: primaryPayload, endpoint: "/api/workspace-state" };
+  }
+
+  const compactSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot);
+  if (compactSnapshot) {
+    const compactPayload = JSON.stringify(compactSnapshot);
+    if (utf8ByteLength(compactPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+      return { payload: compactPayload, endpoint: "/api/workspace-state/keepalive" };
     }
   }
   return null;
@@ -3084,6 +3075,21 @@ function compactWorkspaceUnloadText(value, options = {}) {
     : text;
 }
 
+function compactWorkspaceUnloadEditableRequest(request, options = {}) {
+  if (!request || typeof request !== "object") return null;
+  const body = compactWorkspaceUnloadText(request.body, options);
+  return {
+    scheme: request.scheme || "https",
+    host: request.host || "",
+    method: request.method || "GET",
+    path: request.path || "/",
+    headers: normalizedHeaders(request.headers),
+    body,
+    body_encoding: request.body_encoding || "utf8",
+    preview_truncated: !!request.preview_truncated || body !== String(request.body || ""),
+  };
+}
+
 function compactWorkspaceUnloadReplayTab(tab, options = {}) {
   if (!tab || typeof tab !== "object") return null;
   if (tab.type === "websocket") {
@@ -3116,7 +3122,7 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}) {
     sequence: tab.sequence,
     custom_label: tab.custom_label || "",
     pinned: !!tab.pinned,
-    base_request: tab.base_request || null,
+    base_request: compactWorkspaceUnloadEditableRequest(tab.base_request, options),
     source_transaction_id: tab.source_transaction_id || null,
     notice: tab.notice || "",
     request_text: compactWorkspaceUnloadText(tab.request_text, options),
@@ -3134,7 +3140,7 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}) {
 function compactWorkspaceUnloadFuzzer(fuzzer, options = {}) {
   if (!fuzzer || typeof fuzzer !== "object") return null;
   return {
-    base_request: fuzzer.base_request || null,
+    base_request: compactWorkspaceUnloadEditableRequest(fuzzer.base_request, options),
     source_transaction_id: fuzzer.source_transaction_id || null,
     target: normalizeFuzzerTargetOverride(fuzzer.target),
     target_request_authority: fuzzer.target_request_authority || null,
@@ -16728,22 +16734,7 @@ async function refreshWsReplayFramesOnce(tab, options = {}) {
   }
   const data = await resp.json().catch(() => null) || {};
   if (!isWsReplayTabAlive(tab, lifecycleToken)) return false;
-  const incomingFrames = normalizeWebsocketFrames(data.frames);
-  let addedFrames = false;
-  if (incomingFrames.length > 0) {
-    const existing = new Set(getWsReplayFrames(tab).map((frame) => frame.index));
-    const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
-    if (fresh.length) {
-      if (!Array.isArray(tab.wsFrames)) tab.wsFrames = [];
-      tab.wsFrames.push(...fresh);
-      trimWsReplayFrames(tab);
-      scheduleWsTranscriptWorkspaceSave();
-      addedFrames = true;
-      if (state.activeReplayTabId === tab.id) {
-        scheduleWsFrameListRender(tab);
-      }
-    }
-  }
+  const result = applyWsReplayFramePollResponse(tab, data, sinceIndex);
   if (data.status && data.status !== tab.wsStatus) {
     tab.wsStatus = data.status;
     tab.wsError = data.error || null;
@@ -16752,7 +16743,7 @@ async function refreshWsReplayFramesOnce(tab, options = {}) {
       renderWsStatus();
     }
   }
-  return addedFrames;
+  return result.addedFrames;
 }
 
 async function refreshWsReplayFramesUntilSettled(tab, options = {}) {
@@ -16844,45 +16835,8 @@ function startWsPoll(tab) {
       const data = await resp.json() || {};
       if (!tab.wsPollTimer || tab.wsPollGeneration !== generation || !isWsReplayTabAlive(tab, lifecycleToken)) return;
 
-      const incomingFrames = normalizeWebsocketFrames(data.frames);
-      const firstRetainedIndex = Number(data.first_retained_index);
-      const serverGap = data.gap === true
-        || (Number.isFinite(firstRetainedIndex) && firstRetainedIndex > sinceIndex);
-      const incomingGap = incomingFrames.length > 0
-        && Number.isFinite(Number(incomingFrames[0].index))
-        && Number(incomingFrames[0].index) > sinceIndex;
-      if (serverGap || incomingGap) {
-        tab.wsFramesTruncated = true;
-        const firstAvailable = Number.isFinite(firstRetainedIndex)
-          ? firstRetainedIndex
-          : Number(incomingFrames[0]?.index);
-        tab.wsError = Number.isFinite(firstAvailable)
-          ? `WebSocket replay transcript is missing frames before #${firstAvailable}.`
-          : "WebSocket replay transcript is missing earlier frames.";
-        scheduleWorkspaceStateSave();
-        if (state.activeReplayTabId === tab.id) {
-          renderWsStatus();
-        }
-      }
-      if (incomingFrames.length > 0) {
-        const existing = new Set(getWsReplayFrames(tab).map((frame) => frame.index));
-        const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
-        if (fresh.length) {
-          if (!Array.isArray(tab.wsFrames)) tab.wsFrames = [];
-          tab.wsFrames.push(...fresh);
-          trimWsReplayFrames(tab);
-          scheduleWsTranscriptWorkspaceSave();
-        }
-        sinceIndex = Math.max(sinceIndex, nextWsFrameIndex({ wsFrames: incomingFrames }), nextWsFrameIndex(tab));
-        const nextIndex = Number(data.next_index);
-        if (Number.isFinite(nextIndex)) {
-          sinceIndex = Math.max(sinceIndex, nextIndex);
-        }
-        // Only re-render if this tab is still active
-        if (fresh.length && state.activeReplayTabId === tab.id) {
-          scheduleWsFrameListRender(tab);
-        }
-      }
+      const frameResult = applyWsReplayFramePollResponse(tab, data, sinceIndex);
+      sinceIndex = frameResult.nextIndex;
 
       if (data.status && data.status !== tab.wsStatus) {
         tab.wsStatus = data.status;
@@ -16893,11 +16847,14 @@ function startWsPoll(tab) {
         if (data.status === "connected" && tab.wsSetupPending) {
           runSetupQueue(tab, tab.wsLifecycleToken).catch((error) => console.error(error));
         }
-        if (data.status === "disconnected" || data.status === "error") {
-          scheduleWorkspaceStateSave();
-          stopWsPoll(tab);
-          return;
-        }
+      }
+      if (
+        (data.status === "disconnected" || data.status === "error")
+        && !frameResult.truncated
+      ) {
+        scheduleWorkspaceStateSave();
+        stopWsPoll(tab);
+        return;
       }
     } catch (_e) {
       // ignore poll errors
@@ -16909,6 +16866,60 @@ function startWsPoll(tab) {
   };
 
   tab.wsPollTimer = setTimeout(poll, 0);
+}
+
+function applyWsReplayFramePollResponse(tab, data, sinceIndex) {
+  const incomingFrames = normalizeWebsocketFrames(data?.frames);
+  const firstRetainedIndex = Number(data?.first_retained_index);
+  const serverGap = data?.gap === true
+    || (Number.isFinite(firstRetainedIndex) && firstRetainedIndex > sinceIndex);
+  const incomingGap = incomingFrames.length > 0
+    && Number.isFinite(Number(incomingFrames[0].index))
+    && Number(incomingFrames[0].index) > sinceIndex;
+  if (serverGap || incomingGap) {
+    tab.wsFramesTruncated = true;
+    const firstAvailable = Number.isFinite(firstRetainedIndex)
+      ? firstRetainedIndex
+      : Number(incomingFrames[0]?.index);
+    tab.wsError = Number.isFinite(firstAvailable)
+      ? `WebSocket replay transcript is missing frames before #${firstAvailable}.`
+      : "WebSocket replay transcript is missing earlier frames.";
+    scheduleWorkspaceStateSave();
+    if (state.activeReplayTabId === tab.id) {
+      renderWsStatus();
+    }
+  }
+
+  let addedFrames = false;
+  if (incomingFrames.length > 0) {
+    const existing = new Set(getWsReplayFrames(tab).map((frame) => frame.index));
+    const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
+    if (fresh.length) {
+      if (!Array.isArray(tab.wsFrames)) tab.wsFrames = [];
+      tab.wsFrames.push(...fresh);
+      trimWsReplayFrames(tab);
+      scheduleWsTranscriptWorkspaceSave();
+      addedFrames = true;
+      if (state.activeReplayTabId === tab.id) {
+        scheduleWsFrameListRender(tab);
+      }
+    }
+  }
+
+  let nextIndex = Math.max(
+    sinceIndex,
+    nextWsFrameIndex({ wsFrames: incomingFrames }),
+    nextWsFrameIndex(tab),
+  );
+  const responseNextIndex = Number(data?.next_index);
+  if (Number.isFinite(responseNextIndex)) {
+    nextIndex = Math.max(nextIndex, responseNextIndex);
+  }
+  return {
+    addedFrames,
+    nextIndex,
+    truncated: data?.truncated === true,
+  };
 }
 
 function stopWsPoll(tab) {

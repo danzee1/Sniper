@@ -495,7 +495,16 @@ pub async fn try_send_replay_request_for_session(
     }
 
     if let Err(error) = &exchange.response {
-        let message = error.message.clone();
+        let message = if requested_http_version == Some(Version::HTTP_2)
+            && !error.message.contains("HTTP/2")
+        {
+            format!("HTTP/2 replay failed: {}", error.message)
+        } else {
+            error.message.clone()
+        };
+        if message != error.message {
+            record.notes.push(message.clone());
+        }
         store_record_and_scan(&state, &session, record.clone()).await;
         return Err(ReplaySendError::with_record(message, record));
     }
@@ -2765,18 +2774,22 @@ async fn execute_streaming_http_exchange(
             notes.push(message.clone());
             let (response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
-            let record = TransactionRecord::http(
-                started_at,
-                method.to_string(),
-                request.scheme,
-                request.host,
-                path,
-                Some(StatusCode::BAD_REQUEST.as_u16()),
-                started.elapsed().as_millis() as u64,
-                request_capture,
-                Some(response_capture),
-                notes,
-                original_request_capture,
+            let record = with_record_http_versions(
+                TransactionRecord::http(
+                    started_at,
+                    method.to_string(),
+                    request.scheme,
+                    request.host,
+                    path,
+                    Some(StatusCode::BAD_REQUEST.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    notes,
+                    original_request_capture,
+                    None,
+                ),
+                request_http_version,
                 None,
             );
             store_record_and_scan(&state, &session, record).await;
@@ -2892,18 +2905,22 @@ async fn execute_streaming_http_exchange(
                 .await;
             let (response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
-            let record = TransactionRecord::http(
-                started_at,
-                method.to_string(),
-                request.scheme,
-                request.host,
-                path,
-                Some(StatusCode::BAD_GATEWAY.as_u16()),
-                started.elapsed().as_millis() as u64,
-                request_capture,
-                Some(response_capture),
-                notes,
-                original_request_capture,
+            let record = with_record_http_versions(
+                TransactionRecord::http(
+                    started_at,
+                    method.to_string(),
+                    request.scheme,
+                    request.host,
+                    path,
+                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    notes,
+                    original_request_capture,
+                    None,
+                ),
+                request_http_version,
                 None,
             );
             store_record_and_scan(&state, &session, record).await;
@@ -3078,18 +3095,22 @@ async fn execute_http_exchange(
             let (_response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
             return ExecutedExchange {
-                record: TransactionRecord::http(
-                    started_at,
-                    request.method,
-                    request.scheme,
-                    request.host,
-                    path,
-                    Some(StatusCode::BAD_REQUEST.as_u16()),
-                    started.elapsed().as_millis() as u64,
-                    request_capture,
-                    Some(response_capture),
-                    notes,
-                    None,
+                record: with_record_http_versions(
+                    TransactionRecord::http(
+                        started_at,
+                        request.method,
+                        request.scheme,
+                        request.host,
+                        path,
+                        Some(StatusCode::BAD_REQUEST.as_u16()),
+                        started.elapsed().as_millis() as u64,
+                        request_capture,
+                        Some(response_capture),
+                        notes,
+                        None,
+                        None,
+                    ),
+                    request_http_version,
                     None,
                 ),
                 response: Err(UpstreamError {
@@ -3116,19 +3137,23 @@ async fn execute_http_exchange(
         );
         notes.extend(response.notes.clone());
         return ExecutedExchange {
-            record: TransactionRecord::http(
-                started_at,
-                method.to_string(),
-                request.scheme,
-                request.host,
-                path,
-                Some(response.status.as_u16()),
-                started.elapsed().as_millis() as u64,
-                request_capture,
-                Some(response_capture),
-                notes,
-                original_request_capture,
-                None,
+            record: with_record_http_versions(
+                TransactionRecord::http(
+                    started_at,
+                    method.to_string(),
+                    request.scheme,
+                    request.host,
+                    path,
+                    Some(response.status.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    notes,
+                    original_request_capture,
+                    None,
+                ),
+                request_http_version,
+                Some(Version::HTTP_11),
             ),
             response: Ok(UpstreamResponse {
                 status: response.status,
@@ -3146,18 +3171,22 @@ async fn execute_http_exchange(
             let (_response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
             return ExecutedExchange {
-                record: TransactionRecord::http(
-                    started_at,
-                    method.to_string(),
-                    request.scheme,
-                    request.host,
-                    path,
-                    Some(StatusCode::BAD_REQUEST.as_u16()),
-                    started.elapsed().as_millis() as u64,
-                    request_capture,
-                    Some(response_capture),
-                    notes,
-                    original_request_capture,
+                record: with_record_http_versions(
+                    TransactionRecord::http(
+                        started_at,
+                        method.to_string(),
+                        request.scheme,
+                        request.host,
+                        path,
+                        Some(StatusCode::BAD_REQUEST.as_u16()),
+                        started.elapsed().as_millis() as u64,
+                        request_capture,
+                        Some(response_capture),
+                        notes,
+                        original_request_capture,
+                        None,
+                    ),
+                    request_http_version,
                     None,
                 ),
                 response: Err(UpstreamError {
@@ -3308,19 +3337,23 @@ async fn execute_http_exchange(
                     let (_response, response_capture) =
                         synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
                     ExecutedExchange {
-                        record: TransactionRecord::http(
-                            started_at,
-                            method.to_string(),
-                            request.scheme,
-                            request.host,
-                            path,
-                            Some(StatusCode::BAD_GATEWAY.as_u16()),
-                            started.elapsed().as_millis() as u64,
-                            request_capture,
-                            Some(response_capture),
-                            notes,
-                            original_request_capture,
-                            None,
+                        record: with_record_http_versions(
+                            TransactionRecord::http(
+                                started_at,
+                                method.to_string(),
+                                request.scheme,
+                                request.host,
+                                path,
+                                Some(StatusCode::BAD_GATEWAY.as_u16()),
+                                started.elapsed().as_millis() as u64,
+                                request_capture,
+                                Some(response_capture),
+                                notes,
+                                original_request_capture,
+                                None,
+                            ),
+                            request_http_version,
+                            Some(resp_version),
                         ),
                         response: Err(UpstreamError {
                             status: StatusCode::BAD_GATEWAY,
@@ -3345,18 +3378,22 @@ async fn execute_http_exchange(
             let (_response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
             ExecutedExchange {
-                record: TransactionRecord::http(
-                    started_at,
-                    method.to_string(),
-                    request.scheme,
-                    request.host,
-                    path,
-                    Some(StatusCode::BAD_GATEWAY.as_u16()),
-                    started.elapsed().as_millis() as u64,
-                    request_capture,
-                    Some(response_capture),
-                    notes,
-                    original_request_capture,
+                record: with_record_http_versions(
+                    TransactionRecord::http(
+                        started_at,
+                        method.to_string(),
+                        request.scheme,
+                        request.host,
+                        path,
+                        Some(StatusCode::BAD_GATEWAY.as_u16()),
+                        started.elapsed().as_millis() as u64,
+                        request_capture,
+                        Some(response_capture),
+                        notes,
+                        original_request_capture,
+                        None,
+                    ),
+                    request_http_version,
                     None,
                 ),
                 response: Err(UpstreamError {

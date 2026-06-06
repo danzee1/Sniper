@@ -47,8 +47,9 @@ use crate::{
     target::{TargetHostNode, TargetPathNode},
     ui_settings::AppUiSettingsSnapshot,
     workspace::{
-        can_replace_snapshot, validate_workspace_serialized_size, WorkspaceReplaceError,
-        WorkspaceStateSnapshot, MAX_WORKSPACE_SERIALIZED_BYTES,
+        can_replace_snapshot, validate_workspace_serialized_size, FuzzerWorkspaceState,
+        ReplayTabState, WorkspaceReplaceError, WorkspaceStateSnapshot,
+        MAX_WORKSPACE_SERIALIZED_BYTES,
     },
 };
 
@@ -159,6 +160,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/workspace-state",
             get(get_workspace_state).post(update_workspace_state),
+        )
+        .route(
+            "/api/workspace-state/keepalive",
+            post(update_workspace_state_keepalive),
         )
         .route(
             "/api/startup-settings",
@@ -2204,6 +2209,181 @@ async fn update_workspace_state(
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
+}
+
+async fn update_workspace_state_keepalive(
+    State(state): State<Arc<AppState>>,
+    Json(snapshot): Json<WorkspaceStateSnapshot>,
+) -> Response {
+    let Some(target_session_id) = snapshot.session_id else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let active_session = state.session().await;
+    if target_session_id != active_session.id()
+        && proxy::live_websocket_session_context(target_session_id).is_none()
+        && proxy::pending_session_context(target_session_id).is_none()
+        && !proxy::session_has_active_proxy_work(target_session_id)
+        && !state.sessions.contains_session(target_session_id)
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let workspace_update_lock = state.workspace_update_lock(target_session_id).await;
+    let _workspace_update_guard = workspace_update_lock.lock().await;
+    let active_session = state.session().await;
+    let session = if target_session_id == active_session.id() {
+        active_session
+    } else if proxy::session_has_active_proxy_work(target_session_id) {
+        return StatusCode::CONFLICT.into_response();
+    } else if let Some(session) = proxy::live_websocket_session_context(target_session_id) {
+        session
+    } else if let Some(session) = proxy::pending_session_context(target_session_id) {
+        session
+    } else if !state.sessions.contains_session(target_session_id) {
+        return StatusCode::CONFLICT.into_response();
+    } else {
+        match state
+            .session_context_for_id_operation_locked(target_session_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => return session_load_failure_response(target_session_id, error),
+        }
+    };
+
+    let mut incoming = snapshot;
+    incoming.fuzzer.migrate_attack_record_to_id();
+    let mut current = session.workspace.snapshot().await;
+    current.session_id = Some(session.id());
+    if !can_replace_snapshot(&incoming, &current) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let mut merged = merge_workspace_keepalive_snapshot(current, incoming);
+    merged.session_id = Some(session.id());
+    if let Err(error) = validate_workspace_state(&merged) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    match state
+        .replace_workspace_state_and_persist(&session, merged)
+        .await
+    {
+        Ok(mut snapshot) => {
+            snapshot.session_id = Some(session.id());
+            Json(snapshot).into_response()
+        }
+        Err(WorkspaceReplaceError::Conflict(_)) => StatusCode::CONFLICT.into_response(),
+        Err(WorkspaceReplaceError::Persist(error)) => {
+            tracing::warn!(%error, "failed to persist workspace keepalive update");
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    }
+}
+
+fn merge_workspace_keepalive_snapshot(
+    mut current: WorkspaceStateSnapshot,
+    incoming: WorkspaceStateSnapshot,
+) -> WorkspaceStateSnapshot {
+    current.client_id = incoming.client_id;
+    current.client_version = incoming.client_version;
+    current.replay.active_tab_id = incoming.replay.active_tab_id;
+    current.replay.tab_sequence = current
+        .replay
+        .tab_sequence
+        .max(incoming.replay.tab_sequence);
+
+    for incoming_tab in incoming.replay.tabs {
+        match current
+            .replay
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == incoming_tab.id)
+        {
+            Some(current_tab) => merge_workspace_keepalive_tab(current_tab, incoming_tab),
+            None => current.replay.tabs.push(incoming_tab),
+        }
+    }
+
+    if fuzzer_keepalive_has_payload(&incoming.fuzzer) {
+        current.fuzzer = merge_workspace_keepalive_fuzzer(current.fuzzer, incoming.fuzzer);
+    }
+
+    current
+}
+
+fn merge_workspace_keepalive_tab(current: &mut ReplayTabState, incoming: ReplayTabState) {
+    let request_text_changed =
+        !incoming.request_text.is_empty() && incoming.request_text != current.request_text;
+    let current_history_entries = std::mem::take(&mut current.history_entries);
+    let current_response_record = current.response_record.take();
+    let current_ws_setup_queue = std::mem::take(&mut current.ws_setup_queue);
+    let current_ws_frames = std::mem::take(&mut current.ws_frames);
+    let current_ws_selected_frame_index = current.ws_selected_frame_index;
+    let current_ws_frame_window_start = current.ws_frame_window_start;
+    let current_ws_frames_truncated = current.ws_frames_truncated;
+
+    *current = incoming;
+
+    if current.history_entries.is_empty() {
+        current.history_entries = current_history_entries;
+    }
+    if current.response_record.is_none() && !request_text_changed {
+        current.response_record = current_response_record;
+    }
+    if current.ws_setup_queue.is_empty() {
+        current.ws_setup_queue = current_ws_setup_queue;
+    }
+    if current.ws_frames.is_empty() {
+        current.ws_frames = current_ws_frames;
+    }
+    if current.ws_selected_frame_index.is_none() {
+        current.ws_selected_frame_index = current_ws_selected_frame_index;
+    }
+    if current.ws_frame_window_start.is_none() {
+        current.ws_frame_window_start = current_ws_frame_window_start;
+    }
+    current.ws_frames_truncated |= current_ws_frames_truncated;
+}
+
+fn fuzzer_keepalive_has_payload(fuzzer: &FuzzerWorkspaceState) -> bool {
+    fuzzer.base_request.is_some()
+        || fuzzer.source_transaction_id.is_some()
+        || fuzzer.target.is_some()
+        || fuzzer.target_request_authority.is_some()
+        || !fuzzer.notice.is_empty()
+        || !fuzzer.request_text.is_empty()
+        || !fuzzer.payloads_text.is_empty()
+        || fuzzer.attack_record_id.is_some()
+}
+
+fn merge_workspace_keepalive_fuzzer(
+    mut current: FuzzerWorkspaceState,
+    incoming: FuzzerWorkspaceState,
+) -> FuzzerWorkspaceState {
+    if incoming.base_request.is_some() {
+        current.base_request = incoming.base_request;
+    }
+    if incoming.source_transaction_id.is_some() {
+        current.source_transaction_id = incoming.source_transaction_id;
+    }
+    if incoming.target.is_some() {
+        current.target = incoming.target;
+    }
+    if incoming.target_request_authority.is_some() {
+        current.target_request_authority = incoming.target_request_authority;
+    }
+    if !incoming.notice.is_empty() {
+        current.notice = incoming.notice;
+    }
+    if !incoming.request_text.is_empty() {
+        current.request_text = incoming.request_text;
+    }
+    if !incoming.payloads_text.is_empty() {
+        current.payloads_text = incoming.payloads_text;
+    }
+    if incoming.attack_record_id.is_some() {
+        current.attack_record_id = incoming.attack_record_id;
+    }
+    current.attack_record = None;
+    current
 }
 
 fn action_session_conflict_response(session: &Arc<SessionContext>) -> Response {
@@ -6030,6 +6210,113 @@ mod tests {
         });
 
         assert!(super::validate_workspace_state(&snapshot).is_err());
+    }
+
+    #[test]
+    fn workspace_keepalive_merge_preserves_state_missing_from_compact_payload() {
+        let session_id = uuid::Uuid::new_v4();
+        let current = WorkspaceStateSnapshot {
+            revision: 7,
+            session_id: Some(session_id),
+            client_id: Some("browser".to_string()),
+            client_version: 12,
+            replay: crate::workspace::ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 3,
+                tabs: vec![
+                    ReplayTabState {
+                        id: "active".to_string(),
+                        sequence: 1,
+                        base_request: Some(test_editable_request("/old")),
+                        request_text: "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n".to_string(),
+                        response_record: Some(crate::model::TransactionRecord::http(
+                            chrono::Utc::now(),
+                            "GET".to_string(),
+                            "https".to_string(),
+                            "example.test".to_string(),
+                            "/old".to_string(),
+                            Some(200),
+                            1,
+                            crate::model::MessageRecord::from_headers_and_body(
+                                &HeaderMap::new(),
+                                &[],
+                                0,
+                            ),
+                            None,
+                            Vec::new(),
+                            None,
+                            None,
+                        )),
+                        history_entries: vec![crate::workspace::ReplayHistoryEntryState {
+                            request: Some(test_editable_request("/history")),
+                            request_text: "GET /history HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                                .to_string(),
+                            target_scheme: "https".to_string(),
+                            target_host: "example.test".to_string(),
+                            target_port: "443".to_string(),
+                            ..crate::workspace::ReplayHistoryEntryState::default()
+                        }],
+                        target_scheme: "https".to_string(),
+                        target_host: "example.test".to_string(),
+                        target_port: "443".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                    ReplayTabState {
+                        id: "inactive".to_string(),
+                        sequence: 2,
+                        request_text: "keep me".to_string(),
+                        target_scheme: "https".to_string(),
+                        target_host: "inactive.test".to_string(),
+                        target_port: "443".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                ],
+            },
+            fuzzer: FuzzerWorkspaceState {
+                request_text: "FUZZ /old HTTP/1.1".to_string(),
+                payloads_text: "payload-one".to_string(),
+                ..FuzzerWorkspaceState::default()
+            },
+        };
+        let incoming = WorkspaceStateSnapshot {
+            revision: 7,
+            session_id: Some(session_id),
+            client_id: Some("browser".to_string()),
+            client_version: 13,
+            replay: crate::workspace::ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 3,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    base_request: Some(test_editable_request("/edited")),
+                    request_text: "GET /edited HTTP/1.1\r\nHost: example.test\r\n\r\n".to_string(),
+                    response_record: None,
+                    history_entries: Vec::new(),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            fuzzer: FuzzerWorkspaceState::default(),
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(current, incoming);
+
+        assert_eq!(merged.replay.tabs.len(), 2);
+        let active = merged
+            .replay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "active")
+            .expect("active tab should still exist");
+        assert!(active.request_text.contains("/edited"));
+        assert!(active.response_record.is_none());
+        assert_eq!(active.history_entries.len(), 1);
+        assert!(merged.replay.tabs.iter().any(|tab| tab.id == "inactive"));
+        assert_eq!(merged.fuzzer.payloads_text, "payload-one");
+        assert_eq!(merged.client_version, 13);
     }
 
     #[test]

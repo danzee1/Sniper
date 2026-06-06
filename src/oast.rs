@@ -839,17 +839,27 @@ async fn pending_interactsh_deregistration(
         let reg = store.registration.read().await;
         match &*reg {
             RegistrationState::Interactsh {
+                server_url,
                 correlation_id,
                 secret_key,
                 token,
                 ..
-            } => Some((correlation_id.clone(), secret_key.clone(), token.clone())),
+            } => Some((
+                server_url.clone(),
+                correlation_id.clone(),
+                secret_key.clone(),
+                token.clone(),
+            )),
             RegistrationState::None => None,
         }
     };
 
-    let (base_url, (correlation_id, secret_key, stored_token)) =
-        (prev_url.as_ref()?.clone(), registration?);
+    let (stored_base_url, correlation_id, secret_key, stored_token) = registration?;
+    let base_url = if stored_base_url.is_empty() {
+        prev_url.as_ref()?.clone()
+    } else {
+        stored_base_url
+    };
     let token = if stored_token.is_empty() {
         store.get_config().await.token
     } else {
@@ -2433,6 +2443,30 @@ mod tests {
         restored.restore_registration_blocking(snapshot);
 
         assert!(restored.registration_matches_config(&config).await);
+    }
+
+    #[tokio::test]
+    async fn pending_deregistration_uses_stored_registration_url_without_prev_url() {
+        let store = OastStore::new(16);
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        store
+            .set_registration(RegistrationState::Interactsh {
+                server_url: "https://stored.example.test".to_string(),
+                token: "stored-token".to_string(),
+                correlation_id: "cid".to_string(),
+                secret_key: "secret".to_string(),
+                private_key,
+            })
+            .await;
+
+        let pending = pending_interactsh_deregistration(&store, &None)
+            .await
+            .expect("stored registration URL should be enough to deregister");
+
+        assert_eq!(pending.base_url, "https://stored.example.test");
+        assert_eq!(pending.token, "stored-token");
+        assert_eq!(pending.correlation_id, "cid");
+        assert_eq!(pending.secret_key, "secret");
     }
 
     #[test]
