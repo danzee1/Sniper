@@ -593,6 +593,8 @@ struct WebSocketGetArgs {
     id: Uuid,
     #[arg(long)]
     session_id: Option<Uuid>,
+    #[arg(long)]
+    frame_limit: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1876,29 +1878,18 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
 async fn handle_websocket(api: ApiClient, command: WebSocketCommand) -> Result<()> {
     match command {
         WebSocketCommand::List(args) => {
-            let mut params = Vec::new();
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            if let Some(session_id) = session_id {
-                params.push(("session_id".to_string(), session_id.to_string()));
-            }
-            if let Some(limit) = args.limit {
-                params.push(("limit".to_string(), limit.to_string()));
-            }
-            let query = encode_query(params);
-            let path = if query.is_empty() {
-                "/api/websockets".to_string()
-            } else {
-                format!("/api/websockets?{query}")
-            };
+            let path = websocket_list_path(session_id, args.limit, args.page);
             let websockets: WebSocketListResponse = api.get_json(&path).await?;
             print_json(&websockets.into_cli_output(args.page))
         }
         WebSocketCommand::Get(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let websocket: WebSocketSessionRecord = api
-                .get_json(&session_query_path(
-                    &format!("/api/websockets/{}", args.id),
+                .get_json(&websocket_detail_path(
+                    args.id,
                     session_id,
+                    args.frame_limit,
                 ))
                 .await?;
             print_json(&websocket)
@@ -2342,6 +2333,47 @@ fn transaction_detail_path(transaction_id: Uuid, session_id: Option<Uuid>) -> St
             format!("/api/transactions/{transaction_id}?{query}")
         }
         None => format!("/api/transactions/{transaction_id}"),
+    }
+}
+
+fn websocket_list_path(session_id: Option<Uuid>, limit: Option<usize>, page: bool) -> String {
+    let mut params = Vec::new();
+    if let Some(session_id) = session_id {
+        params.push(("session_id".to_string(), session_id.to_string()));
+    }
+    if let Some(limit) = limit {
+        params.push(("limit".to_string(), limit.to_string()));
+    }
+    let endpoint = if page {
+        "/api/websockets-page"
+    } else {
+        "/api/websockets"
+    };
+    let query = encode_query(params);
+    if query.is_empty() {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}?{query}")
+    }
+}
+
+fn websocket_detail_path(
+    websocket_id: Uuid,
+    session_id: Option<Uuid>,
+    frame_limit: Option<usize>,
+) -> String {
+    let mut params = Vec::new();
+    if let Some(session_id) = session_id {
+        params.push(("session_id".to_string(), session_id.to_string()));
+    }
+    if let Some(frame_limit) = frame_limit {
+        params.push(("frame_limit".to_string(), frame_limit.to_string()));
+    }
+    let query = encode_query(params);
+    if query.is_empty() {
+        format!("/api/websockets/{websocket_id}")
+    } else {
+        format!("/api/websockets/{websocket_id}?{query}")
     }
 }
 
@@ -3731,9 +3763,10 @@ mod tests {
         replay_tab_target_as_request, replay_tab_target_matches_request,
         replay_update_should_preserve_current_port, session_query_path,
         sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
-        sync_replay_tab_target_to_request, transaction_detail_path, Cli, Command, HistoryCommand,
-        HistoryListResponse, SequenceCommand, SequenceCreateInput, SkillsInstallArgs,
-        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        sync_replay_tab_target_to_request, transaction_detail_path, websocket_detail_path,
+        websocket_list_path, Cli, Command, HistoryCommand, HistoryListResponse, SequenceCommand,
+        SequenceCreateInput, SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
+        MAX_CLI_INPUT_BYTES,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -3773,6 +3806,35 @@ mod tests {
         assert_eq!(
             transaction_detail_path(transaction_id, None),
             "/api/transactions/11111111-1111-1111-1111-111111111111"
+        );
+    }
+
+    #[test]
+    fn websocket_list_path_uses_page_endpoint_when_requested() {
+        let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        assert_eq!(
+            websocket_list_path(Some(session_id), Some(1), true),
+            "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1"
+        );
+        assert_eq!(
+            websocket_list_path(Some(session_id), Some(1), false),
+            "/api/websockets?session_id=22222222-2222-2222-2222-222222222222&limit=1"
+        );
+    }
+
+    #[test]
+    fn websocket_detail_path_includes_frame_limit_and_allows_zero() {
+        let websocket_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        assert_eq!(
+            websocket_detail_path(websocket_id, Some(session_id), Some(0)),
+            "/api/websockets/11111111-1111-1111-1111-111111111111?session_id=22222222-2222-2222-2222-222222222222&frame_limit=0"
+        );
+        assert_eq!(
+            websocket_detail_path(websocket_id, None, Some(2)),
+            "/api/websockets/11111111-1111-1111-1111-111111111111?frame_limit=2"
         );
     }
 

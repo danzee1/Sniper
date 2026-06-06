@@ -118,6 +118,7 @@ const WEBSOCKET_POLL_FALLBACK_MS = 30000;
 const WEBSOCKET_PAGE_SIZE = 500;
 const WEBSOCKET_MAX_LOADED_SESSIONS = 5000;
 const WEBSOCKET_SCROLL_PREFETCH_PX = 240;
+const WEBSOCKET_QUERY_BACKFILL_DELAY_MS = 100;
 const WEBSOCKET_DETAIL_FRAME_LIMIT = 1000;
 const FINDINGS_BADGE_POLL_INTERVAL_MS = 30000;
 const WS_REPLAY_MAX_LOADED_FRAMES = 10000;
@@ -453,6 +454,8 @@ let _websocketDetailRefreshTimer = null;
 let _websocketDetailRefreshNeededId = null;
 let _websocketSummaryMutationGeneration = 0;
 let _websocketSummaryMutationById = new Map();
+let _websocketQueryBackfillTimer = 0;
+let _websocketQueryBackfillGeneration = 0;
 let _lastHttpHistoryFallbackPoll = Date.now();
 let _lastWebsocketFallbackPoll = Date.now();
 let _interceptToggleRequestSeq = 0;
@@ -1109,6 +1112,7 @@ function bindEvents() {
 
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
+    clearWebsocketQueryBackfill();
     syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
   });
   document.querySelector("#websocketTable")?.closest(".history-table-shell")?.addEventListener("scroll", (event) => {
@@ -1122,10 +1126,12 @@ function bindEvents() {
   });
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
+    clearWebsocketQueryBackfill();
     syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
   });
   document.getElementById("wsHideClosed")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
+    clearWebsocketQueryBackfill();
     syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
   });
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
@@ -2992,6 +2998,7 @@ function resetSessionScopedUiState() {
   state.selectedWebsocketDetailError = "";
   _websocketLoadGeneration += 1;
   _websocketDetailGeneration += 1;
+  clearWebsocketQueryBackfill();
   if (_websocketDetailRefreshTimer) {
     window.clearTimeout(_websocketDetailRefreshTimer);
     _websocketDetailRefreshTimer = null;
@@ -3734,6 +3741,48 @@ async function loadMoreWebsockets() {
   }
   state.websocketPaging = { ...paging, limit: nextLimit };
   await loadWebsockets(true);
+}
+
+function websocketQueryBackfillShouldRun(visibleCount) {
+  const paging = state.websocketPaging || createWebsocketPagingState();
+  return state.activeProxyTab === "websockets-history"
+    && websocketFilterIsActive()
+    && visibleCount === 0
+    && Boolean(paging.hasMore)
+    && !Boolean(paging.loading)
+    && normalizeWebsocketLoadLimit(paging.limit) < WEBSOCKET_MAX_LOADED_SESSIONS;
+}
+
+function websocketFilterIsActive() {
+  return Boolean(String(state.websocketQuery || "").trim())
+    || Boolean(document.getElementById("wsInScopeOnly")?.classList.contains("active"))
+    || Boolean(document.getElementById("wsHideClosed")?.classList.contains("active"));
+}
+
+function clearWebsocketQueryBackfill() {
+  _websocketQueryBackfillGeneration += 1;
+  if (_websocketQueryBackfillTimer) {
+    window.clearTimeout(_websocketQueryBackfillTimer);
+    _websocketQueryBackfillTimer = 0;
+  }
+}
+
+function scheduleWebsocketQueryBackfill(visibleCount) {
+  if (!websocketQueryBackfillShouldRun(visibleCount) || _websocketQueryBackfillTimer) {
+    return;
+  }
+  const generation = _websocketQueryBackfillGeneration;
+  const sessionId = currentSessionId();
+  _websocketQueryBackfillTimer = window.setTimeout(() => {
+    _websocketQueryBackfillTimer = 0;
+    if (generation !== _websocketQueryBackfillGeneration || sessionId !== currentSessionId()) {
+      return;
+    }
+    if (!websocketQueryBackfillShouldRun(getVisibleWebsocketSessions().length)) {
+      return;
+    }
+    loadMoreWebsockets().catch((error) => console.error(error));
+  }, WEBSOCKET_QUERY_BACKFILL_DELAY_MS);
 }
 
 function normalizeWebsocketLoadLimit(value) {
@@ -6849,6 +6898,19 @@ function renderInspectorPanels() {
     return;
   }
   els.lowerWorkbench.classList.toggle("inspector-collapsed", state.inspectorCollapsed);
+  railTabs.forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.inspectorTab === state.activeInspectorTab);
+  });
+  if (
+    !state.inspectorCollapsed
+    && state.activeInspectorTab === "notes"
+    && els.notesPanel
+    && els.inspectorContent
+  ) {
+    window.requestAnimationFrame(() => {
+      els.notesPanel.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
+  }
 }
 
 function renderInterceptStatus() {
@@ -7710,6 +7772,7 @@ function renderIntercepts() {
 function renderWebsocketSessions() {
   const sortedEntries = getSortedWebsocketEntries();
   const renderedEntries = websocketRenderedSessionWindow(sortedEntries, state.selectedWebsocketId);
+  scheduleWebsocketQueryBackfill(sortedEntries.length);
   if (els.websocketSearchInput.value !== state.websocketQuery) {
     els.websocketSearchInput.value = state.websocketQuery;
   }
@@ -7745,7 +7808,9 @@ function renderWebsocketSessions() {
         <tr class="empty-row">
           <td colspan="7">${
             state.websocketSessions.length
-              ? "No WebSocket sessions match the current filter."
+              ? (websocketFilterIsActive() && state.websocketPaging?.hasMore
+                ? "Searching older WebSocket history for matches..."
+                : "No WebSocket sessions match the current filter.")
               : "No WebSocket sessions have been captured yet."
           }</td>
         </tr>
@@ -7846,8 +7911,14 @@ function renderWebsocketSessions() {
     : frames.length;
   const frameNumberOffset = Math.max(0, fullFrameCount - frames.length);
   const framePositions = new Map(frames.map((frame, index) => [frame.index, frameNumberOffset + index + 1]));
+  const frameWindowNotice = session.frames_truncated && frameNumberOffset > 0
+    ? `
+          <tr class="ws-frame-window-row">
+            <td colspan="5">Showing latest ${frames.length} of ${fullFrameCount} frames (${frameNumberOffset} older not loaded).</td>
+          </tr>`
+    : "";
   els.websocketFramesBody.innerHTML = frames.length
-    ? renderedFrames
+    ? frameWindowNotice + renderedFrames
         .map((frame) => {
           const dir = frame.direction === "client_to_server" ? "\u2192" : "\u2190";
           const dirClass = frame.direction === "client_to_server" ? "dir-client" : "dir-server";
@@ -13682,6 +13753,20 @@ function bindPaneResizer(handle, mode) {
         applyWorkbenchPaneWidths(nextRequest, combinedWidth - nextRequest, start.total);
         return;
       }
+      if (mode === "response-inspector") {
+        const combinedWidth = start.response + start.inspector;
+        const nextResponse = clamp(
+          start.response + delta,
+          WORKBENCH_MIN_WIDTHS.response,
+          combinedWidth - WORKBENCH_MIN_WIDTHS.inspector,
+        );
+        applyWorkbenchPaneWidths(
+          start.request,
+          nextResponse,
+          start.total,
+          combinedWidth - nextResponse,
+        );
+      }
     };
 
     const onUp = () => {
@@ -13689,7 +13774,9 @@ function bindPaneResizer(handle, mode) {
       handle.classList.remove("active");
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-      normalizeWorkbenchPaneWidths();
+      if (mode === "request-response") {
+        normalizeWorkbenchPaneWidths();
+      }
     };
 
     document.addEventListener("mousemove", onMove);
@@ -13706,10 +13793,16 @@ function getWorkbenchWidths() {
     total: els.lowerWorkbench.getBoundingClientRect().width,
     request: els.requestColumn.getBoundingClientRect().width,
     response: els.responseColumn.getBoundingClientRect().width,
+    inspector: els.inspectorColumn?.getBoundingClientRect().width || 0,
   };
 }
 
-function applyWorkbenchPaneWidths(requestWidth, responseWidth, totalWidth = els.lowerWorkbench.getBoundingClientRect().width) {
+function applyWorkbenchPaneWidths(
+  requestWidth,
+  responseWidth,
+  totalWidth = els.lowerWorkbench.getBoundingClientRect().width,
+  inspectorWidth = null,
+) {
   if (!totalWidth) {
     return;
   }
@@ -13718,6 +13811,18 @@ function applyWorkbenchPaneWidths(requestWidth, responseWidth, totalWidth = els.
   const responsePercent = clamp((responseWidth / totalWidth) * 100, 18, 72);
   els.lowerWorkbench.style.setProperty("--request-pane-width", `${requestPercent}%`);
   els.lowerWorkbench.style.setProperty("--response-pane-width", `${responsePercent}%`);
+  if (Number.isFinite(inspectorWidth)) {
+    const maxInspectorWidth = Math.max(
+      WORKBENCH_MIN_WIDTHS.inspector,
+      totalWidth - WORKBENCH_MIN_WIDTHS.request - WORKBENCH_MIN_WIDTHS.response,
+    );
+    const clampedInspectorWidth = clamp(
+      inspectorWidth,
+      WORKBENCH_MIN_WIDTHS.inspector,
+      maxInspectorWidth,
+    );
+    els.lowerWorkbench.style.setProperty("--inspector-pane-width", `${Math.round(clampedInspectorWidth)}px`);
+  }
 }
 
 function normalizeWorkbenchPaneWidths() {
@@ -13756,6 +13861,7 @@ function normalizeWorkbenchPaneWidths() {
 function resetWorkbenchPaneWidths() {
   els.lowerWorkbench.style.removeProperty("--request-pane-width");
   els.lowerWorkbench.style.removeProperty("--response-pane-width");
+  els.lowerWorkbench.style.removeProperty("--inspector-pane-width");
 }
 
 function bindWebsocketPaneResizer(handle) {

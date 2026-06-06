@@ -3181,6 +3181,12 @@ body.pane-resizing-y {
 .websocket-frames-column tr.frame-selected td {
   background: var(--point-soft);
 }
+.websocket-frames-column .ws-frame-window-row td {
+  color: var(--text-dim);
+  font-size: var(--font-xs);
+  text-align: center;
+  background: rgba(255, 255, 255, 0.025);
+}
 .websocket-frames-column .mini-table tr.frame-selected td:first-child {
   box-shadow: inset 1px 0 0 var(--point-border);
 }

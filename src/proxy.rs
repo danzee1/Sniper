@@ -237,12 +237,12 @@ pub async fn rebind_proxy(
         }
     };
 
-    drain_proxy_connections(Duration::from_millis(200)).await;
     close_live_websocket_relays(
         state.as_ref(),
         "Proxy listener rebind closed the live WebSocket relay.",
     )
     .await;
+    drain_proxy_connections(Duration::from_millis(200)).await;
 
     let bound_addr = listener
         .local_addr()
