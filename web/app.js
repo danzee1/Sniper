@@ -2061,11 +2061,21 @@ function bindEvents() {
       if (tab && tab.type === "websocket" && frames.length > 0) {
         event.preventDefault();
         const currentPosition = frames.findIndex((frame) => frame.index === tab.wsSelectedFrameIndex);
+        const visibleFrames = wsReplayRenderedFrameWindow(
+          frames,
+          tab.wsSelectedFrameIndex,
+          tab.wsFrameWindowStart,
+        ).frames;
         const nextPosition = currentPosition === -1
-          ? (event.key === "ArrowDown" ? 0 : frames.length - 1)
+          ? frames.findIndex((frame) => frame.index === (
+            event.key === "ArrowDown"
+              ? visibleFrames[0]?.index
+              : visibleFrames[visibleFrames.length - 1]?.index
+          ))
           : event.key === "ArrowDown"
             ? Math.min(currentPosition + 1, frames.length - 1)
             : Math.max(currentPosition - 1, 0);
+        if (nextPosition < 0) return;
         const nextFrameIndex = frames[nextPosition].index;
         tab.wsSelectedFrameIndex = nextFrameIndex;
         renderWsFrameList();
@@ -3514,7 +3524,15 @@ async function loadTransactionDetail(id) {
 }
 
 async function selectHistoryTransaction(id, options = {}) {
-  state.selectedId = id ?? null;
+  const nextId = id ?? null;
+  if (nextId && state.selectedId === nextId && state.selectedRecord?.id === nextId) {
+    updateHistorySelection(nextId);
+    if (options.scroll) {
+      scrollSelectedHistoryRowIntoView();
+    }
+    return state.selectedRecord;
+  }
+  state.selectedId = nextId;
   state.selectedRecord = null;
   state.loadingDetailId = null;
   updateHistorySelection(state.selectedId);
@@ -16205,6 +16223,12 @@ function trimWsReplayFrames(tab) {
   const overflow = tab.wsFrames.length - WS_REPLAY_MAX_LOADED_FRAMES;
   if (overflow <= 0) return;
   tab.wsFrames.splice(0, overflow);
+  if (tab.wsFrameWindowStart != null) {
+    const windowStart = Number(tab.wsFrameWindowStart);
+    tab.wsFrameWindowStart = Number.isFinite(windowStart)
+      ? Math.max(0, windowStart - overflow)
+      : null;
+  }
   if (
     tab.wsSelectedFrameIndex !== -1
     && !tab.wsFrames.some((frame) => frame.index === tab.wsSelectedFrameIndex)
@@ -16364,21 +16388,87 @@ function renderWsStatus() {
   }
 }
 
-function wsRenderedFrameWindow(frames, selectedFrameIndex) {
+function wsReplayFrameWindowMaxStart(frames) {
+  return Math.max(0, frames.length - WS_REPLAY_MAX_RENDERED_FRAMES);
+}
+
+function normalizeWsReplayFrameWindowStart(frames, preferredStart) {
+  const defaultStart = wsReplayFrameWindowMaxStart(frames);
+  if (preferredStart == null) {
+    return defaultStart;
+  }
+  const numericStart = Number(preferredStart);
+  if (!Number.isFinite(numericStart)) {
+    return defaultStart;
+  }
+  return clamp(Math.floor(numericStart), 0, defaultStart);
+}
+
+function wsReplayRenderedFrameWindow(frames, selectedFrameIndex, preferredStart = null) {
   if (frames.length <= WS_REPLAY_MAX_RENDERED_FRAMES) {
-    return frames;
+    return {
+      frames,
+      start: 0,
+      end: frames.length,
+      total: frames.length,
+    };
   }
-  const tailStart = frames.length - WS_REPLAY_MAX_RENDERED_FRAMES;
+  const tailStart = wsReplayFrameWindowMaxStart(frames);
   const selectedPosition = frames.findIndex((frame) => frame.index === selectedFrameIndex);
-  if (selectedPosition === -1 || selectedPosition >= tailStart) {
-    return frames.slice(tailStart);
+  let start = normalizeWsReplayFrameWindowStart(frames, preferredStart);
+  if (selectedPosition !== -1) {
+    const selectedInPreferredWindow =
+      selectedPosition >= start && selectedPosition < start + WS_REPLAY_MAX_RENDERED_FRAMES;
+    if (!selectedInPreferredWindow) {
+      if (selectedPosition >= tailStart) {
+        start = tailStart;
+      } else {
+        const halfWindow = Math.floor(WS_REPLAY_MAX_RENDERED_FRAMES / 2);
+        start = Math.max(
+          0,
+          Math.min(selectedPosition - halfWindow, tailStart),
+        );
+      }
+    }
   }
-  const halfWindow = Math.floor(WS_REPLAY_MAX_RENDERED_FRAMES / 2);
-  const start = Math.max(
-    0,
-    Math.min(selectedPosition - halfWindow, frames.length - WS_REPLAY_MAX_RENDERED_FRAMES),
-  );
-  return frames.slice(start, start + WS_REPLAY_MAX_RENDERED_FRAMES);
+  const end = Math.min(frames.length, start + WS_REPLAY_MAX_RENDERED_FRAMES);
+  return {
+    frames: frames.slice(start, end),
+    start,
+    end,
+    total: frames.length,
+  };
+}
+
+function pageWsReplayFrameWindow(tab, direction, anchor) {
+  if (!tab || tab.type !== "websocket") return false;
+  const frames = getWsReplayFrames(tab);
+  const maxStart = wsReplayFrameWindowMaxStart(frames);
+  if (maxStart <= 0) return false;
+  const currentStart = wsReplayRenderedFrameWindow(
+    frames,
+    tab.wsSelectedFrameIndex,
+    tab.wsFrameWindowStart,
+  ).start;
+  const pageSize = Math.max(1, Math.floor(WS_REPLAY_MAX_RENDERED_FRAMES * 0.8));
+  const nextStart = clamp(currentStart + (direction * pageSize), 0, maxStart);
+  if (nextStart === currentStart) return false;
+  tab.wsFrameWindowStart = nextStart >= maxStart ? null : nextStart;
+  tab.wsSelectedFrameIndex = -1;
+  tab.wsFrameWindowPaging = true;
+  try {
+    renderWsFrameList();
+  } finally {
+    tab.wsFrameWindowPaging = false;
+  }
+  window.requestAnimationFrame(() => {
+    if (anchor === "bottom") {
+      els.wsFrameList.scrollTop = Math.max(0, els.wsFrameList.scrollHeight - els.wsFrameList.clientHeight - 1);
+    } else {
+      els.wsFrameList.scrollTop = 1;
+    }
+  });
+  return true;
 }
 
 function renderWsFrameList() {
@@ -16391,16 +16481,24 @@ function renderWsFrameList() {
   els.wsFrameCount.textContent = `${frames.length} frame${frames.length === 1 ? "" : "s"}`;
   const previousFrameListScrollTop = els.wsFrameList.scrollTop;
   const wasNearBottom = els.wsFrameList.scrollHeight - els.wsFrameList.scrollTop - els.wsFrameList.clientHeight < 24;
+  const hasSelectedFrame = tab.wsSelectedFrameIndex != null && tab.wsSelectedFrameIndex >= 0;
+  const hasPreferredFrameWindow = tab.wsFrameWindowStart != null
+    && Number.isFinite(Number(tab.wsFrameWindowStart));
 
   if (!frames.length) {
     els.wsFrameList.onclick = null;
     els.wsFrameList.ondblclick = null;
+    els.wsFrameList.onwheel = null;
     els.wsFrameList.innerHTML = '<div class="empty-copy">Connect to start a WebSocket conversation.</div>';
     renderWsFrameDetail();
     return;
   }
 
-  const renderedFrames = wsRenderedFrameWindow(frames, tab.wsSelectedFrameIndex);
+  const frameWindow = wsReplayRenderedFrameWindow(frames, tab.wsSelectedFrameIndex, tab.wsFrameWindowStart);
+  const renderedFrames = frameWindow.frames;
+  const windowAtTail = frameWindow.end >= frames.length;
+  const tailWindowUnpinned = !hasSelectedFrame && !hasPreferredFrameWindow;
+  tab.wsFrameWindowStart = tailWindowUnpinned && windowAtTail ? null : frameWindow.start;
 
   els.wsFrameList.innerHTML = renderedFrames.map((frame) => {
     const isClient = frame.direction === "client_to_server";
@@ -16421,11 +16519,25 @@ function renderWsFrameList() {
     </div>`;
   }).join("");
 
-  if (wasNearBottom || tab.wsSelectedFrameIndex == null || tab.wsSelectedFrameIndex < 0) {
+  if ((wasNearBottom && windowAtTail) || (tailWindowUnpinned && windowAtTail)) {
     els.wsFrameList.scrollTop = els.wsFrameList.scrollHeight;
   } else {
     els.wsFrameList.scrollTop = previousFrameListScrollTop;
   }
+
+  els.wsFrameList.onwheel = (event) => {
+    if (frames.length <= WS_REPLAY_MAX_RENDERED_FRAMES) return;
+    const remainingBottom = els.wsFrameList.scrollHeight - els.wsFrameList.scrollTop - els.wsFrameList.clientHeight;
+    const atTop = els.wsFrameList.scrollTop <= 0;
+    const atBottom = remainingBottom <= 1;
+    if (event.deltaY < 0 && atTop && frameWindow.start > 0) {
+      event.preventDefault();
+      pageWsReplayFrameWindow(tab, -1, "bottom");
+    } else if (event.deltaY > 0 && atBottom && frameWindow.end < frames.length) {
+      event.preventDefault();
+      pageWsReplayFrameWindow(tab, 1, "top");
+    }
+  };
 
   els.wsFrameList.onclick = (event) => {
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;

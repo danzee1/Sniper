@@ -46,7 +46,10 @@ use crate::{
     store::{ListFilters, TransactionListPage},
     target::{TargetHostNode, TargetPathNode},
     ui_settings::AppUiSettingsSnapshot,
-    workspace::{can_replace_snapshot, WorkspaceReplaceError, WorkspaceStateSnapshot},
+    workspace::{
+        can_replace_snapshot, validate_workspace_serialized_size, WorkspaceReplaceError,
+        WorkspaceStateSnapshot, MAX_WORKSPACE_SERIALIZED_BYTES,
+    },
 };
 
 const MAX_WORKSPACE_WS_FRAMES: usize = 1_000;
@@ -65,7 +68,12 @@ const MAX_WORKSPACE_WS_SETUP_QUEUE_ITEMS: usize = 250;
 const MAX_WORKSPACE_WS_SETUP_ITEM_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WORKSPACE_EMBEDDED_RECORD_BYTES: usize = 4 * 1024 * 1024;
-const MAX_WORKSPACE_STORED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WORKSPACE_STORED_BYTES: usize = MAX_WORKSPACE_SERIALIZED_BYTES;
+const MAX_WORKSPACE_CLIENT_ID_BYTES: usize = 128;
+const MAX_WORKSPACE_REPLAY_TAB_ID_BYTES: usize = 128;
+const MAX_WORKSPACE_REPLAY_TAB_TYPE_BYTES: usize = 32;
+const MAX_WORKSPACE_REPLAY_ACTIVE_TAB_ID_BYTES: usize = 128;
+const MAX_WORKSPACE_REPLAY_TARGET_FIELD_BYTES: usize = 4 * 1024;
 const MAX_SEQUENCE_STEPS: usize = 250;
 const MAX_SEQUENCE_EXTRACTIONS_PER_STEP: usize = 50;
 const MAX_SEQUENCE_TEXT_FIELD_BYTES: usize = 64 * 1024;
@@ -807,20 +815,45 @@ fn validate_request_target_override(
 }
 
 fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::Result<(), String> {
+    validate_workspace_serialized_size(snapshot)?;
     let mut tab_ids = HashSet::new();
     let mut ws_frame_total = 0usize;
     let mut ws_frame_body_total = 0usize;
     let mut stored_bytes_total = 0usize;
+    if let Some(client_id) = snapshot.client_id.as_deref() {
+        validate_workspace_string_bytes(
+            "workspace client id",
+            client_id,
+            MAX_WORKSPACE_CLIENT_ID_BYTES,
+        )?;
+    }
     if snapshot.replay.tabs.len() > MAX_WORKSPACE_REPLAY_TABS {
         return Err(format!(
             "workspace has too many replay tabs: {}",
             snapshot.replay.tabs.len()
         ));
     }
+    if let Some(active_tab_id) = snapshot.replay.active_tab_id.as_deref() {
+        validate_workspace_string_bytes(
+            "active replay tab id",
+            active_tab_id,
+            MAX_WORKSPACE_REPLAY_ACTIVE_TAB_ID_BYTES,
+        )?;
+    }
     for tab in &snapshot.replay.tabs {
         if tab.id.trim().is_empty() {
             return Err("replay tab id is required".to_string());
         }
+        validate_workspace_string_bytes(
+            "replay tab id",
+            &tab.id,
+            MAX_WORKSPACE_REPLAY_TAB_ID_BYTES,
+        )?;
+        validate_workspace_string_bytes(
+            "replay tab type",
+            &tab.tab_type,
+            MAX_WORKSPACE_REPLAY_TAB_TYPE_BYTES,
+        )?;
         if !tab_ids.insert(tab.id.as_str()) {
             return Err(format!("duplicate replay tab id: {}", tab.id));
         }
@@ -1088,6 +1121,17 @@ fn add_workspace_stored_bytes(
     Ok(())
 }
 
+fn validate_workspace_string_bytes(
+    label: &str,
+    value: &str,
+    limit: usize,
+) -> std::result::Result<(), String> {
+    if value.len() > limit {
+        return Err(format!("{label} cannot exceed {limit} bytes"));
+    }
+    Ok(())
+}
+
 fn validate_workspace_draft_request(request: &EditableRequest) -> std::result::Result<(), String> {
     if !request.host.trim().is_empty() {
         return validate_editable_request(request);
@@ -1118,6 +1162,21 @@ fn validate_workspace_target_fields(
     host: &str,
     port: &str,
 ) -> std::result::Result<(), String> {
+    validate_workspace_string_bytes(
+        "replay target scheme",
+        scheme,
+        MAX_WORKSPACE_REPLAY_TARGET_FIELD_BYTES,
+    )?;
+    validate_workspace_string_bytes(
+        "replay target host",
+        host,
+        MAX_WORKSPACE_REPLAY_TARGET_FIELD_BYTES,
+    )?;
+    validate_workspace_string_bytes(
+        "replay target port",
+        port,
+        MAX_WORKSPACE_REPLAY_TARGET_FIELD_BYTES,
+    )?;
     let raw_scheme = scheme;
     let raw_host = host;
     let raw_port = port;
@@ -5365,6 +5424,22 @@ mod tests {
         });
 
         assert!(super::validate_workspace_state(&snapshot).is_err());
+    }
+
+    #[test]
+    fn workspace_validation_rejects_unbounded_durable_metadata() {
+        let mut snapshot = WorkspaceStateSnapshot {
+            client_id: Some("x".repeat(super::MAX_WORKSPACE_CLIENT_ID_BYTES + 1)),
+            ..WorkspaceStateSnapshot::default()
+        };
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("workspace client id"));
+
+        snapshot.client_id = None;
+        snapshot.fuzzer.target_request_authority =
+            Some("x".repeat(crate::workspace::MAX_WORKSPACE_SERIALIZED_BYTES));
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("serialized bytes"));
     }
 
     #[test]

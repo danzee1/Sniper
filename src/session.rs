@@ -30,7 +30,7 @@ use crate::{
         TransactionStore,
     },
     websocket::WebSocketStore,
-    workspace::WorkspaceReplaceError,
+    workspace::{validate_workspace_serialized_size, WorkspaceReplaceError},
     workspace::{WorkspaceStateSnapshot, WorkspaceStateStore},
 };
 
@@ -305,6 +305,9 @@ impl SessionContext {
         &self,
         workspace: WorkspaceStateSnapshot,
     ) -> Result<()> {
+        validate_workspace_serialized_size(&workspace)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| "workspace snapshot is too large to persist")?;
         let path = snapshot_path(&self.storage_dir);
         let mut snapshot = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<StoredSessionSnapshot>(&bytes) {
@@ -349,6 +352,9 @@ impl SessionContext {
         &self,
         workspace: WorkspaceStateSnapshot,
     ) -> Result<SessionMetadata> {
+        validate_workspace_serialized_size(&workspace)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| "workspace snapshot is too large to persist")?;
         let snapshot = StoredSessionSnapshot {
             runtime: self.runtime.snapshot().await,
             transactions: self
@@ -1260,6 +1266,14 @@ fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<Store
             .with_context(|| format!("failed to read session snapshot {}", path.display())),
     }?;
     snapshot.workspace.fuzzer.migrate_attack_record_to_id();
+    if let Err(error) = validate_workspace_serialized_size(&snapshot.workspace) {
+        warn!(
+            ?error,
+            path = %path.display(),
+            "discarding invalid stored workspace state"
+        );
+        snapshot.workspace = WorkspaceStateSnapshot::default();
+    }
     snapshot.replayed_transaction_ids =
         replay_transaction_journal(storage_dir, max_entries, &mut snapshot)?;
     snapshot.replayed_transaction_journal = !snapshot.replayed_transaction_ids.is_empty();
@@ -1657,6 +1671,64 @@ mod tests {
 
         assert_eq!(loaded.workspace.fuzzer.attack_record_id, Some(attack_id));
         assert!(loaded.workspace.fuzzer.attack_record.is_none());
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn load_session_snapshot_discards_oversized_workspace_only() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "sniper-load-oversized-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let request = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "Host".to_string(),
+                value: "example.test".to_string(),
+            }],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let transaction = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "example.test".to_string(),
+            "/kept".to_string(),
+            Some(200),
+            1,
+            request,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![transaction.clone()],
+            workspace: WorkspaceStateSnapshot {
+                fuzzer: FuzzerWorkspaceState {
+                    target_request_authority: Some(
+                        "x".repeat(crate::workspace::MAX_WORKSPACE_SERIALIZED_BYTES),
+                    ),
+                    ..FuzzerWorkspaceState::default()
+                },
+                ..WorkspaceStateSnapshot::default()
+            },
+            ..super::StoredSessionSnapshot::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let loaded = super::load_session_snapshot(&storage_dir, 100).unwrap();
+
+        assert_eq!(loaded.transactions.len(), 1);
+        assert_eq!(loaded.transactions[0].id, transaction.id);
+        assert!(loaded.workspace.fuzzer.target_request_authority.is_none());
 
         let _ = std::fs::remove_dir_all(storage_dir);
     }

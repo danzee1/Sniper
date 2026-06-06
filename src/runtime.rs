@@ -122,54 +122,56 @@ impl RuntimeSettings {
             }
         }
         let mut current = self.inner.write().await;
+        let mut candidate = current.clone();
 
         if let Some(intercept_enabled) = update.intercept_enabled {
-            current.intercept_enabled = intercept_enabled;
+            candidate.intercept_enabled = intercept_enabled;
         }
 
         if let Some(websocket_capture_enabled) = update.websocket_capture_enabled {
-            current.websocket_capture_enabled = websocket_capture_enabled;
+            candidate.websocket_capture_enabled = websocket_capture_enabled;
         }
 
         if let Some(scope_patterns) = update.scope_patterns {
-            current.scope_patterns =
+            candidate.scope_patterns =
                 normalize_bounded_scope_patterns("scope pattern", scope_patterns)?;
         }
 
         if let Some(passthrough_hosts) = update.passthrough_hosts {
-            current.passthrough_hosts =
+            candidate.passthrough_hosts =
                 normalize_bounded_scope_patterns("passthrough host", passthrough_hosts)?;
         }
 
         if let Some(upstream_insecure) = update.upstream_insecure {
-            current.upstream_insecure = upstream_insecure;
+            candidate.upstream_insecure = upstream_insecure;
         }
 
         if let Some(intercept_scope_only) = update.intercept_scope_only {
-            current.intercept_scope_only = intercept_scope_only;
+            candidate.intercept_scope_only = intercept_scope_only;
         }
 
         if let Some(oast_enabled) = update.oast_enabled {
-            current.oast_enabled = oast_enabled;
+            candidate.oast_enabled = oast_enabled;
         }
         if let Some(oast_server_url) = update.oast_server_url {
             validate_runtime_text_field("OAST server URL", &oast_server_url)?;
-            current.oast_server_url = oast_server_url;
+            candidate.oast_server_url = oast_server_url;
         }
         if let Some(oast_token) = update.oast_token {
             if oast_token != OAST_TOKEN_REDACTION {
                 validate_runtime_text_field("OAST token", &oast_token)?;
-                current.oast_token = oast_token;
+                candidate.oast_token = oast_token;
             }
         }
         if let Some(oast_polling_interval_secs) = update.oast_polling_interval_secs {
-            current.oast_polling_interval_secs = oast_polling_interval_secs;
+            candidate.oast_polling_interval_secs = oast_polling_interval_secs;
         }
         if let Some(oast_provider) = update.oast_provider {
-            current.oast_provider = oast_provider;
+            candidate.oast_provider = oast_provider;
         }
 
-        Ok(current.clone())
+        *current = candidate.clone();
+        Ok(candidate)
     }
 
     pub async fn replace_snapshot(
@@ -375,12 +377,14 @@ mod tests {
 
         let error = settings
             .update(RuntimeSettingsUpdate {
+                intercept_enabled: Some(true),
                 oast_server_url: Some("x".repeat(super::MAX_RUNTIME_TEXT_FIELD_BYTES + 1)),
                 ..RuntimeSettingsUpdate::default()
             })
             .await
             .unwrap_err();
         assert!(error.to_string().contains("OAST server URL"));
+        assert!(!settings.snapshot().await.intercept_enabled);
     }
 
     #[tokio::test]

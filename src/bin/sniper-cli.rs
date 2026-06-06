@@ -952,6 +952,38 @@ impl ApiClient {
         self.request_json(Method::POST, path, Some(body)).await
     }
 
+    async fn post_json_or_no_content<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<Option<T>> {
+        let response = self
+            .client
+            .post(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("failed to POST {}", path))?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_else(|_| String::new());
+            let detail = if message.trim().is_empty() {
+                status.to_string()
+            } else {
+                message
+            };
+            bail!("request to {} failed ({}): {}", path, status, detail);
+        }
+        if status == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        response
+            .json::<T>()
+            .await
+            .map(Some)
+            .with_context(|| format!("failed to decode JSON response from {}", path))
+    }
+
     async fn post_json_long<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
@@ -2050,7 +2082,15 @@ async fn handle_response_intercept(
         ResponseInterceptCommand::ForwardAll(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/response-intercepts/forward-all", session_id);
-            let mut result: serde_json::Value = api.post_json(&path, &json!({})).await?;
+            let mut result: serde_json::Value = api
+                .post_json_or_no_content(&path, &json!({}))
+                .await?
+                .unwrap_or_else(|| {
+                    json!({
+                        "ok": true,
+                        "action": "forward-all",
+                    })
+                });
             attach_session_id(&mut result, session_id);
             print_json(&result)
         }

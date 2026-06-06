@@ -10,6 +10,8 @@ use crate::{
     ws_replay::WsReplayFrame,
 };
 
+pub const MAX_WORKSPACE_SERIALIZED_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkspaceStateSnapshot {
@@ -29,6 +31,20 @@ pub struct WorkspaceStateSnapshot {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+pub fn validate_workspace_serialized_size(
+    snapshot: &WorkspaceStateSnapshot,
+) -> std::result::Result<(), String> {
+    let bytes = serde_json::to_vec(snapshot)
+        .map_err(|error| format!("failed to measure workspace state: {error}"))?
+        .len();
+    if bytes > MAX_WORKSPACE_SERIALIZED_BYTES {
+        return Err(format!(
+            "workspace state cannot exceed {MAX_WORKSPACE_SERIALIZED_BYTES} serialized bytes"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
