@@ -28,6 +28,10 @@ pub struct RuntimeStateSnapshot {
     pub updated_at: DateTime<Utc>,
     #[serde(default = "default_app_version")]
     pub app_version: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub process_path: Option<String>,
 }
 
 fn default_updated_at() -> DateTime<Utc> {
@@ -69,6 +73,10 @@ impl RuntimeStateSnapshot {
             proxy_online,
             updated_at: Utc::now(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: Some(std::process::id()),
+            process_path: std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string()),
         }
     }
 
@@ -288,6 +296,8 @@ fn runtime_state_matches(left: &RuntimeStateSnapshot, right: &RuntimeStateSnapsh
         && left.proxy_online == right.proxy_online
         && left.updated_at == right.updated_at
         && left.app_version == right.app_version
+        && left.pid == right.pid
+        && left.process_path == right.process_path
 }
 
 fn sync_directory(path: &Path, label: &str) -> Result<()> {
@@ -372,6 +382,8 @@ mod tests {
         assert_eq!(loaded.instance_id, snapshot.instance_id);
         assert_eq!(loaded.proxy_addr, snapshot.proxy_addr);
         assert_eq!(loaded.ui_addr, snapshot.ui_addr);
+        assert_eq!(loaded.pid, Some(std::process::id()));
+        assert_eq!(loaded.process_path, snapshot.process_path);
         assert!(loaded.proxy_online);
         assert!(runtime_state_path(&temp_dir).exists());
 

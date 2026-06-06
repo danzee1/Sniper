@@ -2563,6 +2563,17 @@ fn active_session_conflict_response(state: &AppState) -> Response {
         .into_response()
 }
 
+fn ws_replay_connection_owner_conflict_response(owner_session_id: Uuid) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "websocket replay connection belongs to another session",
+            "owner_session_id": owner_session_id,
+        })),
+    )
+        .into_response()
+}
+
 fn session_load_failure_response(session_id: Uuid, error: anyhow::Error) -> Response {
     if error.to_string().contains("was not found") {
         return StatusCode::NOT_FOUND.into_response();
@@ -2681,9 +2692,11 @@ async fn ensure_ws_replay_connection_owner(
     if !state.sessions.contains_session(session_id) {
         return Err(StatusCode::NOT_FOUND.into_response());
     }
-    match state.ws_replay.belongs_to_session(id, session_id).await {
-        Some(true) => Ok(()),
-        Some(false) => Err(active_session_conflict_response(state)),
+    match state.ws_replay.owner_session_id(id).await {
+        Some(owner_session_id) if owner_session_id == session_id => Ok(()),
+        Some(owner_session_id) => Err(ws_replay_connection_owner_conflict_response(
+            owner_session_id,
+        )),
         None => Err(StatusCode::NOT_FOUND.into_response()),
     }
 }
@@ -4191,12 +4204,10 @@ async fn ws_replay_connect(
     if !state.sessions.contains_session(session.id()) {
         return action_session_conflict_response(&session);
     }
-    if let Some(false) = state
-        .ws_replay
-        .belongs_to_session(payload.id, session.id())
-        .await
-    {
-        return active_session_conflict_response(&state);
+    if let Some(owner_session_id) = state.ws_replay.owner_session_id(payload.id).await {
+        if owner_session_id != session.id() {
+            return ws_replay_connection_owner_conflict_response(owner_session_id);
+        }
     }
     let upstream_insecure = session.runtime.upstream_insecure().await;
 
@@ -4212,7 +4223,12 @@ async fn ws_replay_connect(
         .await
     {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(error) => match error.downcast_ref::<crate::ws_replay::WsReplayOwnerConflict>() {
+            Some(owner_conflict) => {
+                ws_replay_connection_owner_conflict_response(owner_conflict.owner_session_id)
+            }
+            None => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        },
     }
 }
 
@@ -5267,6 +5283,23 @@ mod tests {
         );
     }
 
+    fn assert_ws_replay_owner_conflict_body(body: &str, owner_session_id: Uuid) {
+        let payload: serde_json::Value =
+            serde_json::from_str(body).expect("owner conflict response should be JSON");
+        let expected_owner_session_id = owner_session_id.to_string();
+        assert_eq!(
+            payload.get("error").and_then(serde_json::Value::as_str),
+            Some("websocket replay connection belongs to another session")
+        );
+        assert_eq!(
+            payload
+                .get("owner_session_id")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_owner_session_id.as_str())
+        );
+        assert!(payload.get("session_id").is_none());
+    }
+
     #[tokio::test]
     async fn replay_send_route_enforces_session_id_contracts() {
         let (state, data_dir) = test_state("sniper-route-replay-send-session");
@@ -5514,6 +5547,61 @@ mod tests {
                 api_route_response(state.clone(), reqwest::Method::GET, &path, None).await;
             assert_eq!(status, reqwest::StatusCode::CONFLICT);
             assert_active_session_conflict_body(&body, active_id);
+        }
+
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(connection_id, active_id)
+            .await;
+        let other_id = state
+            .create_session(Some("other".to_string()))
+            .await
+            .unwrap()
+            .id;
+
+        for (path, mut payload) in [
+            (
+                "/api/replay/ws-connect",
+                serde_json::json!({
+                    "id": connection_id,
+                    "scheme": "ws",
+                    "host": "127.0.0.1",
+                    "port": 80,
+                    "path": "/",
+                    "headers": [],
+                }),
+            ),
+            (
+                "/api/replay/ws-send",
+                serde_json::json!({
+                    "id": connection_id,
+                    "body": "hello",
+                    "binary": false,
+                }),
+            ),
+            (
+                "/api/replay/ws-disconnect",
+                serde_json::json!({
+                    "id": connection_id,
+                    "remove": true,
+                }),
+            ),
+        ] {
+            payload["session_id"] = serde_json::json!(other_id);
+            let (status, body) =
+                api_route_json(state.clone(), reqwest::Method::POST, path, payload).await;
+            assert_eq!(status, reqwest::StatusCode::CONFLICT);
+            assert_ws_replay_owner_conflict_body(&body, active_id);
+        }
+
+        for path in [
+            format!("/api/replay/ws-snapshot/{connection_id}?session_id={other_id}"),
+            format!("/api/replay/ws-frames/{connection_id}?since=0&session_id={other_id}"),
+        ] {
+            let (status, body) =
+                api_route_response(state.clone(), reqwest::Method::GET, &path, None).await;
+            assert_eq!(status, reqwest::StatusCode::CONFLICT);
+            assert_ws_replay_owner_conflict_body(&body, active_id);
         }
 
         let _ = std::fs::remove_dir_all(data_dir);

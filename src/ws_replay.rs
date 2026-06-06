@@ -96,6 +96,23 @@ impl std::fmt::Display for WsReplaySendError {
 
 impl std::error::Error for WsReplaySendError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsReplayOwnerConflict {
+    pub owner_session_id: Uuid,
+}
+
+impl std::fmt::Display for WsReplayOwnerConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WS replay connection belongs to session {}",
+            self.owner_session_id
+        )
+    }
+}
+
+impl std::error::Error for WsReplayOwnerConflict {}
+
 #[derive(Debug)]
 enum WsReplayOutboundMessage {
     Message(WsMessage),
@@ -527,7 +544,9 @@ impl WsReplayStore {
             if let Some(existing) = expected.as_ref() {
                 let existing = existing.read().await;
                 if existing.owner_session_id != owner_session_id {
-                    anyhow::bail!("WS replay connection belongs to another session");
+                    anyhow::bail!(WsReplayOwnerConflict {
+                        owner_session_id: existing.owner_session_id,
+                    });
                 }
             }
 
@@ -591,10 +610,16 @@ impl WsReplayStore {
         removed
     }
 
-    pub async fn belongs_to_session(&self, id: Uuid, session_id: Uuid) -> Option<bool> {
+    pub async fn owner_session_id(&self, id: Uuid) -> Option<Uuid> {
         let conn = self.connection(id).await?;
         let c = conn.read().await;
-        Some(c.owner_session_id == session_id)
+        Some(c.owner_session_id)
+    }
+
+    pub async fn belongs_to_session(&self, id: Uuid, session_id: Uuid) -> Option<bool> {
+        self.owner_session_id(id)
+            .await
+            .map(|owner_session_id| owner_session_id == session_id)
     }
 
     async fn send_message(&self, id: Uuid, msg: WsMessage) -> Result<()> {
@@ -971,6 +996,8 @@ mod tests {
             Some(false)
         );
         assert_eq!(store.belongs_to_session(Uuid::new_v4(), owner).await, None);
+        assert_eq!(store.owner_session_id(id).await, Some(owner));
+        assert_eq!(store.owner_session_id(Uuid::new_v4()).await, None);
     }
 
     #[tokio::test]
@@ -1157,7 +1184,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("another session"));
+        let owner_conflict = error
+            .downcast_ref::<WsReplayOwnerConflict>()
+            .expect("owner mismatch should preserve the owning session id");
+        assert_eq!(owner_conflict.owner_session_id, owner);
         assert_eq!(store.belongs_to_session(id, owner).await, Some(true));
     }
 

@@ -1390,7 +1390,15 @@ case "$expected_version" in
 esac
 expected_team="$6"
 backup="${bundle}.previous.$$"
-while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+wait_attempts=0
+while kill -0 "$pid" 2>/dev/null; do
+  wait_attempts=$((wait_attempts + 1))
+  if [ "$wait_attempts" -ge 150 ]; then
+    rm -rf "$tmp"
+    exit 1
+  fi
+  sleep 0.2
+done
 sleep 0.5
 rm -rf "$backup"
 if [ -e "$bundle" ]; then
@@ -1415,15 +1423,16 @@ if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --str
     [ "$installed_version" = "$expected_version" ] && \
     { [ -z "$expected_team" ] || [ "$installed_team" = "$expected_team" ]; } && \
     { [ -z "$expected_team" ] || /usr/sbin/spctl --assess --type execute "$bundle"; }; then
-  rm -rf "$backup" "$tmp"
-  /usr/bin/open "$bundle"
-  exit 0
+  if /usr/bin/open "$bundle"; then
+    rm -rf "$backup" "$tmp"
+    exit 0
+  fi
   fi
 fi
 rm -rf "$bundle"
 if [ -e "$backup" ]; then
   mv "$backup" "$bundle"
-  /usr/bin/open "$bundle"
+  /usr/bin/open "$bundle" || true
 fi
 rm -rf "$tmp"
 exit 1
@@ -1661,17 +1670,10 @@ fn app_release_http_client(error_context: &'static str) -> Result<reqwest::Clien
 }
 
 fn release_proxy_env_targets_loopback() -> bool {
-    [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    .iter()
-    .filter_map(|key| env::var(key).ok())
-    .any(|value| proxy_url_targets_loopback(&value))
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .filter_map(|key| env::var(key).ok())
+        .any(|value| proxy_url_targets_loopback(&value))
 }
 
 fn proxy_url_targets_loopback(value: &str) -> bool {
@@ -1704,17 +1706,20 @@ mod tests {
         ensure_release_is_newer, find_update_app_bundle, native_release_asset_arch,
         parse_codesign_team_identifier, proxy_url_targets_loopback,
         release_asset_archs_match_binary_archs, release_asset_matches_arch,
-        release_update_available, select_release_dmg_asset, self_update_bundle_is_writable,
-        update_installer_script, validate_downloaded_update_size, verify_app_identity, AppState,
-        GitHubAsset, GitHubRelease, UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH,
-        EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH,
-        PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+        release_proxy_env_targets_loopback, release_update_available, select_release_dmg_asset,
+        self_update_bundle_is_writable, update_installer_script, validate_downloaded_update_size,
+        verify_app_identity, AppState, GitHubAsset, GitHubRelease, UpdateArtifactGuard,
+        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
+        HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
     use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
     use crate::workspace::{ReplayTabState, ReplayWorkspaceState};
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn asset(name: &str) -> GitHubAsset {
         GitHubAsset {
@@ -2011,6 +2016,44 @@ mod tests {
             "http://proxy.example.test:8080"
         ));
         assert!(!proxy_url_targets_loopback(""));
+    }
+
+    #[test]
+    fn release_proxy_loopback_detection_uses_https_relevant_proxy_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:8080");
+        std::env::set_var("HTTPS_PROXY", "http://corp.proxy.example:3128");
+        assert!(!release_proxy_env_targets_loopback());
+
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8443");
+        assert!(release_proxy_env_targets_loopback());
+
+        std::env::remove_var("HTTPS_PROXY");
+        std::env::set_var("ALL_PROXY", "localhost:9000");
+        assert!(release_proxy_env_targets_loopback());
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 
     #[test]
@@ -2466,10 +2509,19 @@ mod tests {
             .find("/usr/bin/ditto \"$staged\" \"$bundle\"")
             .expect("installer should copy the staged app");
         assert!(wait_pos < ditto_pos);
+        assert!(script.contains("wait_attempts=$((wait_attempts + 1))"));
+        assert!(script.contains("[ \"$wait_attempts\" -ge 150 ]"));
         assert!(script.contains("mv \"$bundle\" \"$backup\""));
         assert!(script.contains("if ! mv \"$bundle\" \"$backup\""));
         assert!(script.contains("mv \"$backup\" \"$bundle\""));
         assert!(script.contains("/usr/bin/codesign --verify --deep --strict \"$bundle\""));
+        let open_pos = script
+            .find("if /usr/bin/open \"$bundle\"; then")
+            .expect("installer should check whether the new app launched");
+        let cleanup_pos = script
+            .find("rm -rf \"$backup\" \"$tmp\"")
+            .expect("installer should clean up after a successful launch");
+        assert!(open_pos < cleanup_pos);
         assert!(script.contains("v*|V*) expected_version="));
         assert!(script.contains("v*|V*) installed_version="));
     }

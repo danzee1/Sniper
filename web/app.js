@@ -4305,14 +4305,27 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
       append ? Number(state.websocketPaging?.loadedOffset ?? 0) || 0 : 0,
       pageOffset + pageItems.length,
     );
+    const serverHasMore = Boolean(page.has_more);
+    const responsePaging = {
+      ...(state.websocketPaging || createWebsocketPagingState()),
+      hasMore: serverHasMore,
+      capReached: serverHasMore && loadedOffset >= WEBSOCKET_MAX_LOADED_SESSIONS,
+    };
     state.websocketSessions = append
       ? mergeWebsocketAppendPage(pageItems, state.websocketSessions, summaryMutationGeneration)
       : (summaryMutationGeneration === _websocketSummaryMutationGeneration
         ? pageItems
-        : mergeWebsocketPageWithCurrentSummaries(pageItems, state.websocketSessions, summaryMutationGeneration));
+        : mergeWebsocketPageWithCurrentSummaries(
+          pageItems,
+          state.websocketSessions,
+          summaryMutationGeneration,
+          responsePaging,
+        ));
     pruneWebsocketSummaryMutationCache();
-    const loadedLimit = Math.min(WEBSOCKET_MAX_LOADED_SESSIONS, loadedOffset);
-    const serverHasMore = Boolean(page.has_more);
+    const loadedLimit = Math.min(
+      WEBSOCKET_MAX_LOADED_SESSIONS,
+      Math.max(loadedOffset, state.websocketSessions.length),
+    );
     const capReached = serverHasMore && loadedLimit >= WEBSOCKET_MAX_LOADED_SESSIONS;
     state.websocketPaging = {
       querySignature,
@@ -4549,7 +4562,12 @@ function shouldInsertUnknownWebsocketSummary(summary, sessions, paging) {
   return !newestLoadedStartedAt || summaryStartedAt >= newestLoadedStartedAt;
 }
 
-function mergeWebsocketPageWithCurrentSummaries(pageItems, currentItems, mutationGenerationAtRequest) {
+function mergeWebsocketPageWithCurrentSummaries(
+  pageItems,
+  currentItems,
+  mutationGenerationAtRequest,
+  paging = state.websocketPaging,
+) {
   const currentById = new Map((currentItems || []).map((item) => [item.id, item]));
   const seen = new Set();
   const merged = [];
@@ -4568,6 +4586,7 @@ function mergeWebsocketPageWithCurrentSummaries(pageItems, currentItems, mutatio
   for (const item of currentItems || []) {
     if (!item?.id || seen.has(item.id)) continue;
     if ((_websocketSummaryMutationById.get(item.id) || 0) <= mutationGenerationAtRequest) continue;
+    if (!shouldInsertUnknownWebsocketSummary(item, pageItems, paging)) continue;
     preserved.push(item);
     seen.add(item.id);
   }
@@ -4779,6 +4798,7 @@ function applyWebsocketSummaryEvent(event) {
   } else {
     const paging = state.websocketPaging || createWebsocketPagingState();
     if (!shouldInsertUnknownWebsocketSummary(summary, sessions, paging)) {
+      const selectedChanged = applySelectedWebsocketSummary(summary);
       state.websocketPaging = {
         ...paging,
         total: Math.max(Number(paging.total || 0), sessions.length),
@@ -4787,6 +4807,9 @@ function applyWebsocketSummaryEvent(event) {
         capReached: Boolean(paging.capReached),
         loading: false,
       };
+      if (selectedChanged && isWebsocketHistoryVisible()) {
+        scheduleVisibleWebsocketSelectionSync({ deferStaleDetail: true });
+      }
       return;
     }
     nextSessions.unshift(summary);
@@ -4798,11 +4821,18 @@ function applyWebsocketSummaryEvent(event) {
     const nextTotal = Math.max(knownTotal + 1, nextSessions.length);
     const capReached = Boolean(paging.capReached)
       || (nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS && nextTotal > nextSessions.length);
+    const nextLoadedOffset = Math.min(
+      WEBSOCKET_MAX_LOADED_SESSIONS,
+      Math.max(
+        Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
+        nextSessions.length,
+      ),
+    );
     state.websocketPaging = {
       ...paging,
       total: nextTotal,
-      limit: Number(paging.limit ?? paging.loadedOffset ?? 0) || 0,
-      loadedOffset: Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
+      limit: nextLoadedOffset,
+      loadedOffset: nextLoadedOffset,
       hasMore: hasMore && nextSessions.length < WEBSOCKET_MAX_LOADED_SESSIONS,
       capReached,
       loading: false,
@@ -4813,8 +4843,24 @@ function applyWebsocketSummaryEvent(event) {
   _websocketSummaryMutationById.set(summary.id, _websocketSummaryMutationGeneration);
   pruneWebsocketSummaryMutationCache();
 
-  const selectedChanged = state.selectedWebsocketId === summary.id;
-  if (selectedChanged && state.selectedWebsocketRecord) {
+  const selectedChanged = applySelectedWebsocketSummary(summary);
+
+  if (isWebsocketHistoryVisible()) {
+    if (!state.selectedWebsocketId) {
+      scheduleVisibleWebsocketSelectionSync();
+    } else {
+      scheduleVisibleWebsocketSelectionSync({
+        ensureSelectedVisible: true,
+        deferStaleDetail: true,
+      });
+    }
+  }
+}
+
+function applySelectedWebsocketSummary(summary) {
+  const selectedChanged = state.selectedWebsocketId === summary?.id;
+  if (!selectedChanged) return false;
+  if (state.selectedWebsocketRecord) {
     const loadedLastFrameIndex = state.selectedWebsocketRecord.loaded_last_frame_index ?? null;
     state.selectedWebsocketRecord = {
       ...state.selectedWebsocketRecord,
@@ -4829,20 +4875,10 @@ function applyWebsocketSummaryEvent(event) {
     if (Number(loadedLastFrameIndex ?? -1) !== Number(summary.last_frame_index ?? -1)) {
       scheduleSelectedWebsocketDetailRefresh(summary.id);
     }
-  } else if (selectedChanged) {
+  } else {
     scheduleSelectedWebsocketDetailRefresh(summary.id);
   }
-
-  if (isWebsocketHistoryVisible()) {
-    if (!state.selectedWebsocketId) {
-      scheduleVisibleWebsocketSelectionSync();
-    } else {
-      scheduleVisibleWebsocketSelectionSync({
-        ensureSelectedVisible: true,
-        deferStaleDetail: true,
-      });
-    }
-  }
+  return true;
 }
 
 function pruneWebsocketSummaryMutationCache() {
@@ -9132,6 +9168,7 @@ function getSortedWebsocketEntries() {
 
 function getWebsocketSortValue(session, key) {
   switch (key) {
+    case "index": return Number.isFinite(Number(session?.index)) ? Number(session.index) : -1;
     case "host": return String(session?.host || "").toLowerCase();
     case "path": return String(session?.path || "").toLowerCase();
     case "status": return Number.isFinite(Number(session?.status)) ? Number(session.status) : -1;
@@ -9142,12 +9179,16 @@ function getWebsocketSortValue(session, key) {
   }
 }
 
+function defaultWebsocketSortDirection(key) {
+  return ["index", "started_at", "status", "frame_count", "duration_ms"].includes(key) ? "desc" : "asc";
+}
+
 function toggleWebsocketSort(key) {
   if (state.websocketSortKey === key) {
     state.websocketSortDirection = state.websocketSortDirection === "asc" ? "desc" : "asc";
   } else {
     state.websocketSortKey = key;
-    state.websocketSortDirection = key === "index" ? "asc" : "desc";
+    state.websocketSortDirection = defaultWebsocketSortDirection(key);
   }
   clearWebsocketQueryBackfill();
   loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
@@ -9170,7 +9211,14 @@ async function syncVisibleWebsocketSelection(preserveSelection = true, options =
   const deferStaleDetail = options.deferStaleDetail === true;
   const previousSelectedId = state.selectedWebsocketId;
   const visibleSessions = getVisibleWebsocketSessions();
-  if (!preserveSelection || !visibleSessions.some((item) => item.id === state.selectedWebsocketId)) {
+  const selectedIsVisible = visibleSessions.some((item) => item.id === state.selectedWebsocketId);
+  const selectionCanStayWindowed = preserveSelection
+    && !selectedIsVisible
+    && Boolean(state.selectedWebsocketId)
+    && state.selectedWebsocketRecord?.id === state.selectedWebsocketId
+    && websocketLoadedWindowCanHideSelection()
+    && websocketSummaryMatchesCurrentQuery(state.selectedWebsocketRecord);
+  if (!preserveSelection || (!selectedIsVisible && !selectionCanStayWindowed)) {
     state.selectedWebsocketId = visibleSessions[0]?.id ?? null;
   }
   if (previousSelectedId !== state.selectedWebsocketId) {
@@ -9210,6 +9258,14 @@ async function syncVisibleWebsocketSelection(preserveSelection = true, options =
   if (!state.selectedWebsocketRecord || selectedDetailIsStale) {
     await loadWebsocketDetail(state.selectedWebsocketId);
   }
+}
+
+function websocketLoadedWindowCanHideSelection() {
+  const paging = state.websocketPaging || createWebsocketPagingState();
+  const loadedCount = Array.isArray(state.websocketSessions) ? state.websocketSessions.length : 0;
+  const total = Number(paging.total);
+  return Boolean(paging.hasMore || paging.capReached)
+    || (Number.isFinite(total) && loadedCount < total);
 }
 
 function renderProxySettings() {
