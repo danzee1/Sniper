@@ -248,6 +248,28 @@ impl WsReplayConnection {
         }
     }
 
+    fn record_writer_outbound_frame(
+        &mut self,
+        msg: &WsMessage,
+        recorded_index: Option<usize>,
+    ) -> (Option<usize>, bool) {
+        if let Some(index) = recorded_index {
+            return (Some(index), false);
+        }
+        (
+            self.push_frame(WebSocketFrameDirection::ClientToServer, msg),
+            true,
+        )
+    }
+
+    fn rollback_writer_recorded_frame(&mut self, index: Option<usize>, recorded_by_writer: bool) {
+        if recorded_by_writer {
+            if let Some(index) = index {
+                self.remove_frame(index);
+            }
+        }
+    }
+
     fn push_auto_reply_frame(&mut self, msg: &WsMessage) -> Option<usize> {
         match msg {
             WsMessage::Ping(payload) => self.push_frame(
@@ -401,21 +423,16 @@ impl WsReplayStore {
                                             (WsMessage::Close(None), recorded_index)
                                         }
                                     };
-                                    let recorded_msg = msg.clone();
-                                    let recorded_index = if recorded_index.is_some() {
-                                        recorded_index
-                                    } else {
+                                    let (recorded_index, recorded_by_writer) = {
                                         let mut c = conn_for_writer.write().await;
-                                        c.push_frame(
-                                            WebSocketFrameDirection::ClientToServer,
-                                            &recorded_msg,
-                                        )
+                                        c.record_writer_outbound_frame(&msg, recorded_index)
                                     };
                                     if let Err(error) = write.send(msg).await {
                                         let mut c = conn_for_writer.write().await;
-                                        if let Some(index) = recorded_index {
-                                            c.remove_frame(index);
-                                        }
+                                        c.rollback_writer_recorded_frame(
+                                            recorded_index,
+                                            recorded_by_writer,
+                                        );
                                         c.status = WsReplayStatus::Error;
                                         c.error = Some(format!(
                                             "failed to send WebSocket frame: {error}"
@@ -1162,6 +1179,41 @@ mod tests {
         assert_eq!(conn.frame_counter, 2);
         assert_eq!(conn.frames.len(), 1);
         assert_eq!(conn.frames[0].index, 1);
+    }
+
+    #[test]
+    fn writer_rollback_preserves_pre_recorded_user_frame() {
+        let mut conn = test_connection(WsReplayStatus::Connected, None);
+        let recorded = conn
+            .push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Text("user-send".into()),
+            )
+            .unwrap();
+        let (writer_index, recorded_by_writer) =
+            conn.record_writer_outbound_frame(&WsMessage::Text("user-send".into()), Some(recorded));
+
+        conn.rollback_writer_recorded_frame(writer_index, recorded_by_writer);
+
+        assert_eq!(writer_index, Some(recorded));
+        assert!(!recorded_by_writer);
+        assert_eq!(conn.frames.len(), 1);
+        assert_eq!(conn.frames[0].index, recorded);
+        assert!(matches!(conn.frames[0].kind, WebSocketFrameKind::Text));
+    }
+
+    #[test]
+    fn writer_rollback_removes_only_writer_recorded_frame() {
+        let mut conn = test_connection(WsReplayStatus::Connected, None);
+        let (writer_index, recorded_by_writer) =
+            conn.record_writer_outbound_frame(&WsMessage::Pong(b"auto".to_vec().into()), None);
+
+        conn.rollback_writer_recorded_frame(writer_index, recorded_by_writer);
+
+        assert_eq!(writer_index, Some(0));
+        assert!(recorded_by_writer);
+        assert!(conn.frames.is_empty());
+        assert_eq!(conn.frame_counter, 1);
     }
 
     #[tokio::test]

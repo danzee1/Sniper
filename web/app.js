@@ -8371,7 +8371,7 @@ function moveFrameSelection(offset) {
   let target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
   if (!target && frames.length > WEBSOCKET_MAX_RENDERED_FRAME_ROWS) {
     ensureWebsocketFramePositionInView(nextPosition, { center: true });
-    renderWebsocketSessions();
+    renderWebsocketFrameTable();
     target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
   }
   if (target) {

@@ -2741,16 +2741,21 @@ async fn resolve_session_for_required_id(
     resolve_session_for_optional_id(state, Some(target_session_id)).await
 }
 
-async fn ensure_ws_replay_connection_owner(
-    state: &AppState,
+async fn guard_ws_replay_connection_owner_read(
+    state: &Arc<AppState>,
     id: Uuid,
     session_id: Uuid,
-) -> std::result::Result<(), Response> {
+) -> std::result::Result<OwnedMutexGuard<()>, Response> {
+    if !state.sessions.contains_session(session_id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    let operation_lock = state.session_operation_lock(session_id).await;
+    let guard = operation_lock.lock_owned().await;
     if !state.sessions.contains_session(session_id) {
         return Err(StatusCode::NOT_FOUND.into_response());
     }
     match state.ws_replay.owner_session_id(id).await {
-        Some(owner_session_id) if owner_session_id == session_id => Ok(()),
+        Some(owner_session_id) if owner_session_id == session_id => Ok(guard),
         Some(owner_session_id) => Err(ws_replay_connection_owner_conflict_response(
             owner_session_id,
         )),
@@ -4623,9 +4628,11 @@ async fn ws_replay_snapshot(
     let Some(session_id) = query.session_id else {
         return active_session_conflict_response(&state);
     };
-    if let Err(response) = ensure_ws_replay_connection_owner(&state, id, session_id).await {
-        return response;
-    }
+    let _operation_guard = match guard_ws_replay_connection_owner_read(&state, id, session_id).await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     match state.ws_replay.snapshot(id).await {
         Some(snapshot) => Json(snapshot).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -4644,9 +4651,11 @@ async fn ws_replay_frames(
     let Some(session_id) = query.session_id else {
         return active_session_conflict_response(&state);
     };
-    if let Err(response) = ensure_ws_replay_connection_owner(&state, id, session_id).await {
-        return response;
-    }
+    let _operation_guard = match guard_ws_replay_connection_owner_read(&state, id, session_id).await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     match state.ws_replay.frames_since(id, query.since).await {
         Some(frames) => Json(frames).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -6469,10 +6478,13 @@ mod tests {
             .unwrap();
         state.delete_session(deleted_session_id).await.unwrap();
 
-        let response =
-            super::ensure_ws_replay_connection_owner(&state, Uuid::new_v4(), deleted_session_id)
-                .await
-                .unwrap_err();
+        let response = super::guard_ws_replay_connection_owner_read(
+            &state,
+            Uuid::new_v4(),
+            deleted_session_id,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(data_dir);
@@ -10146,6 +10158,96 @@ mod tests {
         let response = response_task.await.unwrap();
         assert_eq!(response.status(), super::StatusCode::OK);
         assert!(state.ws_replay.snapshot(connection_id).await.is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_snapshot_waits_for_session_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-snapshot-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let connection_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(connection_id, session_id)
+            .await;
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard = operation_lock.lock_owned().await;
+
+        let response_task = tokio::spawn(super::ws_replay_snapshot(
+            State(state.clone()),
+            Path(connection_id.to_string()),
+            Query(super::WsFramesSinceQuery {
+                since: 0,
+                session_id: Some(session_id),
+            }),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !response_task.is_finished(),
+            "ws replay snapshot should wait for the session operation lock"
+        );
+        drop(operation_guard);
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), super::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_frames_waits_for_session_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-frames-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let connection_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(connection_id, session_id)
+            .await;
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard = operation_lock.lock_owned().await;
+
+        let response_task = tokio::spawn(super::ws_replay_frames(
+            State(state.clone()),
+            Path(connection_id.to_string()),
+            Query(super::WsFramesSinceQuery {
+                since: 0,
+                session_id: Some(session_id),
+            }),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !response_task.is_finished(),
+            "ws replay frames should wait for the session operation lock"
+        );
+        drop(operation_guard);
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), super::StatusCode::OK);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
