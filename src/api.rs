@@ -1921,7 +1921,7 @@ async fn update_workspace_state(
         }
         Err(WorkspaceReplaceError::Persist(error)) => {
             tracing::warn!(%error, "failed to persist workspace state update");
-            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
 }
@@ -2657,41 +2657,19 @@ async fn update_transaction_annotations(
     let _mutation_guard = session.mutation_guard().await;
     match session
         .store
-        .update_annotations(id, payload.color_tag, payload.user_note)
+        .update_annotations_durable(id, payload.color_tag, payload.user_note)
         .await
     {
-        Some(update) => {
-            if let Err(response) =
-                persist_session_mutation_locked_or_response(&state, &session).await
-            {
-                if let Err(error) = session
-                    .store
-                    .restore_annotations_if_current(
-                        id,
-                        update.applied_color_tag,
-                        update.applied_user_note,
-                        update.previous_color_tag,
-                        update.previous_user_note,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        ?error,
-                        transaction_id = %id,
-                        "failed to persist transaction annotation rollback journal"
-                    );
-                }
-                persist_rolled_back_session_snapshot(
-                    &state,
-                    &session,
-                    "transaction annotation update",
-                )
-                .await;
-                return response;
-            }
-            Json(update.summary).into_response()
+        Ok(Some(update)) => Json(update.summary).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                transaction_id = %id,
+                "failed to persist transaction annotation journal entry"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -6174,78 +6152,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn annotation_update_rolls_back_memory_when_persist_and_rollback_journal_fail() {
+    async fn annotation_update_persists_via_journal_without_registry_metadata_rewrite() {
         let data_dir = std::env::temp_dir().join(format!(
-            "sniper-test-annotation-rollback-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let config = AppConfig {
-            proxy_addr: "127.0.0.1:0".parse().unwrap(),
-            ui_addr: "127.0.0.1:0".parse().unwrap(),
-            max_entries: 100,
-            body_preview_bytes: 4096,
-            data_dir: data_dir.clone(),
-        };
-        let state = Arc::new(AppState::new(config).unwrap());
-        let session = state.session().await;
-        let message = MessageRecord {
-            headers: vec![HeaderRecord {
-                name: "host".to_string(),
-                value: "example.test".to_string(),
-            }],
-            body_preview: String::new(),
-            body_encoding: BodyEncoding::Utf8,
-            body_size: 0,
-            decoded_body_size: None,
-            preview_truncated: false,
-            content_type: None,
-            content_decoded: false,
-        };
-        let record = TransactionRecord::http(
-            Utc::now(),
-            "GET".to_string(),
-            "https".to_string(),
-            "example.test".to_string(),
-            "/annotate".to_string(),
-            Some(200),
-            1,
-            message.clone(),
-            Some(message),
-            Vec::new(),
-            None,
-            None,
-        );
-        let id = record.id;
-        session.store.insert(record).await;
-
-        let storage_dir = session.storage_dir().to_path_buf();
-        std::fs::remove_dir_all(&storage_dir).unwrap();
-        std::fs::write(&storage_dir, b"not a directory").unwrap();
-
-        let response = super::update_transaction_annotations(
-            State(state),
-            Path(id.to_string()),
-            Query(super::TransactionGetQuery { session_id: None }),
-            Json(super::AnnotationsPayload {
-                color_tag: Some(Some("red".to_string())),
-                user_note: Some(Some("should roll back".to_string())),
-            }),
-        )
-        .await;
-
-        assert_eq!(response.status(), super::StatusCode::INTERNAL_SERVER_ERROR);
-        let restored = session.store.get(id).await.unwrap();
-        assert_eq!(restored.color_tag.as_deref(), None);
-        assert_eq!(restored.user_note.as_deref(), None);
-
-        let _ = std::fs::remove_file(storage_dir);
-        let _ = std::fs::remove_dir_all(data_dir);
-    }
-
-    #[tokio::test]
-    async fn annotation_update_reports_registry_metadata_persist_failure() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "sniper-test-annotation-registry-failure-{}",
+            "sniper-test-annotation-registry-bypass-{}",
             uuid::Uuid::new_v4()
         ));
         let config = AppConfig {
@@ -6306,15 +6215,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), super::StatusCode::OK);
         let live = session.store.get(id).await.unwrap();
-        assert_eq!(live.color_tag.as_deref(), None);
-        assert_eq!(live.user_note.as_deref(), None);
+        assert_eq!(live.color_tag.as_deref(), Some("blue"));
+        assert_eq!(live.user_note.as_deref(), Some("durable snapshot"));
 
         let reloaded = state.sessions.load_context(session.id()).unwrap();
         let durable = reloaded.store.get(id).await.unwrap();
-        assert_eq!(durable.color_tag.as_deref(), None);
-        assert_eq!(durable.user_note.as_deref(), None);
+        assert_eq!(durable.color_tag.as_deref(), Some("blue"));
+        assert_eq!(durable.user_note.as_deref(), Some("durable snapshot"));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

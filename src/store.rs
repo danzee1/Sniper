@@ -593,13 +593,49 @@ impl TransactionStore {
         color_tag: Option<Option<String>>,
         user_note: Option<Option<String>>,
     ) -> Option<AnnotationUpdate> {
+        match self
+            .update_annotations_with_journal_mode(id, color_tag, user_note, false)
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "failed to append transaction annotation journal entry before storing"
+                );
+                None
+            }
+        }
+    }
+
+    pub async fn update_annotations_durable(
+        &self,
+        id: Uuid,
+        color_tag: Option<Option<String>>,
+        user_note: Option<Option<String>>,
+    ) -> io::Result<Option<AnnotationUpdate>> {
+        self.update_annotations_with_journal_mode(id, color_tag, user_note, true)
+            .await
+    }
+
+    async fn update_annotations_with_journal_mode(
+        &self,
+        id: Uuid,
+        color_tag: Option<Option<String>>,
+        user_note: Option<Option<String>>,
+        require_journal_append: bool,
+    ) -> io::Result<Option<AnnotationUpdate>> {
         let color_patch = nullable_string_patch(color_tag.as_ref());
         let note_patch = nullable_string_patch(user_note.as_ref());
         let _mutation_guard = self.insert_lock.lock().await;
         let (previous_color_tag, previous_user_note) = {
             let inner = self.inner.read().await;
-            let index = *inner.by_id.get(&id)?;
-            let record = inner.entries.get(index)?;
+            let Some(index) = inner.by_id.get(&id).copied() else {
+                return Ok(None);
+            };
+            let Some(record) = inner.entries.get(index) else {
+                return Ok(None);
+            };
             (record.color_tag.clone(), record.user_note.clone())
         };
         if color_patch.is_some() || note_patch.is_some() {
@@ -618,17 +654,34 @@ impl TransactionStore {
                     })
                 {
                     if let Err(error) = append_transaction_journal(tx, line).await {
+                        if require_journal_append {
+                            return Err(error);
+                        }
                         warn!(
                             ?error,
                             "failed to append transaction annotation journal entry before storing"
                         );
                     }
+                } else if require_journal_append {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "failed to encode transaction annotation journal entry",
+                    ));
                 }
+            } else if require_journal_append {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "transaction journal writer is not available",
+                ));
             }
         }
         let mut inner = self.inner.write().await;
-        let index = *inner.by_id.get(&id)?;
-        let record = inner.entries.get_mut(index)?;
+        let Some(index) = inner.by_id.get(&id).copied() else {
+            return Ok(None);
+        };
+        let Some(record) = inner.entries.get_mut(index) else {
+            return Ok(None);
+        };
         if let Some(tag) = color_tag {
             record.color_tag = tag;
         }
@@ -639,13 +692,13 @@ impl TransactionStore {
         let applied_color_tag = record.color_tag.clone();
         let applied_user_note = record.user_note.clone();
         inner.summaries[index] = CachedSummary::new(summary.clone());
-        Some(AnnotationUpdate {
+        Ok(Some(AnnotationUpdate {
             summary,
             previous_color_tag,
             previous_user_note,
             applied_color_tag,
             applied_user_note,
-        })
+        }))
     }
 
     pub async fn restore_annotations_if_current(
@@ -1711,6 +1764,43 @@ mod tests {
 
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed[0].color_tag.as_deref(), Some("yellow"));
+    }
+
+    #[tokio::test]
+    async fn durable_annotation_update_does_not_mutate_when_journal_append_fails() {
+        use std::{sync::Arc, time::Duration};
+
+        let mut record = test_record("existing.example");
+        record.color_tag = Some("old".to_string());
+        let id = record.id;
+        let mut store = TransactionStore::from_records_with_max_entries(vec![record], None);
+        let (tx, rx) = mpsc::channel();
+        store.journal_tx = Some(tx);
+        let store = Arc::new(store);
+
+        let update_task = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .update_annotations_durable(id, Some(Some("new".to_string())), None)
+                    .await
+            })
+        };
+
+        let command = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let ack = match command {
+            TransactionJournalCommand::Append { ack: Some(ack), .. } => ack,
+            _ => panic!("expected journal append command with ack"),
+        };
+        ack.send(Err(io::Error::other("journal failed"))).unwrap();
+
+        let error = update_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let listed = store.list(&ListFilters::default()).await;
+        assert_eq!(listed[0].color_tag.as_deref(), Some("old"));
     }
 
     #[tokio::test]
