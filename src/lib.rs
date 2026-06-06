@@ -112,13 +112,47 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
 async fn run_api_until_shutdown(state: Arc<AppState>) -> Result<()> {
     tokio::select! {
         result = api::run_api(state) => result,
-        signal = tokio::signal::ctrl_c() => {
-            if let Err(error) = signal {
-                warn!(?error, "failed to listen for shutdown signal");
-            } else {
-                info!("shutdown signal received");
-            }
+        () = wait_for_shutdown_signal() => {
             Ok(())
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => Some(signal),
+                Err(error) => {
+                    warn!(?error, "failed to listen for SIGTERM");
+                    None
+                }
+            };
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    warn!(?error, "failed to listen for shutdown signal");
+                } else {
+                    info!("shutdown signal received");
+                }
+            }
+            _ = async {
+                if let Some(signal) = &mut terminate {
+                    signal.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!("termination signal received");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("shutdown signal received"),
+            Err(error) => warn!(?error, "failed to listen for shutdown signal"),
         }
     }
 }

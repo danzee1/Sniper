@@ -565,7 +565,11 @@ fn should_install_cli_path(macos_dir: &std::path::Path) -> bool {
         return true;
     }
     match env::var("HOME") {
-        Ok(home) => install_dir == std::path::PathBuf::from(home).join("Applications"),
+        Ok(home) => {
+            let home = std::path::PathBuf::from(home);
+            install_dir == home.join("Applications")
+                || app_bundle == home.join("Desktop").join("Sniper.app")
+        }
         Err(_) => false,
     }
 }
@@ -1014,6 +1018,13 @@ mod tests {
         assert!(!should_install_cli_path(std::path::Path::new(
             "/Users/kakao/Desktop/git/Sniper/dist/Sniper.app/Contents/MacOS",
         )));
+        assert!(should_install_cli_path(
+            &std::path::PathBuf::from(std::env::var("HOME").unwrap())
+                .join("Desktop")
+                .join("Sniper.app")
+                .join("Contents")
+                .join("MacOS")
+        ));
         assert!(should_install_cli_path(std::path::Path::new(
             "/Applications/Sniper.app/Contents/MacOS",
         )));

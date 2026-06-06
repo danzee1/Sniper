@@ -480,6 +480,7 @@ let _websocketVisibleSyncEnsureSelected = false;
 let _websocketVisibleSyncDeferStaleDetail = false;
 let _websocketQueryBackfillTimer = 0;
 let _websocketQueryBackfillGeneration = 0;
+let _websocketFilteredReloadTimer = 0;
 let _lastHttpHistoryFallbackPoll = Date.now();
 let _lastWebsocketFallbackPoll = Date.now();
 let _interceptToggleRequestSeq = 0;
@@ -3348,6 +3349,7 @@ function resetSessionScopedUiState() {
   _websocketDetailPendingSessionId = null;
   _websocketDetailPendingPromise = null;
   clearWebsocketQueryBackfill();
+  clearFilteredWebsocketReload();
   if (_websocketDetailRefreshTimer) {
     window.clearTimeout(_websocketDetailRefreshTimer);
     _websocketDetailRefreshTimer = null;
@@ -3785,7 +3787,21 @@ async function loadTransactionDetail(id) {
     return null;
   }
   if (!response.ok) {
-    if (state.selectedId === id) {
+    if (response.status === 404) {
+      const index = state.items.findIndex((item) => item.id === id);
+      if (index >= 0) {
+        state.items.splice(index, 1);
+        state._itemsVersion += 1;
+        precomputeItemIndexes();
+        invalidateVisibleEntriesCache();
+        refreshHistoryPagingCursorFromItems();
+      }
+      if (state.selectedId === id) {
+        state.selectedRecord = null;
+        state.loadingDetailId = null;
+        moveHistorySelectionIfMissing(index <= 0 ? "first" : "last");
+      }
+    } else if (state.selectedId === id) {
       renderEmptyDetail();
     }
     return null;
@@ -4310,7 +4326,7 @@ function websocketSummaryMatchesCurrentQuery(summary) {
   if (!summary) return false;
   const queryState = createWebsocketQueryState();
   if (queryState.inScopeOnly && !isInScopeHost(summary.host)) return false;
-  if (queryState.liveOnly && summary.duration_ms != null) return false;
+  if (queryState.liveOnly && summary.closed_at != null) return false;
   if (queryState.q) {
     const haystack = [
       summary.scheme,
@@ -4318,7 +4334,9 @@ function websocketSummaryMatchesCurrentQuery(summary) {
       summary.path,
       formatStatus(summary.status),
       String(summary.frame_count),
-      summary.duration_ms == null ? "live" : `${summary.duration_ms} ms`,
+      summary.closed_at == null
+        ? "live"
+        : (summary.duration_ms == null ? "closed" : `${summary.duration_ms} ms`),
       formatTimestamp(summary.started_at),
       summary.started_at,
     ]
@@ -4328,6 +4346,25 @@ function websocketSummaryMatchesCurrentQuery(summary) {
     if (!haystack.includes(queryState.q.toLowerCase())) return false;
   }
   return true;
+}
+
+function clearFilteredWebsocketReload() {
+  if (_websocketFilteredReloadTimer) {
+    window.clearTimeout(_websocketFilteredReloadTimer);
+    _websocketFilteredReloadTimer = 0;
+  }
+}
+
+function scheduleFilteredWebsocketReload() {
+  state.websocketHistoryDirty = true;
+  if (_websocketFilteredReloadTimer) return;
+  _websocketFilteredReloadTimer = window.setTimeout(() => {
+    _websocketFilteredReloadTimer = 0;
+    if (!websocketFilterIsActive()) return;
+    if (isWebsocketHistoryVisible()) {
+      loadWebsockets(true).catch((error) => console.error(error));
+    }
+  }, 250);
 }
 
 function clearWebsocketQueryBackfill() {
@@ -4507,6 +4544,16 @@ async function loadWebsocketDetail(id, options = {}) {
       if (state.selectedWebsocketId !== id) {
         return;
       }
+      if (response.status === 404) {
+        state.websocketSessions = (state.websocketSessions || []).filter((item) => item.id !== id);
+        state.selectedWebsocketId = null;
+        state.selectedFrameIdx = null;
+        state.selectedWebsocketRecord = null;
+        state.selectedWebsocketDetailError = "";
+        hideFrameDetail();
+        await syncVisibleWebsocketSelection(false, { ensureSelectedVisible: true });
+        return;
+      }
       state.selectedWebsocketRecord = null;
       state.selectedWebsocketDetailError = "Failed to load selected WebSocket session.";
       renderWebsocketSessions();
@@ -4587,6 +4634,10 @@ function applyWebsocketSummaryEvent(event) {
     return;
   }
   if (!summary?.id) return;
+  if (websocketFilterIsActive()) {
+    scheduleFilteredWebsocketReload();
+    return;
+  }
 
   const sessions = Array.isArray(state.websocketSessions) ? state.websocketSessions : [];
   const existingIndex = sessions.findIndex((item) => item.id === summary.id);

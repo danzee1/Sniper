@@ -2341,13 +2341,15 @@ fn merge_workspace_keepalive_snapshot(
 ) -> WorkspaceStateSnapshot {
     current.client_id = incoming.client_id;
     current.client_version = incoming.client_version;
-    current.replay.active_tab_id = incoming.replay.active_tab_id;
+    let previous_active_tab_id = current.replay.active_tab_id.clone();
+    current.replay.active_tab_id = incoming.replay.active_tab_id.clone();
     current.replay.tab_sequence = current
         .replay
         .tab_sequence
         .max(incoming.replay.tab_sequence);
 
     let mut incoming_tab_ids = HashSet::new();
+    let mut skipped_new_tab_ids = HashSet::new();
     for incoming_tab in incoming.replay.tabs {
         if keepalive.replay_tabs_complete {
             incoming_tab_ids.insert(incoming_tab.id.clone());
@@ -2361,8 +2363,23 @@ fn merge_workspace_keepalive_snapshot(
             Some(current_tab) => {
                 merge_workspace_keepalive_tab(current_tab, incoming_tab, keepalive)
             }
-            None => current.replay.tabs.push(incoming_tab),
+            None if keepalive_can_create_replay_tab(&incoming_tab, keepalive) => {
+                current.replay.tabs.push(incoming_tab)
+            }
+            None => {
+                skipped_new_tab_ids.insert(incoming_tab.id);
+            }
         }
+    }
+    if current
+        .replay
+        .active_tab_id
+        .as_ref()
+        .is_some_and(|id| skipped_new_tab_ids.contains(id))
+    {
+        current.replay.active_tab_id = previous_active_tab_id
+            .filter(|id| current.replay.tabs.iter().any(|tab| tab.id == *id))
+            .or_else(|| current.replay.tabs.first().map(|tab| tab.id.clone()));
     }
     if keepalive.replay_tabs_complete {
         current
@@ -2380,6 +2397,20 @@ fn merge_workspace_keepalive_snapshot(
     }
 
     current
+}
+
+fn keepalive_can_create_replay_tab(
+    tab: &ReplayTabState,
+    keepalive: WorkspaceKeepaliveMetadata,
+) -> bool {
+    if tab.tab_type == "websocket" {
+        return keepalive.ws_text_complete()
+            && tab.ws_setup_queue_complete.unwrap_or(true)
+            && tab.ws_frames_complete.unwrap_or(true);
+    }
+    keepalive.text_complete()
+        && tab.history_entries_complete.unwrap_or(true)
+        && tab.response_record_complete.unwrap_or(true)
 }
 
 fn complete_workspace_keepalive_fuzzer(
@@ -4047,10 +4078,15 @@ async fn run_fuzzer_attack(
 
 async fn list_websockets(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<WebSocketQuery>,
+    Query(mut query): Query<WebSocketQuery>,
 ) -> Response {
+    const MAX_PAGE_LIMIT: usize = 10_000;
+
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    if let Some(limit) = query.limit {
+        query.limit = Some(limit.clamp(1, MAX_PAGE_LIMIT));
     }
     let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
@@ -4064,11 +4100,20 @@ async fn list_websockets(
 
 async fn list_websockets_page(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<WebSocketQuery>,
+    Query(mut query): Query<WebSocketQuery>,
 ) -> Response {
+    const DEFAULT_PAGE_LIMIT: usize = 500;
+    const MAX_PAGE_LIMIT: usize = 10_000;
+
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
+    query.limit = Some(
+        query
+            .limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGE_LIMIT),
+    );
     let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
@@ -6851,6 +6896,89 @@ mod tests {
 
         let active = merged.replay.tabs.first().expect("active tab");
         assert!(active.response_record.is_none());
+    }
+
+    #[test]
+    fn workspace_keepalive_skips_missing_http_tab_when_text_is_partial() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("existing".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "existing".to_string(),
+                    sequence: 1,
+                    request_text: "GET /existing HTTP/1.1\r\n\r\n".to_string(),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("new".to_string()),
+                tab_sequence: 2,
+                tabs: vec![ReplayTabState {
+                    id: "new".to_string(),
+                    sequence: 2,
+                    request_text: "GET /truncated HTTP/1.1\r\n\r\n".to_string(),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                text_complete: Some(false),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(merged.replay.tabs.len(), 1);
+        assert_eq!(merged.replay.tabs[0].id, "existing");
+        assert_eq!(merged.replay.active_tab_id.as_deref(), Some("existing"));
+    }
+
+    #[test]
+    fn workspace_keepalive_skips_missing_websocket_tab_when_text_is_partial() {
+        let current = WorkspaceStateSnapshot::default();
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws-new".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws-new".to_string(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_handshake_text: "GET /partial HTTP/1.1\r\n".to_string(),
+                    ws_editor_text: "partial".to_string(),
+                    ws_setup_queue_complete: Some(false),
+                    ws_frames_complete: Some(false),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                ws_text_complete: Some(false),
+                ..Default::default()
+            },
+        );
+
+        assert!(merged.replay.tabs.is_empty());
+        assert!(merged.replay.active_tab_id.is_none());
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub struct RuntimeStateSnapshot {
 }
 
 fn default_updated_at() -> DateTime<Utc> {
-    Utc::now()
+    DateTime::<Utc>::from(std::time::UNIX_EPOCH)
 }
 
 fn default_app_version() -> String {
@@ -493,6 +493,10 @@ mod tests {
         assert_eq!(loaded.proxy_addr, "127.0.0.1:18080");
         assert_eq!(loaded.ui_addr, "127.0.0.1:23001");
         assert_eq!(loaded.instance_id, uuid::Uuid::nil());
+        assert_eq!(
+            loaded.updated_at,
+            chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH)
+        );
         assert!(!loaded.proxy_online);
         assert_eq!(loaded.app_version, env!("CARGO_PKG_VERSION"));
 

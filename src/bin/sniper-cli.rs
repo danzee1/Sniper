@@ -40,6 +40,11 @@ const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
 const DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const MAX_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const MAX_CLI_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const SNIPER_API_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const SNIPER_API_PROBE_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(150),
+    std::time::Duration::from_millis(400),
+];
 const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
@@ -3183,9 +3188,23 @@ async fn discover_api_base_url_from_data_dir(
 }
 
 async fn probe_sniper_api_base_url(url: &str, client: &reqwest::Client) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..=SNIPER_API_PROBE_RETRY_DELAYS.len() {
+        if attempt > 0 {
+            tokio::time::sleep(SNIPER_API_PROBE_RETRY_DELAYS[attempt - 1]).await;
+        }
+        match probe_sniper_api_base_url_once(url, client).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("probe loop always runs at least once"))
+}
+
+async fn probe_sniper_api_base_url_once(url: &str, client: &reqwest::Client) -> Result<()> {
     let response = client
         .get(api_url(url, "/api/settings")?)
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(SNIPER_API_PROBE_TIMEOUT)
         .send()
         .await
         .with_context(|| format!("failed to probe Sniper API at {url}"))?;
@@ -4121,6 +4140,11 @@ mod tests {
         WorkspaceStateSnapshot,
     };
     use std::fs;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uuid::Uuid;
 
     #[test]
@@ -6061,6 +6085,88 @@ mod tests {
             .to_string()
             .contains("Removed the stale runtime-state"));
         assert!(!runtime_state_path(&root).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn discovery_removes_legacy_stale_runtime_state_missing_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-cli-legacy-runtime-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            runtime_state_path(&root),
+            br#"{"proxy_addr":"127.0.0.1:18080","ui_addr":"127.0.0.1:9"}"#,
+        )
+        .unwrap();
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let error = discover_api_base_url_from_data_dir(&client, root.clone())
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Removed the stale runtime-state"));
+        assert!(!runtime_state_path(&root).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn discovery_retries_runtime_state_probe_before_cleanup() {
+        let root = std::env::temp_dir().join(format!("sniper-cli-probe-retry-{}", Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui_addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let server_root = root.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer).await.unwrap();
+                let attempt = server_attempts.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if attempt < 2 {
+                    ("503 Service Unavailable", "{}".to_string())
+                } else {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "proxy_addr": "127.0.0.1:18080",
+                            "ui_addr": ui_addr.to_string(),
+                            "data_dir": server_root.display().to_string(),
+                            "max_entries": 5000,
+                            "features": ["http_capture", "session_storage", "replay"]
+                        })
+                        .to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let snapshot = RuntimeStateSnapshot::with_proxy_status(
+            "127.0.0.1:18080".parse().unwrap(),
+            ui_addr,
+            true,
+        );
+        persist_runtime_state(&root, &snapshot).unwrap();
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = discover_api_base_url_from_data_dir(&client, root.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(url, format!("http://{ui_addr}"));
+        assert!(runtime_state_path(&root).exists());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.await.unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

@@ -431,7 +431,7 @@ fn websocket_summary_matches_filters(
     if filters.in_scope_only && !summary_matches_scope(&summary.host, &filters.scope_patterns) {
         return false;
     }
-    if filters.live_only && summary.duration_ms.is_some() {
+    if filters.live_only && summary.closed_at.is_some() {
         return false;
     }
     if let Some(query) = normalized_query {
@@ -455,7 +455,13 @@ fn websocket_summary_search_haystack(summary: &WebSocketSessionSummary) -> Strin
         summary
             .duration_ms
             .map(|value| format!("{value} ms"))
-            .unwrap_or_else(|| "live".to_string()),
+            .unwrap_or_else(|| {
+                if summary.closed_at.is_none() {
+                    "live".to_string()
+                } else {
+                    "closed".to_string()
+                }
+            }),
         summary.started_at.to_rfc3339(),
     ]
     .join("\n")
@@ -470,6 +476,17 @@ fn sort_websocket_summaries(
     let Some(sort_key) = sort_key.filter(|key| !key.trim().is_empty()) else {
         return;
     };
+    if sort_key == "index" {
+        let descending = !matches!(sort_direction, Some("asc"));
+        entries.sort_by(|left, right| {
+            if descending {
+                left.0.cmp(&right.0)
+            } else {
+                right.0.cmp(&left.0)
+            }
+        });
+        return;
+    }
     let descending = !matches!(sort_direction, Some("asc"));
     entries.sort_by(|left, right| {
         let ordering = compare_websocket_summary(sort_key, left, right);
@@ -676,6 +693,7 @@ mod tests {
 
         let mut closed = closed_session(vec![frame(1)]);
         closed.host = "out.example.test".to_string();
+        closed.duration_ms = None;
 
         let store = WebSocketStore::from_sessions(10, 10, vec![live, closed]);
 
@@ -699,6 +717,37 @@ mod tests {
 
         assert_eq!(scope_page.filtered_total, Some(1));
         assert_eq!(scope_page.items[0].host, "chat.example.test");
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_index_sort_keeps_desc_newest_first() {
+        let mut newest = session(vec![frame(1)]);
+        newest.host = "newest.example.test".to_string();
+        let mut middle = session(vec![frame(1)]);
+        middle.host = "middle.example.test".to_string();
+        let mut oldest = session(vec![frame(1)]);
+        oldest.host = "oldest.example.test".to_string();
+        let store = WebSocketStore::from_sessions(10, 10, vec![newest, middle, oldest]);
+
+        let desc = store
+            .list_page_filtered(&WebSocketListFilters {
+                sort_key: Some("index".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+        let asc = store
+            .list_page_filtered(&WebSocketListFilters {
+                sort_key: Some("index".to_string()),
+                sort_direction: Some("asc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(desc.items[0].host, "newest.example.test");
+        assert_eq!(desc.items[2].host, "oldest.example.test");
+        assert_eq!(asc.items[0].host, "oldest.example.test");
+        assert_eq!(asc.items[2].host, "newest.example.test");
     }
 
     #[tokio::test]
