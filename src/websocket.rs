@@ -294,6 +294,14 @@ impl WebSocketStore {
     }
 
     pub async fn snapshot(&self, limit: Option<usize>) -> Vec<WebSocketSessionRecord> {
+        self.snapshot_with_frame_limit(limit, None).await
+    }
+
+    pub async fn snapshot_with_frame_limit(
+        &self,
+        limit: Option<usize>,
+        frame_limit: Option<usize>,
+    ) -> Vec<WebSocketSessionRecord> {
         let inner = self.inner.read().await;
         let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
         let mut live_remaining = limit;
@@ -323,7 +331,7 @@ impl WebSocketStore {
                 closed_remaining -= 1;
                 true
             })
-            .map(WebSocketSessionEntry::to_record)
+            .map(|session| session.to_record_with_frame_window(frame_limit))
             .collect()
     }
 
@@ -865,6 +873,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_frame_limit_persists_only_tail_frames() {
+        let store = WebSocketStore::new(10, 10);
+        store
+            .open(session(vec![
+                frame(1),
+                frame(2),
+                frame(3),
+                frame(4),
+                frame(5),
+            ]))
+            .await;
+
+        let snapshot = store.snapshot_with_frame_limit(None, Some(2)).await;
+
+        assert_eq!(
+            snapshot[0]
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(store.get(snapshot[0].id).await.unwrap().frames.len(), 5);
     }
 
     #[tokio::test]

@@ -39,6 +39,7 @@ const REGISTRY_FILE: &str = "registry.json";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const TRANSACTION_JOURNAL_FILE: &str = "transactions.journal";
 const MAX_SESSION_NAME_BYTES: usize = 256;
+const MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION: usize = 1_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -414,7 +415,13 @@ impl SessionContext {
                         self.storage_dir.display()
                     )
                 })?,
-            websockets: self.websockets.snapshot(Some(self.max_entries)).await,
+            websockets: self
+                .websockets
+                .snapshot_with_frame_limit(
+                    Some(self.max_entries),
+                    Some(MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION),
+                )
+                .await,
             event_log: self.event_log.snapshot(Some(self.max_entries)).await,
             match_replace_rules: self.match_replace.snapshot().await,
             fuzzer_attacks: self.fuzzer.snapshot(Some(self.max_entries)).await,
@@ -1895,7 +1902,8 @@ mod tests {
     use crate::{
         model::{
             BodyEncoding, EditableRequest, HeaderRecord, MessageRecord, TransactionRecord,
-            WebSocketFrameDirection, WebSocketFrameKind, WebSocketSessionRecord,
+            WebSocketFrameDirection, WebSocketFrameKind, WebSocketFrameRecord,
+            WebSocketSessionRecord,
         },
         oast::OastProvider,
         runtime::RuntimeSettingsUpdate,
@@ -2124,6 +2132,70 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("restarted before this WebSocket session was closed")));
+    }
+
+    #[tokio::test]
+    async fn session_persist_caps_websocket_frames_to_tail_window() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-websocket-persist-cap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 2_000).unwrap();
+        let websocket_id = Uuid::new_v4();
+        let total_frames = super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION + 7;
+        let frames = (0..total_frames)
+            .map(|index| WebSocketFrameRecord {
+                index,
+                captured_at: Utc::now(),
+                direction: WebSocketFrameDirection::ClientToServer,
+                kind: WebSocketFrameKind::Binary,
+                body_preview: "AAECAwQFBgcICQ==".to_string(),
+                body_encoding: BodyEncoding::Base64,
+                body_size: 10,
+                preview_truncated: false,
+            })
+            .collect::<Vec<_>>();
+
+        active
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now(),
+                closed_at: Some(Utc::now()),
+                duration_ms: Some(1),
+                scheme: "wss".to_string(),
+                host: "socket.example.test".to_string(),
+                path: "/stream".to_string(),
+                status: Some(101),
+                request: MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 1024),
+                response: None,
+                frames,
+                notes: Vec::new(),
+            })
+            .await;
+        assert_eq!(
+            active
+                .websockets
+                .get(websocket_id)
+                .await
+                .unwrap()
+                .frames
+                .len(),
+            total_frames
+        );
+
+        active.persist().await.unwrap();
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.websockets.get(websocket_id).await.unwrap();
+
+        assert_eq!(
+            restored.frames.len(),
+            super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION
+        );
+        assert_eq!(restored.frames[0].index, 7);
+        assert_eq!(restored.frames.last().unwrap().index, total_frames - 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[cfg(unix)]

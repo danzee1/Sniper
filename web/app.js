@@ -121,6 +121,7 @@ const WEBSOCKET_MAX_LOADED_SESSIONS = 5000;
 const WEBSOCKET_SCROLL_PREFETCH_PX = 240;
 const WEBSOCKET_QUERY_BACKFILL_DELAY_MS = 100;
 const WEBSOCKET_DETAIL_FRAME_LIMIT = 1000;
+const WEBSOCKET_FRAME_ROW_PREVIEW_CHARS = 160;
 const FINDINGS_BADGE_POLL_INTERVAL_MS = 30000;
 const EVENT_LOG_LIMIT = 200;
 const WS_REPLAY_MAX_LOADED_FRAMES = 10000;
@@ -14880,9 +14881,13 @@ function renderFramePreview(frame) {
   if (!frame.body_preview) {
     return "(empty)";
   }
-  return frame.body_encoding === "base64"
-    ? `[base64] ${frame.body_preview}`
-    : frame.body_preview;
+  if (frame.body_encoding === "base64") {
+    const preview = String(frame.body_preview);
+    return preview.length > WEBSOCKET_FRAME_ROW_PREVIEW_CHARS
+      ? `[base64] ${preview.slice(0, WEBSOCKET_FRAME_ROW_PREVIEW_CHARS)}...`
+      : `[base64] ${preview}`;
+  }
+  return frame.body_preview;
 }
 
 function showFrameDetail(frame) {
@@ -16948,7 +16953,12 @@ function truncateUtf8Preview(value, maxBytes) {
   const text = String(value || "");
   const fullBytes = utf8ByteLength(text);
   if (fullBytes <= maxBytes) {
-    return { body: text, storedBytes: fullBytes, truncated: false };
+    return {
+      body: text,
+      bodyBytes: fullBytes,
+      storedBytes: fullBytes,
+      truncated: false,
+    };
   }
   const encoder = new TextEncoder();
   let body = "";
@@ -16959,23 +16969,58 @@ function truncateUtf8Preview(value, maxBytes) {
     body += char;
     storedBytes += charBytes;
   }
-  return { body, storedBytes, truncated: true };
+  return {
+    body,
+    bodyBytes: storedBytes,
+    storedBytes,
+    truncated: true,
+  };
 }
 
-function truncateBase64Preview(value, maxBytes) {
+function truncateBase64Preview(
+  value,
+  maxStoredBytes,
+  maxBodyBytes = WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES,
+) {
   const encoded = String(value || "");
+  const storedLimit = Math.max(0, Number.isFinite(maxStoredBytes)
+    ? maxStoredBytes
+    : WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES);
+  const bodyLimit = Math.max(0, Number.isFinite(maxBodyBytes)
+    ? maxBodyBytes
+    : WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES);
   let decoded = "";
   try {
     decoded = atob(encoded);
   } catch (_error) {
-    return { body: "", storedBytes: 0, truncated: true };
+    return { body: "", bodyBytes: 0, storedBytes: 0, truncated: true };
   }
-  if (decoded.length <= maxBytes) {
-    return { body: encoded, storedBytes: decoded.length, truncated: false };
+  const fullStoredBytes = utf8ByteLength(encoded);
+  if (fullStoredBytes <= storedLimit && decoded.length <= bodyLimit) {
+    return {
+      body: encoded,
+      bodyBytes: decoded.length,
+      storedBytes: fullStoredBytes,
+      truncated: false,
+    };
+  }
+  let bodyBytes = Math.min(decoded.length, bodyLimit);
+  let body = "";
+  let storedBytes = 0;
+  while (bodyBytes > 0) {
+    body = btoa(decoded.slice(0, bodyBytes));
+    storedBytes = utf8ByteLength(body);
+    if (storedBytes <= storedLimit) break;
+    const excessBytes = storedBytes - storedLimit;
+    bodyBytes -= Math.max(1, Math.ceil((excessBytes * 3) / 4));
+  }
+  if (bodyBytes <= 0) {
+    return { body: "", bodyBytes: 0, storedBytes: 0, truncated: true };
   }
   return {
-    body: btoa(decoded.slice(0, maxBytes)),
-    storedBytes: maxBytes,
+    body,
+    bodyBytes,
+    storedBytes,
     truncated: true,
   };
 }
@@ -17012,9 +17057,9 @@ function snapshotWsReplayFrames(tab, budget = null) {
       ? truncateBase64Preview(bodySource, frameByteLimit)
       : truncateUtf8Preview(bodySource, frameByteLimit);
     const declaredBodySize = Number(frame.body_size);
-    const bodySize = Number.isFinite(declaredBodySize) && declaredBodySize >= preview.storedBytes
+    const bodySize = Number.isFinite(declaredBodySize) && declaredBodySize >= preview.bodyBytes
       ? declaredBodySize
-      : preview.storedBytes;
+      : preview.bodyBytes;
     const capturedAt = Number.isFinite(Date.parse(frame.captured_at))
       ? String(frame.captured_at)
       : new Date().toISOString();
@@ -17031,7 +17076,7 @@ function snapshotWsReplayFrames(tab, budget = null) {
       body: preview.body,
       body_encoding: encoding,
       body_size: bodySize,
-      preview_truncated: Boolean(frame.preview_truncated || preview.truncated || bodySize > preview.storedBytes),
+      preview_truncated: Boolean(frame.preview_truncated || preview.truncated || bodySize > preview.bodyBytes),
     });
   }
   if (selected.length < frames.length) {
