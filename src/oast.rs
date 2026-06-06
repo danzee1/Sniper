@@ -157,6 +157,13 @@ struct InteractshRegistration {
     private_key: rsa::RsaPrivateKey,
 }
 
+struct PendingInteractshDeregistration {
+    base_url: String,
+    correlation_id: String,
+    secret_key: String,
+    token: String,
+}
+
 // ── OastStore ──
 
 /// Store for OAST callbacks. Mirrors ScannerStore pattern.
@@ -824,6 +831,73 @@ async fn deregister_interactsh(
     }
 }
 
+async fn pending_interactsh_deregistration(
+    store: &OastStore,
+    prev_url: &Option<String>,
+) -> Option<PendingInteractshDeregistration> {
+    let registration = {
+        let reg = store.registration.read().await;
+        match &*reg {
+            RegistrationState::Interactsh {
+                correlation_id,
+                secret_key,
+                token,
+                ..
+            } => Some((correlation_id.clone(), secret_key.clone(), token.clone())),
+            RegistrationState::None => None,
+        }
+    };
+
+    let (base_url, (correlation_id, secret_key, stored_token)) =
+        (prev_url.as_ref()?.clone(), registration?);
+    let token = if stored_token.is_empty() {
+        store.get_config().await.token
+    } else {
+        stored_token
+    };
+    Some(PendingInteractshDeregistration {
+        base_url,
+        correlation_id,
+        secret_key,
+        token,
+    })
+}
+
+fn spawn_interactsh_deregistration(
+    pending: Option<PendingInteractshDeregistration>,
+    client: reqwest::Client,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    tokio::spawn(async move {
+        deregister_interactsh(
+            &pending.base_url,
+            &pending.correlation_id,
+            &pending.secret_key,
+            &pending.token,
+            &client,
+        )
+        .await;
+    });
+}
+
+fn spawn_interactsh_registration_cleanup(
+    config: &OastConfig,
+    registration: InteractshRegistration,
+    client: reqwest::Client,
+) {
+    spawn_interactsh_deregistration(
+        Some(PendingInteractshDeregistration {
+            base_url: config.server_url.clone(),
+            correlation_id: registration.correlation_id,
+            secret_key: registration.secret_key,
+            token: config.token.clone(),
+        }),
+        client,
+    );
+}
+
 /// Poll an Interactsh server for new interactions.
 async fn poll_interactsh(
     base_url: &str,
@@ -1368,14 +1442,14 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
     loop {
         let session = state.session().await;
         let operation_lock = state.session_operation_lock(session.id()).await;
-        let operation_guard = operation_lock.lock().await;
+        let mut operation_guard = Some(operation_lock.lock().await);
         if !state.sessions.contains_session(session.id()) {
             prev_session_id = None;
             prev_provider = None;
             prev_url = None;
             prev_token = None;
             prev_store = None;
-            drop(operation_guard);
+            drop(operation_guard.take());
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
@@ -1389,14 +1463,17 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             if same_session_as_previous && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
             {
                 if let Some(store) = prev_store.as_deref() {
+                    let pending_deregistration =
+                        pending_interactsh_deregistration(store, &prev_url).await;
                     let _mutation_guard = session.mutation_guard().await;
-                    deregister_current_interactsh(store, &prev_url, &client).await;
+                    store.clear_registration().await;
                     if let Err(error) = state
                         .persist_session_context_mutation_locked(&session)
                         .await
                     {
                         warn!(?error, session_id = %session.id(), "failed to persist OAST registration clear");
                     }
+                    spawn_interactsh_deregistration(pending_deregistration, client.clone());
                 }
             }
             prev_session_id = None;
@@ -1404,7 +1481,7 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             prev_url = None;
             prev_token = None;
             prev_store = None;
-            drop(operation_guard);
+            drop(operation_guard.take());
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -1426,8 +1503,11 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
                 && prev_provider.as_ref() == Some(&OastProvider::Interactsh)
             {
                 if let Some(store) = prev_store.as_deref() {
+                    let pending_deregistration =
+                        pending_interactsh_deregistration(store, &prev_url).await;
                     let _mutation_guard = session.mutation_guard().await;
-                    deregister_current_interactsh(store, &prev_url, &client).await;
+                    store.clear_registration().await;
+                    spawn_interactsh_deregistration(pending_deregistration, client.clone());
                 }
             }
 
@@ -1441,7 +1521,48 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
                         "Reusing persisted Interactsh registration"
                     );
                 } else {
-                    match register_interactsh(&config.server_url, &config.token, &client).await {
+                    drop(operation_guard.take());
+                    let registration_result =
+                        register_interactsh(&config.server_url, &config.token, &client).await;
+                    operation_guard = Some(operation_lock.lock().await);
+                    if !state.sessions.contains_session(session.id()) {
+                        if let Ok(registration) = registration_result {
+                            spawn_interactsh_registration_cleanup(
+                                &config,
+                                registration,
+                                client.clone(),
+                            );
+                        }
+                        prev_session_id = None;
+                        prev_provider = None;
+                        prev_url = None;
+                        prev_token = None;
+                        prev_store = None;
+                        drop(operation_guard.take());
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    let latest_config = oast_config_from_session_runtime(&session).await;
+                    session.oast.update_config(latest_config.clone()).await;
+                    if !oast_poll_target_still_current(&latest_config, &config) {
+                        debug!(
+                            session_id = %session.id(),
+                            previous_provider = %config.provider,
+                            latest_provider = %latest_config.provider,
+                            "discarding stale Interactsh registration after config changed"
+                        );
+                        if let Ok(registration) = registration_result {
+                            spawn_interactsh_registration_cleanup(
+                                &config,
+                                registration,
+                                client.clone(),
+                            );
+                        }
+                        drop(operation_guard.take());
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    match registration_result {
                         Ok(reg) => {
                             info!(
                                 session_id = %session.id(),
@@ -1492,7 +1613,7 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             }
         }
 
-        drop(operation_guard);
+        drop(operation_guard.take());
         let clear_generation = session.oast.clear_generation();
         let callbacks = match config.provider {
             OastProvider::Interactsh => {
@@ -1654,6 +1775,7 @@ async fn deregister_current_interactsh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::AppConfig, runtime::RuntimeSettingsUpdate};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn interactsh_config(token: &str) -> OastConfig {
@@ -2007,6 +2129,287 @@ mod tests {
         assert!(register_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2);
         poller.abort();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn state_poller_releases_session_operation_lock_while_registering_interactsh() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (register_started_tx, register_started_rx) = tokio::sync::oneshot::channel();
+        let (release_response_tx, release_response_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 8192];
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.starts_with("POST /register "));
+            let _ = register_started_tx.send(());
+            let _ = release_response_rx.await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+        });
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-oast-state-poller-register-lock-{}",
+            Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 100,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let session = state.session().await;
+        session
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                oast_enabled: Some(true),
+                oast_server_url: Some(format!("http://{addr}")),
+                oast_provider: Some(OastProvider::Interactsh),
+                oast_polling_interval_secs: Some(1),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        let poller = start_oast_poller_for_state(state.clone());
+
+        tokio::time::timeout(Duration::from_secs(20), register_started_rx)
+            .await
+            .expect("registration request should start")
+            .expect("registration signal should be delivered");
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let guard = tokio::time::timeout(Duration::from_millis(100), operation_lock.lock())
+            .await
+            .expect("OAST registration must not hold the session operation lock");
+        drop(guard);
+
+        let _ = release_response_tx.send(());
+        poller.abort();
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn state_poller_deregisters_registration_that_becomes_stale_before_persist() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (register_started_tx, register_started_rx) = tokio::sync::oneshot::channel();
+        let (release_register_tx, release_register_rx) = tokio::sync::oneshot::channel();
+        let (deregister_seen_tx, deregister_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut register_started_tx = Some(register_started_tx);
+            let mut release_register_rx = Some(release_register_rx);
+            let mut deregister_seen_tx = Some(deregister_seen_tx);
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0_u8; 8192];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                if request.starts_with("POST /register ") {
+                    if let Some(tx) = register_started_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release_register_rx.take() {
+                        let _ = rx.await;
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                } else if request.starts_with("POST /deregister ") {
+                    if let Some(tx) = deregister_seen_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                    return;
+                } else {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+                        )
+                        .await;
+                }
+            }
+        });
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-oast-state-poller-stale-register-{}",
+            Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 100,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let session = state.session().await;
+        session
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                oast_enabled: Some(true),
+                oast_server_url: Some(format!("http://{addr}")),
+                oast_provider: Some(OastProvider::Interactsh),
+                oast_polling_interval_secs: Some(1),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        let poller = start_oast_poller_for_state(state.clone());
+
+        tokio::time::timeout(Duration::from_secs(20), register_started_rx)
+            .await
+            .expect("registration request should start")
+            .expect("registration signal should be delivered");
+        session
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                oast_enabled: Some(false),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        let _ = release_register_tx.send(());
+
+        tokio::time::timeout(Duration::from_secs(5), deregister_seen_rx)
+            .await
+            .expect("stale registration should be deregistered")
+            .expect("deregistration signal should be delivered");
+        assert!(session.oast.snapshot_registration().await.is_none());
+
+        poller.abort();
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn state_poller_releases_session_operation_lock_while_deregistering_interactsh() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (poll_seen_tx, poll_seen_rx) = tokio::sync::oneshot::channel();
+        let (deregister_started_tx, deregister_started_rx) = tokio::sync::oneshot::channel();
+        let (release_deregister_tx, release_deregister_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut poll_seen_tx = Some(poll_seen_tx);
+            let mut deregister_started_tx = Some(deregister_started_tx);
+            let mut release_deregister_rx = Some(release_deregister_rx);
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0_u8; 8192];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                if request.starts_with("GET /poll?") {
+                    if let Some(tx) = poll_seen_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+                        )
+                        .await;
+                } else if request.starts_with("POST /deregister ") {
+                    if let Some(tx) = deregister_started_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release_deregister_rx.take() {
+                        let _ = rx.await;
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                    return;
+                } else {
+                    panic!("unexpected OAST request: {request}");
+                }
+            }
+        });
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-oast-state-poller-deregister-lock-{}",
+            Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 100,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let session = state.session().await;
+        let server_url = format!("http://{addr}");
+        session
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                oast_enabled: Some(true),
+                oast_server_url: Some(server_url.clone()),
+                oast_provider: Some(OastProvider::Interactsh),
+                oast_polling_interval_secs: Some(1),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        session
+            .oast
+            .set_registration(RegistrationState::Interactsh {
+                server_url,
+                token: String::new(),
+                correlation_id: "cid".to_string(),
+                secret_key: "secret".to_string(),
+                private_key: rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+            })
+            .await;
+        let poller = start_oast_poller_for_state(state.clone());
+
+        tokio::time::timeout(Duration::from_secs(5), poll_seen_rx)
+            .await
+            .expect("persisted registration should be polled")
+            .expect("poll signal should be delivered");
+        session
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                oast_enabled: Some(false),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), deregister_started_rx)
+            .await
+            .expect("deregistration request should start")
+            .expect("deregistration signal should be delivered");
+
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let guard = tokio::time::timeout(Duration::from_millis(100), operation_lock.lock())
+            .await
+            .expect("OAST deregistration must not hold the session operation lock");
+        drop(guard);
+        assert!(session.oast.snapshot_registration().await.is_none());
+
+        let _ = release_deregister_tx.send(());
+        poller.abort();
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

@@ -1757,6 +1757,8 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 tab_mut.target_scheme = target.scheme.clone();
                 tab_mut.target_host = target.host.clone();
                 tab_mut.target_port = target.port.clone();
+            } else {
+                sync_replay_tab_target_to_request(tab_mut, &request)?;
             }
             tab_mut.response_record = Some(record.clone());
             tab_mut.notice = replay_error.clone().unwrap_or_default();
@@ -4068,14 +4070,14 @@ mod tests {
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
         push_replay_history_entry, read_limited_to_end, read_payloads_input,
         read_raw_request_input, read_raw_response_input, read_text_input, replay_send_http_version,
-        replay_tab_target_as_request, replay_tab_target_matches_request,
-        replay_update_should_preserve_current_port, session_query_path,
-        sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
-        sync_replay_tab_target_to_request, transaction_detail_path, websocket_detail_path,
-        websocket_list_path, workspace_conflict_message, Cli, Command, HistoryCommand,
-        HistoryListResponse, OastConfigureArgs, SequenceCommand, SequenceCreateInput,
-        SessionCommand, SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
-        MAX_CLI_INPUT_BYTES,
+        replay_send_target_for_tab, replay_tab_target_as_request,
+        replay_tab_target_matches_request, replay_update_should_preserve_current_port,
+        session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
+        strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
+        websocket_detail_path, websocket_list_path, workspace_conflict_message, Cli, Command,
+        HistoryCommand, HistoryListResponse, OastConfigureArgs, SequenceCommand,
+        SequenceCreateInput, SessionCommand, SkillsInstallArgs, WebSocketListResponse,
+        CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -5283,6 +5285,39 @@ mod tests {
             !replay_tab_target_matches_request(&custom_tab, custom_tab.base_request.as_ref())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn replay_send_stale_default_target_is_persisted_as_effective_request_target() {
+        let old_request = default_editable_request();
+        let new_request = EditableRequest {
+            host: "new.example.com".to_string(),
+            headers: vec![HeaderRecord {
+                name: "host".to_string(),
+                value: "new.example.com".to_string(),
+            }],
+            ..old_request.clone()
+        };
+        let mut tab = ReplayTabState {
+            base_request: Some(old_request),
+            target_scheme: "https".to_string(),
+            target_host: "example.com".to_string(),
+            target_port: "443".to_string(),
+            ..Default::default()
+        };
+
+        assert!(replay_send_target_for_tab(&tab, &new_request)
+            .unwrap()
+            .is_none());
+
+        sync_replay_tab_target_to_request(&mut tab, &new_request).unwrap();
+        tab.base_request = Some(new_request.clone());
+
+        assert_eq!(tab.target_host, "new.example.com");
+        assert_eq!(tab.target_port, "443");
+        assert!(replay_send_target_for_tab(&tab, &new_request)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -121,6 +121,8 @@ pub struct ReplayTabState {
     pub ws_setup_queue: Vec<serde_json::Value>,
     #[serde(default)]
     pub ws_frames: Vec<WsReplayFrame>,
+    #[serde(default)]
+    pub ws_frames_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_selected_frame_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

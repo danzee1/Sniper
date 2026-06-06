@@ -4219,12 +4219,7 @@ async fn ws_replay_frames(
         return response;
     }
     match state.ws_replay.frames_since(id, query.since).await {
-        Some((status, error, frames)) => Json(serde_json::json!({
-            "status": status,
-            "error": error,
-            "frames": frames,
-        }))
-        .into_response(),
+        Some(frames) => Json(frames).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }

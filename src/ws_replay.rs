@@ -61,6 +61,18 @@ pub struct WsReplaySnapshot {
     pub error: Option<String>,
 }
 
+/// Incremental frame polling response for a WS replay connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WsReplayFramesSince {
+    pub status: WsReplayStatus,
+    pub error: Option<String>,
+    pub frames: Vec<WsReplayFrame>,
+    pub first_retained_index: Option<usize>,
+    pub next_index: usize,
+    pub gap: bool,
+    pub truncated: bool,
+}
+
 /// Sender half to push messages into the WebSocket.
 type WsSender = mpsc::Sender<WsReplayOutboundMessage>;
 
@@ -670,17 +682,27 @@ impl WsReplayStore {
     }
 
     /// Get frames since a given index (for polling).
-    pub async fn frames_since(
-        &self,
-        id: Uuid,
-        since_index: usize,
-    ) -> Option<(WsReplayStatus, Option<String>, Vec<WsReplayFrame>)> {
+    pub async fn frames_since(&self, id: Uuid, since_index: usize) -> Option<WsReplayFramesSince> {
         let conn = self.connection(id).await?;
         let c = conn.read().await;
+        let first_retained_index = c.frames.first().map(|frame| frame.index);
+        let gap = first_retained_index.is_some_and(|index| since_index < index);
         let first_new = c.frames.partition_point(|frame| frame.index < since_index);
         let end = (first_new + MAX_WS_REPLAY_FRAMES_PER_RESPONSE).min(c.frames.len());
-        let new_frames = c.frames[first_new..end].to_vec();
-        Some((c.status.clone(), c.error.clone(), new_frames))
+        let frames = c.frames[first_new..end].to_vec();
+        let next_index = frames
+            .last()
+            .map(|frame| frame.index.saturating_add(1))
+            .unwrap_or(since_index);
+        Some(WsReplayFramesSince {
+            status: c.status.clone(),
+            error: c.error.clone(),
+            frames,
+            first_retained_index,
+            next_index,
+            gap,
+            truncated: gap || end < c.frames.len(),
+        })
     }
 
     /// Remove a connection and its data.
@@ -868,10 +890,10 @@ mod tests {
             .await
             .insert(id, Arc::new(RwLock::new(connection)));
 
-        let (status, error, frames) = store.frames_since(id, 0).await.unwrap();
-        assert_eq!(status, WsReplayStatus::Error);
-        assert_eq!(error.as_deref(), Some("connection refused"));
-        assert!(frames.is_empty());
+        let response = store.frames_since(id, 0).await.unwrap();
+        assert_eq!(response.status, WsReplayStatus::Error);
+        assert_eq!(response.error.as_deref(), Some("connection refused"));
+        assert!(response.frames.is_empty());
     }
 
     #[tokio::test]
@@ -888,10 +910,17 @@ mod tests {
             .await
             .insert(id, Arc::new(RwLock::new(connection)));
 
-        let (_, _, frames) = store.frames_since(id, 0).await.unwrap();
-        assert_eq!(frames.len(), MAX_WS_REPLAY_FRAMES_PER_RESPONSE);
-        assert_eq!(frames[0].index, 0);
-        assert_eq!(frames[MAX_WS_REPLAY_FRAMES_PER_RESPONSE - 1].index, 999);
+        let response = store.frames_since(id, 0).await.unwrap();
+        assert_eq!(response.frames.len(), MAX_WS_REPLAY_FRAMES_PER_RESPONSE);
+        assert_eq!(response.frames[0].index, 0);
+        assert_eq!(
+            response.frames[MAX_WS_REPLAY_FRAMES_PER_RESPONSE - 1].index,
+            999
+        );
+        assert_eq!(response.first_retained_index, Some(0));
+        assert_eq!(response.next_index, 1000);
+        assert!(!response.gap);
+        assert!(response.truncated);
 
         let snapshot = store.snapshot(id).await.unwrap();
         assert_eq!(snapshot.frames.len(), MAX_WS_REPLAY_FRAMES_PER_RESPONSE);
@@ -900,6 +929,27 @@ mod tests {
             snapshot.frames[MAX_WS_REPLAY_FRAMES_PER_RESPONSE - 1].index,
             1005
         );
+    }
+
+    #[tokio::test]
+    async fn frames_since_reports_retention_gap_when_requested_index_was_trimmed() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let mut connection = test_connection(WsReplayStatus::Connected, None);
+        connection.frames = (50..55).map(test_frame).collect();
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(connection)));
+
+        let response = store.frames_since(id, 10).await.unwrap();
+
+        assert_eq!(response.first_retained_index, Some(50));
+        assert_eq!(response.next_index, 55);
+        assert!(response.gap);
+        assert!(response.truncated);
+        assert_eq!(response.frames.first().map(|frame| frame.index), Some(50));
     }
 
     #[tokio::test]

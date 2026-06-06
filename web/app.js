@@ -132,6 +132,8 @@ const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 12 * 1024 * 1024;
 const WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS = 2000;
 const WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS = 5000;
 const WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES = 60 * 1024;
+const WORKSPACE_UNLOAD_COMPACT_TEXT_BYTES = 16 * 1024;
+const WORKSPACE_UNLOAD_MINIMAL_TEXT_BYTES = 4 * 1024;
 const MAX_ANNOTATION_NOTE_BYTES = 32 * 1024;
 const WS_REPLAY_FINAL_POLL_INTERVAL_MS = 100;
 const WS_REPLAY_FINAL_POLL_TIMEOUT_MS = 2200;
@@ -2615,6 +2617,7 @@ function hydrateReplayTab(tab) {
         : [],
       wsStatus: "disconnected",
       wsFrames,
+      wsFramesTruncated: !!tab.ws_frames_truncated || websocketFramesAreTruncated(wsFrames, null),
       wsSelectedFrameIndex: normalizeWsReplaySavedFrameIndex(wsFrames, tab.ws_selected_frame_index),
       wsFrameWindowStart: normalizeWsReplaySavedFrameWindowStart(wsFrames, tab.ws_frame_window_start),
       wsError: null,
@@ -2751,6 +2754,7 @@ function snapshotWorkspaceState(options = {}) {
               autoSend: !!item.autoSend,
             })),
             ws_frames: wsFrames,
+            ws_frames_truncated: !!tab.wsFramesTruncated || websocketFramesAreTruncated(wsFrames, null),
             ws_selected_frame_index: snapshotWsReplaySelectedFrameIndex(tab, wsFrames),
             ws_frame_window_start: snapshotWsReplayFrameWindowStart(tab, wsFrames),
           };
@@ -3027,11 +3031,118 @@ function flushWorkspaceStateOnUnload() {
 }
 
 function workspaceUnloadPayload(primarySnapshot) {
-  const payload = JSON.stringify(primarySnapshot);
-  if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
-    return payload;
+  const candidates = [
+    primarySnapshot,
+    compactWorkspaceUnloadSnapshot(primarySnapshot),
+    compactWorkspaceUnloadSnapshot(primarySnapshot, {
+      activeOnly: true,
+      textByteLimit: WORKSPACE_UNLOAD_COMPACT_TEXT_BYTES,
+    }),
+    compactWorkspaceUnloadSnapshot(primarySnapshot, {
+      activeOnly: true,
+      textByteLimit: WORKSPACE_UNLOAD_MINIMAL_TEXT_BYTES,
+      dropFuzzer: true,
+    }),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const payload = JSON.stringify(candidate);
+    if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+      return payload;
+    }
   }
   return null;
+}
+
+function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const replay = snapshot.replay && typeof snapshot.replay === "object" ? snapshot.replay : {};
+  const activeTabId = replay.active_tab_id || null;
+  const sourceTabs = Array.isArray(replay.tabs) ? replay.tabs : [];
+  const tabs = (options.activeOnly && activeTabId
+    ? sourceTabs.filter((tab) => tab?.id === activeTabId)
+    : sourceTabs
+  ).map((tab) => compactWorkspaceUnloadReplayTab(tab, options)).filter(Boolean);
+  return {
+    revision: snapshot.revision || 0,
+    session_id: snapshot.session_id || null,
+    client_id: snapshot.client_id || workspaceClientId,
+    client_version: snapshot.client_version || workspaceSaveVersion,
+    replay: {
+      tabs,
+      active_tab_id: activeTabId,
+      tab_sequence: replay.tab_sequence || state.replayTabSequence || 0,
+    },
+    fuzzer: options.dropFuzzer ? {} : (compactWorkspaceUnloadFuzzer(snapshot.fuzzer, options) || {}),
+  };
+}
+
+function compactWorkspaceUnloadText(value, options = {}) {
+  const text = String(value || "");
+  return Number.isFinite(options.textByteLimit)
+    ? truncateUtf8(text, options.textByteLimit)
+    : text;
+}
+
+function compactWorkspaceUnloadReplayTab(tab, options = {}) {
+  if (!tab || typeof tab !== "object") return null;
+  if (tab.type === "websocket") {
+    return {
+      id: tab.id,
+      type: "websocket",
+      sequence: tab.sequence,
+      custom_label: tab.custom_label || "",
+      pinned: !!tab.pinned,
+      ws_scheme: tab.ws_scheme || "wss",
+      ws_host: tab.ws_host || "",
+      ws_port: tab.ws_port || defaultWsPortForScheme(tab.ws_scheme),
+      ws_path: tab.ws_path || "/",
+      ws_headers: normalizedHeaders(tab.ws_headers),
+      ws_handshake_text: compactWorkspaceUnloadText(tab.ws_handshake_text, options),
+      ws_handshake_edited: !!tab.ws_handshake_edited,
+      ws_editor_text: compactWorkspaceUnloadText(tab.ws_editor_text, options),
+      ws_message_type: normalizeWsMessageType(tab.ws_message_type),
+      ws_editor_body_encoded: !!tab.ws_editor_body_encoded,
+      ws_setup_notice: tab.ws_setup_notice || "",
+      ws_setup_queue: [],
+      ws_frames: [],
+      ws_frames_truncated: !!tab.ws_frames_truncated || websocketFramesAreTruncated(tab.ws_frames, null),
+      ws_selected_frame_index: tab.ws_selected_frame_index ?? null,
+      ws_frame_window_start: tab.ws_frame_window_start ?? null,
+    };
+  }
+  return {
+    id: tab.id,
+    sequence: tab.sequence,
+    custom_label: tab.custom_label || "",
+    pinned: !!tab.pinned,
+    base_request: tab.base_request || null,
+    source_transaction_id: tab.source_transaction_id || null,
+    notice: tab.notice || "",
+    request_text: compactWorkspaceUnloadText(tab.request_text, options),
+    http_version_mode: tab.http_version_mode || "auto",
+    response_record: null,
+    target_scheme: tab.target_scheme || "https",
+    target_host: tab.target_host || "",
+    target_port: normalizePortValue(tab.target_port),
+    target_manually_edited: !!tab.target_manually_edited,
+    history_entries: [],
+    history_index: null,
+  };
+}
+
+function compactWorkspaceUnloadFuzzer(fuzzer, options = {}) {
+  if (!fuzzer || typeof fuzzer !== "object") return null;
+  return {
+    base_request: fuzzer.base_request || null,
+    source_transaction_id: fuzzer.source_transaction_id || null,
+    target: normalizeFuzzerTargetOverride(fuzzer.target),
+    target_request_authority: fuzzer.target_request_authority || null,
+    notice: fuzzer.notice || "",
+    request_text: compactWorkspaceUnloadText(fuzzer.request_text, options),
+    payloads_text: compactWorkspaceUnloadText(fuzzer.payloads_text, options),
+    attack_record_id: fuzzer.attack_record_id || null,
+  };
 }
 
 function disconnectWsReplayTabsOnUnload() {
@@ -16323,6 +16434,7 @@ function createWsReplayTab(seed = {}) {
     wsHandshakeEdited: !!seed.handshakeEdited,
     wsStatus: "disconnected",
     wsFrames: [],
+    wsFramesTruncated: false,
     wsSelectedFrameIndex: -1,
     wsSessionId: null,
     wsEditorText: seed.editorText || "",
@@ -16432,6 +16544,7 @@ async function wsConnect() {
       throw new Error(text);
     }
     tab.wsFrames = [];
+    tab.wsFramesTruncated = false;
     tab.wsSelectedFrameIndex = -1;
     scheduleWorkspaceStateSave();
     renderWsFrameList();
@@ -16732,6 +16845,25 @@ function startWsPoll(tab) {
       if (!tab.wsPollTimer || tab.wsPollGeneration !== generation || !isWsReplayTabAlive(tab, lifecycleToken)) return;
 
       const incomingFrames = normalizeWebsocketFrames(data.frames);
+      const firstRetainedIndex = Number(data.first_retained_index);
+      const serverGap = data.gap === true
+        || (Number.isFinite(firstRetainedIndex) && firstRetainedIndex > sinceIndex);
+      const incomingGap = incomingFrames.length > 0
+        && Number.isFinite(Number(incomingFrames[0].index))
+        && Number(incomingFrames[0].index) > sinceIndex;
+      if (serverGap || incomingGap) {
+        tab.wsFramesTruncated = true;
+        const firstAvailable = Number.isFinite(firstRetainedIndex)
+          ? firstRetainedIndex
+          : Number(incomingFrames[0]?.index);
+        tab.wsError = Number.isFinite(firstAvailable)
+          ? `WebSocket replay transcript is missing frames before #${firstAvailable}.`
+          : "WebSocket replay transcript is missing earlier frames.";
+        scheduleWorkspaceStateSave();
+        if (state.activeReplayTabId === tab.id) {
+          renderWsStatus();
+        }
+      }
       if (incomingFrames.length > 0) {
         const existing = new Set(getWsReplayFrames(tab).map((frame) => frame.index));
         const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
@@ -16742,6 +16874,10 @@ function startWsPoll(tab) {
           scheduleWsTranscriptWorkspaceSave();
         }
         sinceIndex = Math.max(sinceIndex, nextWsFrameIndex({ wsFrames: incomingFrames }), nextWsFrameIndex(tab));
+        const nextIndex = Number(data.next_index);
+        if (Number.isFinite(nextIndex)) {
+          sinceIndex = Math.max(sinceIndex, nextIndex);
+        }
         // Only re-render if this tab is still active
         if (fresh.length && state.activeReplayTabId === tab.id) {
           scheduleWsFrameListRender(tab);
@@ -16950,10 +17086,14 @@ function renderWsStatus() {
 
   const status = tab.wsStatus;
   els.wsStatusIndicator.className = `ws-status-dot ${status}`;
-  els.wsStatusText.textContent = status === "connected" ? "Connected"
+  let statusText = status === "connected" ? "Connected"
     : status === "connecting" ? "Connecting..."
     : status === "error" ? `Error: ${tab.wsError || "unknown"}`
     : "Disconnected";
+  if (status === "connected" && tab.wsFramesTruncated) {
+    statusText = tab.wsError || "Connected (frames trimmed)";
+  }
+  els.wsStatusText.textContent = statusText;
 
   els.wsConnectButton.disabled = status === "connected" || status === "connecting";
   els.wsDisconnectButton.disabled = status !== "connected" && status !== "connecting";
