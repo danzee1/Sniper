@@ -918,7 +918,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::High,
         ),
         (
-            r"gl[a-z]{2,4}-[A-Za-z0-9\-]{20,}",
+            r"\b(?:glrt|glrtr|gloas|gldt|glcbt|glptt|glft|glimt|glagent|glwt|glsoat|glffct)-[A-Za-z0-9_\-]{20,}",
             "GitLab Token",
             Severity::High,
         ),
@@ -986,7 +986,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::High,
         ),
         (
-            r#"(?i)(password|passwd|pwd)\s*[=:"']\s*[^\s"']{4,}"#,
+            r#"(?i)(?:\b|[_-])(?:password|passwd|pwd)\b\s*["']?\s*[:=]\s*(?:"([^"]{4,})"|'([^']{4,})'|([^\s"'<>{}]{4,}))"#,
             "Password in response",
             Severity::High,
         ),
@@ -1156,7 +1156,15 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
 
     for &(pattern, label, ref severity) in PATTERNS {
         if let Ok(re) = Regex::new(pattern) {
-            if let Some(m) = re.find(body) {
+            for captures in re.captures_iter(body) {
+                let Some(m) = captures.get(0) else {
+                    continue;
+                };
+                if label == "Password in response"
+                    && !password_candidate_looks_like_secret(&captures)
+                {
+                    continue;
+                }
                 // Skip matches embedded inside base64 strings (false positives from
                 // base64-encoded ad payloads, tracking pixels, etc. in JSON responses)
                 if is_embedded_in_base64(body, &m) {
@@ -1170,9 +1178,64 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                     format!("{label} found in response body. This may expose sensitive information to clients."),
                     truncate_evidence(m.as_str(), 80),
                 ));
+                break;
             }
         }
     }
+}
+
+fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool {
+    let Some(value) = captures
+        .iter()
+        .skip(1)
+        .flatten()
+        .map(|capture| capture.as_str().trim())
+        .find(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if value.len() < 8 {
+        return false;
+    }
+
+    let normalized = value
+        .trim_matches(|ch: char| ch.is_ascii_punctuation())
+        .trim()
+        .to_ascii_lowercase();
+    if normalized == "password" || normalized == "passwd" {
+        return false;
+    }
+
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let validation_phrases = [
+        "password is ",
+        "password must ",
+        "password cannot ",
+        "password should ",
+        "password do ",
+        "password does ",
+        "please ",
+        "enter ",
+        "confirm ",
+        "must ",
+        "cannot ",
+        "should ",
+        "do not ",
+        "don't ",
+        "don’t ",
+        "match ",
+        "matches ",
+    ];
+    if validation_phrases
+        .iter()
+        .any(|phrase| collapsed.starts_with(phrase))
+    {
+        return false;
+    }
+    !matches!(
+        collapsed.as_str(),
+        "password required" | "confirm password" | "password confirmation"
+    )
 }
 
 // ── Rule 5: CORS ──
@@ -2293,6 +2356,78 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.custom_rules.is_empty());
         assert_eq!(config.rules.get("jwt"), Some(&true));
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_css_property_that_looks_like_gitlab_token() {
+        let record = make_record(
+            vec![],
+            vec![],
+            r#".icon { glyph-orientation-horizontal: 0deg; }"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "GitLab Token detected in response"),
+            "CSS glyph-* properties should not be reported as GitLab tokens"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_detects_documented_gitlab_token_prefixes() {
+        let record = make_record(
+            vec![],
+            vec![],
+            r#"runner_token = "glrt-ABCDEFGHIJKLMNOPQRSTUV123456";"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "GitLab Token detected in response"),
+            "documented GitLab token prefixes should still be reported"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_password_validation_copy() {
+        let record = make_record(
+            vec![],
+            vec![],
+            r#"{ "password": "Password is required", "confirmPassword": "Confirm password" }"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Password in response detected in response"),
+            "validation copy should not be reported as a password leak"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_detects_likely_hardcoded_password() {
+        let record = make_record(
+            vec![],
+            vec![],
+            r#"{ "password": "CorrectHorseBattery99" }"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Password in response detected in response"),
+            "likely hardcoded passwords should still be reported"
+        );
     }
 
     #[test]
