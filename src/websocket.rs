@@ -282,7 +282,9 @@ impl WebSocketStore {
             filters.sort_direction.as_deref(),
         );
         let filtered_total = matched.len();
-        let offset = filters.offset.unwrap_or(0).min(filtered_total);
+        let offset = sorted_summary_offset_after_id(&matched, filters.after_id)
+            .unwrap_or_else(|| filters.offset.unwrap_or(0))
+            .min(filtered_total);
         let items = matched
             .into_iter()
             .skip(offset)
@@ -523,6 +525,17 @@ fn storage_order_offset_after_id(
         .order
         .iter()
         .position(|id| *id == after_id)
+        .map(|index| index.saturating_add(1))
+}
+
+fn sorted_summary_offset_after_id(
+    entries: &[(usize, WebSocketSessionSummary)],
+    after_id: Option<Uuid>,
+) -> Option<usize> {
+    let after_id = after_id?;
+    entries
+        .iter()
+        .position(|(_, summary)| summary.id == after_id)
         .map(|index| index.saturating_add(1))
 }
 
@@ -966,6 +979,61 @@ mod tests {
                 "oldest.example.test"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_after_id_applies_after_fallback_sort() {
+        let base = Utc::now();
+        let mut newest = session(vec![frame(1)]);
+        newest.host = "newest.example.test".to_string();
+        newest.started_at = base;
+        let mut middle = session(vec![frame(1)]);
+        middle.host = "middle.example.test".to_string();
+        middle.started_at = base - chrono::Duration::seconds(10);
+        let mut oldest = session(vec![frame(1)]);
+        oldest.host = "oldest.example.test".to_string();
+        oldest.started_at = base - chrono::Duration::seconds(20);
+        let oldest_id = oldest.id;
+        let store = WebSocketStore::from_sessions(10, 10, vec![newest, oldest, middle]);
+
+        let first_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(2),
+                sort_key: Some("started_at".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+        let after_id = first_page.items.last().expect("cursor row").id;
+        let first_page_ids = first_page
+            .items
+            .iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>();
+
+        let mut newer = session(vec![frame(1)]);
+        newer.host = "newer.example.test".to_string();
+        newer.started_at = base + chrono::Duration::seconds(10);
+        store.open(newer).await;
+
+        let second_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(2),
+                offset: Some(first_page.items.len()),
+                after_id: Some(after_id),
+                sort_key: Some("started_at".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].id, oldest_id);
+        assert!(second_page
+            .items
+            .iter()
+            .all(|summary| !first_page_ids.contains(&summary.id)));
+        assert!(!second_page.has_more);
     }
 
     #[tokio::test]

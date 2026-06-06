@@ -221,6 +221,10 @@ impl AppState {
         self.session_operation_locks.lock().await.len()
     }
 
+    async fn remove_session_operation_lock(&self, id: uuid::Uuid) {
+        self.session_operation_locks.lock().await.remove(&id);
+    }
+
     pub async fn session_context_for_id(&self, id: uuid::Uuid) -> Result<Arc<SessionContext>> {
         let active = self.session().await;
         if id == active.id() {
@@ -231,7 +235,12 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let operation_lock = self.session_operation_lock(id).await;
-        let _operation_guard = operation_lock.lock().await;
+        let operation_guard = operation_lock.lock().await;
+        if !self.sessions.contains_session(id) {
+            drop(operation_guard);
+            self.remove_session_operation_lock(id).await;
+            anyhow::bail!("session {id} was not found");
+        }
         self.session_context_for_id_operation_locked(id).await
     }
 
@@ -245,7 +254,12 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let operation_lock = self.session_operation_lock(id).await;
-        let _operation_guard = operation_lock.lock().await;
+        let operation_guard = operation_lock.lock().await;
+        if !self.sessions.contains_session(id) {
+            drop(operation_guard);
+            self.remove_session_operation_lock(id).await;
+            anyhow::bail!("session {id} was not found");
+        }
         {
             let mut contexts = self.session_contexts.lock().await;
             if let Some(session) = contexts.get(&id) {
@@ -273,6 +287,8 @@ impl AppState {
             contexts.remove(&id);
         }
         if !self.sessions.contains_session(id) {
+            drop(contexts);
+            self.remove_session_operation_lock(id).await;
             anyhow::bail!("session {id} was not found");
         }
         let session = self.sessions.load_context(id)?;
@@ -313,8 +329,10 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let operation_lock = self.session_operation_lock(id).await;
-        let _operation_guard = operation_lock.lock().await;
+        let operation_guard = operation_lock.lock().await;
         if !self.sessions.contains_session(id) {
+            drop(operation_guard);
+            self.remove_session_operation_lock(id).await;
             anyhow::bail!("session {id} was not found");
         }
         let current_id = self.sessions.active_session_id();
@@ -376,7 +394,7 @@ impl AppState {
         let operation_guard = operation_lock.lock().await;
         if !self.sessions.contains_session(id) {
             drop(operation_guard);
-            self.session_operation_locks.lock().await.remove(&id);
+            self.remove_session_operation_lock(id).await;
             anyhow::bail!("session {id} was not found");
         }
         if crate::proxy::session_has_live_websocket_relays(id) {
@@ -2781,6 +2799,48 @@ mod tests {
             state.activate_session(original_id).await.unwrap().id,
             original_id
         );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn activate_session_prunes_target_lock_when_session_is_deleted_while_waiting() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-activate-delete-race-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let target = state
+            .sessions
+            .create_session(Some("Deleted during activation".to_string()))
+            .unwrap();
+        let target_id = target.id;
+        let before = state.session_operation_lock_count().await;
+        let operation_lock = state.session_operation_lock(target_id).await;
+        let operation_guard = operation_lock.lock().await;
+        assert_eq!(state.session_operation_lock_count().await, before + 1);
+
+        let mut activate_task = {
+            let state = state.clone();
+            tokio::spawn(async move { state.activate_session(target_id).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut activate_task)
+            .await
+            .expect_err("activation should wait on the target session operation lock");
+
+        state.sessions.delete_session(target_id).unwrap();
+        drop(operation_guard);
+        let error = activate_task.await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("was not found"));
+        assert_eq!(state.session_operation_lock_count().await, before);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

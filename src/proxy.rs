@@ -4639,7 +4639,14 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) -
 
     let mut failures = Vec::new();
     for (session_id, session) in sessions_to_persist {
+        let pending_generation = current_persist_generation(session_id);
+        if let Some(generation) = pending_generation {
+            take_persist_dirty_if_generation(session_id, generation);
+        }
         if let Err(error) = state.persist_session_context(&session).await {
+            if let Some(generation) = pending_generation {
+                mark_persist_dirty_generation(session_id, generation);
+            }
             warn!(
                 ?error,
                 session_id = %session_id,
@@ -4647,6 +4654,12 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) -
             );
             failures.push(format!("{session_id}: {error:#}"));
         } else if let Some(relay_ids) = relay_ids_by_session.remove(&session_id) {
+            if let Some(generation) = pending_generation {
+                if !has_persist_dirty(session_id) {
+                    clear_trailing_persist_if_generation(session_id, generation);
+                    forget_persist_context_if_clean(session_id, generation);
+                }
+            }
             for relay_id in relay_ids {
                 forget_live_websocket_relay(relay_id);
             }
@@ -5743,6 +5756,75 @@ mod tests {
         let reloaded = state.sessions.load_context(session.id()).unwrap();
         let durable = reloaded.websockets.get(websocket_id).await.unwrap();
         assert!(durable.closed_at.is_some());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn close_live_websocket_relays_clears_clean_pending_persist_after_direct_save() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-close-live-ws-clears-pending-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let websocket_id = Uuid::new_v4();
+        session
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now(),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                path: "/ws".to_string(),
+                status: Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        assert!(
+            session
+                .websockets
+                .append_frame(websocket_id, ws_text_frame(1))
+                .await
+        );
+        mark_session_persist_pending(&state, &session);
+        assert!(session_has_pending_persist(session.id()));
+
+        let relay_id = Uuid::new_v4();
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(
+            relay_id,
+            Some(websocket_id),
+            &session,
+            Instant::now(),
+            abort,
+        );
+
+        close_live_websocket_relays(
+            state.as_ref(),
+            "test shutdown closed the live WebSocket relay.",
+        )
+        .await
+        .unwrap();
+
+        assert!(!session_has_live_websocket_relays(session.id()));
+        assert!(!session_has_pending_persist(session.id()));
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        let durable = reloaded.websockets.get(websocket_id).await.unwrap();
+        assert!(durable.closed_at.is_some());
+        assert_eq!(durable.frames.len(), 1);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
