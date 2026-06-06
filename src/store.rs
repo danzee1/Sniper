@@ -2554,10 +2554,16 @@ mod tests {
     async fn websocket_mime_filter_takes_priority_over_path_extension() {
         let store = TransactionStore::new();
         let request = MessageRecord {
-            headers: vec![HeaderRecord {
-                name: "Upgrade".into(),
-                value: "websocket".into(),
-            }],
+            headers: vec![
+                HeaderRecord {
+                    name: "Upgrade".into(),
+                    value: "websocket".into(),
+                },
+                HeaderRecord {
+                    name: "Connection".into(),
+                    value: "upgrade".into(),
+                },
+            ],
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,
@@ -2615,10 +2621,16 @@ mod tests {
     async fn websocket_mime_filter_ignores_hidden_path_extension() {
         let store = TransactionStore::new();
         let request = MessageRecord {
-            headers: vec![HeaderRecord {
-                name: "Upgrade".into(),
-                value: "websocket".into(),
-            }],
+            headers: vec![
+                HeaderRecord {
+                    name: "Upgrade".into(),
+                    value: "websocket".into(),
+                },
+                HeaderRecord {
+                    name: "Connection".into(),
+                    value: "upgrade".into(),
+                },
+            ],
             body_preview: String::new(),
             body_encoding: BodyEncoding::Utf8,
             body_size: 0,

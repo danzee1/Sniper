@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -90,7 +90,7 @@ pub fn load_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot
                 .with_context(|| format!("failed to read runtime state at {}", path.display()));
         }
     };
-    let snapshot = match serde_json::from_slice(&bytes) {
+    let mut snapshot = match serde_json::from_slice(&bytes) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             warn!(
@@ -98,22 +98,53 @@ pub fn load_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot
                 path = %path.display(),
                 "discarding corrupt runtime state"
             );
-            let corrupt_path = data_dir.join(format!(
-                ".runtime-state.corrupt-{}.json",
-                uuid::Uuid::new_v4()
-            ));
-            if let Err(rename_error) = fs::rename(&path, &corrupt_path) {
-                warn!(
-                    ?rename_error,
-                    path = %path.display(),
-                    "failed to move corrupt runtime state aside"
-                );
-                let _ = fs::remove_file(&path);
-            }
+            move_invalid_runtime_state_aside(data_dir, &path);
             return Ok(None);
         }
     };
+    if let Err(error) = sanitize_loaded_runtime_state(&mut snapshot) {
+        warn!(
+            ?error,
+            path = %path.display(),
+            "discarding invalid runtime state"
+        );
+        move_invalid_runtime_state_aside(data_dir, &path);
+        return Ok(None);
+    }
     Ok(Some(snapshot))
+}
+
+fn sanitize_loaded_runtime_state(snapshot: &mut RuntimeStateSnapshot) -> Result<()> {
+    let proxy_addr: SocketAddr = snapshot
+        .proxy_addr
+        .parse()
+        .context("runtime-state proxy_addr is not a socket address")?;
+    let ui_addr: SocketAddr = snapshot
+        .ui_addr
+        .parse()
+        .context("runtime-state ui_addr is not a socket address")?;
+    let advertised_ui_addr = advertise_local_api_addr(ui_addr);
+    if !advertised_ui_addr.ip().is_loopback() {
+        bail!("runtime-state ui_addr must be loopback");
+    }
+    snapshot.proxy_addr = proxy_addr.to_string();
+    snapshot.ui_addr = advertised_ui_addr.to_string();
+    Ok(())
+}
+
+fn move_invalid_runtime_state_aside(data_dir: &Path, path: &Path) {
+    let corrupt_path = data_dir.join(format!(
+        ".runtime-state.corrupt-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    if let Err(rename_error) = fs::rename(path, &corrupt_path) {
+        warn!(
+            ?rename_error,
+            path = %path.display(),
+            "failed to move invalid runtime state aside"
+        );
+        let _ = fs::remove_file(path);
+    }
 }
 
 pub fn persist_runtime_state(data_dir: &Path, snapshot: &RuntimeStateSnapshot) -> Result<()> {
@@ -257,6 +288,56 @@ mod tests {
         assert_eq!(loaded.ui_addr, "127.0.0.1:23001");
         assert!(!loaded.proxy_online);
         assert_eq!(loaded.app_version, env!("CARGO_PKG_VERSION"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_load_normalizes_wildcard_ui_addr() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-wildcard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(
+            runtime_state_path(&temp_dir),
+            br#"{"proxy_addr":"127.0.0.1:18080","ui_addr":"0.0.0.0:23001"}"#,
+        )
+        .unwrap();
+
+        let loaded = load_runtime_state(&temp_dir).unwrap().unwrap();
+
+        assert_eq!(loaded.proxy_addr, "127.0.0.1:18080");
+        assert_eq!(loaded.ui_addr, "127.0.0.1:23001");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_ignores_and_moves_invalid_socket_addr() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-invalid-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(
+            runtime_state_path(&temp_dir),
+            br#"{"proxy_addr":"127.0.0.1:18080","ui_addr":"not-an-addr"}"#,
+        )
+        .unwrap();
+
+        let loaded = load_runtime_state(&temp_dir).unwrap();
+
+        assert!(loaded.is_none());
+        assert!(!runtime_state_path(&temp_dir).exists());
+        assert!(fs::read_dir(&temp_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-state.corrupt-")
+        }));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

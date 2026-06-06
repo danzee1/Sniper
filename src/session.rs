@@ -1262,6 +1262,15 @@ fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<Store
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(StoredSessionSnapshot::default())
         }
+        Err(error) if path.exists() => {
+            warn!(
+                ?error,
+                path = %path.display(),
+                "discarding unreadable session snapshot"
+            );
+            move_corrupt_session_file_aside(storage_dir, &path, "snapshot");
+            Ok(StoredSessionSnapshot::default())
+        }
         Err(error) => Err(error)
             .with_context(|| format!("failed to read session snapshot {}", path.display())),
     }?;
@@ -1364,6 +1373,15 @@ fn replay_transaction_journal_file(
     let file = match fs::File::open(journal_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if journal_path.exists() => {
+            warn!(
+                ?error,
+                path = %journal_path.display(),
+                "discarding unreadable transaction journal"
+            );
+            move_unreadable_transaction_journal_aside(journal_path);
+            return Ok(());
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -1373,6 +1391,18 @@ fn replay_transaction_journal_file(
             })
         }
     };
+    if file
+        .metadata()
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        warn!(
+            path = %journal_path.display(),
+            "discarding directory transaction journal"
+        );
+        move_unreadable_transaction_journal_aside(journal_path);
+        return Ok(());
+    }
 
     let mut reader = BufReader::new(file);
     let mut inserted_order = Vec::new();
@@ -1471,6 +1501,19 @@ fn preserve_corrupt_transaction_journal(journal_path: &Path) {
             path = %journal_path.display(),
             corrupt_path = %corrupt_path.display(),
             "failed to preserve corrupt transaction journal"
+        );
+    }
+}
+
+fn move_unreadable_transaction_journal_aside(journal_path: &Path) {
+    let parent = journal_path.parent().unwrap_or_else(|| Path::new("."));
+    let corrupt_path = parent.join(format!(".transactions.journal.corrupt-{}", Uuid::new_v4()));
+    if let Err(error) = fs::rename(journal_path, &corrupt_path) {
+        warn!(
+            ?error,
+            source = %journal_path.display(),
+            corrupt_path = %corrupt_path.display(),
+            "failed to move unreadable transaction journal aside"
         );
     }
 }
@@ -1581,7 +1624,7 @@ fn sync_directory(path: &Path, label: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use chrono::{Duration as ChronoDuration, Utc};
     use uuid::Uuid;
@@ -2571,6 +2614,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_context_recovers_snapshot_directory_by_replaying_transaction_journal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-snapshot-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        active
+            .store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".to_string(),
+                "https".to_string(),
+                "snapshot-dir.example:443".to_string(),
+                "/from-journal".to_string(),
+                Some(200),
+                1,
+                MessageRecord {
+                    headers: vec![],
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                None,
+                vec![],
+                None,
+                None,
+            ))
+            .await;
+        let snapshot_path = super::snapshot_path(active.storage_dir());
+        let _ = std::fs::remove_file(&snapshot_path);
+        std::fs::create_dir(&snapshot_path).expect("snapshot directory should be created");
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].host, "snapshot-dir.example:443");
+        assert!(!snapshot_path.is_dir());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn load_context_stops_at_corrupt_complete_transaction_journal_line() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-session-journal-corrupt-line-{}",
@@ -2627,6 +2718,45 @@ mod tests {
         assert!(has_corrupt_backup);
 
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn transaction_journal_replay_moves_directory_aside() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        std::fs::create_dir(&journal_path).unwrap();
+
+        let mut order = Vec::new();
+        let mut records = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut replayed = HashSet::new();
+        super::replay_transaction_journal_file(
+            &journal_path,
+            None,
+            &mut order,
+            &mut records,
+            &mut seen,
+            &mut replayed,
+            None,
+        )
+        .expect("directory journal should be moved aside");
+
+        assert!(order.is_empty());
+        assert!(!journal_path.exists());
+        let has_corrupt_backup = std::fs::read_dir(&storage_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".transactions.journal.corrupt-")
+        });
+        assert!(has_corrupt_backup);
+
+        let _ = std::fs::remove_dir_all(storage_dir);
     }
 
     #[tokio::test]

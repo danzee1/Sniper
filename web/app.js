@@ -131,6 +131,7 @@ const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 12 * 1024 * 1024;
 const WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS = 2000;
 const WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS = 5000;
 const WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES = 60 * 1024;
+const MAX_ANNOTATION_NOTE_BYTES = 32 * 1024;
 const WS_REPLAY_FINAL_POLL_INTERVAL_MS = 100;
 const WS_REPLAY_FINAL_POLL_TIMEOUT_MS = 2200;
 const HTTP_METHOD_TOKEN_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
@@ -814,6 +815,9 @@ const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
 let uiSettingsSaveTimer = null;
+let uiSettingsDirty = false;
+let uiSettingsInFlight = false;
+let lastUiSettingsPayload = null;
 let toolsBootPromise = null;
 let displaySettingsPreviewActive = false;
 
@@ -1278,7 +1282,10 @@ function bindEvents() {
   els.dashboardOpenStorageBtn?.addEventListener("click", () => {
     const sessionId = state.selectedSessionId || state.activeSession?.id || state.sessions.find((s) => s.active)?.id;
     if (sessionId) {
-      fetch(`/api/sessions/${encodeURIComponent(sessionId)}/reveal`, { method: "POST" }).catch(console.error);
+      revealSessionFolder(sessionId).catch((error) => {
+        console.error(error);
+        showToast(error?.message || "Failed to open session folder.", "error");
+      });
     }
   });
 
@@ -2991,6 +2998,13 @@ function workspaceUnloadPayload(primarySnapshot) {
   const payload = JSON.stringify(primarySnapshot);
   if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
     return payload;
+  }
+  const compactPayload = JSON.stringify(snapshotWorkspaceState({
+    wsFrameLimit: 0,
+    wsBodyByteLimit: 0,
+  }));
+  if (utf8ByteLength(compactPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+    return compactPayload;
   }
   return null;
 }
@@ -5526,12 +5540,24 @@ function showSessionContextMenu(event, sessionId) {
     if (!btn) return;
     const action = btn.dataset.action;
     if (action === "folder") {
-      fetch(`/api/sessions/${encodeURIComponent(sessionId)}/reveal`, { method: "POST" }).catch(console.error);
+      revealSessionFolder(sessionId).catch((error) => {
+        console.error(error);
+        showToast(error?.message || "Failed to open session folder.", "error");
+      });
     } else if (action === "delete") {
       deleteSessionById(sessionId);
     }
     closeSessionContextMenu();
   });
+}
+
+async function revealSessionFolder(sessionId) {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/reveal`, {
+    method: "POST",
+  });
+  await requireOkResponse(response, "Failed to open session folder.");
+  const result = await response.json().catch(() => null);
+  showToast(result?.path ? `Opened ${result.path}` : "Session folder opened.");
 }
 
 function closeSessionContextMenu() {
@@ -6352,9 +6378,14 @@ function openTransactionRecordInReplay(record) {
 }
 
 function isWebSocketUpgradeRecord(record) {
-  return Number(record?.status) === 101 || normalizedHeaders(record?.request?.headers).some(
-    (h) => headerNameEquals(h, "upgrade") && headerValueContainsToken(h.value, "websocket")
+  const headers = normalizedHeaders(record?.request?.headers);
+  const hasUpgradeWebsocket = headers.some(
+    (h) => headerNameEquals(h, "upgrade") && headerValueContainsToken(h.value, "websocket"),
   );
+  const hasConnectionUpgrade = headers.some(
+    (h) => headerNameEquals(h, "connection") && headerValueContainsToken(h.value, "upgrade"),
+  );
+  return hasUpgradeWebsocket && hasConnectionUpgrade;
 }
 
 async function sendFindingToFuzzer(recordId) {
@@ -12940,6 +12971,7 @@ function saveDisplaySettingsFromForm() {
   displaySettingsPreviewActive = false;
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = null;
+  uiSettingsDirty = true;
   persistUiSettings().catch((error) => console.error(error));
   closeDisplaySettingsModal();
 }
@@ -13019,6 +13051,7 @@ function snapshotUiSettings() {
 }
 
 function scheduleUiSettingsSave(delay = 180) {
+  uiSettingsDirty = true;
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = window.setTimeout(() => {
     uiSettingsSaveTimer = null;
@@ -13027,26 +13060,42 @@ function scheduleUiSettingsSave(delay = 180) {
 }
 
 async function persistUiSettings() {
-  const response = await fetch("/api/ui-settings", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(snapshotUiSettings()),
-  });
+  const payload = JSON.stringify(snapshotUiSettings());
+  lastUiSettingsPayload = payload;
+  uiSettingsInFlight = true;
+  try {
+    const response = await fetch("/api/ui-settings", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: payload,
+    });
 
-  if (!response.ok) {
-    throw new Error(await response.text());
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    if (lastUiSettingsPayload === payload) {
+      uiSettingsDirty = false;
+    }
+  } finally {
+    if (lastUiSettingsPayload === payload) {
+      uiSettingsInFlight = false;
+    }
   }
 }
 
 function flushUiSettingsOnUnload() {
-  if (!uiSettingsSaveTimer) {
+  if (!uiSettingsSaveTimer && !uiSettingsDirty && !uiSettingsInFlight) {
     return;
   }
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = null;
-  const payload = JSON.stringify(snapshotUiSettings());
+  const payload = uiSettingsDirty ? JSON.stringify(snapshotUiSettings()) : lastUiSettingsPayload;
+  if (!payload) {
+    return;
+  }
+  lastUiSettingsPayload = payload;
   const blob = new Blob([payload], { type: "application/json" });
   if (navigator.sendBeacon && navigator.sendBeacon("/api/ui-settings", blob)) {
     return;
@@ -15685,6 +15734,10 @@ function utf8ByteLength(value) {
   return new TextEncoder().encode(String(value || "")).length;
 }
 
+function truncateUtf8(value, maxBytes) {
+  return truncateUtf8Preview(value, maxBytes).body;
+}
+
 function truncateUtf8Preview(value, maxBytes) {
   const text = String(value || "");
   const fullBytes = utf8ByteLength(text);
@@ -17082,10 +17135,12 @@ function flushAnnotationsOnUnload() {
   }
   for (const [transactionId, entry] of state._pendingAnnotations.entries()) {
     if (!entry?.sessionId || !entry.payload) continue;
+    const body = JSON.stringify(entry.payload);
+    if (utf8ByteLength(body) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
     fetch(sessionQueryPath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, entry.sessionId), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(entry.payload),
+      body,
       keepalive: true,
     }).catch(() => {});
   }
@@ -17256,7 +17311,10 @@ els.contextMenuNote.addEventListener("input", () => {
   clearTimeout(contextMenuNoteTimer);
   const id = contextMenuTargetId;
   const sessionId = contextMenuSessionId;
-  const value = els.contextMenuNote.value;
+  const value = truncateUtf8(els.contextMenuNote.value, MAX_ANNOTATION_NOTE_BYTES);
+  if (value !== els.contextMenuNote.value) {
+    els.contextMenuNote.value = value;
+  }
   contextMenuPendingNote = { id, sessionId, value };
   contextMenuNoteTimer = setTimeout(() => {
     flushContextMenuPendingNote();
@@ -17274,7 +17332,7 @@ els.contextMenuNote.addEventListener("keydown", (event) => {
     contextMenuPendingNote = {
       id: contextMenuTargetId,
       sessionId: contextMenuSessionId,
-      value: els.contextMenuNote.value,
+      value: truncateUtf8(els.contextMenuNote.value, MAX_ANNOTATION_NOTE_BYTES),
     };
     flushContextMenuPendingNote();
     closeContextMenu();

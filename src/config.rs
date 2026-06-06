@@ -262,6 +262,14 @@ fn load_startup_settings_snapshot(
             persist_startup_settings(&path, &snapshot)?;
             Ok(snapshot)
         }
+        Err(error) if path.exists() => {
+            warn!(
+                %error,
+                path = %path.display(),
+                "recovering unreadable startup settings"
+            );
+            recover_startup_settings_snapshot(&path, default_proxy_addr)
+        }
         Err(error) => Err(error)
             .with_context(|| format!("failed to read startup settings {}", path.display())),
     }
@@ -485,6 +493,25 @@ mod tests {
             })
             .count();
         assert_eq!(corrupt_files, 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_store_recovers_directory_path() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-startup-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(data_dir.join(super::STARTUP_SETTINGS_FILE))
+            .expect("startup settings directory should be created");
+
+        let store =
+            StartupSettingsStore::load_or_create(&data_dir, "127.0.0.1:18080".parse().unwrap())
+                .expect("directory startup settings should recover");
+        let saved = store.snapshot().await;
+
+        assert_eq!(saved.proxy_bind_host, "127.0.0.1");
+        assert_eq!(saved.proxy_port, 18080);
+        assert!(data_dir.join(super::STARTUP_SETTINGS_FILE).is_file());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

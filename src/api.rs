@@ -84,6 +84,8 @@ const MAX_SCANNER_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MATCH_REPLACE_RULES: usize = 500;
 const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
 const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ANNOTATION_NOTE_BYTES: usize = 32 * 1024;
+const ALLOWED_COLOR_TAGS: &[&str] = &["red", "orange", "yellow", "green", "blue", "purple"];
 const DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const MAX_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const OPEN_PATH: &str = "/usr/bin/open";
@@ -1824,6 +1826,18 @@ struct AnnotationsPayload {
     user_note: Option<Option<String>>,
 }
 
+fn validate_annotations_payload(payload: &AnnotationsPayload) -> std::result::Result<(), String> {
+    if let Some(Some(color_tag)) = payload.color_tag.as_ref() {
+        if !ALLOWED_COLOR_TAGS.contains(&color_tag.as_str()) {
+            return Err("unsupported color tag".to_string());
+        }
+    }
+    if let Some(Some(user_note)) = payload.user_note.as_ref() {
+        validate_text_field("user note", user_note, MAX_ANNOTATION_NOTE_BYTES)?;
+    }
+    Ok(())
+}
+
 fn deserialize_double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2794,6 +2808,9 @@ async fn update_transaction_annotations(
             Ok(guard) => guard,
             Err(response) => return response,
         };
+    if let Err(message) = validate_annotations_payload(&payload) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     let _mutation_guard = session.mutation_guard().await;
     match session
         .store
@@ -4569,9 +4586,10 @@ mod tests {
     use super::{
         build_ws_replay_url, decode_ws_replay_control_payload, fuzzer_attack_error_status,
         get_target_site_map, normalize_replay_http_version, persist_bound_runtime_state,
-        sequence_run_error_status, validate_editable_request, validate_editable_response,
-        validate_match_replace_rules, validate_since, validate_status_code, validate_status_range,
-        validate_transaction_query, validate_ws_replay_headers, TransactionQuery,
+        sequence_run_error_status, validate_annotations_payload, validate_editable_request,
+        validate_editable_response, validate_match_replace_rules, validate_since,
+        validate_status_code, validate_status_range, validate_transaction_query,
+        validate_ws_replay_headers, AnnotationsPayload, TransactionQuery,
     };
     use crate::{
         config::AppConfig,
@@ -5003,6 +5021,35 @@ mod tests {
         assert!(validate_match_replace_rules(&rules)
             .unwrap_err()
             .contains("more than"));
+    }
+
+    #[test]
+    fn annotation_validation_limits_color_and_note_size() {
+        assert!(validate_annotations_payload(&AnnotationsPayload {
+            color_tag: Some(Some("blue".to_string())),
+            user_note: Some(Some("short note".to_string())),
+        })
+        .is_ok());
+        assert!(validate_annotations_payload(&AnnotationsPayload {
+            color_tag: Some(None),
+            user_note: Some(None),
+        })
+        .is_ok());
+
+        assert_eq!(
+            validate_annotations_payload(&AnnotationsPayload {
+                color_tag: Some(Some("chartreuse".to_string())),
+                user_note: None,
+            })
+            .unwrap_err(),
+            "unsupported color tag"
+        );
+        assert!(validate_annotations_payload(&AnnotationsPayload {
+            color_tag: None,
+            user_note: Some(Some("x".repeat(super::MAX_ANNOTATION_NOTE_BYTES + 1))),
+        })
+        .unwrap_err()
+        .contains("user note"));
     }
 
     #[test]

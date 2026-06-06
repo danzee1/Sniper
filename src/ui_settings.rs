@@ -237,6 +237,17 @@ fn load_ui_settings_snapshot(data_dir: &Path) -> Result<AppUiSettingsSnapshot> {
             persist_ui_settings(&path, &snapshot)?;
             Ok(snapshot)
         }
+        Err(error) if path.exists() => {
+            warn!(
+                ?error,
+                path = %path.display(),
+                "discarding unreadable ui settings"
+            );
+            move_corrupt_ui_settings_aside(data_dir, &path);
+            let snapshot = AppUiSettingsSnapshot::default();
+            persist_ui_settings(&path, &snapshot)?;
+            Ok(snapshot)
+        }
         Err(error) => {
             Err(error).with_context(|| format!("failed to read ui settings {}", path.display()))
         }
@@ -465,6 +476,23 @@ mod tests {
                     .starts_with(".ui-settings.corrupt-")
             });
         assert!(has_corrupt_backup);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn ui_settings_store_recovers_from_directory_path() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-ui-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(data_dir.join(super::UI_SETTINGS_FILE))
+            .expect("ui settings directory should be created");
+
+        let store = AppUiSettingsStore::load_or_create(&data_dir)
+            .expect("directory ui settings should recover with defaults");
+        let snapshot = store.snapshot().await;
+
+        assert_eq!(snapshot.display_settings.theme, "charcoal");
+        assert!(data_dir.join(super::UI_SETTINGS_FILE).is_file());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

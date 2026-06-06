@@ -427,11 +427,14 @@ impl TransactionRecord {
     }
 
     pub fn is_websocket(&self) -> bool {
-        self.status == Some(101)
-            || self
+        self.request
+            .header_value("upgrade")
+            .map(|value| header_value_contains_token(value, "websocket"))
+            .unwrap_or(false)
+            && self
                 .request
-                .header_value("upgrade")
-                .map(|value| header_value_contains_token(value, "websocket"))
+                .header_value("connection")
+                .map(|value| header_value_contains_token(value, "upgrade"))
                 .unwrap_or(false)
     }
 }
@@ -785,7 +788,7 @@ mod tests {
         write::{GzEncoder, ZlibEncoder},
         Compression,
     };
-    use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, UPGRADE};
+    use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, UPGRADE};
     use std::io::Write;
 
     fn gzip(body: &[u8]) -> Vec<u8> {
@@ -961,6 +964,7 @@ mod tests {
     fn transaction_record_detects_websocket_upgrade_token_lists() {
         let mut headers = HeaderMap::new();
         headers.insert(UPGRADE, "h2c, websocket".parse().unwrap());
+        headers.insert(CONNECTION, "keep-alive, upgrade".parse().unwrap());
         let request = MessageRecord::from_headers_and_body(&headers, &[], 1024);
         let record = TransactionRecord::http(
             Utc::now(),
@@ -979,6 +983,28 @@ mod tests {
 
         assert!(record.is_websocket());
         assert!(record.summary().is_websocket);
+    }
+
+    #[test]
+    fn transaction_record_does_not_treat_status_101_alone_as_websocket() {
+        let request = MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024);
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "socket.example.com".to_string(),
+            "/upgrade".to_string(),
+            Some(101),
+            1,
+            request,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(!record.is_websocket());
+        assert!(!record.summary().is_websocket);
     }
 
     #[test]

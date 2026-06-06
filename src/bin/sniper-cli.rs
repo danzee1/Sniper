@@ -2315,6 +2315,9 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
         }
         OastCommand::Configure(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            if args.provider.as_deref() == Some("boast") && args.token.is_some() {
+                bail!("BOAST provider does not use an OAST token");
+            }
             let update = build_oast_configure_update(&args, session_id);
             if update.len() == usize::from(session_id.is_some()) {
                 // Just show current settings
@@ -2544,7 +2547,7 @@ fn websocket_list_path(
     if let Some(offset) = offset {
         params.push(("offset".to_string(), offset.to_string()));
     }
-    let endpoint = if page {
+    let endpoint = if page || offset.is_some() {
         "/api/websockets-page"
     } else {
         "/api/websockets"
@@ -4101,6 +4104,10 @@ mod tests {
             "/api/websockets?session_id=22222222-2222-2222-2222-222222222222&limit=1"
         );
         assert_eq!(
+            websocket_list_path(Some(session_id), Some(1), Some(100), false),
+            "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&offset=100"
+        );
+        assert_eq!(
             websocket_list_path(Some(session_id), Some(1), Some(100), true),
             "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&offset=100"
         );
@@ -4342,20 +4349,20 @@ mod tests {
     }
 
     #[test]
-    fn oast_configure_explicit_token_wins_for_boast() {
+    fn oast_configure_boast_without_token_sets_provider_only() {
         let update = build_oast_configure_update(
             &OastConfigureArgs {
                 provider: Some("boast".to_string()),
-                token: Some("manual-token".to_string()),
                 ..Default::default()
             },
             None,
         );
 
         assert_eq!(
-            update.get("oast_token"),
-            Some(&serde_json::json!("manual-token"))
+            update.get("oast_provider"),
+            Some(&serde_json::json!("boast"))
         );
+        assert!(update.get("oast_token").is_none());
     }
 
     #[test]
