@@ -425,6 +425,7 @@ const state = {
   fuzzerNotice: "",
   fuzzerRequestText: "",
   fuzzerPayloadsText: "",
+  fuzzerAttackRecordId: null,
   fuzzerAttackRecord: null,
   fuzzerRunning: false,
   fuzzerDraftVersion: 0,
@@ -2464,7 +2465,15 @@ function applyWorkspaceState(snapshot) {
   state.fuzzerNotice = fuzzerWS.notice || "";
   state.fuzzerRequestText = fuzzerWS.request_text || "";
   state.fuzzerPayloadsText = fuzzerWS.payloads_text || "";
-  state.fuzzerAttackRecord = normalizeFuzzerAttackRecord(fuzzerWS.attack_record);
+  const legacyFuzzerAttackRecord = normalizeFuzzerAttackRecord(fuzzerWS.attack_record);
+  setFuzzerAttackRecord(legacyFuzzerAttackRecord);
+  state.fuzzerAttackRecordId = fuzzerWorkspaceAttackRecordId(fuzzerWS, legacyFuzzerAttackRecord);
+  if (legacyFuzzerAttackRecord) {
+    scheduleWorkspaceStateSave();
+  } else if (state.fuzzerAttackRecordId) {
+    state.fuzzerNotice = state.fuzzerNotice || "Loading saved fuzzer run...";
+    hydrateFuzzerAttackRecordById(state.fuzzerAttackRecordId, snapshot?.session_id || currentSessionId());
+  }
 }
 
 function workspaceSnapshotMatchesActiveSession(snapshot) {
@@ -2677,7 +2686,7 @@ function snapshotWorkspaceState(options = {}) {
       notice: state.fuzzerNotice || "",
       request_text: state.fuzzerRequestText || "",
       payloads_text: state.fuzzerPayloadsText || "",
-      attack_record: normalizeFuzzerAttackRecord(state.fuzzerAttackRecord),
+      attack_record_id: state.fuzzerAttackRecordId || state.fuzzerAttackRecord?.id || null,
     },
   };
 }
@@ -3006,7 +3015,7 @@ function resetSessionScopedUiState() {
   state.fuzzerNotice = "";
   state.fuzzerRequestText = "";
   state.fuzzerPayloadsText = "";
-  state.fuzzerAttackRecord = null;
+  clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   state._fuzzerDetailRecord = null;
   state.sequenceDefinitions = [];
@@ -5832,7 +5841,7 @@ async function sendFindingToFuzzer(recordId) {
   updateFuzzerRequestText(buildEditableRawRequest(request), { userEdit: true });
   state.fuzzerNotice = isRequestPreviewTruncated(record) ? buildTruncatedBodyNotice(record, "Fuzzer") : "";
   updateFuzzerPayloadsText("", { userEdit: true });
-  state.fuzzerAttackRecord = null;
+  clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
   state.activeTool = "fuzzer";
@@ -8632,6 +8641,9 @@ function renderFuzzer() {
 
   const attackRecord = normalizeFuzzerAttackRecord(state.fuzzerAttackRecord);
   state.fuzzerAttackRecord = attackRecord;
+  if (attackRecord?.id) {
+    state.fuzzerAttackRecordId = attackRecord.id;
+  }
   if (!attackRecord) {
     els.fuzzerMeta.textContent = state.fuzzerNotice || "No fuzz run has been started yet.";
     els.fuzzerResultsBody.innerHTML = `
@@ -8679,6 +8691,67 @@ function normalizeFuzzerAttackRecord(record) {
     marker_count: Number.isFinite(Number(record.marker_count)) ? Number(record.marker_count) : 0,
     results: jsonArray(record.results),
   };
+}
+
+function setFuzzerAttackRecord(record) {
+  const attackRecord = normalizeFuzzerAttackRecord(record);
+  state.fuzzerAttackRecord = attackRecord;
+  state.fuzzerAttackRecordId = typeof attackRecord?.id === "string" && attackRecord.id
+    ? attackRecord.id
+    : null;
+  return attackRecord;
+}
+
+function clearFuzzerAttackRecord() {
+  state.fuzzerAttackRecord = null;
+  state.fuzzerAttackRecordId = null;
+}
+
+function fuzzerWorkspaceAttackRecordId(fuzzerWS, legacyRecord = null) {
+  const explicitId = typeof fuzzerWS?.attack_record_id === "string" ? fuzzerWS.attack_record_id : "";
+  if (explicitId) return explicitId;
+  const legacyId = typeof legacyRecord?.id === "string" ? legacyRecord.id : "";
+  return legacyId || null;
+}
+
+async function hydrateFuzzerAttackRecordById(recordId, sessionId) {
+  if (!recordId) return;
+  const expectedSessionId = sessionId || currentSessionId();
+  try {
+    const response = await fetch(sessionQueryPath(`/api/fuzzer/attacks/${encodeURIComponent(recordId)}`, expectedSessionId));
+    if (state.fuzzerAttackRecordId !== recordId || currentSessionId() !== expectedSessionId) {
+      return;
+    }
+    if (response.status === 404) {
+      if (!state.fuzzerNotice || state.fuzzerNotice === "Loading saved fuzzer run...") {
+        state.fuzzerNotice = "Saved fuzzer run is no longer available.";
+      }
+      renderFuzzer();
+      return;
+    }
+    await requireOkResponse(response, "Failed to load saved fuzzer run.");
+    const detail = await response.json();
+    if (state.fuzzerAttackRecordId !== recordId || currentSessionId() !== expectedSessionId) {
+      return;
+    }
+    const attackRecord = setFuzzerAttackRecord(detail);
+    if (!attackRecord) {
+      return;
+    }
+    if (state.fuzzerNotice === "Loading saved fuzzer run...") {
+      state.fuzzerNotice = "";
+    }
+    renderFuzzer();
+  } catch (error) {
+    if (state.fuzzerAttackRecordId !== recordId || currentSessionId() !== expectedSessionId) {
+      return;
+    }
+    console.error(error);
+    if (!state.fuzzerNotice || state.fuzzerNotice === "Loading saved fuzzer run...") {
+      state.fuzzerNotice = error?.message || "Failed to load saved fuzzer run.";
+    }
+    renderFuzzer();
+  }
 }
 
 // ─── Fuzzer result detail panel ────────────────────────────────────────────
@@ -8892,7 +8965,7 @@ async function openFuzzerFromReplay() {
   state.fuzzerNotice = "";
   state.fuzzerRequestText = tab.requestText;
   state.fuzzerPayloadsText = "";
-  state.fuzzerAttackRecord = null;
+  clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
   state.activeTool = "fuzzer";
@@ -8921,7 +8994,7 @@ async function openFuzzerFromSelection() {
     : "";
   state.fuzzerRequestText = buildEditableRawRequest(request);
   state.fuzzerPayloadsText = "";
-  state.fuzzerAttackRecord = null;
+  clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
   state.activeTool = "fuzzer";
@@ -9080,7 +9153,7 @@ function resetFuzzer() {
     { userEdit: true },
   );
   state.fuzzerPayloadsText = "";
-  state.fuzzerAttackRecord = null;
+  clearFuzzerAttackRecord();
   state.fuzzerNotice = "";
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
@@ -9106,8 +9179,8 @@ function updateFuzzerPayloadsText(text, { userEdit = false } = {}) {
 
 function markFuzzerDraftChanged() {
   state.fuzzerDraftVersion = (state.fuzzerDraftVersion || 0) + 1;
-  if (state.fuzzerAttackRecord) {
-    state.fuzzerAttackRecord = null;
+  if (state.fuzzerAttackRecord || state.fuzzerAttackRecordId) {
+    clearFuzzerAttackRecord();
     state._selectedFuzzerResultKey = null;
     state.fuzzerNotice = "Fuzzer draft changed. Start a new run to see results for the current template.";
     hideFuzzerDetailPanel();
@@ -9225,7 +9298,7 @@ async function runFuzzerAttack() {
       ? getCMView("fuzzerReq").getContent()
       : (els.fuzzerRequestEditor ? els.fuzzerRequestEditor.value : "");
     if (!fuzzerReqText.trim()) {
-      state.fuzzerAttackRecord = null;
+      clearFuzzerAttackRecord();
       state.fuzzerNotice = "Request template is empty. Paste a raw HTTP request with $payload$ markers, or send one from HTTP History (Command+I).";
       scheduleWorkspaceStateSave();
       renderFuzzer();
@@ -9236,7 +9309,7 @@ async function runFuzzerAttack() {
     try {
       template = parseEditableRawRequest(fuzzerReqText, fallback);
     } catch (parseErr) {
-      state.fuzzerAttackRecord = null;
+      clearFuzzerAttackRecord();
       state.fuzzerNotice = parseErr.message || "Failed to parse the request template.";
       scheduleWorkspaceStateSave();
       renderFuzzer();
@@ -9247,7 +9320,7 @@ async function runFuzzerAttack() {
     const payloads = splitFuzzerPayloadLines(payloadsText);
 
     if (payloads.length === 0) {
-      state.fuzzerAttackRecord = null;
+      clearFuzzerAttackRecord();
       state.fuzzerNotice = "No payloads provided. Enter one payload per line in the Payloads panel.";
       scheduleWorkspaceStateSave();
       renderFuzzer();
@@ -9283,7 +9356,7 @@ async function runFuzzerAttack() {
         showToast(notice || "Fuzzer run failed after the draft changed.", "error", 4000);
         return;
       }
-      state.fuzzerAttackRecord = null;
+      clearFuzzerAttackRecord();
       state.fuzzerNotice = notice;
       scheduleWorkspaceStateSave();
       renderFuzzer();
@@ -9295,7 +9368,7 @@ async function runFuzzerAttack() {
     }
     const draftUnchanged = (state.fuzzerDraftVersion || 0) === draftVersion;
     if (!draftUnchanged) {
-      state.fuzzerAttackRecord = null;
+      clearFuzzerAttackRecord();
       state.fuzzerNotice = "Fuzzer run completed, but the draft changed while it was running. Start again to see current results.";
       state._selectedFuzzerResultKey = null;
       hideFuzzerDetailPanel();
@@ -9312,7 +9385,7 @@ async function runFuzzerAttack() {
     state.fuzzerNotice = "";
     state._selectedFuzzerResultKey = null;
     hideFuzzerDetailPanel();
-    state.fuzzerAttackRecord = attackRecord;
+    setFuzzerAttackRecord(attackRecord);
     scheduleWorkspaceStateSave();
     renderFuzzer();
     scheduleRefresh();
@@ -9326,7 +9399,7 @@ async function runFuzzerAttack() {
       showToast(error?.message || "Fuzzer run failed after the draft changed.", "error", 4000);
       return;
     }
-    state.fuzzerAttackRecord = null;
+    clearFuzzerAttackRecord();
     state.fuzzerNotice = error?.message || "An unexpected error occurred while starting the fuzzer.";
     scheduleWorkspaceStateSave();
     renderFuzzer();

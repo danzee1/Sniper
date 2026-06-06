@@ -1411,7 +1411,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
             workspace.fuzzer.target_request_authority = target_request_authority;
             workspace.fuzzer.request_text = request_text;
             workspace.fuzzer.notice.clear();
-            workspace.fuzzer.attack_record = None;
+            workspace.fuzzer.clear_attack_record_reference();
             let snapshot = post_workspace_state(&api, &mut workspace).await?;
             print_json(&snapshot.fuzzer)
         }
@@ -1691,7 +1691,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.target_request_authority = target_request_authority;
             workspace.fuzzer.request_text = request_text;
             workspace.fuzzer.notice.clear();
-            workspace.fuzzer.attack_record = None;
+            workspace.fuzzer.clear_attack_record_reference();
             let snapshot = post_workspace_state(&api, &mut workspace).await?;
             print_json(&snapshot.fuzzer)
         }
@@ -1700,7 +1700,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.payloads_text =
                 read_payloads_input(args.payloads, args.file, args.stdin)?;
             workspace.fuzzer.notice.clear();
-            workspace.fuzzer.attack_record = None;
+            workspace.fuzzer.clear_attack_record_reference();
             let snapshot = post_workspace_state(&api, &mut workspace).await?;
             print_json(&snapshot.fuzzer)
         }
@@ -1731,7 +1731,8 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                     },
                 )
                 .await?;
-            workspace.fuzzer.attack_record = Some(record.clone());
+            workspace.fuzzer.attack_record_id = Some(record.id);
+            workspace.fuzzer.attack_record = None;
             workspace.fuzzer.notice.clear();
             let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
 

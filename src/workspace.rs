@@ -115,7 +115,24 @@ pub struct FuzzerWorkspaceState {
     pub notice: String,
     pub request_text: String,
     pub payloads_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_record_id: Option<Uuid>,
+    #[serde(default, skip_serializing)]
     pub attack_record: Option<FuzzerAttackRecord>,
+}
+
+impl FuzzerWorkspaceState {
+    pub fn clear_attack_record_reference(&mut self) {
+        self.attack_record_id = None;
+        self.attack_record = None;
+    }
+
+    pub fn migrate_attack_record_to_id(&mut self) {
+        if self.attack_record_id.is_none() {
+            self.attack_record_id = self.attack_record.as_ref().map(|record| record.id);
+        }
+        self.attack_record = None;
+    }
 }
 
 pub struct WorkspaceStateStore {
@@ -221,8 +238,47 @@ impl Default for WorkspaceStateStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplayHistoryEntryState, WorkspaceStateSnapshot, WorkspaceStateStore};
+    use super::{
+        FuzzerWorkspaceState, ReplayHistoryEntryState, WorkspaceStateSnapshot, WorkspaceStateStore,
+    };
     use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn fuzzer_workspace_migrates_legacy_attack_record_and_serializes_id_only() {
+        let attack_id = Uuid::new_v4();
+        let mut fuzzer: FuzzerWorkspaceState = serde_json::from_value(json!({
+            "attack_record": {
+                "id": attack_id,
+                "started_at": "2026-01-01T00:00:00Z",
+                "completed_at": "2026-01-01T00:00:01Z",
+                "status": "completed",
+                "template": {
+                    "scheme": "https",
+                    "host": "fuzzer.example",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": [],
+                    "body": "",
+                    "body_encoding": "utf8",
+                    "preview_truncated": false
+                },
+                "payload_count": 1,
+                "marker_count": 0,
+                "results": [],
+                "notes": []
+            }
+        }))
+        .unwrap();
+
+        fuzzer.migrate_attack_record_to_id();
+
+        assert_eq!(fuzzer.attack_record_id, Some(attack_id));
+        assert!(fuzzer.attack_record.is_none());
+        let serialized = serde_json::to_value(&fuzzer).unwrap();
+        assert_eq!(serialized["attack_record_id"], attack_id.to_string());
+        assert!(serialized.get("attack_record").is_none());
+    }
 
     #[tokio::test]
     async fn workspace_replace_rejects_stale_revision_zero_after_first_write() {

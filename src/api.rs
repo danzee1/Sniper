@@ -62,7 +62,6 @@ const MAX_WORKSPACE_WS_SETUP_QUEUE_ITEMS: usize = 250;
 const MAX_WORKSPACE_WS_SETUP_ITEM_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WORKSPACE_EMBEDDED_RECORD_BYTES: usize = 4 * 1024 * 1024;
-const MAX_WORKSPACE_FUZZER_ATTACK_RESULTS: usize = 5_000;
 const MAX_WORKSPACE_STORED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEQUENCE_STEPS: usize = 250;
 const MAX_SEQUENCE_EXTRACTIONS_PER_STEP: usize = 50;
@@ -991,20 +990,6 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
             "fuzzer payload text cannot contain more than {MAX_WORKSPACE_FUZZER_PAYLOAD_LINES} lines"
         ));
     }
-    if let Some(record) = &snapshot.fuzzer.attack_record {
-        if record.results.len() > MAX_WORKSPACE_FUZZER_ATTACK_RESULTS {
-            return Err(format!(
-                "fuzzer attack record has too many results: {}",
-                record.results.len()
-            ));
-        }
-        add_workspace_json_bytes(
-            &mut stored_bytes_total,
-            "fuzzer attack record",
-            record,
-            MAX_WORKSPACE_EMBEDDED_RECORD_BYTES,
-        )?;
-    }
     Ok(())
 }
 
@@ -1910,6 +1895,8 @@ async fn update_workspace_state(
             Err(error) => return session_load_failure_response(target_session_id, error),
         }
     };
+    let mut snapshot = snapshot;
+    snapshot.fuzzer.migrate_attack_record_to_id();
     let mut current = session.workspace.snapshot().await;
     current.session_id = Some(session.id());
     if !can_replace_snapshot(&snapshot, &current) {
@@ -1918,7 +1905,6 @@ async fn update_workspace_state(
     if let Err(error) = validate_workspace_state(&snapshot) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let mut snapshot = snapshot;
     snapshot.session_id = Some(session.id());
     match state
         .replace_workspace_state_and_persist(&session, snapshot)
@@ -6455,6 +6441,66 @@ mod tests {
         assert_eq!(response.status(), super::StatusCode::CONFLICT);
         let active = active_session.workspace.snapshot().await;
         assert!(active.replay.active_tab_id.is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_update_migrates_legacy_fuzzer_attack_record_to_id_only() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-workspace-fuzzer-id-only-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let attack = FuzzerAttackRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            status: FuzzerAttackStatus::Completed,
+            template: EditableRequest {
+                scheme: "https".to_string(),
+                host: "fuzzer.example".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: Vec::new(),
+                body: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                preview_truncated: false,
+            },
+            payload_count: 1,
+            marker_count: 0,
+            results: Vec::new(),
+            notes: Vec::new(),
+        };
+        let attack_id = attack.id;
+        let snapshot = WorkspaceStateSnapshot {
+            session_id: Some(session.id()),
+            client_id: Some("test-ui".to_string()),
+            client_version: 1,
+            fuzzer: FuzzerWorkspaceState {
+                attack_record: Some(attack),
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let response = super::update_workspace_state(State(state.clone()), Json(snapshot)).await;
+
+        assert_eq!(response.status(), super::StatusCode::OK);
+        let saved: WorkspaceStateSnapshot = response_json(response).await;
+        assert_eq!(saved.fuzzer.attack_record_id, Some(attack_id));
+        assert!(saved.fuzzer.attack_record.is_none());
+        let durable = session.workspace.snapshot().await;
+        assert_eq!(durable.fuzzer.attack_record_id, Some(attack_id));
+        assert!(durable.fuzzer.attack_record.is_none());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -1253,6 +1253,7 @@ fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<Store
         Err(error) => Err(error)
             .with_context(|| format!("failed to read session snapshot {}", path.display())),
     }?;
+    snapshot.workspace.fuzzer.migrate_attack_record_to_id();
     snapshot.replayed_transaction_ids =
         replay_transaction_journal(storage_dir, max_entries, &mut snapshot)?;
     snapshot.replayed_transaction_journal = !snapshot.replayed_transaction_ids.is_empty();
@@ -1611,6 +1612,53 @@ mod tests {
         assert_eq!(temp_files, 0);
 
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn load_session_snapshot_migrates_legacy_workspace_fuzzer_attack_record() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "sniper-load-legacy-fuzzer-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let attack_id = Uuid::new_v4();
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &serde_json::json!({
+                "workspace": {
+                    "fuzzer": {
+                        "attack_record": {
+                            "id": attack_id,
+                            "started_at": "2026-01-01T00:00:00Z",
+                            "completed_at": "2026-01-01T00:00:01Z",
+                            "status": "completed",
+                            "template": {
+                                "scheme": "https",
+                                "host": "fuzzer.example",
+                                "method": "GET",
+                                "path": "/",
+                                "headers": [],
+                                "body": "",
+                                "body_encoding": "utf8",
+                                "preview_truncated": false
+                            },
+                            "payload_count": 1,
+                            "marker_count": 0,
+                            "results": [],
+                            "notes": []
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let loaded = super::load_session_snapshot(&storage_dir, 100).unwrap();
+
+        assert_eq!(loaded.workspace.fuzzer.attack_record_id, Some(attack_id));
+        assert!(loaded.workspace.fuzzer.attack_record.is_none());
+
+        let _ = std::fs::remove_dir_all(storage_dir);
     }
 
     #[test]
@@ -2592,7 +2640,7 @@ mod tests {
                     notice: "Ready".to_string(),
                     request_text: "POST /login HTTP/1.1".to_string(),
                     payloads_text: "admin\nuser".to_string(),
-                    attack_record: None,
+                    ..FuzzerWorkspaceState::default()
                 },
                 ..Default::default()
             })
