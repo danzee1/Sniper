@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     convert::Infallible,
     future::Future,
     net::{IpAddr, SocketAddr},
@@ -3492,8 +3492,8 @@ fn websocket_response_validation_error(
 
 static LAST_PERSIST: Mutex<Option<Instant>> = Mutex::new(None);
 static PERSIST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static PERSIST_DIRTY_SESSIONS: LazyLock<Mutex<HashSet<Uuid>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static PERSIST_DIRTY_SESSIONS: LazyLock<Mutex<HashMap<Uuid, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static PERSIST_TRAILING_SESSIONS: LazyLock<Mutex<HashMap<Uuid, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PERSIST_PENDING_CONTEXTS: LazyLock<Mutex<HashMap<Uuid, Arc<SessionContext>>>> =
@@ -3511,6 +3511,7 @@ static ACTIVE_PROXY_SESSION_OWNERS: LazyLock<Mutex<HashMap<Uuid, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
 const PENDING_PERSIST_FLUSH_PROXY_WAIT: Duration = Duration::from_secs(1);
+const PENDING_PERSIST_FLUSH_RETRY_LIMIT: usize = 3;
 
 #[derive(Clone)]
 struct LiveWebSocketRelay {
@@ -3539,13 +3540,13 @@ async fn persist_session_quiet(state: &Arc<AppState>, session: &Arc<SessionConte
     let generation = remember_persist_context(session);
 
     if let Some(delay) = persist_debounce_remaining() {
-        mark_persist_dirty(session);
+        mark_persist_dirty_generation(session.id(), generation);
         schedule_delayed_persist(state, session, delay, generation);
         return;
     }
 
     if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        mark_persist_dirty(session);
+        mark_persist_dirty_generation(session.id(), generation);
         schedule_delayed_persist(state, session, PERSIST_DEBOUNCE, generation);
         return;
     }
@@ -3584,8 +3585,8 @@ fn schedule_delayed_persist(
         if !clear_trailing_persist_if_generation(session_id, generation) {
             return;
         }
-        if !take_persist_dirty(session_id) {
-            forget_persist_context_if_generation(session_id, generation);
+        if !take_persist_dirty_if_generation(session_id, generation) {
+            forget_persist_context_if_clean(session_id, generation);
             return;
         }
         start_persist_or_reschedule(state, session, generation);
@@ -3598,13 +3599,13 @@ fn start_persist_or_reschedule(
     generation: u64,
 ) {
     if let Some(delay) = persist_debounce_remaining() {
-        mark_persist_dirty(&session);
+        mark_persist_dirty_generation(session.id(), generation);
         schedule_delayed_persist(&state, &session, delay, generation);
         return;
     }
 
     if PERSIST_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        mark_persist_dirty(&session);
+        mark_persist_dirty_generation(session.id(), generation);
         schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE, generation);
         return;
     }
@@ -3621,7 +3622,7 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>, genera
     tokio::spawn(async move {
         if let Err(error) = state.persist_session_context(&session).await {
             warn!(?error, session_id = %session.id(), "failed to persist session snapshot");
-            mark_persist_dirty(&session);
+            mark_persist_dirty_generation(session.id(), generation);
         }
         PERSIST_IN_FLIGHT.store(false, Ordering::Release);
         if has_persist_dirty(session.id()) {
@@ -3633,9 +3634,9 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>, genera
     });
 }
 
-fn mark_session_persist_pending(session: &Arc<SessionContext>) {
-    remember_persist_context_once(session);
-    mark_persist_dirty(session);
+fn mark_session_persist_pending(state: &Arc<AppState>, session: &Arc<SessionContext>) {
+    let generation = remember_persist_context_once_and_mark_dirty(session);
+    schedule_delayed_persist(state, session, PERSIST_DEBOUNCE, generation);
 }
 
 fn remember_persist_context(session: &Arc<SessionContext>) -> u64 {
@@ -3651,7 +3652,7 @@ fn remember_persist_context(session: &Arc<SessionContext>) -> u64 {
     generation
 }
 
-fn remember_persist_context_once(session: &Arc<SessionContext>) -> u64 {
+fn remember_persist_context_once_and_mark_dirty(session: &Arc<SessionContext>) -> u64 {
     let session_id = session.id();
     let mut pending = PERSIST_PENDING_CONTEXTS
         .lock()
@@ -3659,14 +3660,17 @@ fn remember_persist_context_once(session: &Arc<SessionContext>) -> u64 {
     let mut generations = PERSIST_CONTEXT_GENERATIONS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if pending.contains_key(&session_id) {
-        if let Some(generation) = generations.get(&session_id).copied() {
-            return generation;
-        }
-    }
-    let generation = NEXT_PERSIST_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let generation = if pending.contains_key(&session_id) {
+        generations
+            .get(&session_id)
+            .copied()
+            .unwrap_or_else(|| NEXT_PERSIST_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed))
+    } else {
+        NEXT_PERSIST_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+    };
     pending.insert(session_id, Arc::clone(session));
     generations.insert(session_id, generation);
+    mark_persist_dirty_generation(session_id, generation);
     generation
 }
 
@@ -3685,6 +3689,44 @@ fn forget_persist_context_if_generation(session_id: Uuid, generation: u64) -> bo
     if generations.get(&session_id).copied() != Some(generation) {
         return false;
     }
+    pending.remove(&session_id);
+    generations.remove(&session_id);
+    true
+}
+
+fn forget_persist_state_if_generation(session_id: Uuid, generation: u64) -> bool {
+    if !forget_persist_context_if_generation(session_id, generation) {
+        return false;
+    }
+    take_persist_dirty_if_generation(session_id, generation);
+    clear_trailing_persist_if_generation(session_id, generation);
+    true
+}
+
+fn forget_persist_context_if_clean(session_id: Uuid, generation: u64) -> bool {
+    let mut pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut generations = PERSIST_CONTEXT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if generations.get(&session_id).copied() != Some(generation) {
+        return false;
+    }
+    let dirty = PERSIST_DIRTY_SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if dirty.contains_key(&session_id) {
+        return false;
+    }
+    let trailing = PERSIST_TRAILING_SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if trailing.contains_key(&session_id) {
+        return false;
+    }
+    drop(trailing);
+    drop(dirty);
     pending.remove(&session_id);
     generations.remove(&session_id);
     true
@@ -3981,25 +4023,53 @@ pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
     for (session, generation) in sessions {
         let session_id = session.id();
         if !state.sessions.contains_session(session_id) {
-            forget_persist_context_if_generation(session_id, generation);
+            forget_persist_state_if_generation(session_id, generation);
             continue;
         }
         wait_for_session_proxy_work_to_finish(session_id, PENDING_PERSIST_FLUSH_PROXY_WAIT).await;
-        clear_trailing_persist(session_id);
-        take_persist_dirty(session_id);
-        if let Err(error) = state.persist_session_context(&session).await {
-            warn!(
-                ?error,
-                session_id = %session_id,
-                "failed to flush pending session snapshot"
-            );
-            mark_persist_dirty(&session);
-            failures.push(anyhow!(
-                "failed to persist pending session {session_id}: {error}"
-            ));
-            continue;
+        let mut attempts = 0;
+        loop {
+            if current_persist_generation(session_id) != Some(generation) {
+                break;
+            }
+            attempts += 1;
+            take_persist_dirty_if_generation(session_id, generation);
+            if let Err(error) = state.persist_session_context(&session).await {
+                warn!(
+                    ?error,
+                    session_id = %session_id,
+                    "failed to flush pending session snapshot"
+                );
+                mark_persist_dirty_generation(session_id, generation);
+                failures.push(anyhow!(
+                    "failed to persist pending session {session_id}: {error}"
+                ));
+                break;
+            }
+            if take_persist_dirty_if_generation(session_id, generation) {
+                if attempts >= PENDING_PERSIST_FLUSH_RETRY_LIMIT {
+                    mark_persist_dirty_generation(session_id, generation);
+                    failures.push(anyhow!(
+                        "session {session_id} changed while flushing pending capture persistence"
+                    ));
+                    break;
+                }
+                continue;
+            }
+            clear_trailing_persist_if_generation(session_id, generation);
+            if forget_persist_context_if_clean(session_id, generation) {
+                break;
+            }
+            if current_persist_generation(session_id) != Some(generation) {
+                break;
+            }
+            if attempts >= PENDING_PERSIST_FLUSH_RETRY_LIMIT {
+                failures.push(anyhow!(
+                    "session {session_id} still has pending capture persistence after flush"
+                ));
+                break;
+            }
         }
-        forget_persist_context_if_generation(session_id, generation);
     }
     if failures.is_empty() {
         Ok(())
@@ -4041,27 +4111,38 @@ async fn wait_for_session_proxy_work_to_finish(session_id: Uuid, timeout: Durati
     }
 }
 
-fn mark_persist_dirty(session: &SessionContext) {
+fn mark_persist_dirty_generation(session_id: Uuid, generation: u64) {
     let mut dirty = PERSIST_DIRTY_SESSIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    dirty.insert(session.id());
+    dirty
+        .entry(session_id)
+        .and_modify(|existing| *existing = (*existing).max(generation))
+        .or_insert(generation);
 }
 
-fn take_persist_dirty(session_id: Uuid) -> bool {
+fn take_persist_dirty_if_generation(session_id: Uuid, generation: u64) -> bool {
     let mut dirty = PERSIST_DIRTY_SESSIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    dirty.remove(&session_id)
+    if dirty
+        .get(&session_id)
+        .is_none_or(|dirty_generation| *dirty_generation > generation)
+    {
+        return false;
+    }
+    dirty.remove(&session_id);
+    true
 }
 
 fn has_persist_dirty(session_id: Uuid) -> bool {
     let dirty = PERSIST_DIRTY_SESSIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    dirty.contains(&session_id)
+    dirty.contains_key(&session_id)
 }
 
+#[cfg(test)]
 fn clear_trailing_persist(session_id: Uuid) {
     let mut scheduled = PERSIST_TRAILING_SESSIONS
         .lock()
@@ -4112,7 +4193,7 @@ async fn relay_websocket_session(
                                     max_preview,
                                 ) {
                                     if session.websockets.append_frame(id, frame).await {
-                                        mark_session_persist_pending(&session);
+                                        mark_session_persist_pending(&state, &session);
                                     }
                                     frame_index += 1;
                                 }
@@ -4133,7 +4214,7 @@ async fn relay_websocket_session(
                                 max_preview,
                             ) {
                                 if session.websockets.append_frame(id, frame).await {
-                                    mark_session_persist_pending(&session);
+                                    mark_session_persist_pending(&state, &session);
                                 }
                                 frame_index += 1;
                             }
@@ -4168,7 +4249,7 @@ async fn relay_websocket_session(
                                     max_preview,
                                 ) {
                                     if session.websockets.append_frame(id, frame).await {
-                                        mark_session_persist_pending(&session);
+                                        mark_session_persist_pending(&state, &session);
                                     }
                                     frame_index += 1;
                                 }
@@ -4189,7 +4270,7 @@ async fn relay_websocket_session(
                                 max_preview,
                             ) {
                                 if session.websockets.append_frame(id, frame).await {
-                                    mark_session_persist_pending(&session);
+                                    mark_session_persist_pending(&state, &session);
                                 }
                                 frame_index += 1;
                             }
@@ -4388,6 +4469,19 @@ mod tests {
         }
     }
 
+    fn ws_text_frame(index: usize) -> WebSocketFrameRecord {
+        WebSocketFrameRecord {
+            index,
+            captured_at: Utc::now(),
+            direction: WebSocketFrameDirection::ClientToServer,
+            kind: WebSocketFrameKind::Text,
+            body_preview: format!("frame-{index}"),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            preview_truncated: false,
+        }
+    }
+
     fn captured_transaction(host: &str) -> TransactionRecord {
         TransactionRecord::http(
             Utc::now(),
@@ -4466,12 +4560,12 @@ mod tests {
             let mut dirty = PERSIST_DIRTY_SESSIONS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            dirty.insert(session_id);
+            dirty.insert(session_id, 1);
         }
 
         assert!(has_persist_dirty(session_id));
         assert!(has_persist_dirty(session_id));
-        assert!(take_persist_dirty(session_id));
+        assert!(take_persist_dirty_if_generation(session_id, 1));
         assert!(!has_persist_dirty(session_id));
     }
 
@@ -4527,13 +4621,70 @@ mod tests {
         let session_id = session.id();
 
         let generation = remember_persist_context(&session);
-        mark_session_persist_pending(&session);
+        mark_session_persist_pending(&state, &session);
 
         assert_eq!(current_persist_generation(session_id), Some(generation));
         assert!(pending_session_context(session_id).is_some());
-        assert!(take_persist_dirty(session_id));
+        assert!(session_has_pending_persist(session_id));
+        assert!(take_persist_dirty_if_generation(session_id, generation));
+        clear_trailing_persist(session_id);
         assert!(forget_persist_context_if_generation(session_id, generation));
         assert!(pending_session_context(session_id).is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_frame_pending_persist_flushes_without_close() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-proxy-ws-frame-flush-without-close-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let websocket_id = Uuid::new_v4();
+        session
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now(),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "flush.example".to_string(),
+                path: "/socket".to_string(),
+                status: Some(101),
+                request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        assert!(
+            session
+                .websockets
+                .append_frame(websocket_id, ws_text_frame(1))
+                .await
+        );
+        mark_session_persist_pending(&state, &session);
+
+        flush_pending_session_persists(state.as_ref())
+            .await
+            .unwrap();
+
+        assert!(pending_session_context(session.id()).is_none());
+        assert!(!session_has_pending_persist(session.id()));
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        let durable = reloaded.websockets.get(websocket_id).await.unwrap();
+        assert_eq!(durable.frames.len(), 1);
+        assert_eq!(durable.frames[0].index, 1);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -4596,16 +4747,56 @@ mod tests {
         assert_eq!(current_persist_generation(session_id), Some(old_generation));
 
         let new_generation = remember_persist_context(&session);
+        mark_session_persist_pending(&state, &session);
         drop(mutation_guard);
         flush_task.await.unwrap().unwrap();
 
         assert_eq!(current_persist_generation(session_id), Some(new_generation));
         assert!(pending_session_context(session_id).is_some());
+        assert!(session_has_pending_persist(session_id));
+        assert!(take_persist_dirty_if_generation(session_id, new_generation));
+        clear_trailing_persist(session_id);
         assert!(forget_persist_context_if_generation(
             session_id,
             new_generation
         ));
         assert!(pending_session_context(session_id).is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_persist_retries_same_generation_dirty_marker() {
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: std::env::temp_dir().join(format!(
+                "sniper-proxy-flush-same-generation-dirty-{}",
+                Uuid::new_v4()
+            )),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let mutation_guard = session.mutation_guard().await;
+
+        let generation = remember_persist_context(&session);
+        let flush_state = Arc::clone(&state);
+        let flush_task =
+            tokio::spawn(async move { flush_pending_session_persists(flush_state.as_ref()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        mark_session_persist_pending(&state, &session);
+        assert_eq!(current_persist_generation(session_id), Some(generation));
+        drop(mutation_guard);
+
+        flush_task.await.unwrap().unwrap();
+
+        assert!(pending_session_context(session_id).is_none());
+        assert!(!session_has_pending_persist(session_id));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -4619,10 +4810,10 @@ mod tests {
             let mut dirty = PERSIST_DIRTY_SESSIONS
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            dirty.insert(session_id);
+            dirty.insert(session_id, 1);
         }
         assert!(session_has_pending_persist(session_id));
-        assert!(take_persist_dirty(session_id));
+        assert!(take_persist_dirty_if_generation(session_id, 1));
 
         {
             let mut trailing = PERSIST_TRAILING_SESSIONS

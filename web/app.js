@@ -394,6 +394,7 @@ const state = {
   websocketSortDirection: "desc",
   selectedWebsocketId: null,
   selectedWebsocketRecord: null,
+  selectedWebsocketDetailError: "",
   selectedFrameIdx: null,
   wsKeyboardFocus: "sessions",
   replayTabs: [],
@@ -449,6 +450,9 @@ let _websocketDetailGeneration = 0;
 let _websocketDetailPendingId = null;
 let _websocketDetailPendingPromise = null;
 let _websocketDetailRefreshTimer = null;
+let _websocketDetailRefreshNeededId = null;
+let _websocketSummaryMutationGeneration = 0;
+let _websocketSummaryMutationById = new Map();
 let _lastHttpHistoryFallbackPoll = Date.now();
 let _lastWebsocketFallbackPoll = Date.now();
 let _interceptToggleRequestSeq = 0;
@@ -2985,12 +2989,16 @@ function resetSessionScopedUiState() {
   state.websocketPaging = createWebsocketPagingState();
   state.selectedWebsocketId = null;
   state.selectedWebsocketRecord = null;
+  state.selectedWebsocketDetailError = "";
   _websocketLoadGeneration += 1;
   _websocketDetailGeneration += 1;
   if (_websocketDetailRefreshTimer) {
     window.clearTimeout(_websocketDetailRefreshTimer);
     _websocketDetailRefreshTimer = null;
   }
+  _websocketDetailRefreshNeededId = null;
+  _websocketSummaryMutationGeneration += 1;
+  _websocketSummaryMutationById.clear();
   _lastWebsocketFallbackPoll = Date.now();
   state.eventLog = [];
   state.matchReplaceRules = [];
@@ -3670,6 +3678,7 @@ async function toggleInterceptRuleEnabled(ruleId, enabled) {
 
 async function loadWebsockets(preserveSelection = true) {
   const generation = ++_websocketLoadGeneration;
+  const summaryMutationGeneration = _websocketSummaryMutationGeneration;
   const sessionId = currentSessionId();
   const requestedLimit = normalizeWebsocketLoadLimit(state.websocketPaging?.limit);
   state.websocketPaging = {
@@ -3686,9 +3695,11 @@ async function loadWebsockets(preserveSelection = true) {
       return;
     }
     const loadedLimit = normalizeWebsocketLoadLimit(page.limit || requestedLimit);
-    state.websocketSessions = page.items;
+    state.websocketSessions = summaryMutationGeneration === _websocketSummaryMutationGeneration
+      ? page.items
+      : mergeWebsocketPageWithCurrentSummaries(page.items, state.websocketSessions, summaryMutationGeneration);
     state.websocketPaging = {
-      total: page.total,
+      total: Math.max(Number(page.total || 0), state.websocketSessions.length),
       limit: loadedLimit,
       hasMore: Boolean(page.has_more) && loadedLimit < WEBSOCKET_MAX_LOADED_SESSIONS,
       loading: false,
@@ -3736,9 +3747,75 @@ function normalizeWebsocketLoadLimit(value) {
   );
 }
 
-async function loadWebsocketDetail(id) {
+function websocketSummaryNumber(summary, key, fallback = -1) {
+  const value = Number(summary?.[key]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function websocketSummaryTimestamp(summary, key) {
+  const raw = summary?.[key];
+  if (!raw) return 0;
+  const timestamp = Date.parse(raw);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function isWebsocketSummaryFresher(candidate, baseline) {
+  if (!candidate) return false;
+  if (!baseline) return true;
+  const numericKeys = ["frame_count", "last_frame_index", "note_count"];
+  for (const key of numericKeys) {
+    const candidateValue = websocketSummaryNumber(candidate, key);
+    const baselineValue = websocketSummaryNumber(baseline, key);
+    if (candidateValue !== baselineValue) {
+      return candidateValue > baselineValue;
+    }
+  }
+  const closedDelta = websocketSummaryTimestamp(candidate, "closed_at") - websocketSummaryTimestamp(baseline, "closed_at");
+  if (closedDelta !== 0) return closedDelta > 0;
+  const durationDelta = websocketSummaryNumber(candidate, "duration_ms") - websocketSummaryNumber(baseline, "duration_ms");
+  if (durationDelta !== 0) return durationDelta > 0;
+  return false;
+}
+
+function mergeWebsocketPageWithCurrentSummaries(pageItems, currentItems, mutationGenerationAtRequest) {
+  const currentById = new Map((currentItems || []).map((item) => [item.id, item]));
+  const seen = new Set();
+  const merged = [];
+  const preserved = [];
+  for (const item of pageItems || []) {
+    if (!item?.id || seen.has(item.id)) continue;
+    const current = currentById.get(item.id);
+    const currentMutatedDuringRequest = (_websocketSummaryMutationById.get(item.id) || 0) > mutationGenerationAtRequest;
+    merged.push(
+      currentMutatedDuringRequest && isWebsocketSummaryFresher(current, item)
+        ? current
+        : item,
+    );
+    seen.add(item.id);
+  }
+  for (const item of currentItems || []) {
+    if (!item?.id || seen.has(item.id)) continue;
+    if ((_websocketSummaryMutationById.get(item.id) || 0) <= mutationGenerationAtRequest) continue;
+    preserved.push(item);
+    seen.add(item.id);
+  }
+  merged.unshift(...preserved);
+  if (merged.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
+    merged.length = WEBSOCKET_MAX_LOADED_SESSIONS;
+  }
+  return merged;
+}
+
+async function loadWebsocketDetail(id, options = {}) {
+  const force = Boolean(options.force);
   if (_websocketDetailPendingId === id && _websocketDetailPendingPromise) {
+    if (force) {
+      _websocketDetailRefreshNeededId = id;
+    }
     return _websocketDetailPendingPromise;
+  }
+  if (force && _websocketDetailRefreshNeededId === id) {
+    _websocketDetailRefreshNeededId = null;
   }
   const generation = ++_websocketDetailGeneration;
   if (state.selectedWebsocketId !== id) {
@@ -3760,6 +3837,7 @@ async function loadWebsocketDetail(id) {
         return;
       }
       state.selectedWebsocketRecord = null;
+      state.selectedWebsocketDetailError = "Failed to load selected WebSocket session.";
       renderWebsocketSessions();
       return;
     }
@@ -3790,6 +3868,7 @@ async function loadWebsocketDetail(id) {
         && Number.isFinite(Number(summary?.frame_count))
         && detail.frames.length < Number(summary.frame_count),
     };
+    state.selectedWebsocketDetailError = "";
     renderWebsocketSessions();
   })();
   _websocketDetailPendingId = id;
@@ -3800,6 +3879,10 @@ async function loadWebsocketDetail(id) {
     if (_websocketDetailPendingId === id && _websocketDetailPendingPromise === pending) {
       _websocketDetailPendingId = null;
       _websocketDetailPendingPromise = null;
+    }
+    if (_websocketDetailRefreshNeededId === id && id === state.selectedWebsocketId) {
+      _websocketDetailRefreshNeededId = null;
+      await loadWebsocketDetail(id, { force: true });
     }
   }
 }
@@ -3846,14 +3929,18 @@ function applyWebsocketSummaryEvent(event) {
       nextSessions.length = WEBSOCKET_MAX_LOADED_SESSIONS;
     }
     const paging = state.websocketPaging || createWebsocketPagingState();
+    const knownTotal = Number(paging.total || 0);
+    const hasMore = Boolean(paging.hasMore);
     state.websocketPaging = {
       ...paging,
-      total: Math.max(Number(paging.total || 0) + 1, nextSessions.length),
-      hasMore: Boolean(paging.hasMore) || nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS,
+      total: Math.max(knownTotal + 1, nextSessions.length),
+      hasMore: hasMore || nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS,
       loading: false,
     };
   }
   state.websocketSessions = nextSessions;
+  _websocketSummaryMutationGeneration += 1;
+  _websocketSummaryMutationById.set(summary.id, _websocketSummaryMutationGeneration);
 
   const selectedChanged = state.selectedWebsocketId === summary.id;
   if (selectedChanged && state.selectedWebsocketRecord) {
@@ -3873,6 +3960,8 @@ function applyWebsocketSummaryEvent(event) {
     if (Number(loadedLastFrameIndex ?? -1) !== Number(summary.last_frame_index ?? -1)) {
       scheduleSelectedWebsocketDetailRefresh(summary.id);
     }
+  } else if (selectedChanged) {
+    scheduleSelectedWebsocketDetailRefresh(summary.id);
   }
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "websockets-history") {
@@ -3885,17 +3974,23 @@ function applyWebsocketSummaryEvent(event) {
 }
 
 function scheduleSelectedWebsocketDetailRefresh(id) {
-  if (id !== state.selectedWebsocketId || _websocketDetailRefreshTimer) {
+  if (id !== state.selectedWebsocketId) {
+    return;
+  }
+  _websocketDetailRefreshNeededId = id;
+  if (_websocketDetailRefreshTimer) {
     return;
   }
   _websocketDetailRefreshTimer = window.setTimeout(() => {
     _websocketDetailRefreshTimer = null;
+    const refreshId = _websocketDetailRefreshNeededId;
     if (
-      id === state.selectedWebsocketId
+      refreshId
+      && refreshId === state.selectedWebsocketId
       && state.activeTool === "proxy"
       && state.activeProxyTab === "websockets-history"
     ) {
-      loadWebsocketDetail(id).catch((error) => console.error(error));
+      loadWebsocketDetail(refreshId, { force: true }).catch((error) => console.error(error));
     }
   }, 750);
 }
@@ -7000,6 +7095,8 @@ async function moveWebsocketSelection(offset) {
 
   if (state.selectedWebsocketId !== nextId) {
     state.selectedFrameIdx = null;
+    state.selectedWebsocketRecord = null;
+    state.selectedWebsocketDetailError = "";
     hideFrameDetail();
   }
   state.selectedWebsocketId = nextId;
@@ -7636,6 +7733,7 @@ function renderWebsocketSessions() {
 	      if (state.selectedWebsocketId !== row.dataset.id) {
 	        state.selectedFrameIdx = null;
 	        state.selectedWebsocketRecord = null;
+	        state.selectedWebsocketDetailError = "";
 	        hideFrameDetail();
 	      }
 	      state.selectedWebsocketId = row.dataset.id;
@@ -7645,9 +7743,13 @@ function renderWebsocketSessions() {
 	  });
 
   if (!state.selectedWebsocketRecord) {
-    const noSessionMsg = state.websocketSessions.length && !sortedEntries.length
-      ? "No WebSocket session matches the current filter."
-      : "Select a WebSocket session.";
+    const detailLoading = Boolean(state.selectedWebsocketId);
+    const noSessionMsg = state.selectedWebsocketDetailError
+      || (detailLoading
+        ? "Loading selected WebSocket session..."
+        : (state.websocketSessions.length && !sortedEntries.length
+          ? "No WebSocket session matches the current filter."
+          : "Select a WebSocket session."));
     if (els.websocketHandshakeCM) {
       updateCodePaneCM("wsHandshake", els.websocketHandshakeCM, noSessionMsg, { mode: "http" });
     } else {
@@ -7657,9 +7759,13 @@ function renderWebsocketSessions() {
     els.websocketFramesBody.innerHTML = `
       <tr class="empty-row">
         <td colspan="5">${
-        state.websocketSessions.length && !sortedEntries.length
-          ? "Clear or adjust the filter to inspect captured frames."
-          : "Frame capture will appear here after a WebSocket handshake completes."
+        state.selectedWebsocketDetailError
+          ? "Select the session again or wait for the next refresh."
+          : (detailLoading
+            ? "Loading captured frames..."
+            : (state.websocketSessions.length && !sortedEntries.length
+              ? "Clear or adjust the filter to inspect captured frames."
+              : "Frame capture will appear here after a WebSocket handshake completes."))
         }</td>
       </tr>
     `;
@@ -7902,17 +8008,20 @@ async function syncVisibleWebsocketSelection(preserveSelection = true) {
   }
   if (previousSelectedId !== state.selectedWebsocketId) {
     state.selectedFrameIdx = null;
+    state.selectedWebsocketDetailError = "";
     hideFrameDetail();
   }
 
   if (!state.selectedWebsocketId) {
     state.selectedWebsocketRecord = null;
+    state.selectedWebsocketDetailError = "";
     renderWebsocketSessions();
     return;
   }
 
   if (state.selectedWebsocketRecord?.id !== state.selectedWebsocketId) {
     state.selectedWebsocketRecord = null;
+    state.selectedWebsocketDetailError = "";
   }
   const selectedSummary = visibleSessions.find((item) => item.id === state.selectedWebsocketId);
   const selectedDetailIsStale = Boolean(

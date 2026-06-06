@@ -1,18 +1,110 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
-use crate::model::{WebSocketFrameRecord, WebSocketSessionRecord, WebSocketSessionSummary};
+use crate::model::{
+    MessageRecord, WebSocketFrameRecord, WebSocketSessionRecord, WebSocketSessionSummary,
+};
 
 const MAX_WEBSOCKET_BROADCAST_CAPACITY: usize = 4096;
 
 pub struct WebSocketStore {
     max_entries: usize,
     max_frames_per_session: usize,
-    sessions: RwLock<VecDeque<WebSocketSessionRecord>>,
+    inner: RwLock<WebSocketStoreInner>,
     events: broadcast::Sender<WebSocketSessionSummary>,
+}
+
+struct WebSocketStoreInner {
+    order: VecDeque<Uuid>,
+    sessions: HashMap<Uuid, WebSocketSessionEntry>,
+}
+
+impl WebSocketStoreInner {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::with_capacity(capacity),
+            sessions: HashMap::with_capacity(capacity),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WebSocketSessionEntry {
+    id: Uuid,
+    started_at: DateTime<Utc>,
+    closed_at: Option<DateTime<Utc>>,
+    duration_ms: Option<u64>,
+    scheme: String,
+    host: String,
+    path: String,
+    status: Option<u16>,
+    request: MessageRecord,
+    response: Option<MessageRecord>,
+    frames: VecDeque<WebSocketFrameRecord>,
+    notes: Vec<String>,
+}
+
+impl From<WebSocketSessionRecord> for WebSocketSessionEntry {
+    fn from(record: WebSocketSessionRecord) -> Self {
+        Self {
+            id: record.id,
+            started_at: record.started_at,
+            closed_at: record.closed_at,
+            duration_ms: record.duration_ms,
+            scheme: record.scheme,
+            host: record.host,
+            path: record.path,
+            status: record.status,
+            request: record.request,
+            response: record.response,
+            frames: VecDeque::from(record.frames),
+            notes: record.notes,
+        }
+    }
+}
+
+impl WebSocketSessionEntry {
+    fn summary(&self) -> WebSocketSessionSummary {
+        WebSocketSessionSummary {
+            id: self.id,
+            started_at: self.started_at,
+            closed_at: self.closed_at,
+            duration_ms: self.duration_ms,
+            scheme: self.scheme.clone(),
+            host: self.host.clone(),
+            path: self.path.clone(),
+            status: self.status,
+            frame_count: self.frames.len(),
+            last_frame_index: self.frames.back().map(|frame| frame.index),
+            note_count: self.notes.len(),
+        }
+    }
+
+    fn to_record(&self) -> WebSocketSessionRecord {
+        self.to_record_with_frame_window(None)
+    }
+
+    fn to_record_with_frame_window(&self, frame_limit: Option<usize>) -> WebSocketSessionRecord {
+        let frames = frame_window(&self.frames, frame_limit);
+
+        WebSocketSessionRecord {
+            id: self.id,
+            started_at: self.started_at,
+            closed_at: self.closed_at,
+            duration_ms: self.duration_ms,
+            scheme: self.scheme.clone(),
+            host: self.host.clone(),
+            path: self.path.clone(),
+            status: self.status,
+            request: self.request.clone(),
+            response: self.response.clone(),
+            frames,
+            notes: self.notes.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -35,16 +127,12 @@ impl WebSocketStore {
     ) -> Self {
         let (events, _) =
             broadcast::channel(max_entries.clamp(32, MAX_WEBSOCKET_BROADCAST_CAPACITY));
-        let mut sessions = VecDeque::with_capacity(records.len().min(max_entries));
-        sessions.extend(sessions_with_live_preserved(
-            records,
-            max_entries,
-            max_frames_per_session,
-        ));
+        let records = sessions_with_live_preserved(records, max_entries, max_frames_per_session);
+        let inner = inner_from_records(records, max_entries);
         Self {
             max_entries,
             max_frames_per_session,
-            sessions: RwLock::new(sessions),
+            inner: RwLock::new(inner),
             events,
         }
     }
@@ -52,17 +140,22 @@ impl WebSocketStore {
     pub async fn open(&self, mut session: WebSocketSessionRecord) {
         trim_frame_overflow(&mut session.frames, self.max_frames_per_session);
         let summary = session.summary();
-        let mut sessions = self.sessions.write().await;
-        sessions.push_front(session);
-        trim_overflow(&mut sessions, self.max_entries);
+        let mut inner = self.inner.write().await;
+        remove_ordered_session(&mut inner, session.id);
+        let id = session.id;
+        inner.order.push_front(id);
+        inner
+            .sessions
+            .insert(id, WebSocketSessionEntry::from(session));
+        trim_overflow(&mut inner, self.max_entries);
         let _ = self.events.send(summary);
     }
 
     pub async fn append_frame(&self, id: Uuid, frame: WebSocketFrameRecord) -> bool {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
-            session.frames.push(frame);
-            trim_frame_overflow(&mut session.frames, self.max_frames_per_session);
+        let mut inner = self.inner.write().await;
+        if let Some(session) = inner.sessions.get_mut(&id) {
+            session.frames.push_back(frame);
+            trim_frame_deque_overflow(&mut session.frames, self.max_frames_per_session);
             let _ = self.events.send(session.summary());
             true
         } else {
@@ -77,8 +170,8 @@ impl WebSocketStore {
         duration_ms: u64,
         note: Option<String>,
     ) -> bool {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
+        let mut inner = self.inner.write().await;
+        if let Some(session) = inner.sessions.get_mut(&id) {
             session.closed_at = Some(closed_at);
             session.duration_ms = Some(duration_ms);
             if let Some(note) = note {
@@ -86,7 +179,7 @@ impl WebSocketStore {
             }
             let summary = session.summary();
             let _ = self.events.send(summary);
-            trim_overflow(&mut sessions, self.max_entries);
+            trim_overflow(&mut inner, self.max_entries);
             true
         } else {
             false
@@ -98,13 +191,14 @@ impl WebSocketStore {
     }
 
     pub async fn list_page(&self, limit: Option<usize>) -> WebSocketListPage {
-        let sessions = self.sessions.read().await;
-        let total = sessions.len();
+        let inner = self.inner.read().await;
+        let total = inner.order.len();
         let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
-        let items = sessions
+        let items = inner
+            .order
             .iter()
             .take(limit)
-            .map(WebSocketSessionRecord::summary)
+            .filter_map(|id| inner.sessions.get(id).map(WebSocketSessionEntry::summary))
             .collect();
         WebSocketListPage {
             items,
@@ -115,12 +209,12 @@ impl WebSocketStore {
     }
 
     pub async fn get(&self, id: Uuid) -> Option<WebSocketSessionRecord> {
-        self.sessions
+        self.inner
             .read()
             .await
-            .iter()
-            .find(|session| session.id == id)
-            .cloned()
+            .sessions
+            .get(&id)
+            .map(WebSocketSessionEntry::to_record)
     }
 
     pub async fn get_windowed(
@@ -128,26 +222,30 @@ impl WebSocketStore {
         id: Uuid,
         frame_limit: Option<usize>,
     ) -> Option<WebSocketSessionRecord> {
-        self.sessions
+        self.inner
             .read()
             .await
-            .iter()
-            .find(|session| session.id == id)
-            .map(|session| clone_session_with_frame_window(session, frame_limit))
+            .sessions
+            .get(&id)
+            .map(|session| session.to_record_with_frame_window(frame_limit))
     }
 
     pub async fn snapshot(&self, limit: Option<usize>) -> Vec<WebSocketSessionRecord> {
-        let sessions = self.sessions.read().await;
+        let inner = self.inner.read().await;
         let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
         let mut live_remaining = limit;
         let mut closed_remaining = limit.saturating_sub(
-            sessions
+            inner
+                .order
                 .iter()
+                .filter_map(|id| inner.sessions.get(id))
                 .filter(|session| session.closed_at.is_none())
                 .count(),
         );
-        sessions
+        inner
+            .order
             .iter()
+            .filter_map(|id| inner.sessions.get(id))
             .filter(|session| {
                 if session.closed_at.is_none() {
                     if live_remaining == 0 {
@@ -162,50 +260,20 @@ impl WebSocketStore {
                 closed_remaining -= 1;
                 true
             })
-            .cloned()
+            .map(WebSocketSessionEntry::to_record)
             .collect()
     }
 
     pub async fn replace_all(&self, records: Vec<WebSocketSessionRecord>) {
-        let mut sessions = self.sessions.write().await;
-        sessions.clear();
-        sessions.extend(sessions_with_live_preserved(
-            records,
+        let mut inner = self.inner.write().await;
+        *inner = inner_from_records(
+            sessions_with_live_preserved(records, self.max_entries, self.max_frames_per_session),
             self.max_entries,
-            self.max_frames_per_session,
-        ));
+        );
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WebSocketSessionSummary> {
         self.events.subscribe()
-    }
-}
-
-fn clone_session_with_frame_window(
-    session: &WebSocketSessionRecord,
-    frame_limit: Option<usize>,
-) -> WebSocketSessionRecord {
-    let frames = match frame_limit {
-        Some(0) => Vec::new(),
-        Some(limit) if session.frames.len() > limit => {
-            session.frames[session.frames.len() - limit..].to_vec()
-        }
-        _ => session.frames.clone(),
-    };
-
-    WebSocketSessionRecord {
-        id: session.id,
-        started_at: session.started_at,
-        closed_at: session.closed_at,
-        duration_ms: session.duration_ms,
-        scheme: session.scheme.clone(),
-        host: session.host.clone(),
-        path: session.path.clone(),
-        status: session.status,
-        request: session.request.clone(),
-        response: session.response.clone(),
-        frames,
-        notes: session.notes.clone(),
     }
 }
 
@@ -240,6 +308,35 @@ fn sessions_with_live_preserved(
         .collect()
 }
 
+fn inner_from_records(
+    records: Vec<WebSocketSessionRecord>,
+    max_entries: usize,
+) -> WebSocketStoreInner {
+    let mut inner = WebSocketStoreInner::with_capacity(records.len().min(max_entries));
+    for record in records {
+        remove_ordered_session(&mut inner, record.id);
+        let id = record.id;
+        inner.order.push_back(id);
+        inner
+            .sessions
+            .insert(id, WebSocketSessionEntry::from(record));
+    }
+    inner
+}
+
+fn frame_window(
+    frames: &VecDeque<WebSocketFrameRecord>,
+    frame_limit: Option<usize>,
+) -> Vec<WebSocketFrameRecord> {
+    match frame_limit {
+        Some(0) => Vec::new(),
+        Some(limit) if frames.len() > limit => {
+            frames.iter().skip(frames.len() - limit).cloned().collect()
+        }
+        _ => frames.iter().cloned().collect(),
+    }
+}
+
 fn trim_frame_overflow(frames: &mut Vec<WebSocketFrameRecord>, max_frames_per_session: usize) {
     if frames.len() > max_frames_per_session {
         let overflow = frames.len() - max_frames_per_session;
@@ -247,22 +344,44 @@ fn trim_frame_overflow(frames: &mut Vec<WebSocketFrameRecord>, max_frames_per_se
     }
 }
 
-fn trim_closed_overflow(sessions: &mut VecDeque<WebSocketSessionRecord>, max_entries: usize) {
-    while sessions.len() > max_entries {
-        let Some(index) = sessions
-            .iter()
-            .rposition(|session| session.closed_at.is_some())
-        else {
-            break;
-        };
-        sessions.remove(index);
+fn trim_frame_deque_overflow(
+    frames: &mut VecDeque<WebSocketFrameRecord>,
+    max_frames_per_session: usize,
+) {
+    while frames.len() > max_frames_per_session {
+        frames.pop_front();
     }
 }
 
-fn trim_overflow(sessions: &mut VecDeque<WebSocketSessionRecord>, max_entries: usize) {
-    trim_closed_overflow(sessions, max_entries);
-    while sessions.len() > max_entries {
-        sessions.pop_back();
+fn remove_ordered_session(inner: &mut WebSocketStoreInner, id: Uuid) {
+    inner.sessions.remove(&id);
+    if let Some(index) = inner.order.iter().position(|candidate| *candidate == id) {
+        inner.order.remove(index);
+    }
+}
+
+fn trim_closed_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) {
+    while inner.order.len() > max_entries {
+        let Some(index) = inner.order.iter().rposition(|id| {
+            inner
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.closed_at.is_some())
+        }) else {
+            break;
+        };
+        if let Some(id) = inner.order.remove(index) {
+            inner.sessions.remove(&id);
+        }
+    }
+}
+
+fn trim_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) {
+    trim_closed_overflow(inner, max_entries);
+    while inner.order.len() > max_entries {
+        if let Some(id) = inner.order.pop_back() {
+            inner.sessions.remove(&id);
+        }
     }
 }
 
@@ -375,6 +494,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_frame_caps_with_tail_order_after_many_overflow_frames() {
+        let record = session(Vec::new());
+        let record_id = record.id;
+        let store = WebSocketStore::from_sessions(10, 3, vec![record]);
+
+        for index in 1..=10 {
+            assert!(store.append_frame(record_id, frame(index)).await);
+        }
+
+        let stored = store.get(record_id).await.unwrap();
+        assert_eq!(
+            stored
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        let summary = &store.list_page(Some(10)).await.items[0];
+        assert_eq!(summary.frame_count, 3);
+        assert_eq!(summary.last_frame_index, Some(10));
+    }
+
+    #[tokio::test]
+    async fn snapshot_materializes_vec_frames_in_wire_order() {
+        let store = WebSocketStore::new(10, 3);
+        store
+            .open(session(vec![frame(1), frame(2), frame(3)]))
+            .await;
+
+        let snapshot = store.snapshot(None).await;
+        let raw = serde_json::to_string(&snapshot).unwrap();
+        assert!(raw.contains("\"frames\""));
+        assert!(!raw.contains("\"order\""));
+        assert!(!raw.contains("\"sessions\""));
+
+        let value = serde_json::to_value(&snapshot[0]).unwrap();
+        assert!(value["frames"].is_array());
+
+        let round_trip: WebSocketSessionRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            round_trip
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_same_session_id_replaces_ordered_entry() {
+        let first = session(vec![frame(1)]);
+        let first_id = first.id;
+        let mut replacement = session(vec![frame(2)]);
+        replacement.id = first_id;
+        replacement.host = "replacement.example".to_string();
+        let store = WebSocketStore::new(10, 10);
+
+        store.open(first).await;
+        store.open(replacement).await;
+
+        let page = store.list_page(Some(10)).await;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].host, "replacement.example");
+        let stored = store.get(first_id).await.unwrap();
+        assert_eq!(stored.frames[0].index, 2);
+    }
+
+    #[tokio::test]
     async fn open_evicts_oldest_live_session_when_all_entries_are_live() {
         let store = WebSocketStore::new(1, 10);
         let first = session(Vec::new());
@@ -402,7 +591,7 @@ mod tests {
     async fn from_sessions_does_not_preallocate_full_retention_for_empty_restore() {
         let store = WebSocketStore::from_sessions(500_000, 10, Vec::new());
 
-        assert_eq!(store.sessions.read().await.capacity(), 0);
+        assert_eq!(store.inner.read().await.order.capacity(), 0);
     }
 
     #[tokio::test]
