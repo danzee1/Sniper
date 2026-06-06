@@ -719,15 +719,6 @@ impl AppState {
         detach_update_dmg(&mount_point).await;
         artifact_guard.clear_mount_point();
 
-        if let Err(error) = self.persist_active_session().await {
-            cleanup_update_artifacts(None, &tmp_dir).await;
-            return Err(error.context("failed to persist active session before self-update"));
-        }
-        if let Err(error) = crate::proxy::flush_pending_session_persists(self).await {
-            cleanup_update_artifacts(None, &tmp_dir).await;
-            return Err(error.context("failed to flush pending sessions before self-update"));
-        }
-
         if let Err(error) = self.prepare_for_self_update_shutdown().await {
             cleanup_update_artifacts(None, &tmp_dir).await;
             return Err(error);

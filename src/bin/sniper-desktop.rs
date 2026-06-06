@@ -297,6 +297,13 @@ fn persist_desktop_session_state(
     runtime: &tokio::runtime::Runtime,
     state: &AppState,
 ) -> Result<()> {
+    runtime.block_on(proxy::close_live_websocket_relays(
+        state,
+        "Sniper desktop shutdown closed the live WebSocket relay.",
+    ));
+    runtime.block_on(proxy::drain_proxy_connections(
+        std::time::Duration::from_secs(1),
+    ));
     let flush_result = runtime
         .block_on(proxy::flush_pending_session_persists(state))
         .context("failed to flush pending session snapshots before desktop shutdown");

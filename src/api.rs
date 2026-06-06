@@ -223,6 +223,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sequence-runs", get(list_sequence_runs))
         .route("/api/sequence-runs/:id", get(get_sequence_run))
         .route("/api/websockets", get(list_websockets))
+        .route("/api/websockets-page", get(list_websockets_page))
         .route("/api/websockets/:id", get(get_websocket))
         .route("/api/replay/ws-connect", post(ws_replay_connect))
         .route("/api/replay/ws-send", post(ws_replay_send))
@@ -3445,6 +3446,21 @@ async fn list_websockets(
         Err(response) => return response,
     };
     let page = session.websockets.list_page(query.limit).await;
+    Json(page.items).into_response()
+}
+
+async fn list_websockets_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WebSocketQuery>,
+) -> Response {
+    if let Err(error) = validate_optional_limit(query.limit) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let page = session.websockets.list_page(query.limit).await;
     Json(WebSocketPageResponse {
         items: page.items,
         total: page.total,
@@ -3467,9 +3483,6 @@ async fn get_websocket(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(error) = validate_optional_limit(query.frame_limit) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
-    }
     match session.websockets.get_windowed(id, query.frame_limit).await {
         Some(record) => Json(record).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -4408,7 +4421,7 @@ mod tests {
         model::{
             BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, MessageRecord,
             RequestTargetOverride, TransactionRecord, WebSocketFrameDirection, WebSocketFrameKind,
-            WebSocketFrameRecord, WebSocketSessionRecord,
+            WebSocketFrameRecord, WebSocketSessionRecord, WebSocketSessionSummary,
         },
         oast::{OastCallback, OastProvider},
         runtime::{RuntimeSettingsSnapshot, RuntimeSettingsUpdate},
@@ -7351,7 +7364,7 @@ mod tests {
         )
         .await;
         assert_eq!(pinned_websocket_response.status(), super::StatusCode::OK);
-        let pinned_websocket_list = super::list_websockets(
+        let pinned_websocket_list = super::list_websockets_page(
             State(state),
             Query(super::WebSocketQuery {
                 session_id: Some(original_id),
@@ -7433,7 +7446,34 @@ mod tests {
             vec![4, 5]
         );
 
-        let list_response = super::list_websockets(
+        let empty_detail_response = super::get_websocket(
+            State(state.clone()),
+            Path(websocket_id.to_string()),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                limit: None,
+                frame_limit: Some(0),
+            }),
+        )
+        .await;
+        assert_eq!(empty_detail_response.status(), super::StatusCode::OK);
+        let empty_detail: WebSocketSessionRecord = response_json(empty_detail_response).await;
+        assert!(empty_detail.frames.is_empty());
+
+        let legacy_list_response = super::list_websockets(
+            State(state.clone()),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                limit: Some(10),
+                frame_limit: None,
+            }),
+        )
+        .await;
+        let legacy_list: Vec<WebSocketSessionSummary> = response_json(legacy_list_response).await;
+        assert_eq!(legacy_list[0].frame_count, 5);
+        assert_eq!(legacy_list[0].last_frame_index, Some(5));
+
+        let list_response = super::list_websockets_page(
             State(state),
             Query(super::WebSocketQuery {
                 session_id: Some(session.id()),

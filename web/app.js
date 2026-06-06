@@ -3688,7 +3688,7 @@ async function loadWebsockets(preserveSelection = true) {
     loading: true,
   };
   try {
-    const response = await fetch(sessionQueryPath(`/api/websockets?limit=${requestedLimit}`, sessionId));
+    const response = await fetch(sessionQueryPath(`/api/websockets-page?limit=${requestedLimit}`, sessionId));
     await requireOkResponse(response, "Failed to load WebSocket history.");
     const page = websocketPagePayload(await response.json());
     if (generation !== _websocketLoadGeneration || sessionId !== currentSessionId()) {
@@ -3775,6 +3775,20 @@ function isWebsocketSummaryFresher(candidate, baseline) {
   const durationDelta = websocketSummaryNumber(candidate, "duration_ms") - websocketSummaryNumber(baseline, "duration_ms");
   if (durationDelta !== 0) return durationDelta > 0;
   return false;
+}
+
+function shouldInsertUnknownWebsocketSummary(summary, sessions, paging) {
+  if (!summary?.id) return false;
+  if (!Boolean(paging?.hasMore)) return true;
+  if (!Array.isArray(sessions) || !sessions.length) return true;
+
+  const summaryStartedAt = websocketSummaryTimestamp(summary, "started_at");
+  if (!summaryStartedAt) return false;
+  const newestLoadedStartedAt = sessions.reduce(
+    (newest, item) => Math.max(newest, websocketSummaryTimestamp(item, "started_at")),
+    0,
+  );
+  return !newestLoadedStartedAt || summaryStartedAt >= newestLoadedStartedAt;
 }
 
 function mergeWebsocketPageWithCurrentSummaries(pageItems, currentItems, mutationGenerationAtRequest) {
@@ -3924,11 +3938,19 @@ function applyWebsocketSummaryEvent(event) {
   if (existingIndex >= 0) {
     nextSessions[existingIndex] = summary;
   } else {
+    const paging = state.websocketPaging || createWebsocketPagingState();
+    if (!shouldInsertUnknownWebsocketSummary(summary, sessions, paging)) {
+      state.websocketPaging = {
+        ...paging,
+        total: Math.max(Number(paging.total || 0), sessions.length),
+        loading: false,
+      };
+      return;
+    }
     nextSessions.unshift(summary);
     if (nextSessions.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
       nextSessions.length = WEBSOCKET_MAX_LOADED_SESSIONS;
     }
-    const paging = state.websocketPaging || createWebsocketPagingState();
     const knownTotal = Number(paging.total || 0);
     const hasMore = Boolean(paging.hasMore);
     state.websocketPaging = {
@@ -4355,9 +4377,7 @@ function reconcileHistorySelectionAfterTrim(removedItems = []) {
   if (!state.selectedId || !removedItems.some((item) => item?.id === state.selectedId)) {
     return;
   }
-  state.selectedId = null;
-  state.selectedRecord = null;
-  renderEmptyDetail();
+  updateHistorySelection(state.selectedId);
 }
 
 function adjustHistoryScrollAfterHeadTrim(removedCount) {
@@ -4775,11 +4795,9 @@ function scheduleIncrementalRefresh() {
         return;
       }
       const refreshSessionId = state.activeSession?.id || null;
-      const refreshItemsVersion = state._itemsVersion;
       const resp = await fetch(buildTransactionsPageUrl({ limit: 50, offset: 0, queryState: refreshQueryState }));
       if (
         refreshSessionId !== (state.activeSession?.id || null)
-        || refreshItemsVersion !== state._itemsVersion
         || !isCurrentHistoryQuerySignature(refreshQuerySignature)
       ) {
         return;
@@ -4799,7 +4817,6 @@ function scheduleIncrementalRefresh() {
       const page = await resp.json();
       if (
         refreshSessionId !== (state.activeSession?.id || null)
-        || refreshItemsVersion !== state._itemsVersion
         || !isCurrentHistoryQuerySignature(refreshQuerySignature)
         || state.historyPaging?.querySignature !== refreshQuerySignature
       ) {
@@ -6918,6 +6935,13 @@ function renderHistoryVirtual() {
 
   const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - HISTORY_BUFFER_ROWS);
   const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / rowHeight) + HISTORY_BUFFER_ROWS);
+  if (
+    startIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS
+    && state.historyPaging?.trimmedHeadCount > 0
+    && !state.historyPaging.loading
+  ) {
+    loadNewerTransactions({ background: true }).catch((error) => console.error(error));
+  }
   if (totalCount - endIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS) {
     const atLoadedBottom = scrollTop >= maxScrollTop - rowHeight;
     scheduleHistoryBackfill(0, { allowAtCap: atLoadedBottom });

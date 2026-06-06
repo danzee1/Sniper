@@ -3512,6 +3512,7 @@ static ACTIVE_PROXY_SESSION_OWNERS: LazyLock<Mutex<HashMap<Uuid, usize>>> =
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
 const PENDING_PERSIST_FLUSH_PROXY_WAIT: Duration = Duration::from_secs(1);
 const PENDING_PERSIST_FLUSH_RETRY_LIMIT: usize = 3;
+const PENDING_PERSIST_FLUSH_SWEEP_LIMIT: usize = 8;
 
 #[derive(Clone)]
 struct LiveWebSocketRelay {
@@ -3931,6 +3932,7 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) {
             .collect::<Vec<_>>()
     };
 
+    let mut sessions_to_persist = HashMap::new();
     for (relay_id, relay) in relays {
         relay.abort.abort();
         if let Some(websocket_id) = relay.captured_websocket_id {
@@ -3944,16 +3946,19 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) {
                     Some(note.to_string()),
                 )
                 .await;
-            if let Err(error) = state.persist_session_context(&relay.session).await {
-                warn!(
-                    ?error,
-                    session_id = %relay.session.id(),
-                    websocket_id = %websocket_id,
-                    "failed to persist closed live websocket relay"
-                );
-            }
+            sessions_to_persist.insert(relay.session.id(), Arc::clone(&relay.session));
         }
         forget_live_websocket_relay(relay_id);
+    }
+
+    for (session_id, session) in sessions_to_persist {
+        if let Err(error) = state.persist_session_context(&session).await {
+            warn!(
+                ?error,
+                session_id = %session_id,
+                "failed to persist closed live websocket relays"
+            );
+        }
     }
 }
 
@@ -4000,80 +4005,103 @@ pub fn session_has_pending_persist(session_id: Uuid) -> bool {
     trailing.contains_key(&session_id)
 }
 
+fn pending_persist_session_count() -> usize {
+    let pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending.len()
+}
+
 pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
-    let sessions = {
-        let pending = PERSIST_PENDING_CONTEXTS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let generations = PERSIST_CONTEXT_GENERATIONS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        pending
-            .iter()
-            .filter_map(|(session_id, session)| {
-                generations
-                    .get(session_id)
-                    .copied()
-                    .map(|generation| (Arc::clone(session), generation))
-            })
-            .collect::<Vec<_>>()
-    };
     let mut failures = Vec::new();
 
-    for (session, generation) in sessions {
-        let session_id = session.id();
-        if !state.sessions.contains_session(session_id) {
-            forget_persist_state_if_generation(session_id, generation);
-            continue;
+    for _ in 0..PENDING_PERSIST_FLUSH_SWEEP_LIMIT {
+        let sessions = {
+            let pending = PERSIST_PENDING_CONTEXTS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let generations = PERSIST_CONTEXT_GENERATIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pending
+                .iter()
+                .filter_map(|(session_id, session)| {
+                    generations
+                        .get(session_id)
+                        .copied()
+                        .map(|generation| (Arc::clone(session), generation))
+                })
+                .collect::<Vec<_>>()
+        };
+        if sessions.is_empty() {
+            break;
         }
-        wait_for_session_proxy_work_to_finish(session_id, PENDING_PERSIST_FLUSH_PROXY_WAIT).await;
-        let mut attempts = 0;
-        loop {
-            if current_persist_generation(session_id) != Some(generation) {
-                break;
+
+        for (session, generation) in sessions {
+            let session_id = session.id();
+            if !state.sessions.contains_session(session_id) {
+                forget_persist_state_if_generation(session_id, generation);
+                continue;
             }
-            attempts += 1;
-            take_persist_dirty_if_generation(session_id, generation);
-            if let Err(error) = state.persist_session_context(&session).await {
-                warn!(
-                    ?error,
-                    session_id = %session_id,
-                    "failed to flush pending session snapshot"
-                );
-                mark_persist_dirty_generation(session_id, generation);
-                failures.push(anyhow!(
-                    "failed to persist pending session {session_id}: {error}"
-                ));
-                break;
-            }
-            if take_persist_dirty_if_generation(session_id, generation) {
-                if attempts >= PENDING_PERSIST_FLUSH_RETRY_LIMIT {
+            wait_for_session_proxy_work_to_finish(session_id, PENDING_PERSIST_FLUSH_PROXY_WAIT)
+                .await;
+            let mut attempts = 0;
+            loop {
+                if current_persist_generation(session_id) != Some(generation) {
+                    break;
+                }
+                attempts += 1;
+                take_persist_dirty_if_generation(session_id, generation);
+                if let Err(error) = state.persist_session_context(&session).await {
+                    warn!(
+                        ?error,
+                        session_id = %session_id,
+                        "failed to flush pending session snapshot"
+                    );
                     mark_persist_dirty_generation(session_id, generation);
                     failures.push(anyhow!(
-                        "session {session_id} changed while flushing pending capture persistence"
+                        "failed to persist pending session {session_id}: {error}"
                     ));
                     break;
                 }
-                continue;
-            }
-            clear_trailing_persist_if_generation(session_id, generation);
-            if forget_persist_context_if_clean(session_id, generation) {
-                break;
-            }
-            if current_persist_generation(session_id) != Some(generation) {
-                break;
-            }
-            if attempts >= PENDING_PERSIST_FLUSH_RETRY_LIMIT {
-                failures.push(anyhow!(
-                    "session {session_id} still has pending capture persistence after flush"
-                ));
-                break;
+                if take_persist_dirty_if_generation(session_id, generation) {
+                    if attempts >= PENDING_PERSIST_FLUSH_RETRY_LIMIT {
+                        mark_persist_dirty_generation(session_id, generation);
+                        failures.push(anyhow!(
+                            "session {session_id} changed while flushing pending capture persistence"
+                        ));
+                        break;
+                    }
+                    continue;
+                }
+                clear_trailing_persist_if_generation(session_id, generation);
+                if forget_persist_context_if_clean(session_id, generation) {
+                    break;
+                }
+                if current_persist_generation(session_id) != Some(generation) {
+                    break;
+                }
+                if attempts >= PENDING_PERSIST_FLUSH_RETRY_LIMIT {
+                    failures.push(anyhow!(
+                        "session {session_id} still has pending capture persistence after flush"
+                    ));
+                    break;
+                }
             }
         }
+        if !failures.is_empty() || pending_persist_session_count() == 0 {
+            break;
+        }
     }
-    if failures.is_empty() {
+    let remaining = pending_persist_session_count();
+    if failures.is_empty() && remaining == 0 {
         Ok(())
     } else {
+        if remaining > 0 {
+            failures.push(anyhow!(
+                "{remaining} pending session persist(s) remained after flush"
+            ));
+        }
         Err(anyhow!(
             "{} pending session persist(s) failed: {}",
             failures.len(),
@@ -4722,7 +4750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_pending_persist_does_not_forget_new_generation() {
+    async fn flush_pending_persist_drains_new_generation() {
         let config = crate::config::AppConfig {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
@@ -4746,21 +4774,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(current_persist_generation(session_id), Some(old_generation));
 
-        let new_generation = remember_persist_context(&session);
+        let _new_generation = remember_persist_context(&session);
         mark_session_persist_pending(&state, &session);
         drop(mutation_guard);
         flush_task.await.unwrap().unwrap();
 
-        assert_eq!(current_persist_generation(session_id), Some(new_generation));
-        assert!(pending_session_context(session_id).is_some());
-        assert!(session_has_pending_persist(session_id));
-        assert!(take_persist_dirty_if_generation(session_id, new_generation));
-        clear_trailing_persist(session_id);
-        assert!(forget_persist_context_if_generation(
-            session_id,
-            new_generation
-        ));
+        assert_eq!(current_persist_generation(session_id), None);
         assert!(pending_session_context(session_id).is_none());
+        assert!(!session_has_pending_persist(session_id));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
