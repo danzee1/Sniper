@@ -246,7 +246,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/replay/ws-snapshot/:id", get(ws_replay_snapshot))
         .route("/api/replay/ws-frames/:id", get(ws_replay_frames))
         .route("/api/events", get(events))
-        .fallback(get(index))
+        .fallback(get(spa_or_api_not_found))
         .layer(middleware::from_fn(local_api_write_guard))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)) // 64 MB
         .with_state(state)
@@ -274,6 +274,13 @@ async fn local_api_write_guard(request: Request, next: Next) -> Response {
         }
     }
     next.run(request).await
+}
+
+async fn spa_or_api_not_found(request: Request) -> Response {
+    if request.uri().path().starts_with("/api/") {
+        return (StatusCode::NOT_FOUND, "API endpoint not found").into_response();
+    }
+    index().await.into_response()
 }
 
 fn request_host_is_allowed_local_api(headers: &HeaderMap, uri: &Uri) -> bool {
@@ -584,7 +591,9 @@ fn validate_since(input: &str) -> Option<()> {
         .map(|_| ())
 }
 
-fn validate_editable_request(request: &EditableRequest) -> std::result::Result<(), String> {
+pub(crate) fn validate_editable_request(
+    request: &EditableRequest,
+) -> std::result::Result<(), String> {
     validate_http_scheme_field(&request.scheme, "request scheme")?;
     validate_editable_request_host(&request.host)?;
     validate_editable_request_path(&request.path)?;
@@ -1547,12 +1556,18 @@ fn validate_sequence_definition(
             }
             match rule.source {
                 crate::sequence::ExtractionSource::ResponseBody => {
-                    RegexBuilder::new(&rule.pattern).build().map_err(|error| {
+                    let regex = RegexBuilder::new(&rule.pattern).build().map_err(|error| {
                         format!(
                             "sequence step {} extraction {} has invalid regex: {error}",
                             step.label, rule.variable_name
                         )
                     })?;
+                    if rule.group >= regex.captures_len() {
+                        return Err(format!(
+                            "sequence step {} extraction {} references missing capture group {}",
+                            step.label, rule.variable_name, rule.group
+                        ));
+                    }
                 }
                 crate::sequence::ExtractionSource::ResponseHeader => {
                     let header_name = rule.pattern.trim();
@@ -4588,7 +4603,7 @@ mod tests {
 
     use axum::{
         extract::{Path, Query, State},
-        http::{HeaderMap, HeaderValue, StatusCode, Uri},
+        http::{HeaderMap, HeaderValue, Request, StatusCode, Uri},
         Json,
     };
     use chrono::Utc;
@@ -4720,6 +4735,18 @@ mod tests {
         let uri = Uri::from_static("/api/runtime");
 
         assert!(!super::request_host_is_allowed_local_api(&headers, &uri));
+    }
+
+    #[tokio::test]
+    async fn api_fallback_returns_not_found_for_unknown_api_paths() {
+        let request = Request::builder()
+            .uri("/api/not-real")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = super::spa_or_api_not_found(request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -5347,6 +5374,44 @@ mod tests {
             }],
         };
         assert!(super::validate_sequence_definition(&definition).is_err());
+    }
+
+    #[test]
+    fn sequence_validation_rejects_missing_response_body_capture_group() {
+        let request = crate::model::EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            steps: vec![SequenceStep {
+                id: uuid::Uuid::new_v4(),
+                label: "extract".to_string(),
+                request,
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+                request_text: None,
+                request_parse_error: None,
+                extractions: vec![ExtractionRule {
+                    variable_name: "token".to_string(),
+                    source: ExtractionSource::ResponseBody,
+                    pattern: "csrf=[a-z]+".to_string(),
+                    group: 1,
+                }],
+            }],
+        };
+
+        assert!(super::validate_sequence_definition(&definition)
+            .unwrap_err()
+            .contains("missing capture group 1"));
     }
 
     #[test]

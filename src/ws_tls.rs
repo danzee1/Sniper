@@ -2,6 +2,7 @@ use std::{fmt, sync::Arc};
 
 use rustls23::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
     DigitallySignedStruct, Error as RustlsError, SignatureScheme,
 };
@@ -11,15 +12,18 @@ pub fn insecure_connector(accept_invalid: bool) -> Option<Connector> {
     if !accept_invalid {
         return None;
     }
+    let provider = Arc::new(rustls23::crypto::ring::default_provider());
 
     let config = rustls23::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptInvalidServerCerts))
+        .with_custom_certificate_verifier(Arc::new(AcceptInvalidServerCerts { provider }))
         .with_no_client_auth();
     Some(Connector::Rustls(Arc::new(config)))
 }
 
-struct AcceptInvalidServerCerts;
+struct AcceptInvalidServerCerts {
+    provider: Arc<CryptoProvider>,
+}
 
 impl fmt::Debug for AcceptInvalidServerCerts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -41,33 +45,35 @@ impl ServerCertVerifier for AcceptInvalidServerCerts {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls23::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls23::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA256,
-        ]
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

@@ -312,7 +312,10 @@ impl SessionContext {
     pub async fn replace_workspace_snapshot_checked_and_persist(
         &self,
         snapshot: WorkspaceStateSnapshot,
-    ) -> std::result::Result<WorkspaceStateSnapshot, WorkspaceReplaceError<anyhow::Error>> {
+    ) -> std::result::Result<
+        (WorkspaceStateSnapshot, Option<SessionMetadata>),
+        WorkspaceReplaceError<anyhow::Error>,
+    > {
         let _mutation_guard = self.mutation_lock.lock().await;
         let _persist_guard = self.persist_lock.lock().await;
         self.workspace
@@ -320,13 +323,20 @@ impl SessionContext {
                 self.persist_workspace_snapshot_locked(workspace).await
             })
             .await
-            .map(|(snapshot, ())| snapshot)
     }
 
     async fn persist_workspace_snapshot_locked(
         &self,
         workspace: WorkspaceStateSnapshot,
-    ) -> Result<()> {
+    ) -> Result<Option<SessionMetadata>> {
+        self.persist_workspace_snapshot_locked_inner(workspace)
+            .await
+    }
+
+    async fn persist_workspace_snapshot_locked_inner(
+        &self,
+        workspace: WorkspaceStateSnapshot,
+    ) -> Result<Option<SessionMetadata>> {
         validate_workspace_serialized_size(&workspace)
             .map_err(anyhow::Error::msg)
             .with_context(|| "workspace snapshot is too large to persist")?;
@@ -341,9 +351,10 @@ impl SessionContext {
                         path = %path.display(),
                         "falling back to full session persist after workspace snapshot decode failed"
                     );
-                    self.persist_with_workspace_snapshot_locked(workspace)
+                    let metadata = self
+                        .persist_with_workspace_snapshot_locked(workspace)
                         .await?;
-                    return Ok(());
+                    return Ok(Some(metadata));
                 }
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -352,9 +363,10 @@ impl SessionContext {
                     path = %path.display(),
                     "falling back to full session persist because workspace snapshot is missing"
                 );
-                self.persist_with_workspace_snapshot_locked(workspace)
+                let metadata = self
+                    .persist_with_workspace_snapshot_locked(workspace)
                     .await?;
-                return Ok(());
+                return Ok(Some(metadata));
             }
             Err(error) if path.exists() => {
                 warn!(
@@ -364,9 +376,10 @@ impl SessionContext {
                     "falling back to full session persist after workspace snapshot became unreadable"
                 );
                 move_corrupt_session_file_aside(&self.storage_dir, &path, "snapshot");
-                self.persist_with_workspace_snapshot_locked(workspace)
+                let metadata = self
+                    .persist_with_workspace_snapshot_locked(workspace)
                     .await?;
-                return Ok(());
+                return Ok(Some(metadata));
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -379,7 +392,7 @@ impl SessionContext {
         snapshot.replayed_transaction_journal = false;
         snapshot.replayed_transaction_ids.clear();
         write_json(&path, &snapshot)?;
-        Ok(())
+        Ok(None)
     }
 
     async fn persist_with_workspace_snapshot_locked(
@@ -2099,11 +2112,12 @@ mod tests {
             ..ReplayWorkspaceState::default()
         };
 
-        let committed = active
+        let (committed, fallback_metadata) = active
             .replace_workspace_snapshot_checked_and_persist(workspace)
             .await
             .unwrap();
 
+        assert!(fallback_metadata.is_none());
         assert_eq!(
             committed.replay.active_tab_id.as_deref(),
             Some("workspace-only-tab")
@@ -2147,11 +2161,12 @@ mod tests {
             ..ReplayWorkspaceState::default()
         };
 
-        let committed = active
+        let (committed, fallback_metadata) = active
             .replace_workspace_snapshot_checked_and_persist(workspace)
             .await
             .unwrap();
 
+        assert!(fallback_metadata.is_some());
         assert_eq!(
             committed.replay.active_tab_id.as_deref(),
             Some("recovered-workspace-tab")

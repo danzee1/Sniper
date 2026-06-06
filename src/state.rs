@@ -339,7 +339,7 @@ impl AppState {
                 session.id()
             )));
         }
-        let snapshot = session
+        let (snapshot, fallback_metadata) = session
             .replace_workspace_snapshot_checked_and_persist(snapshot)
             .await
             .map_err(|error| match error {
@@ -350,6 +350,12 @@ impl AppState {
                     crate::workspace::WorkspaceReplaceError::Persist(error.to_string())
                 }
             })?;
+        if let Some(metadata) = fallback_metadata {
+            self.finalize_session_persist(session, metadata)
+                .map_err(|error| {
+                    crate::workspace::WorkspaceReplaceError::Persist(error.to_string())
+                })?;
+        }
         Ok(snapshot)
     }
 
@@ -1586,6 +1592,8 @@ mod tests {
         PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
+    use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
+    use crate::workspace::{ReplayTabState, ReplayWorkspaceState};
     use std::fs;
     use std::path::Path;
 
@@ -1957,6 +1965,80 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.last_opened_at, touched_last_opened_at);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_snapshot_fallback_updates_registry_metadata() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-workspace-fallback-registry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let session = state.session().await;
+        session
+            .store
+            .insert(TransactionRecord::http(
+                chrono::Utc::now(),
+                "GET".to_string(),
+                "https".to_string(),
+                "registry.example".to_string(),
+                "/fallback".to_string(),
+                Some(200),
+                1,
+                MessageRecord {
+                    headers: Vec::new(),
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                None,
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+        let snapshot_path = session.storage_dir().join("snapshot.json");
+        std::fs::remove_file(&snapshot_path).unwrap();
+
+        let mut workspace = session.workspace.snapshot().await;
+        workspace.replay = ReplayWorkspaceState {
+            active_tab_id: Some("fallback-tab".to_string()),
+            tabs: vec![ReplayTabState {
+                id: "fallback-tab".to_string(),
+                sequence: 1,
+                ..ReplayTabState::default()
+            }],
+            ..ReplayWorkspaceState::default()
+        };
+
+        let committed = state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            committed.replay.active_tab_id.as_deref(),
+            Some("fallback-tab")
+        );
+        let summary = state
+            .list_sessions()
+            .into_iter()
+            .find(|summary| summary.id == session.id())
+            .unwrap();
+        assert_eq!(summary.request_count, 1);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -593,6 +593,7 @@ fn build_replay_exchange_request(
     request: &EditableRequest,
     target: Option<&RequestTargetOverride>,
 ) -> Result<EditableRequest> {
+    validate_replay_header_records(&request.headers)?;
     let Some(target) = target else {
         return Ok(request.clone());
     };
@@ -627,6 +628,16 @@ fn build_replay_exchange_request(
             .or(request_authority.port),
     )?;
     Ok(rewritten)
+}
+
+fn validate_replay_header_records(headers: &[HeaderRecord]) -> Result<()> {
+    for header in headers {
+        HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| anyhow!("invalid request header name: {}", header.name))?;
+        HeaderValue::from_str(&header.value)
+            .map_err(|_| anyhow!("invalid request header value for {}", header.name))?;
+    }
+    Ok(())
 }
 
 fn build_replay_outbound_uri_authority(
@@ -3309,10 +3320,7 @@ fn websocket_upgrade_validation_error(
         return Some("WebSocket upgrade requests must not include a request body");
     }
 
-    let key = match headers
-        .get(SEC_WEBSOCKET_KEY)
-        .and_then(|value| value.to_str().ok())
-    {
+    let key = match single_header_value(headers, SEC_WEBSOCKET_KEY) {
         Some(key) => key,
         None => return Some("missing or invalid Sec-WebSocket-Key"),
     };
@@ -3324,15 +3332,21 @@ fn websocket_upgrade_validation_error(
         return Some("invalid Sec-WebSocket-Key");
     }
 
-    let version = headers
-        .get(SEC_WEBSOCKET_VERSION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim);
+    let version = single_header_value(headers, SEC_WEBSOCKET_VERSION).map(str::trim);
     if version != Some("13") {
         return Some("unsupported Sec-WebSocket-Version");
     }
 
     None
+}
+
+fn single_header_value(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 fn websocket_upgrade_validation_error_for_editable(
@@ -3489,12 +3503,33 @@ fn websocket_response_validation_error(
         None => return Some("missing request Sec-WebSocket-Key"),
     };
     let expected_accept = derive_accept_key(request_key.as_bytes());
-    let response_accept = response_headers
-        .get(SEC_WEBSOCKET_ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim);
+    let response_accept =
+        single_header_value(response_headers, SEC_WEBSOCKET_ACCEPT).map(str::trim);
     if response_accept != Some(expected_accept.as_str()) {
         return Some("invalid Sec-WebSocket-Accept");
+    }
+    if response_headers.contains_key(SEC_WEBSOCKET_EXTENSIONS) {
+        return Some("WebSocket extensions must not be negotiated by match/replace");
+    }
+    if response_headers.contains_key(SEC_WEBSOCKET_PROTOCOL) {
+        let Some(protocol) =
+            single_header_value(response_headers, SEC_WEBSOCKET_PROTOCOL).map(str::trim)
+        else {
+            return Some("invalid Sec-WebSocket-Protocol");
+        };
+        if protocol.is_empty() {
+            return Some("invalid Sec-WebSocket-Protocol");
+        }
+        let offered = request_headers
+            .get_all(SEC_WEBSOCKET_PROTOCOL)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .any(|offered| !offered.is_empty() && offered == protocol);
+        if !offered {
+            return Some("Sec-WebSocket-Protocol was not offered by the client");
+        }
     }
 
     None
@@ -5279,6 +5314,39 @@ mod tests {
     }
 
     #[test]
+    fn websocket_upgrade_validation_rejects_duplicate_key_or_version() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.append(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.append(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
+        );
+        headers.insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+
+        assert_eq!(
+            websocket_upgrade_validation_error(&Method::GET, &headers),
+            Some("missing or invalid Sec-WebSocket-Key")
+        );
+
+        headers.remove(SEC_WEBSOCKET_KEY);
+        headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.append(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+
+        assert_eq!(
+            websocket_upgrade_validation_error(&Method::GET, &headers),
+            Some("unsupported Sec-WebSocket-Version")
+        );
+    }
+
+    #[test]
     fn websocket_upgrade_validation_rejects_body_framing_before_collecting_body() {
         let mut headers = HeaderMap::new();
         headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
@@ -5420,6 +5488,18 @@ mod tests {
         assert_eq!(frame.body_preview.len(), WEBSOCKET_CAPTURE_PREVIEW_BYTES);
         assert_eq!(frame.body_size, WEBSOCKET_CAPTURE_PREVIEW_BYTES + 1);
         assert!(frame.preview_truncated);
+    }
+
+    #[test]
+    fn replay_exchange_rejects_invalid_header_records() {
+        let mut request = editable_request("origin.example:443");
+        request.headers.push(record("X-Token", "abc\ndef"));
+
+        let error = build_replay_exchange_request(&request, None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("invalid request header value for X-Token"));
     }
 
     #[test]
@@ -5700,6 +5780,62 @@ mod tests {
         assert_eq!(
             websocket_response_validation_error(&request_headers, &response_headers),
             Some("invalid Sec-WebSocket-Accept")
+        );
+    }
+
+    #[test]
+    fn websocket_response_validation_rejects_extensions_added_after_sanitization() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        let mut response_headers =
+            build_websocket_client_response_headers(&request_headers, HeaderMap::new()).unwrap();
+        response_headers.insert(
+            SEC_WEBSOCKET_EXTENSIONS,
+            HeaderValue::from_static("permessage-deflate"),
+        );
+
+        assert_eq!(
+            websocket_response_validation_error(&request_headers, &response_headers),
+            Some("WebSocket extensions must not be negotiated by match/replace")
+        );
+    }
+
+    #[test]
+    fn websocket_response_validation_rejects_unoffered_protocol() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        request_headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("chat, superchat"),
+        );
+        let mut response_headers =
+            build_websocket_client_response_headers(&request_headers, HeaderMap::new()).unwrap();
+        response_headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("other"));
+
+        assert_eq!(
+            websocket_response_validation_error(&request_headers, &response_headers),
+            Some("Sec-WebSocket-Protocol was not offered by the client")
+        );
+
+        response_headers.append(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat"));
+        assert_eq!(
+            websocket_response_validation_error(&request_headers, &response_headers),
+            Some("invalid Sec-WebSocket-Protocol")
+        );
+        response_headers.remove(SEC_WEBSOCKET_PROTOCOL);
+        response_headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("superchat"),
+        );
+        assert_eq!(
+            websocket_response_validation_error(&request_headers, &response_headers),
+            None
         );
     }
 

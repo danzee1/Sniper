@@ -950,6 +950,7 @@ function resetLayoutTextareas() {
 
 function bindEvents() {
   window.addEventListener("resize", resetLayoutTextareas);
+  document.addEventListener("visibilitychange", flushWorkspaceStateBeforeHidden);
   window.addEventListener("pagehide", flushWorkspaceStateOnUnload);
   window.addEventListener("beforeunload", flushWorkspaceStateOnUnload);
   window.addEventListener("pagehide", flushUiSettingsOnUnload);
@@ -2962,6 +2963,15 @@ async function flushWorkspaceState() {
   if (workspaceSaveConflictPending) {
     throw new WorkspaceStateConflictError(null);
   }
+}
+
+function flushWorkspaceStateBeforeHidden() {
+  if (document.visibilityState !== "hidden") return;
+  if (!hasPendingWorkspaceStateSave()) return;
+  flushWorkspaceState().catch((error) => {
+    if (error instanceof WorkspaceStateConflictError) return;
+    console.warn("Failed to flush workspace state before page hide:", error);
+  });
 }
 
 function flushWorkspaceStateOnUnload() {
@@ -15641,21 +15651,12 @@ function applyWsMessageJsonHighlight() {
   // Only apply JSON highlighting if it looks like JSON
   const trimmed = text.trim();
   if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
-    // Save cursor position
-    const sel = window.getSelection();
-    let cursorOffset = 0;
-    if (sel.rangeCount > 0 && els.wsMessageHighlight.contains(sel.anchorNode)) {
-      const range = document.createRange();
-      range.selectNodeContents(els.wsMessageHighlight);
-      range.setEnd(sel.anchorNode, sel.anchorOffset);
-      cursorOffset = range.toString().length;
-    }
+    const savedCaret = saveContentEditableCaret(els.wsMessageHighlight);
 
     els.wsMessageHighlight.innerHTML = highlightJson(text);
 
-    // Restore cursor position
-    if (document.activeElement === els.wsMessageHighlight && cursorOffset > 0) {
-      restoreCursorPosition(els.wsMessageHighlight, cursorOffset);
+    if (document.activeElement === els.wsMessageHighlight) {
+      restoreContentEditableCaret(els.wsMessageHighlight, savedCaret);
     }
   }
 }
@@ -15684,22 +15685,20 @@ function highlightJson(text) {
   return html;
 }
 
-function restoreCursorPosition(element, offset) {
-  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null);
-  let remaining = offset;
-  let node;
-  while ((node = walker.nextNode())) {
-    if (remaining <= node.textContent.length) {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.setStart(node, remaining);
-      range.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      return;
+let wsMessageHighlightTimer = null;
+let wsMessageHighlightPendingText = null;
+let wsMessageHighlightComposing = false;
+
+function scheduleWsMessageJsonHighlight(text) {
+  if (wsMessageHighlightComposing) return;
+  wsMessageHighlightPendingText = text;
+  if (wsMessageHighlightTimer) return;
+  wsMessageHighlightTimer = window.setTimeout(() => {
+    wsMessageHighlightTimer = null;
+    if (els.wsMessageHighlight && els.wsMessageHighlight.innerText === wsMessageHighlightPendingText) {
+      applyWsMessageJsonHighlight();
     }
-    remaining -= node.textContent.length;
-  }
+  }, 120);
 }
 
 function renderHeaderList(headers) {
@@ -17217,6 +17216,13 @@ function bindWsReplayEvents() {
     }
   });
   // WS Message highlight editor: input → sync to hidden textarea + JSON highlight
+  els.wsMessageHighlight.addEventListener("compositionstart", () => {
+    wsMessageHighlightComposing = true;
+  });
+  els.wsMessageHighlight.addEventListener("compositionend", () => {
+    wsMessageHighlightComposing = false;
+    scheduleWsMessageJsonHighlight(els.wsMessageHighlight.innerText || "");
+  });
   els.wsMessageHighlight.addEventListener("input", () => {
     const plainText = els.wsMessageHighlight.innerText || "";
     els.wsMessageEditor.value = plainText;
@@ -17226,7 +17232,7 @@ function bindWsReplayEvents() {
       tab.wsEditorBodyEncoded = false;
       scheduleWorkspaceStateSave();
     }
-    applyWsMessageJsonHighlight();
+    scheduleWsMessageJsonHighlight(plainText);
   });
 
   // Cmd+Enter to send in WS editor

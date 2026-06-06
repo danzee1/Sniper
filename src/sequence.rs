@@ -405,6 +405,23 @@ pub async fn run_sequence(
 
     for step in &definition.steps {
         let request = apply_variables_to_request(&step.request, &variables);
+        if let Err(error) = crate::api::validate_editable_request(&request) {
+            let message = format!(
+                "Sequence step {} produced an invalid request after variable substitution: {error}",
+                step.label
+            );
+            step_results.push(StepResult {
+                step_id: step.id,
+                label: step.label.clone(),
+                transaction_id: None,
+                status: None,
+                duration_ms: None,
+                extracted: HashMap::new(),
+                error: Some(message),
+            });
+            failed = true;
+            break;
+        }
 
         match proxy::try_send_replay_request_for_session(
             state.clone(),
@@ -794,6 +811,107 @@ mod tests {
 
         let error = extract_from_response(&rules, "", &[], false).unwrap_err();
         assert!(error.to_string().contains("could not find response header"));
+    }
+
+    #[tokio::test]
+    async fn variable_substitution_revalidates_request_before_replay() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_handle = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let body = b"token=abc\ndef";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 4096,
+            data_dir: std::env::temp_dir().join(format!(
+                "sniper-sequence-invalid-variable-{}",
+                Uuid::new_v4()
+            )),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let definition = SequenceDefinition {
+            id: Uuid::new_v4(),
+            name: "Invalid variable".to_string(),
+            steps: vec![
+                SequenceStep {
+                    id: Uuid::new_v4(),
+                    label: "extract".to_string(),
+                    request: EditableRequest {
+                        scheme: "http".to_string(),
+                        host: upstream_addr.to_string(),
+                        method: "GET".to_string(),
+                        path: "/".to_string(),
+                        headers: Vec::new(),
+                        body: String::new(),
+                        body_encoding: BodyEncoding::Utf8,
+                        preview_truncated: false,
+                    },
+                    source_transaction_id: None,
+                    http_version: None,
+                    target: None,
+                    request_text: None,
+                    request_parse_error: None,
+                    extractions: vec![ExtractionRule {
+                        variable_name: "token".to_string(),
+                        source: ExtractionSource::ResponseBody,
+                        pattern: "(?s)token=(.+)".to_string(),
+                        group: 1,
+                    }],
+                },
+                SequenceStep {
+                    id: Uuid::new_v4(),
+                    label: "revalidated".to_string(),
+                    request: EditableRequest {
+                        scheme: "http".to_string(),
+                        host: upstream_addr.to_string(),
+                        method: "GET".to_string(),
+                        path: "/".to_string(),
+                        headers: vec![HeaderRecord {
+                            name: "X-Token".to_string(),
+                            value: "{{token}}".to_string(),
+                        }],
+                        body: String::new(),
+                        body_encoding: BodyEncoding::Utf8,
+                        preview_truncated: false,
+                    },
+                    source_transaction_id: None,
+                    http_version: None,
+                    target: None,
+                    request_text: None,
+                    request_parse_error: None,
+                    extractions: Vec::new(),
+                },
+            ],
+        };
+
+        let run = run_sequence(state, session.clone(), definition)
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, SequenceRunStatus::Failed);
+        assert_eq!(run.step_results.len(), 2);
+        assert!(run.step_results[1]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invalid request after variable substitution"));
+        assert_eq!(session.store.snapshot(Some(10)).await.len(), 1);
+
+        upstream_handle.await.unwrap();
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
