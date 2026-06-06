@@ -326,6 +326,7 @@ function createWebsocketPagingState() {
   return {
     total: 0,
     limit: WEBSOCKET_PAGE_SIZE,
+    loadedOffset: 0,
     offset: 0,
     hasMore: false,
     loading: false,
@@ -3905,7 +3906,9 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
   const summaryMutationGeneration = _websocketSummaryMutationGeneration;
   const sessionId = currentSessionId();
   const append = Boolean(options.append);
-  const requestedOffset = append ? Math.max(0, Number(options.offset ?? state.websocketSessions.length) || 0) : 0;
+  const requestedOffset = append
+    ? Math.max(0, Number(options.offset ?? state.websocketPaging?.loadedOffset ?? state.websocketPaging?.limit ?? 0) || 0)
+    : 0;
   const requestedLimit = append
     ? WEBSOCKET_PAGE_SIZE
     : normalizeWebsocketLoadLimit(options.limit ?? state.websocketPaging?.limit);
@@ -3922,19 +3925,23 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     if (generation !== _websocketLoadGeneration || sessionId !== currentSessionId()) {
       return;
     }
-    state.websocketSessions = append
-      ? mergeWebsocketAppendPage(page.items, state.websocketSessions, summaryMutationGeneration)
-      : (summaryMutationGeneration === _websocketSummaryMutationGeneration
-        ? page.items
-        : mergeWebsocketPageWithCurrentSummaries(page.items, state.websocketSessions, summaryMutationGeneration));
-    const loadedLimit = Math.max(
-      state.websocketSessions.length,
-      Number(page.offset || requestedOffset) + jsonArray(page.items).length,
+    const pageItems = jsonArray(page.items);
+    const pageOffset = Math.max(0, Number(page.offset ?? requestedOffset) || 0);
+    const loadedOffset = Math.max(
+      append ? Number(state.websocketPaging?.loadedOffset ?? 0) || 0 : 0,
+      pageOffset + pageItems.length,
     );
+    state.websocketSessions = append
+      ? mergeWebsocketAppendPage(pageItems, state.websocketSessions, summaryMutationGeneration)
+      : (summaryMutationGeneration === _websocketSummaryMutationGeneration
+        ? pageItems
+        : mergeWebsocketPageWithCurrentSummaries(pageItems, state.websocketSessions, summaryMutationGeneration));
+    const loadedLimit = Math.min(WEBSOCKET_MAX_LOADED_SESSIONS, loadedOffset);
     state.websocketPaging = {
       total: Math.max(Number(page.total || 0), state.websocketSessions.length),
       limit: loadedLimit,
-      offset: Math.max(0, Number(page.offset || requestedOffset) || 0),
+      loadedOffset: loadedLimit,
+      offset: pageOffset,
       hasMore: Boolean(page.has_more) && loadedLimit < WEBSOCKET_MAX_LOADED_SESSIONS,
       loading: false,
     };
@@ -3956,7 +3963,7 @@ async function loadMoreWebsockets() {
   if (paging.loading || !paging.hasMore) {
     return;
   }
-  const nextOffset = Math.max(0, state.websocketSessions.length);
+  const nextOffset = Math.max(0, Number(paging.loadedOffset ?? paging.limit ?? state.websocketSessions.length) || 0);
   if (nextOffset >= WEBSOCKET_MAX_LOADED_SESSIONS) {
     state.websocketPaging = { ...paging, hasMore: false };
     renderWebsocketSessions();
@@ -4253,6 +4260,8 @@ function applyWebsocketSummaryEvent(event) {
       state.websocketPaging = {
         ...paging,
         total: Math.max(Number(paging.total || 0), sessions.length),
+        limit: Number(paging.limit ?? paging.loadedOffset ?? 0) || 0,
+        loadedOffset: Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
         loading: false,
       };
       return;
@@ -4266,6 +4275,8 @@ function applyWebsocketSummaryEvent(event) {
     state.websocketPaging = {
       ...paging,
       total: Math.max(knownTotal + 1, nextSessions.length),
+      limit: Number(paging.limit ?? paging.loadedOffset ?? 0) || 0,
+      loadedOffset: Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
       hasMore: hasMore || nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS,
       loading: false,
     };
@@ -12308,6 +12319,40 @@ function authorityToTargetState(authority, scheme = "https") {
   }
 }
 
+function explicitAuthorityPort(authority) {
+  const normalized = String(authority || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(normalized)) {
+    try {
+      const parsed = new URL(normalized);
+      const authorityStart = normalized.toLowerCase().indexOf(`${parsed.protocol}//`);
+      const authorityText = authorityStart >= 0
+        ? normalized.slice(authorityStart + parsed.protocol.length + 2).split(/[/?#]/, 1)[0]
+        : parsed.host;
+      return explicitAuthorityPort(authorityText) || parsed.port || "";
+    } catch (_error) {
+      return "";
+    }
+  }
+  if (normalized.startsWith("[")) {
+    const closingBracket = normalized.indexOf("]");
+    if (closingBracket >= 0 && normalized[closingBracket + 1] === ":") {
+      return normalized.slice(closingBracket + 2);
+    }
+    return "";
+  }
+  const colonIndex = normalized.lastIndexOf(":");
+  if (colonIndex <= 0) {
+    return "";
+  }
+  if (normalized.slice(0, colonIndex).includes(":")) {
+    return "";
+  }
+  return normalized.slice(colonIndex + 1);
+}
+
 function joinAuthority(host, port) {
   const normalizedHost = String(host || "").trim();
   const normalizedPort = normalizePortValue(port);
@@ -12412,7 +12457,7 @@ function validateManualRepeaterTargetInput(host, port) {
 
 function validateWsReplayTargetInput(scheme, host, port, path) {
   const normalizedScheme = String(scheme || "").toLowerCase();
-  const base = validateManualRepeaterTargetInput(host, port);
+  const base = { hostError: "", portError: "" };
   let schemeError = "";
   let pathError = "";
   if (!["ws", "wss"].includes(normalizedScheme)) {
@@ -12423,9 +12468,28 @@ function validateWsReplayTargetInput(scheme, host, port, path) {
     base.hostError = "WebSocket host is required.";
   } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawHost)) {
     base.hostError = "WebSocket host must not include URL components.";
+  } else if (/\s/.test(rawHost) || rawHost.includes("\\") || rawHost.includes("@")) {
+    base.hostError = "WebSocket host must not include whitespace, user info, or URL components.";
+  } else if (/[/?#]/.test(rawHost)) {
+    base.hostError = "WebSocket host must not include path, query, or fragment.";
+  } else if (rawHost.includes(":") && !isLikelyIpv6Literal(rawHost)) {
+    const authorityPort = explicitAuthorityPort(rawHost)
+      || authorityToTargetState(rawHost, normalizedScheme || "wss").port;
+    if (!normalizePortValue(authorityPort)) {
+      base.hostError = "WebSocket host port must be a number from 1 to 65535.";
+    }
   }
   const rawPort = String(port ?? "").trim();
-  if (!rawPort) {
+  const authorityPort = rawHost && !base.hostError
+    ? normalizePortValue(
+      explicitAuthorityPort(rawHost) || authorityToTargetState(rawHost, normalizedScheme || "wss").port,
+    )
+    : "";
+  if (rawPort && (!/^\d+$/.test(rawPort) || !normalizePortValue(rawPort))) {
+    base.portError = "WebSocket port must be a number from 1 to 65535.";
+  } else if (rawPort && authorityPort && normalizePortValue(rawPort) !== authorityPort) {
+    base.portError = `Port conflicts with WebSocket host port ${authorityPort}.`;
+  } else if (!rawPort && !authorityPort) {
     base.portError = "WebSocket port is required.";
   }
   const rawPath = String(path || "").trim();
@@ -12440,6 +12504,19 @@ function validateWsReplayTargetInput(scheme, host, port, path) {
     hostError: base.hostError,
     portError: base.portError,
     pathError,
+  };
+}
+
+function normalizeWsReplayTargetFields(scheme, host, port) {
+  const normalizedScheme = String(scheme || "wss").trim().toLowerCase();
+  const rawHost = String(host || "").trim();
+  const target = authorityToTargetState(rawHost, normalizedScheme);
+  const authorityPort = normalizePortValue(explicitAuthorityPort(rawHost) || target.port);
+  const inputPort = normalizePortValue(port);
+  return {
+    scheme: normalizedScheme,
+    host: stripIpv6Brackets(String(target.host || rawHost).trim()),
+    port: authorityPort || inputPort || String(defaultWsPortForScheme(normalizedScheme)),
   };
 }
 
@@ -15982,11 +16059,15 @@ async function wsConnect() {
     els.wsPathInput.reportValidity();
     return;
   }
-  const wsPort = normalizePortValue(wsPortText);
-  tab.wsScheme = wsScheme;
-  tab.wsHost = wsHost;
+  const normalizedTarget = normalizeWsReplayTargetFields(wsScheme, wsHost, wsPortText);
+  const wsPort = normalizePortValue(normalizedTarget.port);
+  tab.wsScheme = normalizedTarget.scheme;
+  tab.wsHost = normalizedTarget.host;
   tab.wsPort = wsPort;
   tab.wsPath = wsPath;
+  els.wsSchemeSelect.value = tab.wsScheme;
+  els.wsHostInput.value = tab.wsHost;
+  els.wsPortInput.value = tab.wsPort;
 
   tab.wsStatus = "connecting";
   tab.wsError = null;
@@ -16009,8 +16090,8 @@ async function wsConnect() {
       body: JSON.stringify({
         session_id: sessionId,
         id: tab.id,
-        scheme: wsScheme,
-        host: wsHost,
+        scheme: tab.wsScheme,
+        host: tab.wsHost,
         port: Number(wsPort),
         path: wsPath,
         headers,

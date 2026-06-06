@@ -1432,7 +1432,14 @@ fn summary_matches_scope(host: &str, patterns: &[String]) -> bool {
 }
 
 fn normalize_host_for_matching(host: &str) -> String {
-    host_without_port(host).to_ascii_lowercase()
+    let mut value = host.trim().to_ascii_lowercase();
+    if let Some((_, rest)) = value.split_once("://") {
+        value = rest.to_string();
+    } else if let Some(rest) = value.strip_prefix("//") {
+        value = rest.to_string();
+    }
+    let host = value.split(['/', '?', '#']).next().unwrap_or("").trim();
+    host_without_port(host).to_string()
 }
 
 fn host_without_port(host: &str) -> &str {
@@ -2810,5 +2817,48 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].host, "[::1]:9443");
+    }
+
+    #[tokio::test]
+    async fn scope_filters_match_url_shaped_patterns() {
+        let store = TransactionStore::new();
+        let empty_message = MessageRecord {
+            headers: Vec::new(),
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+
+        store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "api.example.test:9443".into(),
+                "/kept".into(),
+                Some(200),
+                1,
+                empty_message,
+                None,
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+
+        let filtered = store
+            .list(&ListFilters {
+                in_scope_only: true,
+                scope_patterns: vec!["https://*.example.test:9443/scope".into()],
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].host, "api.example.test:9443");
     }
 }

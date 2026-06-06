@@ -278,9 +278,23 @@ impl Default for RuntimeSettings {
 fn normalize_scope_patterns(patterns: Vec<String>) -> Vec<String> {
     patterns
         .into_iter()
-        .map(|pattern| pattern.trim().to_ascii_lowercase())
-        .filter(|pattern| !pattern.is_empty())
+        .filter_map(|pattern| normalize_scope_pattern(&pattern))
         .collect()
+}
+
+fn normalize_scope_pattern(pattern: &str) -> Option<String> {
+    let mut value = pattern.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some((_, rest)) = value.split_once("://") {
+        value = rest.to_string();
+    } else if let Some(rest) = value.strip_prefix("//") {
+        value = rest.to_string();
+    }
+    let host = value.split(['/', '?', '#']).next().unwrap_or("").trim();
+    let host = host_without_port(host).to_string();
+    (!host.is_empty()).then_some(host)
 }
 
 fn normalize_bounded_scope_patterns(label: &str, patterns: Vec<String>) -> Result<Vec<String>> {
@@ -422,6 +436,33 @@ mod tests {
             snapshot.oast_polling_interval_secs,
             super::default_oast_interval()
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_normalizes_scope_url_patterns_to_hosts() {
+        let settings = RuntimeSettings::new();
+        let snapshot = settings
+            .update(RuntimeSettingsUpdate {
+                scope_patterns: Some(vec![
+                    " HTTPS://Example.COM:443/api?x=1#frag ".to_string(),
+                    "example.org/path".to_string(),
+                    "wss://*.Example.NET/socket".to_string(),
+                    "/path-only".to_string(),
+                ]),
+                passthrough_hosts: Some(vec!["https://PassThrough.TEST/tunnel".to_string()]),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.scope_patterns,
+            vec!["example.com", "example.org", "*.example.net"]
+        );
+        assert_eq!(snapshot.passthrough_hosts, vec!["passthrough.test"]);
+        assert!(settings.is_in_scope("api.example.net").await);
+        assert!(settings.is_in_scope("example.org:9443").await);
+        assert!(settings.is_passthrough("passthrough.test:443").await);
     }
 
     #[tokio::test]

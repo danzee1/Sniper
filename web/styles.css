@@ -5252,7 +5252,8 @@ button.utility-button.replay-tab-add {
   .display-settings-grid,
   .fuzzer-top-row {
     flex-direction: column;
-    height: auto;
+    height: auto !important;
+    min-height: 0;
   }
   .fuzzer-col-resizer {
     display: none;

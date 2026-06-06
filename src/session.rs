@@ -1440,11 +1440,11 @@ fn replay_transaction_journal_file(
 
     let mut reader = BufReader::new(file);
     let mut inserted_order = Vec::new();
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut line_number = 0usize;
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line).with_context(|| {
+        let bytes = reader.read_until(b'\n', &mut line).with_context(|| {
             format!(
                 "failed to read transaction journal {}",
                 journal_path.display()
@@ -1454,22 +1454,21 @@ fn replay_transaction_journal_file(
             break;
         }
         line_number += 1;
-        let line_has_newline = line.ends_with('\n');
-        let trimmed = line.trim();
+        let line_has_newline = line.ends_with(b"\n");
+        let trimmed = trim_ascii_whitespace(&line);
         if trimmed.is_empty() {
             continue;
         }
-        let entry: TransactionJournalEntry = match serde_json::from_str(trimmed) {
+        if !line_has_newline {
+            warn!(
+                path = %journal_path.display(),
+                line = line_number,
+                "ignoring trailing partial transaction journal line"
+            );
+            break;
+        }
+        let entry: TransactionJournalEntry = match serde_json::from_slice(trimmed) {
             Ok(entry) => entry,
-            Err(error) if !line_has_newline => {
-                warn!(
-                    ?error,
-                    path = %journal_path.display(),
-                    line = line_number,
-                    "ignoring trailing partial transaction journal line"
-                );
-                break;
-            }
             Err(error) => {
                 warn!(
                     ?error,
@@ -1522,6 +1521,19 @@ fn replay_transaction_journal_file(
         *order = replayed_order;
     }
     Ok(())
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
 }
 
 fn preserve_corrupt_transaction_journal(journal_path: &Path) {
@@ -3817,6 +3829,55 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].host, "partial.example:443");
         assert_eq!(restored[0].path, "/before-partial");
+    }
+
+    #[tokio::test]
+    async fn registry_ignores_trailing_partial_utf8_transaction_journal_line() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-partial-utf8-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "partial-utf8.example:443".to_string(),
+            "/before-partial-utf8".to_string(),
+            Some(200),
+            6,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut lines = Vec::new();
+        serde_json::to_writer(&mut lines, &TransactionJournalEntry::Insert { record }).unwrap();
+        lines.push(b'\n');
+        lines.extend_from_slice(b"{\"type\":\"insert\",\"record\":{\"body\":\"");
+        lines.extend_from_slice(&[0xF0, 0x9F]);
+        std::fs::write(journal_path, lines).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].host, "partial-utf8.example:443");
+        assert_eq!(restored[0].path, "/before-partial-utf8");
     }
 
     #[tokio::test]

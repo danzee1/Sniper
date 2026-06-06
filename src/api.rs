@@ -3972,6 +3972,9 @@ async fn ws_replay_disconnect(
         return active_session_conflict_response(&state);
     };
     let result = if payload.remove {
+        if !state.sessions.contains_session(session_id) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         if let Some(false) = state
             .ws_replay
             .belongs_to_session(payload.id, session_id)
@@ -7531,6 +7534,35 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), super::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_remove_rejects_unknown_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-remove-unknown-session-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+
+        let response = super::ws_replay_disconnect(
+            State(state),
+            Json(super::WsReplayDisconnectPayload {
+                session_id: Some(Uuid::new_v4()),
+                id: Uuid::new_v4(),
+                remove: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
