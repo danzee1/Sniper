@@ -89,6 +89,7 @@ struct StreamedRecordContext {
     state: Arc<AppState>,
     session: Arc<SessionContext>,
     _session_owner: ActiveProxySessionGuard,
+    persist_generation: u64,
     started_at: chrono::DateTime<Utc>,
     started: Instant,
     method: String,
@@ -2537,11 +2538,12 @@ async fn execute_streaming_http_exchange(
             let response_version = response.version();
             let response_headers = response.headers().clone();
             let method_text = method.to_string();
-            remember_persist_context(&session);
+            let persist_generation = remember_persist_context(&session);
             let context = StreamedRecordContext {
                 state: state.clone(),
                 session: session.clone(),
                 _session_owner: remember_active_proxy_session_owner(session.id()),
+                persist_generation,
                 started_at,
                 started,
                 method: method_text.clone(),
@@ -2733,6 +2735,7 @@ impl StreamedRecordContext {
         )
         .with_http_version(self.response_version);
         store_record_and_scan(&self.state, &self.session, record).await;
+        forget_persist_context_if_clean(self.session.id(), self.persist_generation);
     }
 }
 
@@ -4765,6 +4768,62 @@ mod tests {
         assert!(session.store.get(record_id).await.is_some());
         assert!(pending_session_context(session_id).is_none());
         assert!(!session_has_pending_persist(session_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn streamed_capture_store_clears_clean_pending_persist_context() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-proxy-streamed-capture-cleans-pending-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let mut scanner_config = session.scanner.get_config().await;
+        scanner_config.enabled = false;
+        session.scanner.update_config(scanner_config).await;
+
+        let request_capture = MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024);
+        let persist_generation = remember_persist_context(&session);
+        let context = StreamedRecordContext {
+            state: Arc::clone(&state),
+            session: Arc::clone(&session),
+            _session_owner: remember_active_proxy_session_owner(session_id),
+            persist_generation,
+            started_at: Utc::now(),
+            started: Instant::now(),
+            method: "GET".to_string(),
+            scheme: "https".to_string(),
+            host: "streamed.example".to_string(),
+            path: "/stream".to_string(),
+            status: StatusCode::OK,
+            request_capture,
+            response_headers: HeaderMap::new(),
+            notes: Vec::new(),
+            original_request_capture: None,
+            response_version: Version::HTTP_11,
+            max_preview: 1024,
+        };
+
+        context.store(b"ok".to_vec(), 2).await;
+        drain_proxy_connections(Duration::from_secs(1)).await;
+
+        assert!(pending_session_context(session_id).is_none());
+        assert!(!session_has_pending_persist(session_id));
+        state
+            .create_session(Some("replacement".to_string()))
+            .await
+            .unwrap();
+        state.delete_session(session_id).await.unwrap();
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

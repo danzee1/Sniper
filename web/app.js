@@ -1384,7 +1384,9 @@ function bindEvents() {
       .catch((error) => { console.error(error); showToast("Failed to save proxy settings", "error"); });
   });
   els.reloadProxySettingsButton.addEventListener("click", () => {
-    loadSettings().catch((error) => console.error(error));
+    loadSettings()
+      .then(renderProxySettings)
+      .catch((error) => console.error(error));
   });
   document.getElementById("proxySettingAutoContentLength")?.addEventListener("change", (e) => {
     localStorage.setItem("sniper_auto_content_length", e.target.checked);
@@ -3753,10 +3755,19 @@ function websocketQueryBackfillShouldRun(visibleCount) {
   const paging = state.websocketPaging || createWebsocketPagingState();
   return state.activeProxyTab === "websockets-history"
     && websocketFilterIsActive()
-    && visibleCount === 0
+    && visibleCount < websocketQueryBackfillVisibleTarget()
     && Boolean(paging.hasMore)
     && !Boolean(paging.loading)
     && normalizeWebsocketLoadLimit(paging.limit) < WEBSOCKET_MAX_LOADED_SESSIONS;
+}
+
+function websocketQueryBackfillVisibleTarget() {
+  const shell = document.querySelector("#websocketTable")?.closest(".history-table-shell");
+  const rowHeight = measuredWebsocketSessionRowHeight || WEBSOCKET_SESSION_ROW_HEIGHT;
+  const viewportRows = shell?.clientHeight
+    ? Math.ceil(shell.clientHeight / rowHeight)
+    : 1;
+  return Math.max(1, Math.min(WEBSOCKET_MAX_RENDERED_SESSION_ROWS, viewportRows + WEBSOCKET_SESSION_BUFFER_ROWS));
 }
 
 function websocketFilterIsActive() {
@@ -6871,6 +6882,7 @@ function renderProxyPanels() {
   }
 
   if (showWebsockets) {
+    applySavedWebsocketPaneWidth();
     els.footerMode.textContent = "Web Socket active";
     return;
   }
@@ -13878,7 +13890,7 @@ function bindWorkbenchStackResizer(handle) {
       handle.classList.remove("active");
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-      normalizeWorkbenchStackHeight();
+      normalizeWorkbenchStackHeight({ persist: true });
     };
 
     document.addEventListener("mousemove", onMove);
@@ -14167,6 +14179,10 @@ function applySavedWebsocketPaneWidth() {
   if (window.matchMedia(WEBSOCKET_WORKBENCH_BREAKPOINT).matches) {
     return;
   }
+  const bounds = getWebsocketWorkbenchWidths();
+  if (!bounds || bounds.total <= 0) {
+    return;
+  }
   applyWebsocketPaneWidth(state.websocketPaneWidth, { updateState: false });
 }
 
@@ -14181,6 +14197,7 @@ function normalizeWebsocketPaneWidth(options = {}) {
 
   const customWidth = els.websocketWorkbench.style.getPropertyValue("--websocket-left-pane-width");
   if (!customWidth) {
+    applySavedWebsocketPaneWidth();
     return;
   }
 
@@ -14264,7 +14281,7 @@ function applyWorkbenchStackHeight(height, persist = true) {
   }
 }
 
-function normalizeWorkbenchStackHeight() {
+function normalizeWorkbenchStackHeight(options = {}) {
   if (
     !els.proxyShell
     || !els.trafficRegion
@@ -14287,7 +14304,7 @@ function normalizeWorkbenchStackHeight() {
     WORKBENCH_STACK_MIN_HEIGHTS.messages,
     combinedHeight - WORKBENCH_STACK_MIN_HEIGHTS.history,
   );
-  applyWorkbenchStackHeight(nextMessages);
+  applyWorkbenchStackHeight(nextMessages, options.persist === true);
 }
 
 function resetWorkbenchStackHeight() {
