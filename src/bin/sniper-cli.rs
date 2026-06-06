@@ -463,6 +463,8 @@ enum InterceptCommand {
     List(InterceptSessionArgs),
     Forward(InterceptForwardArgs),
     Drop(InterceptDropArgs),
+    #[command(name = "forward-all")]
+    ForwardAll(InterceptSessionArgs),
 }
 
 #[derive(Args, Debug, Default)]
@@ -1973,6 +1975,21 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                 id: args.id,
                 session_id,
             })
+        }
+        InterceptCommand::ForwardAll(args) => {
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let path = session_query_path("/api/intercepts/forward-all", session_id);
+            let mut result: serde_json::Value = api
+                .post_json_or_no_content(&path, &json!({}))
+                .await?
+                .unwrap_or_else(|| {
+                    json!({
+                        "ok": true,
+                        "action": "forward-all",
+                    })
+                });
+            attach_session_id(&mut result, session_id);
+            print_json(&result)
         }
     }
 }

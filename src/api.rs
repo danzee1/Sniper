@@ -55,7 +55,7 @@ use crate::{
 const MAX_WORKSPACE_WS_FRAMES: usize = 1_000;
 const MAX_WORKSPACE_WS_FRAME_BODY_BYTES: usize = 16 * 1024;
 const MAX_WORKSPACE_WS_TOTAL_FRAMES: usize = 2_000;
-const MAX_WORKSPACE_WS_TOTAL_FRAME_BODY_BYTES: usize = 24 * 1024 * 1024;
+const MAX_WORKSPACE_WS_TOTAL_FRAME_BODY_BYTES: usize = 12 * 1024 * 1024;
 const MAX_WORKSPACE_REPLAY_TABS: usize = 128;
 const MAX_WORKSPACE_REPLAY_HISTORY_ENTRIES_PER_TAB: usize = 500;
 const MAX_WORKSPACE_TEXT_FIELD_BYTES: usize = 2 * 1024 * 1024;
@@ -2956,7 +2956,12 @@ async fn forward_all_intercepts(
         )
         .await;
     }
-    StatusCode::NO_CONTENT.into_response()
+    Json(serde_json::json!({
+        "ok": true,
+        "action": "forward-all",
+        "forwarded": count,
+    }))
+    .into_response()
 }
 
 async fn list_intercept_rules(
@@ -4539,7 +4544,10 @@ mod tests {
         config::AppConfig,
         event_log::EventLevel,
         fuzzer::{FuzzerAttackRecord, FuzzerAttackStatus},
-        intercept::{InterceptRule, InterceptScope},
+        intercept::{
+            InterceptRecord, InterceptResolution, InterceptRule, InterceptScope,
+            ResponseInterceptRecord, ResponseInterceptResolution,
+        },
         match_replace::{
             MatchReplaceRule, MatchReplaceRulesPayload, MatchReplaceScope, MatchReplaceTarget,
         },
@@ -4573,6 +4581,41 @@ mod tests {
             .await
             .expect("response body should be readable");
         serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    fn test_app_config(name: &str) -> AppConfig {
+        AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4())),
+        }
+    }
+
+    fn test_editable_request(path: &str) -> EditableRequest {
+        EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "GET".to_string(),
+            path: path.to_string(),
+            headers: vec![HeaderRecord {
+                name: "host".to_string(),
+                value: "example.test".to_string(),
+            }],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        }
+    }
+
+    fn test_editable_response(status: u16) -> EditableResponse {
+        EditableResponse {
+            status,
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+        }
     }
 
     #[test]
@@ -5440,6 +5483,126 @@ mod tests {
             Some("x".repeat(crate::workspace::MAX_WORKSPACE_SERIALIZED_BYTES));
         let error = super::validate_workspace_state(&snapshot).unwrap_err();
         assert!(error.contains("serialized bytes"));
+    }
+
+    #[tokio::test]
+    async fn request_forward_all_returns_json_count() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-forward-all-requests")).unwrap());
+        let session = state.session().await;
+        let queue = session.intercepts.clone();
+        let first = InterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            peer_addr: "127.0.0.1:12345".to_string(),
+            request: test_editable_request("/one"),
+            is_websocket: false,
+        };
+        let second = InterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            peer_addr: "127.0.0.1:12346".to_string(),
+            request: test_editable_request("/two"),
+            is_websocket: false,
+        };
+        let first_task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(first).await }
+        });
+        let second_task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(second).await }
+        });
+        for _ in 0..20 {
+            if session.intercepts.list().await.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(session.intercepts.list().await.len(), 2);
+
+        let response = super::forward_all_intercepts(
+            State(state.clone()),
+            Query(super::SessionScopedQuery { session_id: None }),
+        )
+        .await;
+        let payload = response_body_json(response).await;
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["action"], "forward-all");
+        assert_eq!(payload["forwarded"], 2);
+        assert!(session.intercepts.list().await.is_empty());
+        assert!(matches!(
+            first_task.await.unwrap(),
+            InterceptResolution::Forward(_)
+        ));
+        assert!(matches!(
+            second_task.await.unwrap(),
+            InterceptResolution::Forward(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_forward_all_returns_json_count() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-forward-all-responses")).unwrap());
+        let session = state.session().await;
+        let queue = session.response_intercepts.clone();
+        let first = ResponseInterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "GET".to_string(),
+            path: "/one".to_string(),
+            status: 200,
+            response: test_editable_response(200),
+        };
+        let second = ResponseInterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "GET".to_string(),
+            path: "/two".to_string(),
+            status: 204,
+            response: test_editable_response(204),
+        };
+        let first_task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(first).await }
+        });
+        let second_task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(second).await }
+        });
+        for _ in 0..20 {
+            if session.response_intercepts.list().await.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(session.response_intercepts.list().await.len(), 2);
+
+        let response = super::forward_all_response_intercepts(
+            State(state.clone()),
+            Query(super::SessionScopedQuery { session_id: None }),
+        )
+        .await;
+        let payload = response_body_json(response).await;
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["action"], "forward-all");
+        assert_eq!(payload["forwarded"], 2);
+        assert!(session.response_intercepts.list().await.is_empty());
+        assert!(matches!(
+            first_task.await.unwrap(),
+            ResponseInterceptResolution::Forward(_)
+        ));
+        assert!(matches!(
+            second_task.await.unwrap(),
+            ResponseInterceptResolution::Forward(_)
+        ));
     }
 
     #[test]

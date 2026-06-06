@@ -127,12 +127,10 @@ const WS_REPLAY_MAX_RENDERED_FRAMES = 1000;
 const WS_REPLAY_MAX_PERSISTED_FRAMES = 1000;
 const WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES = 16 * 1024;
 const WS_REPLAY_MAX_PERSISTED_TOTAL_FRAMES = 2000;
-const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 24 * 1024 * 1024;
+const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 12 * 1024 * 1024;
 const WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS = 2000;
 const WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS = 5000;
 const WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES = 60 * 1024;
-const WORKSPACE_UNLOAD_WS_FRAME_BUDGET = 32;
-const WORKSPACE_UNLOAD_WS_BODY_BUDGET = 32 * 1024;
 const WS_REPLAY_FINAL_POLL_INTERVAL_MS = 100;
 const WS_REPLAY_FINAL_POLL_TIMEOUT_MS = 2200;
 const HTTP_METHOD_TOKEN_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
@@ -1447,20 +1445,23 @@ function bindEvents() {
           })
           .catch(handleSendActionError);
       } else if (action.startsWith("copy-response-")) {
-        const record = getMenuTargetRecordForClipboard(target);
-        if (!record) return;
-        copyResponseContentForRecord(record, action.replace("copy-", ""));
+        loadMenuTargetRecord(target)
+          .then((record) => {
+            if (!record) throw new Error("Selected transaction could not be loaded.");
+            return copyResponseContentForRecord(record, action.replace("copy-", ""));
+          })
+          .catch(handleClipboardActionError);
       }
       else if (action.startsWith("copy-as-")) {
         const fmt = action.replace("copy-as-", "");
-        const record = getMenuTargetRecordForClipboard(target);
-        if (!record) return;
-        const text = recordToFormat(record, fmt);
-        if (text) {
-          copyTextToClipboard(text)
-            .then(() => showToast(`Copied as ${fmt}`))
-            .catch(() => showToast("Failed to copy", "error"));
-        }
+        loadMenuTargetRecord(target)
+          .then((record) => {
+            if (!record) throw new Error("Selected transaction could not be loaded.");
+            const text = recordToFormat(record, fmt);
+            if (!text) return null;
+            return copyTextToClipboard(text).then(() => showToast(`Copied as ${fmt}`));
+          })
+          .catch(handleClipboardActionError);
       }
     });
   }
@@ -2961,10 +2962,10 @@ function flushWorkspaceStateOnUnload() {
     : (workspaceSaveInFlight && workspaceSaveLastSnapshot
       ? workspaceSaveLastSnapshot
       : snapshotWorkspaceState());
-  const payload = workspaceUnloadPayload(snapshot, { allowLossyFallback: !workspaceSaveInFlight });
+  const payload = workspaceUnloadPayload(snapshot);
   if (!payload) {
     workspaceSaveDirty = true;
-    console.warn("Skipping unload workspace keepalive save because even the bounded snapshot is too large.");
+    console.warn("Skipping unload workspace keepalive save because the full workspace snapshot is too large.");
     return;
   }
   const blob = new Blob([payload], { type: "application/json" });
@@ -2979,22 +2980,10 @@ function flushWorkspaceStateOnUnload() {
   }).catch(() => {});
 }
 
-function workspaceUnloadPayload(primarySnapshot, options = {}) {
-  const candidates = [primarySnapshot];
-  if (options.allowLossyFallback !== false) {
-    candidates.push(
-      snapshotWorkspaceState({
-        wsFrameLimit: WORKSPACE_UNLOAD_WS_FRAME_BUDGET,
-        wsBodyByteLimit: WORKSPACE_UNLOAD_WS_BODY_BUDGET,
-      }),
-      snapshotWorkspaceState({ wsFrameLimit: 0, wsBodyByteLimit: 0 }),
-    );
-  }
-  for (const candidate of candidates) {
-    const payload = JSON.stringify(candidate);
-    if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
-      return payload;
-    }
+function workspaceUnloadPayload(primarySnapshot) {
+  const payload = JSON.stringify(primarySnapshot);
+  if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+    return payload;
   }
   return null;
 }
@@ -3485,7 +3474,7 @@ async function loadTransactions(preserveSelection = true, options = {}) {
 
     renderHistory();
     if (state.selectedId) {
-      if (preserveSelection && state.selectedRecord && state.selectedRecord.id === state.selectedId) {
+      if (preserveSelection && canReuseSelectedHistoryRecord(state.selectedId)) {
         return;
       }
       await selectHistoryTransaction(state.selectedId);
@@ -3523,9 +3512,47 @@ async function loadTransactionDetail(id) {
   return record;
 }
 
+function historyRecordSummarySignature(source) {
+  if (!source) return "";
+  const requestBytes = source.request_bytes ?? source.request?.body_size ?? 0;
+  const responseBytes = source.response_bytes ?? source.response?.body_size ?? 0;
+  const noteCount = source.note_count ?? (Array.isArray(source.notes) ? source.notes.length : 0);
+  const hasResponse = source.has_response ?? Boolean(source.response);
+  const hasUserNote = source.has_user_note ?? Boolean(source.user_note);
+  return JSON.stringify([
+    source.id || "",
+    source.kind || "",
+    source.sequence ?? 0,
+    source.method || "",
+    source.scheme || "",
+    source.host || "",
+    source.path || "",
+    source.status ?? null,
+    source.duration_ms ?? null,
+    source.started_at || "",
+    requestBytes,
+    responseBytes,
+    noteCount,
+    Boolean(hasResponse),
+    source.content_type || source.response?.content_type || source.request?.content_type || "",
+    Boolean(source.is_websocket),
+    Boolean(source.has_match_replace),
+    source.color_tag || "",
+    Boolean(hasUserNote),
+  ]);
+}
+
+function canReuseSelectedHistoryRecord(id) {
+  return Boolean(
+    id
+    && state.selectedRecord?.id === id
+    && historyRecordSummarySignature(state.selectedRecord) === historyRecordSummarySignature(getHistoryItem(id))
+  );
+}
+
 async function selectHistoryTransaction(id, options = {}) {
   const nextId = id ?? null;
-  if (nextId && state.selectedId === nextId && state.selectedRecord?.id === nextId) {
+  if (nextId && state.selectedId === nextId && canReuseSelectedHistoryRecord(nextId)) {
     updateHistorySelection(nextId);
     if (options.scroll) {
       scrollSelectedHistoryRowIntoView();
@@ -3622,23 +3649,6 @@ function loadMenuTargetRecord(target) {
     return Promise.resolve(target.record);
   }
   return target.loadPromise || loadTransactionRecordById(target.id, target.sessionId);
-}
-
-function getMenuTargetRecordForClipboard(target) {
-  if (!target?.id || target.sessionId !== currentSessionId()) {
-    showToast("The selected session changed. Open the menu again.", "error");
-    return null;
-  }
-  if (target.record?.id === target.id) {
-    return target.record;
-  }
-  showToast(
-    target.loadError
-      ? "Selected transaction could not be loaded."
-      : "Transaction is still loading. Open the menu again.",
-    "error",
-  );
-  return null;
 }
 
 function transactionUrlFromSource(source) {
@@ -9741,6 +9751,11 @@ async function sendRecordToSequence(record) {
 function handleSendActionError(error) {
   console.error(error);
   showToast(error?.message || "Failed to send selected item.", "error");
+}
+
+function handleClipboardActionError(error) {
+  console.error(error);
+  showToast(error?.message || "Failed to copy selected item.", "error");
 }
 
 function handleReplayActionError(error) {
@@ -17142,14 +17157,14 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
       copyMenuTargetUrl(target);
     } else if (action?.startsWith("copy-as-")) {
       const format = action.replace("copy-as-", "");
-      const record = getMenuTargetRecordForClipboard(target);
-      if (!record) return;
-      const text = recordToFormat(record, format);
-      if (text) {
-        copyTextToClipboard(text)
-          .then(() => showToast(`Copied as ${format}`))
-          .catch(() => showToast("Failed to copy", "error"));
-      }
+      loadTargetRecord()
+        .then((record) => {
+          if (!record) throw new Error("Selected transaction could not be loaded.");
+          const text = recordToFormat(record, format);
+          if (!text) return null;
+          return copyTextToClipboard(text).then(() => showToast(`Copied as ${format}`));
+        })
+        .catch(handleClipboardActionError);
     } else if (action === "compare-set-base") {
       setCompareBase(targetId);
     } else if (action === "compare-with-base") {
