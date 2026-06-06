@@ -167,6 +167,14 @@ pub async fn rebind_proxy(
     new_addr: std::net::SocketAddr,
 ) -> std::result::Result<(), String> {
     let _rebind_guard = state.proxy_rebind_lock.lock().await;
+    rebind_proxy_locked(Arc::clone(&state), new_addr).await
+}
+
+/// Rebind the proxy listener while the caller already holds `proxy_rebind_lock`.
+pub async fn rebind_proxy_locked(
+    state: Arc<AppState>,
+    new_addr: std::net::SocketAddr,
+) -> std::result::Result<(), String> {
     let current = state.get_active_proxy_addr().await;
     if current == new_addr {
         if !state.is_proxy_online() {

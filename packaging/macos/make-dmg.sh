@@ -52,6 +52,21 @@ cleanup() {
 
 trap cleanup EXIT
 
+plist_array_count() {
+  local plist_file="$1"
+  local key="$2"
+  /usr/libexec/PlistBuddy -c "Print :$key" "$plist_file" 2>/dev/null | awk '
+    /^[[:space:]]*Dict \{/ { count += 1 }
+    END { print count + 0 }
+  '
+}
+
+plist_optional_value() {
+  local plist_file="$1"
+  local path="$2"
+  /usr/libexec/PlistBuddy -c "Print :$path" "$plist_file" 2>/dev/null || true
+}
+
 normalize_dmg_arch() {
   local arch
   arch="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
@@ -89,6 +104,52 @@ plist_value() {
   local info_plist="$1"
   local key="$2"
   /usr/libexec/PlistBuddy -c "Print :$key" "$info_plist" 2>/dev/null || true
+}
+
+attach_dmg_readwrite() {
+  local dmg_path="$1"
+  local attach_plist="$TMP_ROOT/attach.plist"
+  local entity_count
+  local mount_count=0
+  local first_detach_device=""
+
+  hdiutil attach -readwrite -noverify -noautoopen -plist "$dmg_path" > "$attach_plist"
+  entity_count="$(plist_array_count "$attach_plist" "system-entities")"
+  if [[ "$entity_count" -le 0 ]]; then
+    echo "hdiutil attach did not report any system entities" >&2
+    return 1
+  fi
+
+  for ((i = 0; i < entity_count; i++)); do
+    local dev_entry
+    local mount_point
+    dev_entry="$(plist_optional_value "$attach_plist" "system-entities:$i:dev-entry")"
+    mount_point="$(plist_optional_value "$attach_plist" "system-entities:$i:mount-point")"
+    if [[ -n "$dev_entry" && -z "$first_detach_device" ]]; then
+      first_detach_device="$dev_entry"
+      DEVICE="$dev_entry"
+    fi
+    if [[ -n "$mount_point" ]]; then
+      if [[ "$mount_point" != /Volumes/* ]]; then
+        echo "Unexpected DMG mount point: $mount_point" >&2
+        return 1
+      fi
+      mount_count=$((mount_count + 1))
+      MOUNT_POINT="$mount_point"
+      if [[ -n "$dev_entry" ]]; then
+        DEVICE="$dev_entry"
+      fi
+    fi
+  done
+
+  if [[ "$mount_count" -ne 1 ]]; then
+    echo "Expected exactly one mounted DMG volume, got $mount_count" >&2
+    return 1
+  fi
+  if [[ -z "$DEVICE" ]]; then
+    echo "hdiutil attach did not report a detachable device" >&2
+    return 1
+  fi
 }
 
 validate_app_bundle_metadata() {
@@ -336,9 +397,8 @@ hdiutil create \
   "$DMG_TMP"
 
 # Mount
-ATTACH_OUTPUT=$(hdiutil attach -readwrite -noverify -noautoopen "$DMG_TMP")
-DEVICE=$(echo "$ATTACH_OUTPUT" | awk '/\/Volumes\// { print $1 }')
-MOUNT_POINT=$(echo "$ATTACH_OUTPUT" | awk '/\/Volumes\// { for(i=NF;i>=1;i--) if($i ~ /^\/Volumes/) { s=$i; for(j=i+1;j<=NF;j++) s=s" "$j; print s; exit } }')
+MOUNT_POINT=""
+attach_dmg_readwrite "$DMG_TMP"
 DISK_NAME=$(basename "$MOUNT_POINT")
 
 echo "Mounted at: $MOUNT_POINT (device: $DEVICE)"

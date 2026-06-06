@@ -1636,7 +1636,7 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             })
         }
         TargetCommand::SetScope(args) => {
-            let session_id = args.session_id;
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let scope_patterns = if args.clear {
                 Vec::new()
             } else {
@@ -1981,7 +1981,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
 async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<()> {
     match command {
         InterceptCommand::On(args) => {
-            let session_id = args.session_id;
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
@@ -1996,7 +1996,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             print_json_with_session(&runtime, session_id)
         }
         InterceptCommand::Off(args) => {
-            let session_id = args.session_id;
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
@@ -2351,7 +2351,7 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             print_json(&serde_json::json!({"status": "cleared", "session_id": session_id}))
         }
         OastCommand::Configure(args) => {
-            let session_id = args.session_id;
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             if args.provider.as_deref() == Some("boast") && args.token.is_some() {
                 bail!("BOAST provider does not use an OAST token");
             }

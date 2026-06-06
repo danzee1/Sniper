@@ -78,6 +78,8 @@ pub struct AppState {
     proxy_task: Arc<RwLock<Option<JoinHandle<()>>>>,
     /// Serializes runtime proxy rebinds so reported state cannot race the actual listener.
     pub proxy_rebind_lock: Arc<AsyncMutex<()>>,
+    /// Serializes persisted startup settings with the hot-rebound listener state.
+    pub startup_settings_lock: Arc<AsyncMutex<()>>,
     /// Serializes session operations so inactive writes and deletion cannot race each other.
     session_operation_locks: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<AsyncMutex<()>>>>>,
     /// Serializes session activation so old/new session operation locks cannot deadlock.
@@ -122,6 +124,7 @@ impl AppState {
             active_ui_addr: Arc::new(RwLock::new(active_ui_addr)),
             proxy_task: Arc::new(RwLock::new(None)),
             proxy_rebind_lock: Arc::new(AsyncMutex::new(())),
+            startup_settings_lock: Arc::new(AsyncMutex::new(())),
             session_operation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             session_activation_lock: Arc::new(AsyncMutex::new(())),
             session_contexts: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -1481,7 +1484,13 @@ esac
 expected_team="$6"
 backup="${bundle}.previous.$$"
 matching_sniper_pids() {
-  /usr/bin/pgrep -f "$bundle/Contents/MacOS/Sniper" 2>/dev/null || true
+  sniper_executable="$bundle/Contents/MacOS/Sniper"
+  /bin/ps -axo pid=,command= | /usr/bin/awk -v exe="$sniper_executable" '
+    index($0, exe) {
+      pid=$1
+      if (pid ~ /^[0-9]+$/) print pid
+    }
+  '
 }
 launch_health_check() {
   before_pids="$(matching_sniper_pids)"
@@ -2735,6 +2744,10 @@ mod tests {
         assert!(script.contains("if mv \"$backup\" \"$bundle\"; then"));
         assert!(script.contains("rm -rf \"$tmp\"\n    exit 1"));
         assert!(script.contains("/usr/bin/codesign --verify --deep --strict \"$bundle\""));
+        assert!(script.contains("sniper_executable=\"$bundle/Contents/MacOS/Sniper\""));
+        assert!(script.contains("/bin/ps -axo pid=,command="));
+        assert!(script.contains("index($0, exe)"));
+        assert!(!script.contains("pgrep -f \"$bundle/Contents/MacOS/Sniper\""));
         let health_check_pos = script
             .find("launch_health_check()")
             .expect("installer should define a launch health check");

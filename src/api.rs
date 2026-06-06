@@ -2434,6 +2434,27 @@ fn complete_workspace_keepalive_fuzzer(
     incoming
 }
 
+fn merge_workspace_keepalive_ws_frames(
+    current_frames: Vec<crate::ws_replay::WsReplayFrame>,
+    incoming_frames: Vec<crate::ws_replay::WsReplayFrame>,
+    current_truncated: bool,
+    incoming_truncated: bool,
+) -> (Vec<crate::ws_replay::WsReplayFrame>, bool) {
+    let mut by_index = IndexMap::new();
+    for frame in current_frames.into_iter().chain(incoming_frames) {
+        by_index.insert(frame.index, frame);
+    }
+    let mut frames: Vec<_> = by_index.into_values().collect();
+    frames.sort_by_key(|frame| frame.index);
+    let mut truncated = current_truncated || incoming_truncated;
+    if frames.len() > MAX_WORKSPACE_WS_FRAMES {
+        let overflow = frames.len() - MAX_WORKSPACE_WS_FRAMES;
+        frames.drain(..overflow);
+        truncated = true;
+    }
+    (frames, truncated)
+}
+
 fn merge_workspace_keepalive_tab(
     current: &mut ReplayTabState,
     incoming: ReplayTabState,
@@ -2489,17 +2510,23 @@ fn merge_workspace_keepalive_tab(
     {
         current.ws_setup_queue = current_ws_setup_queue;
     }
-    let preserve_ws_frames =
-        preserve_websocket_state && current.ws_frames.is_empty() && !incoming_ws_frames_complete;
-    if preserve_ws_frames {
-        current.ws_frames = current_ws_frames;
+    if preserve_websocket_state && !incoming_ws_frames_complete {
+        let incoming_ws_frames = std::mem::take(&mut current.ws_frames);
+        let incoming_ws_frames_truncated = current.ws_frames_truncated;
+        let (merged_ws_frames, merged_ws_frames_truncated) = merge_workspace_keepalive_ws_frames(
+            current_ws_frames,
+            incoming_ws_frames,
+            current_ws_frames_truncated,
+            incoming_ws_frames_truncated,
+        );
+        current.ws_frames = merged_ws_frames;
         if current.ws_selected_frame_index.is_none() {
             current.ws_selected_frame_index = current_ws_selected_frame_index;
         }
         if current.ws_frame_window_start.is_none() {
             current.ws_frame_window_start = current_ws_frame_window_start;
         }
-        current.ws_frames_truncated |= current_ws_frames_truncated;
+        current.ws_frames_truncated = merged_ws_frames_truncated;
     }
 }
 
@@ -2848,6 +2875,9 @@ async fn update_startup_settings(
     State(state): State<Arc<AppState>>,
     Json(update): Json<StartupSettingsUpdate>,
 ) -> Response {
+    let event_session = state.session().await;
+    let _startup_guard = state.startup_settings_lock.lock().await;
+    let _rebind_guard = state.proxy_rebind_lock.lock().await;
     match state.startup.update(update).await {
         Ok(snapshot) => {
             let active_addr = state.get_active_proxy_addr().await;
@@ -2860,7 +2890,7 @@ async fn update_startup_settings(
 
             // Try hot-rebind if address changed
             let (rebound, rebind_error) = if desired_addr != active_addr {
-                match crate::proxy::rebind_proxy(state.clone(), desired_addr).await {
+                match crate::proxy::rebind_proxy_locked(state.clone(), desired_addr).await {
                     Ok(()) => (Some(true), None),
                     Err(err) => (Some(false), Some(err)),
                 }
@@ -2890,31 +2920,34 @@ async fn update_startup_settings(
                 _ => None,
             };
             if let Some((level, title, message)) = rebind_event {
-                let session = state.session().await;
-                let _mutation_guard = session.mutation_guard().await;
-                let previous_events = session
-                    .event_log
-                    .snapshot(Some(state.config.max_entries))
-                    .await;
-                session
-                    .event_log
-                    .push(level, "config", title, message)
-                    .await;
-                if let Err(error) = state
-                    .persist_session_context_mutation_locked(&session)
-                    .await
-                {
-                    session.event_log.replace_all(previous_events).await;
-                    persist_rolled_back_session_snapshot(
-                        &state,
-                        &session,
-                        "proxy rebind event log update",
-                    )
-                    .await;
-                    tracing::warn!(
-                        %error,
-                        "failed to persist proxy rebind event log entry"
-                    );
+                let operation_lock = state.session_operation_lock(event_session.id()).await;
+                let _operation_guard = operation_lock.lock().await;
+                if state.sessions.contains_session(event_session.id()) {
+                    let _mutation_guard = event_session.mutation_guard().await;
+                    let previous_events = event_session
+                        .event_log
+                        .snapshot(Some(state.config.max_entries))
+                        .await;
+                    event_session
+                        .event_log
+                        .push(level, "config", title, message)
+                        .await;
+                    if let Err(error) = state
+                        .persist_session_context_mutation_locked(&event_session)
+                        .await
+                    {
+                        event_session.event_log.replace_all(previous_events).await;
+                        persist_rolled_back_session_snapshot(
+                            &state,
+                            &event_session,
+                            "proxy rebind event log update",
+                        )
+                        .await;
+                        tracing::warn!(
+                            %error,
+                            "failed to persist proxy rebind event log entry"
+                        );
+                    }
                 }
             }
 
@@ -5176,7 +5209,7 @@ mod tests {
         TransactionQuery, MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES,
     };
     use crate::{
-        config::AppConfig,
+        config::{AppConfig, StartupSettingsUpdate},
         event_log::EventLevel,
         fuzzer::{FuzzerAttackRecord, FuzzerAttackStatus},
         intercept::{
@@ -5235,6 +5268,19 @@ mod tests {
             max_entries: 100,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4())),
+        }
+    }
+
+    fn test_ws_replay_frame(index: usize, body: &str) -> WsReplayFrame {
+        WsReplayFrame {
+            index,
+            captured_at: Utc::now().to_rfc3339(),
+            direction: WebSocketFrameDirection::ServerToClient,
+            kind: WebSocketFrameKind::Text,
+            body: body.to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: body.len(),
+            preview_truncated: false,
         }
     }
 
@@ -7032,6 +7078,67 @@ mod tests {
     }
 
     #[test]
+    fn workspace_keepalive_merge_preserves_existing_partial_websocket_frames() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws".to_string(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_frames: vec![
+                        test_ws_replay_frame(1, "old-one"),
+                        test_ws_replay_frame(2, "old-two"),
+                    ],
+                    ws_selected_frame_index: Some(1),
+                    ws_frame_window_start: Some(1),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws".to_string(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_frames: vec![
+                        test_ws_replay_frame(2, "new-two"),
+                        test_ws_replay_frame(3, "new-three"),
+                    ],
+                    ws_frames_complete: Some(false),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        let tab = merged.replay.tabs.first().expect("merged tab");
+        let frames: Vec<_> = tab
+            .ws_frames
+            .iter()
+            .map(|frame| (frame.index, frame.body.as_str()))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![(1, "old-one"), (2, "new-two"), (3, "new-three")]
+        );
+        assert_eq!(tab.ws_selected_frame_index, Some(1));
+        assert_eq!(tab.ws_frame_window_start, Some(1));
+        assert!(!tab.ws_frames_truncated);
+    }
+
+    #[test]
     fn workspace_keepalive_merge_does_not_preserve_websocket_state_on_http_tab() {
         let frame = WsReplayFrame {
             index: 7,
@@ -8398,6 +8505,65 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(session.oast.list(None).await.is_empty());
 
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_rebind_event_stays_on_request_start_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-startup-rebind-event-session-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let reserved_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let desired_port = reserved_listener.local_addr().unwrap().port();
+        drop(reserved_listener);
+
+        let rebind_guard = state.proxy_rebind_lock.lock().await;
+        let mut update_future = Box::pin(super::update_startup_settings(
+            State(state.clone()),
+            Json(StartupSettingsUpdate {
+                proxy_bind_host: Some("127.0.0.1".to_string()),
+                proxy_port: Some(desired_port),
+            }),
+        ));
+
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut update_future).await;
+        assert!(blocked.is_err());
+
+        let next = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(state.sessions.active_session_id(), next.id);
+        drop(rebind_guard);
+
+        let view = response_body_json(update_future.await).await;
+        assert_eq!(view["proxy_port"].as_u64(), Some(u64::from(desired_port)));
+        assert_eq!(view["rebound"].as_bool(), Some(true));
+
+        let original_events = original.event_log.list(Some(10)).await;
+        assert!(original_events
+            .iter()
+            .any(|entry| entry.title == "Proxy listener rebound"));
+        let active = state.session().await;
+        assert_eq!(active.id(), next.id);
+        assert!(!active
+            .event_log
+            .list(Some(10))
+            .await
+            .iter()
+            .any(|entry| entry.title == "Proxy listener rebound"));
+
+        state.abort_proxy_task().await;
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
