@@ -1629,6 +1629,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
             .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
     }
     let tmp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let mut tmp_guard = TempJsonFile::new(tmp_path.clone());
     {
         let mut file = create_private_file(&tmp_path)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
@@ -1650,6 +1651,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
             path.display()
         )
     })?;
+    tmp_guard.commit();
     tighten_private_file(path).with_context(|| {
         format!(
             "failed to set private permissions on session JSON {}",
@@ -1660,6 +1662,32 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         sync_directory(parent, "session JSON directory")?;
     }
     Ok(())
+}
+
+struct TempJsonFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TempJsonFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TempJsonFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn sync_directory(path: &Path, label: &str) -> Result<()> {
@@ -2715,6 +2743,12 @@ mod tests {
             })
             .collect::<HashSet<_>>();
         assert_eq!(session_dir_ids, before_ids);
+        let temp_files = std::fs::read_dir(&registry.root_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(temp_files, 0);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -122,6 +122,7 @@ const WEBSOCKET_SCROLL_PREFETCH_PX = 240;
 const WEBSOCKET_QUERY_BACKFILL_DELAY_MS = 100;
 const WEBSOCKET_DETAIL_FRAME_LIMIT = 1000;
 const FINDINGS_BADGE_POLL_INTERVAL_MS = 30000;
+const EVENT_LOG_LIMIT = 200;
 const WS_REPLAY_MAX_LOADED_FRAMES = 10000;
 const WS_REPLAY_MAX_RENDERED_FRAMES = 1000;
 const WS_REPLAY_MAX_PERSISTED_FRAMES = 1000;
@@ -164,6 +165,9 @@ const REPEATER_HISTORY_LIMIT = 30;
 const HISTORY_ROW_HEIGHT = 27;
 let measuredHistoryRowHeight = HISTORY_ROW_HEIGHT;
 const HISTORY_BUFFER_ROWS = 30;
+const FUZZER_RESULT_ROW_HEIGHT = 27;
+let measuredFuzzerResultRowHeight = FUZZER_RESULT_ROW_HEIGHT;
+const FUZZER_RESULT_BUFFER_ROWS = 30;
 const FINDINGS_ROW_HEIGHT = 27;
 const FINDINGS_BUFFER_ROWS = 20;
 const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "fuzzer", "sequence", "replay", "tools", "logger"]);
@@ -1556,32 +1560,6 @@ function bindEvents() {
   // Fuzzer layout resizers
   initFuzzerResizers();
 
-  // Fuzzer result row selection helper
-  function selectFuzzerRow(row) {
-    if (!row) return;
-    els.fuzzerResultsBody.querySelectorAll(".fuzzer-result-selected").forEach((r) => r.classList.remove("fuzzer-result-selected"));
-    row.classList.add("fuzzer-result-selected");
-    row.scrollIntoView({ block: "nearest" });
-    const txId = row.dataset.transactionId;
-    const rowIndex = Number.isFinite(Number(row.dataset.rowIndex))
-      ? Number(row.dataset.rowIndex)
-      : Number(row.dataset.resultIndex);
-    const selectionKey = txId ? `tx:${txId}` : `row:${rowIndex}`;
-    state._selectedFuzzerResultKey = selectionKey;
-    if (txId) {
-      showFuzzerResultDetail(txId, selectionKey).catch((err) => console.error(err));
-    } else {
-      const result = state.fuzzerAttackRecord?.results?.[rowIndex];
-      state._fuzzerDetailRecord = null;
-      if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.remove("hidden");
-      const _dr = document.getElementById("fuzzerDetailResizer");
-      if (_dr) _dr.classList.remove("hidden");
-      if (els.fuzzerDetailReqCM) updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, result?.note || "No transaction was captured for this payload.", { mode: "http" });
-      if (els.fuzzerDetailResCM) updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
-      if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
-    }
-  }
-
   // Fuzzer results shell (for keyboard navigation + focus)
   const fuzzerResultsShell = els.fuzzerResultsBody.closest(".history-table-shell");
 
@@ -1597,16 +1575,27 @@ function bindEvents() {
   // Fuzzer results keyboard navigation (↑↓)
   if (fuzzerResultsShell) {
     fuzzerResultsShell.setAttribute("tabindex", "0");
+    let fuzzerScrollRaf = 0;
+    fuzzerResultsShell.addEventListener("scroll", () => {
+      if (fuzzerScrollRaf) return;
+      fuzzerScrollRaf = requestAnimationFrame(() => {
+        fuzzerScrollRaf = 0;
+        renderFuzzerResultsVirtual();
+      });
+    });
     fuzzerResultsShell.addEventListener("keydown", (e) => {
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
       e.preventDefault();
-      const selected = els.fuzzerResultsBody.querySelector(".fuzzer-result-selected");
-      const rows = Array.from(els.fuzzerResultsBody.querySelectorAll(".fuzzer-result-row"));
-      if (!rows.length) return;
-      let idx = selected ? rows.indexOf(selected) : -1;
-      if (e.key === "ArrowDown") idx = Math.min(idx + 1, rows.length - 1);
-      else idx = Math.max(idx - 1, 0);
-      selectFuzzerRow(rows[idx]);
+      const totalCount = jsonArray(state.fuzzerAttackRecord?.results).length;
+      if (!totalCount) return;
+      const selectedIndex = fuzzerSelectedResultIndex();
+      const fallbackIndex = e.key === "ArrowDown" ? 0 : totalCount - 1;
+      const nextIndex = selectedIndex < 0
+        ? fallbackIndex
+        : (e.key === "ArrowDown"
+          ? Math.min(selectedIndex + 1, totalCount - 1)
+          : Math.max(selectedIndex - 1, 0));
+      selectFuzzerResultIndex(nextIndex, { scroll: true });
     });
   }
 
@@ -4340,7 +4329,7 @@ function scheduleSelectedWebsocketDetailRefresh(id) {
 
 async function loadEventLog() {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath("/api/event-log?limit=200", sessionId));
+  const response = await fetch(sessionQueryPath(`/api/event-log?limit=${EVENT_LOG_LIMIT}`, sessionId));
   await requireOkResponse(response, "Failed to load event log.");
   const entries = jsonArray(await response.json());
   if (sessionId !== currentSessionId()) {
@@ -4348,6 +4337,27 @@ async function loadEventLog() {
   }
   state.eventLog = entries;
   renderEventLog();
+}
+
+function applyEventLogEvent(event) {
+  try {
+    return applyEventLogEntry(JSON.parse(event.data || "{}"));
+  } catch (error) {
+    console.error("Failed to parse event log SSE:", error);
+    return false;
+  }
+}
+
+function applyEventLogEntry(entry) {
+  if (!entry || typeof entry !== "object" || !entry.id) {
+    return false;
+  }
+  state.eventLog = [
+    entry,
+    ...jsonArray(state.eventLog).filter((existing) => existing?.id !== entry.id),
+  ].slice(0, EVENT_LOG_LIMIT);
+  renderEventLog();
+  return true;
 }
 
 async function clearEventLog() {
@@ -4506,12 +4516,14 @@ function connectEvents() {
     scheduleRefresh();
   });
 
-  eventSource.addEventListener("event_log", () => {
+  eventSource.addEventListener("event_log", (event) => {
     if (eventSessionId !== currentSessionId()) {
       return;
     }
     if (state.activeTool === "logger") {
-      loadEventLog().catch((error) => console.error(error));
+      if (!applyEventLogEvent(event)) {
+        loadEventLog().catch((error) => console.error(error));
+      }
     } else {
       els.eventLogStatus.textContent = "New activity";
     }
@@ -4721,6 +4733,9 @@ function adjustHistoryScrollAfterHeadTrim(removedCount) {
 async function loadMoreTransactions({ background = false } = {}) {
   const paging = state.historyPaging || (state.historyPaging = createHistoryPagingState());
   if (paging.loading || !paging.hasMore) {
+    return 0;
+  }
+  if (!canUseSequenceCursorForHistoryPaging() && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
     return 0;
   }
   const queryState = createHistoryQueryState();
@@ -7311,7 +7326,7 @@ function renderHistoryVirtual() {
   }
   if (totalCount - endIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS) {
     const atLoadedBottom = scrollTop >= maxScrollTop - rowHeight;
-    scheduleHistoryBackfill(0, { allowAtCap: atLoadedBottom });
+    scheduleHistoryBackfill(0, { allowAtCap: atLoadedBottom && canUseSequenceCursorForHistoryPaging() });
   }
 
   const topPadding = startIdx * rowHeight;
@@ -9426,13 +9441,66 @@ function renderFuzzer() {
     `${attackRecord.marker_count ?? 0} marker(s)`,
     attackRecord.status || "completed",
   ].join(" · ");
-  els.fuzzerResultsBody.innerHTML = attackRecord.results
-    .map((result, rowIndex) => {
-      const resultIndex = Number.isFinite(Number(result.index)) ? Number(result.index) : rowIndex;
-      const selectionKey = result.transaction_id ? `tx:${result.transaction_id}` : `row:${rowIndex}`;
-      const selectedClass = state._selectedFuzzerResultKey === selectionKey ? " fuzzer-result-selected" : "";
-      return `
-      <tr class="fuzzer-result-row${selectedClass}" data-transaction-id="${result.transaction_id || ""}" data-result-index="${resultIndex}" data-row-index="${rowIndex}">
+  renderFuzzerResultsVirtual();
+}
+
+function fuzzerSelectionKeyForResult(result, rowIndex) {
+  const txId = String(result?.transaction_id || "");
+  return txId ? `tx:${txId}` : `row:${rowIndex}`;
+}
+
+function fuzzerSelectedResultIndex() {
+  const selectionKey = String(state._selectedFuzzerResultKey || "");
+  if (!selectionKey) {
+    return -1;
+  }
+  if (selectionKey.startsWith("row:")) {
+    const rowIndex = Number(selectionKey.slice(4));
+    return Number.isFinite(rowIndex) ? rowIndex : -1;
+  }
+  if (selectionKey.startsWith("tx:")) {
+    const txId = selectionKey.slice(3);
+    return jsonArray(state.fuzzerAttackRecord?.results).findIndex((result) => result?.transaction_id === txId);
+  }
+  return -1;
+}
+
+function fuzzerResultsShell() {
+  return els.fuzzerResultsBody?.closest(".history-table-shell") || null;
+}
+
+function renderFuzzerResultsVirtual() {
+  const results = jsonArray(state.fuzzerAttackRecord?.results);
+  if (!els.fuzzerResultsBody || !results.length) {
+    return;
+  }
+  const shell = fuzzerResultsShell();
+  if (!shell) {
+    return;
+  }
+
+  const rowHeight = measuredFuzzerResultRowHeight || FUZZER_RESULT_ROW_HEIGHT;
+  const viewportHeight = shell.clientHeight || rowHeight;
+  const totalCount = results.length;
+  const maxScrollTop = Math.max(0, totalCount * rowHeight - viewportHeight);
+  const scrollTop = Math.min(shell.scrollTop, maxScrollTop);
+  if (shell.scrollTop !== scrollTop) {
+    shell.scrollTop = scrollTop;
+  }
+
+  const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - FUZZER_RESULT_BUFFER_ROWS);
+  const endIdx = Math.min(totalCount, Math.ceil((scrollTop + viewportHeight) / rowHeight) + FUZZER_RESULT_BUFFER_ROWS);
+  const topPadding = startIdx * rowHeight;
+  const bottomPadding = Math.max(0, (totalCount - endIdx) * rowHeight);
+
+  const rows = [];
+  for (let rowIndex = startIdx; rowIndex < endIdx; rowIndex++) {
+    const result = results[rowIndex];
+    const resultIndex = Number.isFinite(Number(result.index)) ? Number(result.index) : rowIndex;
+    const selectionKey = fuzzerSelectionKeyForResult(result, rowIndex);
+    const selectedClass = state._selectedFuzzerResultKey === selectionKey ? " fuzzer-result-selected" : "";
+    rows.push(`
+      <tr class="fuzzer-result-row${selectedClass}" data-transaction-id="${escapeHtml(result.transaction_id || "")}" data-result-index="${resultIndex}" data-row-index="${rowIndex}">
         <td>${resultIndex + 1}</td>
         <td class="cell-url">${escapeHtml(result.payload)}</td>
         <td>${escapeHtml(formatStatus(result.status))}</td>
@@ -9440,9 +9508,67 @@ function renderFuzzer() {
         <td>${escapeHtml(formatSize(result.response_bytes))}</td>
         <td>${result.transaction_id ? escapeHtml(String(result.transaction_id).slice(0, 8)) : escapeHtml(result.note || "-")}</td>
       </tr>
-    `;
-    })
-    .join("");
+    `);
+  }
+
+  els.fuzzerResultsBody.innerHTML =
+    (topPadding > 0 ? `<tr class="virtual-spacer"><td colspan="6" style="height:${topPadding}px;padding:0;border:none"></td></tr>` : "") +
+    rows.join("") +
+    (bottomPadding > 0 ? `<tr class="virtual-spacer"><td colspan="6" style="height:${bottomPadding}px;padding:0;border:none"></td></tr>` : "");
+
+  const measuredRow = els.fuzzerResultsBody.querySelector(".fuzzer-result-row");
+  const measured = measuredRow?.getBoundingClientRect().height || 0;
+  if (measured > 0 && Math.abs(measured - rowHeight) >= 1) {
+    measuredFuzzerResultRowHeight = measured;
+    renderFuzzerResultsVirtual();
+  }
+}
+
+function scrollFuzzerResultToIndex(rowIndex) {
+  const shell = fuzzerResultsShell();
+  if (!shell) {
+    return;
+  }
+  const rowHeight = measuredFuzzerResultRowHeight || FUZZER_RESULT_ROW_HEIGHT;
+  shell.scrollTop = Math.max(0, rowIndex * rowHeight - shell.clientHeight / 2);
+  renderFuzzerResultsVirtual();
+}
+
+function selectFuzzerResultIndex(rowIndex, options = {}) {
+  const results = jsonArray(state.fuzzerAttackRecord?.results);
+  if (rowIndex < 0 || rowIndex >= results.length) {
+    return;
+  }
+  const result = results[rowIndex];
+  const txId = String(result?.transaction_id || "");
+  const selectionKey = fuzzerSelectionKeyForResult(result, rowIndex);
+  state._selectedFuzzerResultKey = selectionKey;
+
+  if (options.scroll !== false) {
+    scrollFuzzerResultToIndex(rowIndex);
+  } else {
+    renderFuzzerResultsVirtual();
+  }
+
+  if (txId) {
+    showFuzzerResultDetail(txId, selectionKey).catch((err) => console.error(err));
+  } else {
+    state._fuzzerDetailRecord = null;
+    if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.remove("hidden");
+    const detailResizer = document.getElementById("fuzzerDetailResizer");
+    if (detailResizer) detailResizer.classList.remove("hidden");
+    if (els.fuzzerDetailReqCM) updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, result?.note || "No transaction was captured for this payload.", { mode: "http" });
+    if (els.fuzzerDetailResCM) updateCodePaneCM("fuzzerDetailRes", els.fuzzerDetailResCM, "", { mode: "http" });
+    if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
+  }
+}
+
+function selectFuzzerRow(row) {
+  if (!row) return;
+  const rowIndex = Number.isFinite(Number(row.dataset.rowIndex))
+    ? Number(row.dataset.rowIndex)
+    : Number(row.dataset.resultIndex);
+  selectFuzzerResultIndex(rowIndex, { scroll: false });
 }
 
 function normalizeFuzzerAttackRecord(record) {
@@ -16310,13 +16436,14 @@ async function refreshWsReplayFramesOnce(tab) {
 
 async function refreshWsReplayFramesUntilSettled(tab) {
   const started = Date.now();
+  const lifecycleToken = tab.wsLifecycleToken || 0;
   let sawFrame = false;
   do {
-    const added = await refreshWsReplayFramesOnce(tab);
-    sawFrame = sawFrame || added;
-    if (!added) {
+    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
       return sawFrame;
     }
+    const added = await refreshWsReplayFramesOnce(tab);
+    sawFrame = sawFrame || added;
     await new Promise((resolve) => window.setTimeout(resolve, WS_REPLAY_FINAL_POLL_INTERVAL_MS));
   } while (Date.now() - started < WS_REPLAY_FINAL_POLL_TIMEOUT_MS);
   return sawFrame;

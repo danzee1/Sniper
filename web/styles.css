@@ -1524,7 +1524,8 @@ code {
   color: var(--accent-strong);
 }
 
-.history-table .virtual-spacer td {
+.history-table .virtual-spacer td,
+.mini-table .virtual-spacer td {
   padding: 0 !important;
   border: none !important;
   line-height: 0;
