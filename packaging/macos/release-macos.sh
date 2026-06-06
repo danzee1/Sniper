@@ -45,11 +45,25 @@ if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/
     exit 1
   fi
   CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
-  if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+  TRACKED_RELEASE_STATUS="$(git status --porcelain --untracked-files=no)"
+  UNTRACKED_RELEASE_INPUTS="$(git ls-files --others --exclude-standard -- \
+    Cargo.toml Cargo.lock README.md \
+    src web packaging tests 2>/dev/null || true)"
+  if [[ -n "$TRACKED_RELEASE_STATUS" || -n "$UNTRACKED_RELEASE_INPUTS" ]]; then
     echo "Release artifacts require a clean worktree." >&2
-    git status --short --untracked-files=all >&2
+    if [[ -n "$TRACKED_RELEASE_STATUS" ]]; then
+      printf '%s\n' "$TRACKED_RELEASE_STATUS" >&2
+    fi
+    if [[ -n "$UNTRACKED_RELEASE_INPUTS" ]]; then
+      printf '%s\n' "$UNTRACKED_RELEASE_INPUTS" | sed 's/^/?? /' >&2
+    fi
     echo "Commit/stash/remove these files first, or set ALLOW_ADHOC_RELEASE=1 for local-only testing." >&2
     exit 1
+  fi
+  UNTRACKED_LOCAL_FILES="$(git ls-files --others --exclude-standard 2>/dev/null || true)"
+  if [[ -n "$UNTRACKED_LOCAL_FILES" ]]; then
+    echo "Ignoring untracked files outside release inputs:" >&2
+    printf '%s\n' "$UNTRACKED_LOCAL_FILES" | sed 's/^/?? /' >&2
   fi
   HEAD_COMMIT="$(git rev-parse HEAD)"
   REMOTE_MAIN_COMMIT=""

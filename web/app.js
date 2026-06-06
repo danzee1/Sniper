@@ -2640,6 +2640,7 @@ function hydrateReplayTab(tab) {
     tab.target_scheme || fallbackTarget.scheme,
   );
   const requestText = tab.request_text ?? buildEditableRawRequest(fallbackRequest);
+  const hasHttpVersionMode = Object.prototype.hasOwnProperty.call(tab, "http_version_mode");
   return {
     id: typeof tab.id === "string" && tab.id ? tab.id : crypto.randomUUID(),
     sequence: Number.isFinite(tab.sequence) ? tab.sequence : state.replayTabSequence + 1,
@@ -2649,7 +2650,12 @@ function hydrateReplayTab(tab) {
     sourceTransactionId: tab.source_transaction_id || null,
     notice: tab.notice || "",
     requestText,
-    httpVersionMode: replayHttpVersionState(fallbackRequest, requestText, tab.http_version_mode),
+    httpVersionMode: replayStoredHttpVersionMode(
+      fallbackRequest,
+      requestText,
+      tab.http_version_mode,
+      hasHttpVersionMode,
+    ),
     responseRecord: tab.response_record || null,
     targetScheme: normalizedTarget.scheme,
     targetHost: normalizedTarget.host,
@@ -2666,6 +2672,8 @@ function hydrateRepeaterHistoryEntry(entry, fallbackRequest) {
   }
 
   const request = entry.request ? cloneEditableRequest(entry.request) : cloneEditableRequest(fallbackRequest);
+  const requestText = entry.request_text ?? buildEditableRawRequest(request);
+  const hasHttpVersionMode = Object.prototype.hasOwnProperty.call(entry, "http_version_mode");
   const fallbackTarget = authorityToTargetState(request.host, request.scheme);
   const normalizedTarget = normalizeRepeaterTargetInput(
     entry.target_host ?? fallbackTarget.host,
@@ -2674,11 +2682,12 @@ function hydrateRepeaterHistoryEntry(entry, fallbackRequest) {
   );
   return {
     request,
-    requestText: entry.request_text ?? buildEditableRawRequest(request),
-    httpVersionMode: replayHttpVersionState(
+    requestText,
+    httpVersionMode: replayStoredHttpVersionMode(
       request,
-      entry.request_text ?? buildEditableRawRequest(request),
+      requestText,
       entry.http_version_mode,
+      hasHttpVersionMode,
     ),
     responseRecord: entry.response_record || null,
     notice: entry.notice || "",
@@ -2770,7 +2779,7 @@ function snapshotWorkspaceState(options = {}) {
           source_transaction_id: tab.sourceTransactionId || null,
           notice: tab.notice || "",
           request_text: tab.requestText || "",
-          http_version_mode: replayHttpVersionState(tab.baseRequest, tab.requestText, tab.httpVersionMode),
+          http_version_mode: normalizeReplayHttpVersionMode(tab.httpVersionMode),
           response_record: tab.responseRecord || null,
           target_scheme: tab.targetScheme || "https",
           target_host: tab.targetHost || "",
@@ -2779,7 +2788,7 @@ function snapshotWorkspaceState(options = {}) {
           history_entries: historyEntries.map((entry) => ({
             request: cloneEditableRequest(entry.request),
             request_text: entry.requestText || "",
-            http_version_mode: replayHttpVersionState(entry.request, entry.requestText, entry.httpVersionMode),
+            http_version_mode: normalizeReplayHttpVersionMode(entry.httpVersionMode),
             response_record: entry.responseRecord || null,
             notice: entry.notice || "",
             target_scheme: entry.targetScheme || "https",
@@ -3036,14 +3045,23 @@ function workspaceUnloadPayload(primarySnapshot) {
     return { payload: primaryPayload, endpoint: "/api/workspace-state" };
   }
 
-  const compactSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot);
+  const sourceReplayTabById = new Map(
+    (Array.isArray(state.replayTabs) ? state.replayTabs : [])
+      .filter((tab) => tab && typeof tab.id === "string" && tab.id)
+      .map((tab) => [tab.id, tab]),
+  );
+
+  const compactSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, { sourceReplayTabById });
   if (compactSnapshot) {
     const compactPayload = JSON.stringify(compactSnapshot);
     if (utf8ByteLength(compactPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
       return { payload: compactPayload, endpoint: "/api/workspace-state/keepalive" };
     }
   }
-  const activeOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, { activeOnly: true });
+  const activeOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+    activeOnly: true,
+    sourceReplayTabById,
+  });
   if (activeOnlySnapshot) {
     const activeOnlyPayload = JSON.stringify(activeOnlySnapshot);
     if (utf8ByteLength(activeOnlyPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
@@ -3053,6 +3071,7 @@ function workspaceUnloadPayload(primarySnapshot) {
   const activeOnlyReplaySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
     activeOnly: true,
     dropFuzzer: true,
+    sourceReplayTabById,
   });
   if (activeOnlyReplaySnapshot) {
     const activeOnlyReplayPayload = JSON.stringify(activeOnlyReplaySnapshot);
@@ -3064,6 +3083,7 @@ function workspaceUnloadPayload(primarySnapshot) {
     activeOnly: true,
     textByteLimit: 8 * 1024,
     wsTextByteLimit: 8 * 1024,
+    sourceReplayTabById,
   });
   if (boundedActiveOnlySnapshot) {
     const boundedActiveOnlyPayload = JSON.stringify(boundedActiveOnlySnapshot);
@@ -3076,6 +3096,7 @@ function workspaceUnloadPayload(primarySnapshot) {
     dropFuzzer: true,
     textByteLimit: 2 * 1024,
     wsTextByteLimit: 2 * 1024,
+    sourceReplayTabById,
   });
   if (minimalActiveReplaySnapshot) {
     const minimalActiveReplayPayload = JSON.stringify(minimalActiveReplaySnapshot);
@@ -3091,10 +3112,17 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
   const replay = snapshot.replay && typeof snapshot.replay === "object" ? snapshot.replay : {};
   const activeTabId = replay.active_tab_id || null;
   const sourceTabs = Array.isArray(replay.tabs) ? replay.tabs : [];
+  const sourceReplayTabById = options.sourceReplayTabById instanceof Map
+    ? options.sourceReplayTabById
+    : null;
   const tabs = (options.activeOnly && activeTabId
     ? sourceTabs.filter((tab) => tab?.id === activeTabId)
     : sourceTabs
-  ).map((tab) => compactWorkspaceUnloadReplayTab(tab, options)).filter(Boolean);
+  ).map((tab) => compactWorkspaceUnloadReplayTab(
+    tab,
+    options,
+    sourceReplayTabById?.get(tab?.id) || null,
+  )).filter(Boolean);
   return {
     revision: snapshot.revision || 0,
     session_id: snapshot.session_id || null,
@@ -3144,9 +3172,24 @@ function compactWorkspaceUnloadEditableRequest(request, options = {}) {
   };
 }
 
-function compactWorkspaceUnloadReplayTab(tab, options = {}) {
+function compactWorkspaceUnloadArrayLength(snapshotTab, liveTab, snapshotKey, liveKey) {
+  const liveValue = liveTab && typeof liveTab === "object" ? liveTab[liveKey] : null;
+  if (Array.isArray(liveValue)) return liveValue.length;
+  const snapshotValue = snapshotTab && typeof snapshotTab === "object" ? snapshotTab[snapshotKey] : null;
+  return Array.isArray(snapshotValue) ? snapshotValue.length : 0;
+}
+
+function compactWorkspaceUnloadReplayTab(tab, options = {}, liveTab = null) {
   if (!tab || typeof tab !== "object") return null;
   if (tab.type === "websocket") {
+    const wsFrames = Array.isArray(tab.ws_frames) ? tab.ws_frames : [];
+    const wsSetupQueueLength = compactWorkspaceUnloadArrayLength(
+      tab,
+      liveTab,
+      "ws_setup_queue",
+      "wsSetupQueue",
+    );
+    const wsFrameLength = compactWorkspaceUnloadArrayLength(tab, liveTab, "ws_frames", "wsFrames");
     return {
       id: tab.id,
       type: "websocket",
@@ -3165,12 +3208,20 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}) {
       ws_editor_body_encoded: !!tab.ws_editor_body_encoded,
       ws_setup_notice: tab.ws_setup_notice || "",
       ws_setup_queue: [],
+      ws_setup_queue_complete: wsSetupQueueLength === 0,
       ws_frames: [],
-      ws_frames_truncated: !!tab.ws_frames_truncated || websocketFramesAreTruncated(tab.ws_frames, null),
+      ws_frames_complete: wsFrameLength === 0,
+      ws_frames_truncated: !!tab.ws_frames_truncated || websocketFramesAreTruncated(wsFrames, null),
       ws_selected_frame_index: tab.ws_selected_frame_index ?? null,
       ws_frame_window_start: tab.ws_frame_window_start ?? null,
     };
   }
+  const historyEntriesLength = compactWorkspaceUnloadArrayLength(
+    tab,
+    liveTab,
+    "history_entries",
+    "historyEntries",
+  );
   return {
     id: tab.id,
     sequence: tab.sequence,
@@ -3180,13 +3231,14 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}) {
     source_transaction_id: tab.source_transaction_id || null,
     notice: tab.notice || "",
     request_text: compactWorkspaceUnloadText(tab.request_text, options),
-    http_version_mode: tab.http_version_mode || "auto",
+    http_version_mode: normalizeReplayHttpVersionMode(tab.http_version_mode),
     response_record: null,
     target_scheme: tab.target_scheme || "https",
     target_host: tab.target_host || "",
     target_port: normalizePortValue(tab.target_port),
     target_manually_edited: !!tab.target_manually_edited,
     history_entries: [],
+    history_entries_complete: historyEntriesLength === 0,
     history_index: null,
   };
 }
@@ -4311,9 +4363,11 @@ function mergeWebsocketPageWithCurrentSummaries(pageItems, currentItems, mutatio
 function mergeWebsocketAppendPage(pageItems, currentItems, mutationGenerationAtRequest) {
   const currentById = new Map((currentItems || []).map((item) => [item.id, item]));
   const merged = [];
+  const indexById = new Map();
   const seen = new Set();
   for (const item of currentItems || []) {
     if (!item?.id || seen.has(item.id)) continue;
+    indexById.set(item.id, merged.length);
     merged.push(item);
     seen.add(item.id);
   }
@@ -4323,11 +4377,12 @@ function mergeWebsocketAppendPage(pageItems, currentItems, mutationGenerationAtR
     const currentMutatedDuringRequest = (_websocketSummaryMutationById.get(item.id) || 0) > mutationGenerationAtRequest;
     if (current) {
       if (currentMutatedDuringRequest && isWebsocketSummaryFresher(current, item)) continue;
-      const index = merged.findIndex((candidate) => candidate.id === item.id);
+      const index = indexById.get(item.id);
       if (index >= 0) merged[index] = item;
       continue;
     }
     if (seen.has(item.id)) continue;
+    indexById.set(item.id, merged.length);
     merged.push(item);
     seen.add(item.id);
   }
@@ -6717,6 +6772,7 @@ function openTransactionRecordInReplay(record) {
 }
 
 function isWebSocketUpgradeRecord(record) {
+  if (Number(record?.status) !== 101) return false;
   const headers = normalizedHeaders(record?.request?.headers);
   const hasUpgradeWebsocket = headers.some(
     (h) => headerNameEquals(h, "upgrade") && headerValueContainsToken(h.value, "websocket"),
@@ -9524,6 +9580,12 @@ function normalizeReplayHttpVersion(value) {
   return "";
 }
 
+function normalizeReplayHttpVersionMode(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.toLowerCase() === "auto") return "";
+  return normalizeReplayHttpVersion(raw);
+}
+
 function replayHttpVersionFromText(text) {
   const firstLine = (text || "").split(/\r?\n/)[0] || "";
   const match = firstLine.match(/^[A-Z]+\s+\S+\s+(HTTP\/[0-9.]+)$/i);
@@ -9533,7 +9595,14 @@ function replayHttpVersionFromText(text) {
 function replayHttpVersionState(request, requestText, mode) {
   return replayHttpVersionFromText(requestText || "")
     || normalizeReplayHttpVersion(request?.http_version || "")
-    || normalizeReplayHttpVersion(mode || "");
+    || normalizeReplayHttpVersionMode(mode);
+}
+
+function replayStoredHttpVersionMode(request, requestText, mode, hasStoredMode) {
+  if (hasStoredMode) {
+    return normalizeReplayHttpVersionMode(mode);
+  }
+  return replayHttpVersionState(request, requestText, mode);
 }
 
 function parseReplayHttpVersionToken(token) {

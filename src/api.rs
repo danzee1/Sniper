@@ -2391,10 +2391,15 @@ fn merge_workspace_keepalive_tab(
     let current_ws_selected_frame_index = current.ws_selected_frame_index;
     let current_ws_frame_window_start = current.ws_frame_window_start;
     let current_ws_frames_truncated = current.ws_frames_truncated;
+    let incoming_history_entries_complete = incoming.history_entries_complete.unwrap_or(false);
+    let incoming_ws_setup_queue_complete = incoming.ws_setup_queue_complete.unwrap_or(false);
+    let incoming_ws_frames_complete = incoming.ws_frames_complete.unwrap_or(false);
 
     *current = incoming;
 
-    if current.history_entries.is_empty() {
+    let preserve_history_entries =
+        current.history_entries.is_empty() && !incoming_history_entries_complete;
+    if preserve_history_entries {
         current.history_entries = current_history_entries;
         if current.history_index.is_none() {
             current.history_index = current_history_index;
@@ -2411,19 +2416,20 @@ fn merge_workspace_keepalive_tab(
         current.ws_handshake_text = current_ws_handshake_text;
         current.ws_editor_text = current_ws_editor_text;
     }
-    if current.ws_setup_queue.is_empty() {
+    if current.ws_setup_queue.is_empty() && !incoming_ws_setup_queue_complete {
         current.ws_setup_queue = current_ws_setup_queue;
     }
-    if current.ws_frames.is_empty() {
+    let preserve_ws_frames = current.ws_frames.is_empty() && !incoming_ws_frames_complete;
+    if preserve_ws_frames {
         current.ws_frames = current_ws_frames;
+        if current.ws_selected_frame_index.is_none() {
+            current.ws_selected_frame_index = current_ws_selected_frame_index;
+        }
+        if current.ws_frame_window_start.is_none() {
+            current.ws_frame_window_start = current_ws_frame_window_start;
+        }
+        current.ws_frames_truncated |= current_ws_frames_truncated;
     }
-    if current.ws_selected_frame_index.is_none() {
-        current.ws_selected_frame_index = current_ws_selected_frame_index;
-    }
-    if current.ws_frame_window_start.is_none() {
-        current.ws_frame_window_start = current_ws_frame_window_start;
-    }
-    current.ws_frames_truncated |= current_ws_frames_truncated;
 }
 
 fn fuzzer_keepalive_has_payload(fuzzer: &FuzzerWorkspaceState) -> bool {
@@ -6407,6 +6413,175 @@ mod tests {
         assert!(merged.replay.tabs.iter().any(|tab| tab.id == "inactive"));
         assert_eq!(merged.fuzzer.payloads_text, "payload-one");
         assert_eq!(merged.client_version, 13);
+    }
+
+    #[test]
+    fn workspace_keepalive_merge_preserves_websocket_state_missing_from_compact_payload() {
+        let frame = WsReplayFrame {
+            index: 7,
+            captured_at: Utc::now().to_rfc3339(),
+            direction: WebSocketFrameDirection::ServerToClient,
+            kind: WebSocketFrameKind::Text,
+            body: "live-frame".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 10,
+            preview_truncated: false,
+        };
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws".to_string(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_setup_queue: vec![serde_json::json!({
+                        "id": "queued-message",
+                        "body": "old"
+                    })],
+                    ws_frames: vec![frame.clone()],
+                    ws_selected_frame_index: Some(0),
+                    ws_frame_window_start: Some(4),
+                    ws_frames_truncated: true,
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws".to_string(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_setup_queue: Vec::new(),
+                    ws_frames: Vec::new(),
+                    ws_selected_frame_index: None,
+                    ws_frame_window_start: None,
+                    ws_frames_truncated: false,
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        let tab = merged.replay.tabs.first().expect("merged tab");
+        assert_eq!(tab.ws_setup_queue.len(), 1);
+        assert_eq!(tab.ws_frames.len(), 1);
+        assert_eq!(tab.ws_frames[0].index, frame.index);
+        assert_eq!(tab.ws_frames[0].body, frame.body);
+        assert_eq!(tab.ws_selected_frame_index, Some(0));
+        assert_eq!(tab.ws_frame_window_start, Some(4));
+        assert!(tab.ws_frames_truncated);
+    }
+
+    #[test]
+    fn workspace_keepalive_merge_honors_complete_empty_replay_arrays() {
+        let frame = WsReplayFrame {
+            index: 3,
+            captured_at: Utc::now().to_rfc3339(),
+            direction: WebSocketFrameDirection::ClientToServer,
+            kind: WebSocketFrameKind::Text,
+            body: "stale-frame".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 11,
+            preview_truncated: false,
+        };
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("http".to_string()),
+                tab_sequence: 2,
+                tabs: vec![
+                    ReplayTabState {
+                        id: "http".to_string(),
+                        sequence: 1,
+                        history_entries: vec![ReplayHistoryEntryState {
+                            request_text: "GET /stale HTTP/1.1\r\n\r\n".to_string(),
+                            ..ReplayHistoryEntryState::default()
+                        }],
+                        history_index: Some(0),
+                        ..ReplayTabState::default()
+                    },
+                    ReplayTabState {
+                        id: "ws".to_string(),
+                        tab_type: "websocket".to_string(),
+                        sequence: 2,
+                        ws_setup_queue: vec![serde_json::json!({ "body": "stale" })],
+                        ws_frames: vec![frame],
+                        ws_selected_frame_index: Some(0),
+                        ws_frame_window_start: Some(8),
+                        ws_frames_truncated: true,
+                        ..ReplayTabState::default()
+                    },
+                ],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("http".to_string()),
+                tab_sequence: 2,
+                tabs: vec![
+                    ReplayTabState {
+                        id: "http".to_string(),
+                        sequence: 1,
+                        history_entries: Vec::new(),
+                        history_index: None,
+                        history_entries_complete: Some(true),
+                        ..ReplayTabState::default()
+                    },
+                    ReplayTabState {
+                        id: "ws".to_string(),
+                        tab_type: "websocket".to_string(),
+                        sequence: 2,
+                        ws_setup_queue: Vec::new(),
+                        ws_setup_queue_complete: Some(true),
+                        ws_frames: Vec::new(),
+                        ws_frames_complete: Some(true),
+                        ws_selected_frame_index: None,
+                        ws_frame_window_start: None,
+                        ws_frames_truncated: false,
+                        ..ReplayTabState::default()
+                    },
+                ],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        let http = merged
+            .replay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "http")
+            .expect("http tab");
+        assert!(http.history_entries.is_empty());
+        assert_eq!(http.history_index, None);
+
+        let ws = merged
+            .replay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "ws")
+            .expect("ws tab");
+        assert!(ws.ws_setup_queue.is_empty());
+        assert!(ws.ws_frames.is_empty());
+        assert_eq!(ws.ws_selected_frame_index, None);
+        assert_eq!(ws.ws_frame_window_start, None);
+        assert!(!ws.ws_frames_truncated);
     }
 
     #[test]

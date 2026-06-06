@@ -200,11 +200,9 @@ impl WebSocketStore {
         let total = inner.order.len();
         let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
         let offset = offset.unwrap_or(0).min(total);
-        let items = inner
-            .order
-            .iter()
-            .skip(offset)
-            .take(limit)
+        let end = offset.saturating_add(limit).min(total);
+        let items = (offset..end)
+            .filter_map(|index| inner.order.get(index))
             .filter_map(|id| inner.sessions.get(id).map(WebSocketSessionEntry::summary))
             .collect();
         WebSocketListPage {

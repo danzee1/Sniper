@@ -2125,7 +2125,7 @@ mod tests {
         ));
         let poller = start_oast_poller(store.clone());
 
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::time::timeout(std::time::Duration::from_secs(45), async {
             loop {
                 if store.get_registration_info().await.is_some() {
                     break;

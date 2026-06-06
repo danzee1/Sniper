@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
@@ -1487,8 +1487,16 @@ fn replay_transaction_journal(
             records.insert(record.id, record);
         }
     }
-    let snapshot_record_ids = seen.clone();
     let mut replayed_transaction_ids = HashSet::new();
+    let mut inserted_order = VecDeque::new();
+    trim_transaction_replay_state(
+        max_entries,
+        &mut order,
+        &mut inserted_order,
+        &mut records,
+        &mut replayed_transaction_ids,
+    );
+    let snapshot_record_ids = seen.clone();
     let replay_insert_after_sequence = (!records.is_empty()).then(|| {
         records
             .values()
@@ -1505,6 +1513,7 @@ fn replay_transaction_journal(
         &mut seen,
         &mut replayed_transaction_ids,
         Some(&snapshot_record_ids),
+        max_entries,
     )?;
     replay_transaction_journal_file(
         &journal_path,
@@ -1514,6 +1523,7 @@ fn replay_transaction_journal(
         &mut seen,
         &mut replayed_transaction_ids,
         None,
+        max_entries,
     )?;
 
     snapshot.transactions = order
@@ -1538,6 +1548,7 @@ fn replay_transaction_journal_file(
     seen: &mut HashSet<Uuid>,
     replayed_transaction_ids: &mut HashSet<Uuid>,
     skip_annotations_for: Option<&HashSet<Uuid>>,
+    max_entries: usize,
 ) -> Result<()> {
     let file = match fs::File::open(journal_path) {
         Ok(file) => file,
@@ -1574,7 +1585,7 @@ fn replay_transaction_journal_file(
     }
 
     let mut reader = BufReader::new(file);
-    let mut inserted_order = Vec::new();
+    let mut inserted_order = VecDeque::new();
     let mut line = Vec::new();
     let mut line_number = 0usize;
     let mut offset = 0u64;
@@ -1630,8 +1641,15 @@ fn replay_transaction_journal_file(
                 }
                 if seen.insert(record.id) {
                     replayed_transaction_ids.insert(record.id);
-                    inserted_order.push(record.id);
+                    inserted_order.push_back(record.id);
                     records.insert(record.id, record);
+                    trim_transaction_replay_state(
+                        max_entries,
+                        order,
+                        &mut inserted_order,
+                        records,
+                        replayed_transaction_ids,
+                    );
                 }
             }
             TransactionJournalEntry::Annotation {
@@ -1665,6 +1683,23 @@ fn replay_transaction_journal_file(
         *order = replayed_order;
     }
     Ok(())
+}
+
+fn trim_transaction_replay_state(
+    max_entries: usize,
+    order: &mut Vec<Uuid>,
+    inserted_order: &mut VecDeque<Uuid>,
+    records: &mut HashMap<Uuid, TransactionRecord>,
+    replayed_transaction_ids: &mut HashSet<Uuid>,
+) {
+    while records.len() > max_entries {
+        let evicted = order.pop().or_else(|| inserted_order.pop_front());
+        let Some(evicted) = evicted else {
+            break;
+        };
+        records.remove(&evicted);
+        replayed_transaction_ids.remove(&evicted);
+    }
 }
 
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
@@ -3250,6 +3285,7 @@ mod tests {
             &mut seen,
             &mut replayed,
             None,
+            100,
         )
         .expect("directory journal should be moved aside");
 
@@ -4651,6 +4687,62 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].host, "4.example:443");
         assert_eq!(restored[1].host, "3.example:443");
+    }
+
+    #[tokio::test]
+    async fn registry_bounds_active_journal_replay_to_max_entries() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-replay-bound-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 2, 32).unwrap();
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &super::StoredSessionSnapshot::default(),
+        )
+        .unwrap();
+
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut journal = Vec::new();
+        for sequence in 1..=32 {
+            let mut record = TransactionRecord::http(
+                Utc::now(),
+                "GET".to_string(),
+                "https".to_string(),
+                format!("{sequence}.example:443"),
+                format!("/{sequence}"),
+                Some(200),
+                1,
+                MessageRecord {
+                    headers: vec![],
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                None,
+                vec![],
+                None,
+                None,
+            );
+            record.sequence = sequence;
+            serde_json::to_writer(&mut journal, &TransactionJournalEntry::Insert { record })
+                .unwrap();
+            journal.push(b'\n');
+        }
+        std::fs::write(journal_path, journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].host, "32.example:443");
+        assert_eq!(restored[1].host, "31.example:443");
     }
 
     #[tokio::test]

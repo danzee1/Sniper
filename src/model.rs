@@ -479,16 +479,21 @@ impl TransactionRecord {
     }
 
     pub fn is_websocket(&self) -> bool {
-        self.request
-            .header_value("upgrade")
-            .map(|value| header_value_contains_token(value, "websocket"))
-            .unwrap_or(false)
-            && self
-                .request
-                .header_value("connection")
-                .map(|value| header_value_contains_token(value, "upgrade"))
-                .unwrap_or(false)
+        self.status == Some(101) && request_has_websocket_upgrade_headers(&self.request)
     }
+}
+
+fn request_has_websocket_upgrade_headers(request: &MessageRecord) -> bool {
+    request_header_values_contain_token(request, "upgrade", "websocket")
+        && request_header_values_contain_token(request, "connection", "upgrade")
+}
+
+fn request_header_values_contain_token(request: &MessageRecord, name: &str, token: &str) -> bool {
+    request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(name))
+        .any(|header| header_value_contains_token(&header.value, token))
 }
 
 fn header_value_contains_token(value: &str, token: &str) -> bool {
@@ -1024,7 +1029,7 @@ mod tests {
             "https".to_string(),
             "socket.example.com".to_string(),
             "/ws".to_string(),
-            Some(400),
+            Some(101),
             1,
             request,
             None,
@@ -1035,6 +1040,75 @@ mod tests {
 
         assert!(record.is_websocket());
         assert!(record.summary().is_websocket);
+    }
+
+    #[test]
+    fn transaction_record_detects_websocket_upgrade_split_connection_headers() {
+        let request = MessageRecord {
+            headers: vec![
+                HeaderRecord {
+                    name: "Upgrade".to_string(),
+                    value: "websocket".to_string(),
+                },
+                HeaderRecord {
+                    name: "Connection".to_string(),
+                    value: "keep-alive".to_string(),
+                },
+                HeaderRecord {
+                    name: "Connection".to_string(),
+                    value: "Upgrade".to_string(),
+                },
+            ],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "socket.example.com".to_string(),
+            "/ws".to_string(),
+            Some(101),
+            1,
+            request,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(record.is_websocket());
+        assert!(record.summary().is_websocket);
+    }
+
+    #[test]
+    fn transaction_record_does_not_treat_failed_upgrade_attempt_as_websocket() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, "websocket".parse().unwrap());
+        headers.insert(CONNECTION, "upgrade".parse().unwrap());
+        let request = MessageRecord::from_headers_and_body(&headers, &[], 1024);
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "socket.example.com".to_string(),
+            "/ws".to_string(),
+            Some(400),
+            1,
+            request,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(!record.is_websocket());
+        assert!(!record.summary().is_websocket);
     }
 
     #[test]
