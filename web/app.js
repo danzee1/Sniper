@@ -1190,6 +1190,7 @@ function bindEvents() {
       state.selectedWebsocketRecord = null;
       state.selectedWebsocketDetailError = "";
       hideFrameDetail();
+      resetWebsocketFrameScroll();
     }
     state.selectedWebsocketId = row.dataset.id;
     renderWebsocketSessions();
@@ -3392,6 +3393,7 @@ function resetSessionScopedUiState() {
   state.selectedWebsocketId = null;
   state.selectedWebsocketRecord = null;
   state.selectedWebsocketDetailError = "";
+  resetWebsocketFrameScroll();
   _websocketLoadGeneration += 1;
   _websocketDetailGeneration += 1;
   _websocketDetailPendingId = null;
@@ -4727,6 +4729,7 @@ async function loadWebsocketDetail(id, options = {}) {
         state.selectedWebsocketRecord = null;
         state.selectedWebsocketDetailError = "";
         hideFrameDetail();
+        resetWebsocketFrameScroll();
         await syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true });
         return;
       }
@@ -8254,6 +8257,7 @@ async function selectWebsocketSession(id, options = {}) {
     state.selectedWebsocketRecord = null;
     state.selectedWebsocketDetailError = "";
     hideFrameDetail();
+    resetWebsocketFrameScroll();
   }
   state.selectedWebsocketId = nextId;
   renderWebsocketSessions();
@@ -9219,6 +9223,13 @@ function websocketFramesShell() {
   return els.websocketFramesBody?.closest(".history-table-shell") || null;
 }
 
+function resetWebsocketFrameScroll() {
+  const shell = websocketFramesShell();
+  if (shell) {
+    shell.scrollTop = 0;
+  }
+}
+
 function ensureWebsocketFramePositionInView(position, options = {}) {
   const shell = websocketFramesShell();
   if (!shell || !Number.isFinite(position) || position < 0) {
@@ -9355,6 +9366,7 @@ async function syncVisibleWebsocketSelection(preserveSelection = true, options =
     state.selectedFrameIdx = null;
     state.selectedWebsocketDetailError = "";
     hideFrameDetail();
+    resetWebsocketFrameScroll();
   }
 
   if (!state.selectedWebsocketId) {
@@ -14876,16 +14888,21 @@ function showFrameDetail(frame) {
   const isClient = frame.direction === "client_to_server";
   const dirClass = isClient ? "dir-client" : "dir-server";
   const dirLabel = isClient ? "client \u2192" : "\u2190 server";
+  const truncatedLabel = frame.preview_truncated ? `<span>preview truncated</span>` : "";
   els.frameDetailMeta.innerHTML = `
     <span>#${(frame.index ?? 0) + 1}</span>
     <span class="${dirClass}">${dirLabel}</span>
     <span>${escapeHtml(frame.kind)}</span>
     <span>${escapeHtml(formatSize(frame.body_size))}</span>
+    ${truncatedLabel}
   `;
 
   let body = frame.body_preview || "(empty)";
   if (frame.body_encoding === "base64") {
-    body = safeDecodeBase64(frame.body_preview, `[base64] ${frame.body_preview}`);
+    els.frameDetailBody.innerHTML = escapeHtml(renderBinaryFrameDetailText(frame));
+    els.frameDetailResizer.classList.remove("hidden");
+    els.frameDetailPanel.classList.remove("hidden");
+    return;
   }
 
   // Try to pretty-print JSON
@@ -14904,6 +14921,27 @@ function showFrameDetail(frame) {
   els.frameDetailBody.innerHTML = highlighted;
   els.frameDetailResizer.classList.remove("hidden");
   els.frameDetailPanel.classList.remove("hidden");
+}
+
+function renderBinaryFrameDetailText(frame) {
+  const base64 = String(frame?.body_preview ?? frame?.body ?? "");
+  const bytes = base64ToBytes(base64);
+  const previewSize = bytes ? bytes.length : 0;
+  const metadata = [
+    `Binary frame kind: ${frame?.kind || "binary"}`,
+    `Total size: ${formatSize(frame?.body_size || 0)}`,
+    `Preview size: ${formatSize(previewSize)}`,
+    `Encoding: base64`,
+    `Preview truncated: ${frame?.preview_truncated ? "yes" : "no"}`,
+  ].join("\n");
+
+  if (!base64) {
+    return `${metadata}\n\n(empty binary preview)`;
+  }
+  if (!bytes) {
+    return `${metadata}\n\nInvalid base64 preview:\n${base64}`;
+  }
+  return `${metadata}\n\nHex / ASCII preview:\n${toHexDumpFromBytes(bytes)}\n\nBase64 preview:\n${base64}`;
 }
 
 function hideFrameDetail() {

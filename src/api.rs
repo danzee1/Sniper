@@ -2687,6 +2687,11 @@ async fn begin_session_proxy_operation(
     if !state.sessions.contains_session(session.id()) {
         return Err(action_session_conflict_response(session));
     }
+    if state.sessions.active_session_id() != session.id()
+        && proxy::session_has_active_proxy_work(session.id())
+    {
+        return Err(session_proxy_work_conflict_response(session.id()));
+    }
     Ok(proxy::remember_active_proxy_session_owner(session.id()))
 }
 
@@ -3861,11 +3866,10 @@ async fn upsert_sequence(
     if let Err(error) = validate_sequence_definition(&definition) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _operation_guard = match guard_session_write_operation(&state, &session, false).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.sequence.snapshot_definitions().await;
     session.sequence.upsert_definition(definition).await;
@@ -3890,11 +3894,10 @@ async fn delete_sequence(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _operation_guard = match guard_session_write_operation(&state, &session, false).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.sequence.snapshot_definitions().await;
     if session.sequence.delete_definition(id).await {
@@ -3922,11 +3925,10 @@ async fn run_sequence(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
+    let _session_owner = match begin_session_proxy_operation(&state, &session).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
     let definition = match session.sequence.get_definition(id).await {
         Some(def) => def,
         None => return (StatusCode::NOT_FOUND, "Sequence not found").into_response(),
@@ -3934,8 +3936,6 @@ async fn run_sequence(
     if let Err(error) = validate_sequence_definition(&definition) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let _session_owner = crate::proxy::remember_active_proxy_session_owner(session.id());
-    drop(_operation_guard);
     match sequence::run_sequence(state, session, definition).await {
         Ok(record) => Json(record).into_response(),
         Err(error) => (sequence_run_error_status(&error), error.to_string()).into_response(),
@@ -8164,7 +8164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn implicit_runtime_update_rejects_active_session_change_after_lock_wait() {
+    async fn implicit_runtime_update_finishes_before_delayed_activation_after_lock_wait() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-runtime-active-race-{}",
             uuid::Uuid::new_v4()
@@ -8192,15 +8192,18 @@ mod tests {
 
         let blocked = tokio::time::timeout(Duration::from_millis(30), &mut update_future).await;
         assert!(blocked.is_err());
-        state
+        drop(operation_guard);
+
+        let runtime: RuntimeSettingsSnapshot = response_json(update_future.await).await;
+        assert!(runtime.intercept_enabled);
+        assert!(original.runtime.snapshot().await.intercept_enabled);
+
+        let next = state
             .create_session(Some("new active".to_string()))
             .await
             .unwrap();
-        drop(operation_guard);
-
-        let response = update_future.await;
-        assert_eq!(response.status(), super::StatusCode::CONFLICT);
-        assert!(!original.runtime.snapshot().await.intercept_enabled);
+        assert_ne!(next.id, original.id());
+        assert_eq!(state.sessions.active_session_id(), next.id);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -8245,6 +8248,47 @@ mod tests {
         let response = update_future.await;
         assert_eq!(response.status(), super::StatusCode::CONFLICT);
         assert!(!original.runtime.snapshot().await.intercept_enabled);
+
+        drop(active_proxy_owner);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn session_proxy_operation_rechecks_proxy_work_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-proxy-operation-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut proxy_future = Box::pin(super::begin_session_proxy_operation(&state, &original));
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut proxy_future).await;
+        assert!(blocked.is_err());
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        drop(operation_guard);
+
+        match proxy_future.await {
+            Ok(owner) => {
+                drop(owner);
+                panic!("proxy operation should reject inactive sessions with active proxy work");
+            }
+            Err(response) => assert_eq!(response.status(), super::StatusCode::CONFLICT),
+        }
 
         drop(active_proxy_owner);
         let _ = std::fs::remove_dir_all(data_dir);
@@ -10915,6 +10959,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequence_upsert_rechecks_proxy_work_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-sequence-upsert-proxy-work-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Race upsert".to_string(),
+            steps: Vec::new(),
+        };
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut upsert_future = Box::pin(super::upsert_sequence(
+            State(state.clone()),
+            Json(super::SequenceUpsertPayload {
+                session_id: Some(original_id),
+                definition,
+            }),
+        ));
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut upsert_future).await;
+        assert!(blocked.is_err());
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        drop(operation_guard);
+
+        let response = upsert_future.await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(original.sequence.list_definitions().await.is_empty());
+
+        drop(active_proxy_owner);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn sequence_delete_rechecks_proxy_work_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-sequence-delete-proxy-work-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Race delete".to_string(),
+            steps: Vec::new(),
+        };
+        original
+            .sequence
+            .upsert_definition(definition.clone())
+            .await;
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut delete_future = Box::pin(super::delete_sequence(
+            State(state.clone()),
+            Path(definition.id.to_string()),
+            Query(super::SequenceSessionQuery {
+                session_id: Some(original_id),
+            }),
+        ));
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut delete_future).await;
+        assert!(blocked.is_err());
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        drop(operation_guard);
+
+        let response = delete_future.await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(original
+            .sequence
+            .get_definition(definition.id)
+            .await
+            .is_some());
+
+        drop(active_proxy_owner);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn sequence_run_rejects_unknown_session_before_running() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-sequence-unknown-session-run-{}",
@@ -10948,6 +11096,58 @@ mod tests {
         assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
         assert!(session.sequence.list_runs(None).await.is_empty());
 
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn sequence_run_rechecks_proxy_work_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-sequence-run-proxy-work-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Race run".to_string(),
+            steps: Vec::new(),
+        };
+        original
+            .sequence
+            .upsert_definition(definition.clone())
+            .await;
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut run_future = Box::pin(super::run_sequence(
+            State(state.clone()),
+            Path(definition.id.to_string()),
+            Json(super::SequenceRunPayload {
+                session_id: Some(original_id),
+            }),
+        ));
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut run_future).await;
+        assert!(blocked.is_err());
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        drop(operation_guard);
+
+        let response = run_future.await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(original.sequence.list_runs(None).await.is_empty());
+
+        drop(active_proxy_owner);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
