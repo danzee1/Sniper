@@ -481,6 +481,7 @@ let _websocketVisibleSyncDeferStaleDetail = false;
 let _websocketQueryBackfillTimer = 0;
 let _websocketQueryBackfillGeneration = 0;
 let _websocketFilteredReloadTimer = 0;
+let _websocketSearchReloadTimer = 0;
 let _lastHttpHistoryFallbackPoll = Date.now();
 let _lastWebsocketFallbackPoll = Date.now();
 let _interceptToggleRequestSeq = 0;
@@ -1144,7 +1145,13 @@ function bindEvents() {
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
     clearWebsocketQueryBackfill();
-    loadWebsockets(true).catch((error) => console.error(error));
+    if (_websocketSearchReloadTimer) {
+      window.clearTimeout(_websocketSearchReloadTimer);
+    }
+    _websocketSearchReloadTimer = window.setTimeout(() => {
+      _websocketSearchReloadTimer = 0;
+      loadWebsockets(true).catch((error) => console.error(error));
+    }, 160);
   });
   let websocketScrollRaf = 0;
   document.querySelector("#websocketTable")?.closest(".history-table-shell")?.addEventListener("scroll", (event) => {
@@ -3353,6 +3360,7 @@ function resetSessionScopedUiState() {
   _websocketDetailPendingPromise = null;
   clearWebsocketQueryBackfill();
   clearFilteredWebsocketReload();
+  clearWebsocketSearchReload();
   if (_websocketDetailRefreshTimer) {
     window.clearTimeout(_websocketDetailRefreshTimer);
     _websocketDetailRefreshTimer = null;
@@ -4233,12 +4241,19 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
   const queryState = createWebsocketQueryState();
   const querySignature = websocketQuerySignature(queryState);
   const append = Boolean(options.append);
+  const previousQuerySignature = state.websocketPaging?.querySignature || "";
+  const queryChanged = !append
+    && Boolean(previousQuerySignature)
+    && previousQuerySignature !== querySignature;
   const requestedOffset = append
     ? Math.max(0, Number(options.offset ?? state.websocketPaging?.loadedOffset ?? state.websocketPaging?.limit ?? 0) || 0)
     : 0;
   const requestedLimit = append
     ? WEBSOCKET_PAGE_SIZE
-    : normalizeWebsocketLoadLimit(options.limit ?? state.websocketPaging?.limit);
+    : normalizeWebsocketLoadLimit(options.limit ?? (queryChanged ? WEBSOCKET_PAGE_SIZE : state.websocketPaging?.limit));
+  if (queryChanged) {
+    resetWebsocketHistoryScroll();
+  }
   state.websocketPaging = {
     ...createWebsocketPagingState(),
     ...(state.websocketPaging || {}),
@@ -4390,6 +4405,20 @@ function clearFilteredWebsocketReload() {
   if (_websocketFilteredReloadTimer) {
     window.clearTimeout(_websocketFilteredReloadTimer);
     _websocketFilteredReloadTimer = 0;
+  }
+}
+
+function clearWebsocketSearchReload() {
+  if (_websocketSearchReloadTimer) {
+    window.clearTimeout(_websocketSearchReloadTimer);
+    _websocketSearchReloadTimer = 0;
+  }
+}
+
+function resetWebsocketHistoryScroll() {
+  const shell = document.querySelector("#websocketTable")?.closest(".history-table-shell");
+  if (shell) {
+    shell.scrollTop = 0;
   }
 }
 
@@ -4575,18 +4604,22 @@ async function loadWebsocketDetail(id, options = {}) {
       sessionId,
     );
     const response = await fetch(detailPath);
-    if (generation !== _websocketDetailGeneration || sessionId !== currentSessionId()) {
+    if (sessionId !== currentSessionId()) {
       return;
     }
     if (!response.ok) {
-      if (state.selectedWebsocketId !== id) {
-        return;
-      }
       if (response.status === 404) {
+        const wasSelected = state.selectedWebsocketId === id;
         const removedIndex = (state.websocketSessions || []).findIndex((item) => item.id === id);
         const previousLength = (state.websocketSessions || []).length;
         state.websocketSessions = (state.websocketSessions || []).filter((item) => item.id !== id);
         adjustWebsocketPagingAfterLocalRemoval(previousLength - state.websocketSessions.length);
+        if (!wasSelected) {
+          if (previousLength !== state.websocketSessions.length) {
+            renderWebsocketSessions();
+          }
+          return;
+        }
         state.selectedWebsocketId = removedIndex >= 0
           ? (state.websocketSessions[Math.min(removedIndex, state.websocketSessions.length - 1)]?.id ?? null)
           : null;
@@ -4597,12 +4630,18 @@ async function loadWebsocketDetail(id, options = {}) {
         await syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true });
         return;
       }
+      if (generation !== _websocketDetailGeneration || state.selectedWebsocketId !== id) {
+        return;
+      }
       state.selectedWebsocketRecord = null;
       state.selectedWebsocketDetailError = "Failed to load selected WebSocket session.";
       renderWebsocketSessions();
       return;
     }
 
+    if (generation !== _websocketDetailGeneration) {
+      return;
+    }
     const detail = await response.json();
     if (generation !== _websocketDetailGeneration || sessionId !== currentSessionId() || state.selectedWebsocketId !== id) {
       return;
@@ -18400,7 +18439,15 @@ function sendWsFrameToReplay(frameIdx) {
     return;
   }
   const frame = frames.find((candidate) => candidate.index === requestedIndex);
-  if (!frame) return;
+  if (!frame) {
+    showToast("That WebSocket frame is no longer loaded. Refreshing frames...", "error");
+    state.selectedFrameIdx = null;
+    hideFrameDetail();
+    if (session.id) {
+      loadWebsocketDetail(session.id, { force: true }).catch((error) => console.error(error));
+    }
+    return;
+  }
   const firstLoadedFrameIndex = frames.length ? Number(frames[0]?.index) : 0;
   const priorClientSetupFrameTruncated = frames.some((candidate) => (
     candidate.direction === "client_to_server"

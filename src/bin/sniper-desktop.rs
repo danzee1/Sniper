@@ -74,8 +74,8 @@ fn main() -> Result<()> {
 
     let state = Arc::new(AppState::new(config.clone())?);
 
-    if proxy_listener.is_some() {
-        state.set_proxy_online(true);
+    let initial_proxy_generation = if proxy_listener.is_some() {
+        let proxy_generation = state.mark_proxy_listener_online();
         runtime.block_on(state.log_info(
             "runtime",
             "Sniper desktop started",
@@ -84,6 +84,7 @@ fn main() -> Result<()> {
                 config.proxy_addr, config.ui_addr
             ),
         ));
+        Some(proxy_generation)
     } else {
         runtime.block_on(state.log_error(
             "runtime",
@@ -93,7 +94,8 @@ fn main() -> Result<()> {
                 config.proxy_addr
             ),
         ));
-    }
+        None
+    };
 
     let ui_state = state.clone();
 
@@ -108,12 +110,15 @@ fn main() -> Result<()> {
         let proxy_state = state.clone();
         let offline_state = state.clone();
         let proxy_addr = config.proxy_addr;
+        let proxy_generation =
+            initial_proxy_generation.expect("proxy generation should exist when listener is bound");
         let handle = runtime.spawn(async move {
             if let Err(error) = proxy::serve_proxy(listener, proxy_state).await {
                 error!(?error, "proxy task stopped");
                 proxy::mark_proxy_offline_after_task_exit(
                     &offline_state,
                     proxy_addr,
+                    proxy_generation,
                     "after initial proxy task stopped",
                 )
                 .await;

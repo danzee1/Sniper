@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -46,6 +46,18 @@ const PLIST_BUDDY_PATH: &str = "/usr/libexec/PlistBuddy";
 const LIPO_PATH: &str = "/usr/bin/lipo";
 const SH_PATH: &str = "/bin/sh";
 
+fn proxy_listener_status_word(generation: u64, online: bool) -> u64 {
+    (generation << 1) | u64::from(online)
+}
+
+fn proxy_listener_generation(status: u64) -> u64 {
+    status >> 1
+}
+
+fn proxy_listener_online(status: u64) -> bool {
+    status & 1 == 1
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -54,6 +66,7 @@ pub struct AppState {
     pub ui_settings: Arc<AppUiSettingsStore>,
     pub sessions: Arc<SessionRegistry>,
     pub proxy_online: Arc<AtomicBool>,
+    proxy_listener_status: Arc<AtomicU64>,
     active_session: Arc<RwLock<Arc<SessionContext>>>,
     app_version_cache: Arc<RwLock<Option<CachedAppVersionInfo>>>,
     update_in_progress: Arc<AtomicBool>,
@@ -99,6 +112,7 @@ impl AppState {
             ui_settings,
             sessions: Arc::new(sessions),
             proxy_online: Arc::new(AtomicBool::new(false)),
+            proxy_listener_status: Arc::new(AtomicU64::new(proxy_listener_status_word(0, false))),
             active_session: Arc::new(RwLock::new(active_session)),
             app_version_cache: Arc::new(RwLock::new(None)),
             update_in_progress: Arc::new(AtomicBool::new(false)),
@@ -114,11 +128,59 @@ impl AppState {
     }
 
     pub fn set_proxy_online(&self, online: bool) {
+        loop {
+            let current = self.proxy_listener_status.load(Ordering::Acquire);
+            let generation = proxy_listener_generation(current);
+            let next = proxy_listener_status_word(generation, online);
+            if self
+                .proxy_listener_status
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
         self.proxy_online.store(online, Ordering::Relaxed);
     }
 
     pub fn is_proxy_online(&self) -> bool {
-        self.proxy_online.load(Ordering::Relaxed)
+        proxy_listener_online(self.proxy_listener_status.load(Ordering::Acquire))
+    }
+
+    pub fn mark_proxy_listener_online(&self) -> u64 {
+        loop {
+            let current = self.proxy_listener_status.load(Ordering::Acquire);
+            let next_generation = proxy_listener_generation(current).saturating_add(1);
+            let next = proxy_listener_status_word(next_generation, true);
+            if self
+                .proxy_listener_status
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.proxy_online.store(true, Ordering::Relaxed);
+                return next_generation;
+            }
+        }
+    }
+
+    pub fn mark_proxy_listener_offline_if_current(&self, expected_generation: u64) -> bool {
+        let current_online = proxy_listener_status_word(expected_generation, true);
+        let current_offline = proxy_listener_status_word(expected_generation, false);
+        if self
+            .proxy_listener_status
+            .compare_exchange(
+                current_online,
+                current_offline,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.proxy_online.store(false, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn session(&self) -> Arc<SessionContext> {
@@ -529,7 +591,10 @@ impl AppState {
     /// Download the latest DMG from GitHub releases, mount it, copy the new
     /// app bundle over the current one, then restart the process.
     /// Sends progress events through the provided sender.
-    pub async fn self_update(&self, tx: tokio::sync::mpsc::Sender<UpdateProgress>) -> Result<()> {
+    pub async fn self_update(
+        self: &Arc<Self>,
+        tx: tokio::sync::mpsc::Sender<UpdateProgress>,
+    ) -> Result<()> {
         use std::process::Command;
         use tokio::io::AsyncWriteExt;
 
@@ -743,8 +808,7 @@ impl AppState {
             &expected_team,
         ) {
             cleanup_update_artifacts(None, &tmp_dir).await;
-            self.mark_proxy_offline_after_self_update_prepare_failure()
-                .await;
+            self.restore_proxy_after_self_update_prepare_failure().await;
             return Err(error);
         }
 
@@ -790,23 +854,38 @@ impl AppState {
         Ok(())
     }
 
-    async fn mark_proxy_offline_after_self_update_prepare_failure(&self) {
-        self.set_proxy_online(false);
+    async fn restore_proxy_after_self_update_prepare_failure(self: &Arc<Self>) {
         let proxy_addr = self.get_active_proxy_addr().await;
-        let ui_addr = self.get_active_ui_addr().await;
-        if let Err(error) = crate::runtime_state::persist_runtime_state(
-            &self.config.data_dir,
-            &crate::runtime_state::RuntimeStateSnapshot::with_proxy_status_and_instance(
-                proxy_addr,
-                ui_addr,
-                false,
-                self.runtime_instance_id,
-            ),
-        ) {
-            tracing::warn!(
-                ?error,
-                "failed to persist offline runtime state after self-update installer spawn failure"
-            );
+        match crate::proxy::rebind_proxy(Arc::clone(self), proxy_addr).await {
+            Ok(()) => {
+                tracing::warn!(
+                    %proxy_addr,
+                    "restored proxy listener after self-update installer spawn failure"
+                );
+            }
+            Err(error) => {
+                self.set_proxy_online(false);
+                let ui_addr = self.get_active_ui_addr().await;
+                if let Err(persist_error) = crate::runtime_state::persist_runtime_state(
+                    &self.config.data_dir,
+                    &crate::runtime_state::RuntimeStateSnapshot::with_proxy_status_and_instance(
+                        proxy_addr,
+                        ui_addr,
+                        false,
+                        self.runtime_instance_id,
+                    ),
+                ) {
+                    tracing::warn!(
+                        ?persist_error,
+                        "failed to persist offline runtime state after self-update installer spawn failure"
+                    );
+                }
+                tracing::warn!(
+                    %error,
+                    %proxy_addr,
+                    "failed to restore proxy listener after self-update installer spawn failure"
+                );
+            }
         }
     }
 

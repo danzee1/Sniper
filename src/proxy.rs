@@ -169,6 +169,9 @@ pub async fn rebind_proxy(
     let _rebind_guard = state.proxy_rebind_lock.lock().await;
     let current = state.get_active_proxy_addr().await;
     if current == new_addr {
+        if !state.is_proxy_online() {
+            return restart_proxy_listener_on_current_addr(Arc::clone(&state), new_addr).await;
+        }
         return Ok(());
     }
 
@@ -221,7 +224,7 @@ pub async fn rebind_proxy(
                 Ok(restored) => {
                     let restored_addr = restored.local_addr().unwrap_or(current);
                     state.set_active_proxy_addr(restored_addr).await;
-                    state.set_proxy_online(true);
+                    let proxy_generation = state.mark_proxy_listener_online();
                     persist_proxy_runtime_state(
                         &state,
                         restored_addr,
@@ -237,6 +240,7 @@ pub async fn rebind_proxy(
                             mark_proxy_offline_after_task_exit(
                                 &offline_state,
                                 restored_addr,
+                                proxy_generation,
                                 "after restored proxy task stopped",
                             )
                             .await;
@@ -270,7 +274,7 @@ pub async fn rebind_proxy(
 
     // Update active address
     state.set_active_proxy_addr(bound_addr).await;
-    state.set_proxy_online(true);
+    let proxy_generation = state.mark_proxy_listener_online();
     persist_proxy_runtime_state(&state, bound_addr, true, "after proxy rebind").await;
 
     info!(old = %current, new = %bound_addr, "proxy listener rebound");
@@ -284,7 +288,48 @@ pub async fn rebind_proxy(
             mark_proxy_offline_after_task_exit(
                 &offline_state,
                 bound_addr,
+                proxy_generation,
                 "after rebound proxy task stopped",
+            )
+            .await;
+        }
+    });
+    state.set_proxy_task(handle).await;
+
+    Ok(())
+}
+
+async fn restart_proxy_listener_on_current_addr(
+    state: Arc<AppState>,
+    addr: SocketAddr,
+) -> std::result::Result<(), String> {
+    let listener = bind_proxy_listener(addr)
+        .await
+        .map_err(|error| format!("Could not bind to {addr} ({error})"))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|error| format!("failed to read bound address: {error}"))?;
+    state.set_active_proxy_addr(bound_addr).await;
+    let proxy_generation = state.mark_proxy_listener_online();
+    persist_proxy_runtime_state(
+        &state,
+        bound_addr,
+        true,
+        "after restarting offline proxy listener",
+    )
+    .await;
+
+    info!(addr = %bound_addr, "offline proxy listener restarted");
+    let proxy_state = state.clone();
+    let offline_state = state.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(error) = serve_proxy(listener, proxy_state).await {
+            tracing::error!(?error, "restarted proxy task stopped");
+            mark_proxy_offline_after_task_exit(
+                &offline_state,
+                bound_addr,
+                proxy_generation,
+                "after restarted proxy task stopped",
             )
             .await;
         }
@@ -317,13 +362,16 @@ async fn persist_proxy_runtime_state(
 pub async fn mark_proxy_offline_after_task_exit(
     state: &Arc<AppState>,
     expected_addr: SocketAddr,
+    expected_generation: u64,
     context: &'static str,
 ) {
     let proxy_addr = state.get_active_proxy_addr().await;
     if proxy_addr != expected_addr {
         return;
     }
-    state.set_proxy_online(false);
+    if !state.mark_proxy_listener_offline_if_current(expected_generation) {
+        return;
+    }
     persist_proxy_runtime_state(state, proxy_addr, false, context).await;
 }
 
@@ -4554,6 +4602,9 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) -
     let mut sessions_to_persist = HashMap::new();
     let mut relay_ids_by_session: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for (relay_id, relay) in relays {
+        if !state.sessions.contains_session(relay.session.id()) {
+            continue;
+        }
         relay.abort.abort();
         if let Some(websocket_id) = relay.captured_websocket_id {
             relay.close_persist_pending.store(true, Ordering::Release);
@@ -5750,6 +5801,73 @@ mod tests {
         assert!(session_has_live_websocket_relays(session.id()));
 
         forget_live_websocket_relay(websocket_id);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn rebind_proxy_starts_listener_when_same_address_is_offline() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-rebind-offline-same-address-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let desired_addr = state.get_active_proxy_addr().await;
+
+        rebind_proxy(state.clone(), desired_addr).await.unwrap();
+
+        let active_addr = state.get_active_proxy_addr().await;
+        assert!(state.is_proxy_online());
+        assert_ne!(active_addr.port(), 0);
+
+        state.abort_proxy_task().await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn stale_proxy_task_exit_does_not_mark_new_listener_offline() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-stale-proxy-exit-generation-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:18080".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let active_addr = "127.0.0.1:18080".parse().unwrap();
+        state.set_active_proxy_addr(active_addr).await;
+        let old_generation = state.mark_proxy_listener_online();
+        let new_generation = state.mark_proxy_listener_online();
+
+        mark_proxy_offline_after_task_exit(
+            &state,
+            active_addr,
+            old_generation,
+            "after stale proxy task stopped",
+        )
+        .await;
+
+        assert!(state.is_proxy_online());
+
+        mark_proxy_offline_after_task_exit(
+            &state,
+            active_addr,
+            new_generation,
+            "after current proxy task stopped",
+        )
+        .await;
+
+        assert!(!state.is_proxy_online());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

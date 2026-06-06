@@ -2670,13 +2670,7 @@ async fn resolve_session_for_required_id(
         let active_session = state.session().await;
         return Err(action_session_conflict_response(&active_session));
     };
-    match resolve_session_for_optional_id(state, Some(target_session_id)).await {
-        Ok(session) => Ok(session),
-        Err(response) if response.status() == StatusCode::NOT_FOUND => {
-            Err(active_session_conflict_response(state))
-        }
-        Err(response) => Err(response),
-    }
+    resolve_session_for_optional_id(state, Some(target_session_id)).await
 }
 
 async fn ensure_ws_replay_connection_owner(
@@ -8715,7 +8709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_send_rejects_payload_for_wrong_session_before_sending() {
+    async fn replay_send_rejects_payload_for_unknown_session_before_sending() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-replay-send-session-guard-{}",
             uuid::Uuid::new_v4()
@@ -8751,7 +8745,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
         assert!(session.store.snapshot(Some(10)).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);
@@ -8975,7 +8969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_send_rejects_wrong_session_before_validating_payload() {
+    async fn replay_send_rejects_unknown_session_before_validating_payload() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-replay-invalid-session-guard-{}",
             uuid::Uuid::new_v4()
@@ -9010,13 +9004,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
-    async fn fuzzer_run_rejects_payload_for_wrong_session_before_attack() {
+    async fn fuzzer_run_rejects_payload_for_unknown_session_before_attack() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-session-guard-{}",
             uuid::Uuid::new_v4()
@@ -9053,7 +9047,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
         assert!(session.fuzzer.list(Some(10)).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);
@@ -9104,7 +9098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fuzzer_run_rejects_wrong_session_before_validating_payload() {
+    async fn fuzzer_run_rejects_unknown_session_before_validating_payload() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-invalid-session-guard-{}",
             uuid::Uuid::new_v4()
@@ -9140,7 +9134,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -9298,6 +9292,39 @@ mod tests {
                 session_id: Some(session.id()),
                 id: Uuid::new_v4(),
                 remove: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_connect_rejects_unknown_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-connect-unknown-session-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+
+        let response = super::ws_replay_connect(
+            State(state),
+            Json(super::WsReplayConnectPayload {
+                session_id: Some(Uuid::new_v4()),
+                id: Uuid::new_v4(),
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                port: 443,
+                path: "/socket".to_string(),
+                headers: Vec::new(),
             }),
         )
         .await;
@@ -10228,9 +10255,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequence_run_rejects_wrong_session_before_running() {
+    async fn sequence_run_rejects_unknown_session_before_running() {
         let data_dir = std::env::temp_dir().join(format!(
-            "sniper-test-sequence-wrong-session-run-{}",
+            "sniper-test-sequence-unknown-session-run-{}",
             uuid::Uuid::new_v4()
         ));
         let config = AppConfig {
@@ -10244,7 +10271,7 @@ mod tests {
         let session = state.session().await;
         let definition = SequenceDefinition {
             id: uuid::Uuid::new_v4(),
-            name: "Wrong session run".to_string(),
+            name: "Unknown session run".to_string(),
             steps: Vec::new(),
         };
         session.sequence.upsert_definition(definition.clone()).await;
@@ -10258,7 +10285,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
         assert!(session.sequence.list_runs(None).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);

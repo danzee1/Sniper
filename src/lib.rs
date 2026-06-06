@@ -58,7 +58,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 .local_addr()
                 .context("failed to read bound proxy address")?;
             state.set_active_proxy_addr(proxy_addr).await;
-            state.set_proxy_online(true);
+            let proxy_generation = state.mark_proxy_listener_online();
             state
                 .log_info(
                     "runtime",
@@ -78,6 +78,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                     proxy::mark_proxy_offline_after_task_exit(
                         &offline_state,
                         proxy_addr,
+                        proxy_generation,
                         "after initial proxy task stopped",
                     )
                     .await;
