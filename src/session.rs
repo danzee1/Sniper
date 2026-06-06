@@ -144,6 +144,12 @@ struct StoredSessionSnapshot {
     replayed_transaction_ids: HashSet<Uuid>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionSnapshotLoadMode {
+    Writable,
+    ReadOnly,
+}
+
 fn deserialize_workspace_state_lossy<'de, D>(
     deserializer: D,
 ) -> std::result::Result<WorkspaceStateSnapshot, D::Error>
@@ -195,6 +201,41 @@ impl SessionContext {
         max_frames_per_session: usize,
         snapshot: StoredSessionSnapshot,
     ) -> Self {
+        Self::from_snapshot_with_journal_mode(
+            metadata,
+            storage_dir,
+            max_entries,
+            max_frames_per_session,
+            snapshot,
+            true,
+        )
+    }
+
+    fn from_snapshot_read_only(
+        metadata: SessionMetadata,
+        storage_dir: PathBuf,
+        max_entries: usize,
+        max_frames_per_session: usize,
+        snapshot: StoredSessionSnapshot,
+    ) -> Self {
+        Self::from_snapshot_with_journal_mode(
+            metadata,
+            storage_dir,
+            max_entries,
+            max_frames_per_session,
+            snapshot,
+            false,
+        )
+    }
+
+    fn from_snapshot_with_journal_mode(
+        metadata: SessionMetadata,
+        storage_dir: PathBuf,
+        max_entries: usize,
+        max_frames_per_session: usize,
+        snapshot: StoredSessionSnapshot,
+        enable_journal: bool,
+    ) -> Self {
         let journal_path = transaction_journal_path(&storage_dir);
         let runtime_snapshot = snapshot.runtime.clone();
         let scanner_config = snapshot.scanner_config.clone();
@@ -214,11 +255,18 @@ impl SessionContext {
             id: metadata.id,
             storage_dir,
             max_entries,
-            store: Arc::new(TransactionStore::from_records_with_journal(
-                snapshot.transactions,
-                journal_path,
-                Some(max_entries),
-            )),
+            store: Arc::new(if enable_journal {
+                TransactionStore::from_records_with_journal(
+                    snapshot.transactions,
+                    journal_path,
+                    Some(max_entries),
+                )
+            } else {
+                TransactionStore::from_records_with_max_entries(
+                    snapshot.transactions,
+                    Some(max_entries),
+                )
+            }),
             runtime: Arc::new(RuntimeSettings::from_snapshot(runtime_snapshot.clone())),
             intercepts: Arc::new(InterceptQueue::new()),
             response_intercepts: Arc::new(ResponseInterceptQueue::new()),
@@ -833,6 +881,28 @@ impl SessionRegistry {
         )))
     }
 
+    pub fn load_context_read_only(&self, id: Uuid) -> Result<Arc<SessionContext>> {
+        let mut metadata = self
+            .inner
+            .read()
+            .expect("session registry lock poisoned")
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow!("session {id} was not found"))?;
+        let storage_dir = session_dir(&self.root_dir, id);
+        let snapshot = load_session_snapshot_read_only(&storage_dir, self.max_entries)?;
+        update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries);
+        Ok(Arc::new(SessionContext::from_snapshot_read_only(
+            metadata,
+            storage_dir,
+            self.max_entries,
+            self.max_frames_per_session,
+            snapshot,
+        )))
+    }
+
     fn touch_active_session(&self, id: Uuid) -> Result<SessionMetadata> {
         let mut registry = self.inner.write().expect("session registry lock poisoned");
         let mut next = registry.clone();
@@ -1398,7 +1468,32 @@ fn tighten_private_file(_path: &Path) -> io::Result<()> {
 }
 
 fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<StoredSessionSnapshot> {
-    ensure_existing_private_session_dir(storage_dir)?;
+    load_session_snapshot_with_mode(storage_dir, max_entries, SessionSnapshotLoadMode::Writable)
+}
+
+fn load_session_snapshot_read_only(
+    storage_dir: &Path,
+    max_entries: usize,
+) -> Result<StoredSessionSnapshot> {
+    load_session_snapshot_with_mode(storage_dir, max_entries, SessionSnapshotLoadMode::ReadOnly)
+}
+
+fn load_session_snapshot_with_mode(
+    storage_dir: &Path,
+    max_entries: usize,
+    mode: SessionSnapshotLoadMode,
+) -> Result<StoredSessionSnapshot> {
+    match mode {
+        SessionSnapshotLoadMode::Writable => ensure_existing_private_session_dir(storage_dir)?,
+        SessionSnapshotLoadMode::ReadOnly => {
+            if session_storage_metadata(storage_dir)?.is_none() {
+                bail!(
+                    "session storage directory {} was not found",
+                    storage_dir.display()
+                );
+            }
+        }
+    }
     let path = snapshot_path(storage_dir);
     let mut snapshot = match fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<StoredSessionSnapshot>(&bytes) {
@@ -1409,7 +1504,9 @@ fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<Store
                     path = %path.display(),
                     "discarding corrupt session snapshot"
                 );
-                move_corrupt_session_file_aside(storage_dir, &path, "snapshot");
+                if mode == SessionSnapshotLoadMode::Writable {
+                    move_corrupt_session_file_aside(storage_dir, &path, "snapshot");
+                }
                 Ok(StoredSessionSnapshot::default())
             }
         },
@@ -1422,7 +1519,9 @@ fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<Store
                 path = %path.display(),
                 "discarding unreadable session snapshot"
             );
-            move_corrupt_session_file_aside(storage_dir, &path, "snapshot");
+            if mode == SessionSnapshotLoadMode::Writable {
+                move_corrupt_session_file_aside(storage_dir, &path, "snapshot");
+            }
             Ok(StoredSessionSnapshot::default())
         }
         Err(error) => Err(error)
@@ -1437,8 +1536,12 @@ fn load_session_snapshot(storage_dir: &Path, max_entries: usize) -> Result<Store
         );
         snapshot.workspace = WorkspaceStateSnapshot::default();
     }
-    snapshot.replayed_transaction_ids =
-        replay_transaction_journal(storage_dir, max_entries, &mut snapshot)?;
+    snapshot.replayed_transaction_ids = replay_transaction_journal(
+        storage_dir,
+        max_entries,
+        &mut snapshot,
+        mode == SessionSnapshotLoadMode::Writable,
+    )?;
     snapshot.replayed_transaction_journal = !snapshot.replayed_transaction_ids.is_empty();
     Ok(snapshot)
 }
@@ -1459,6 +1562,7 @@ fn replay_transaction_journal(
     storage_dir: &Path,
     max_entries: usize,
     snapshot: &mut StoredSessionSnapshot,
+    repair_files: bool,
 ) -> Result<HashSet<Uuid>> {
     let journal_path = transaction_journal_path(storage_dir);
     let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
@@ -1499,6 +1603,7 @@ fn replay_transaction_journal(
         &mut replayed_transaction_ids,
         Some(&snapshot_record_ids),
         max_entries,
+        repair_files,
     )?;
     replay_transaction_journal_file(
         &journal_path,
@@ -1509,6 +1614,7 @@ fn replay_transaction_journal(
         &mut replayed_transaction_ids,
         None,
         max_entries,
+        repair_files,
     )?;
 
     snapshot.transactions = order
@@ -1534,6 +1640,7 @@ fn replay_transaction_journal_file(
     replayed_transaction_ids: &mut HashSet<Uuid>,
     skip_annotations_for: Option<&HashSet<Uuid>>,
     max_entries: usize,
+    repair_files: bool,
 ) -> Result<()> {
     let file = match fs::File::open(journal_path) {
         Ok(file) => file,
@@ -1544,7 +1651,9 @@ fn replay_transaction_journal_file(
                 path = %journal_path.display(),
                 "discarding unreadable transaction journal"
             );
-            move_unreadable_transaction_journal_aside(journal_path);
+            if repair_files {
+                move_unreadable_transaction_journal_aside(journal_path);
+            }
             return Ok(());
         }
         Err(error) => {
@@ -1565,7 +1674,9 @@ fn replay_transaction_journal_file(
             path = %journal_path.display(),
             "discarding directory transaction journal"
         );
-        move_unreadable_transaction_journal_aside(journal_path);
+        if repair_files {
+            move_unreadable_transaction_journal_aside(journal_path);
+        }
         return Ok(());
     }
 
@@ -1603,7 +1714,9 @@ fn replay_transaction_journal_file(
                 line = line_number,
                 "ignoring trailing partial transaction journal line"
             );
-            repair_corrupt_transaction_journal_tail(journal_path, valid_prefix_len);
+            if repair_files {
+                repair_corrupt_transaction_journal_tail(journal_path, valid_prefix_len);
+            }
             break;
         }
         let entry: TransactionJournalEntry = match serde_json::from_slice(trimmed) {
@@ -1615,7 +1728,9 @@ fn replay_transaction_journal_file(
                     line = line_number,
                     "stopping transaction journal replay at corrupt line"
                 );
-                repair_corrupt_transaction_journal_tail(journal_path, line_start_offset);
+                if repair_files {
+                    repair_corrupt_transaction_journal_tail(journal_path, line_start_offset);
+                }
                 break;
             }
         };
@@ -2132,6 +2247,61 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("restarted before this WebSocket session was closed")));
+    }
+
+    #[test]
+    fn load_context_read_only_does_not_create_transaction_journal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-read-only-no-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, _active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let inactive = registry
+            .create_session(Some("Inactive".to_string()))
+            .unwrap();
+        let storage_dir = super::session_dir(&data_dir.join(super::SESSIONS_DIR), inactive.id);
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        assert!(!journal_path.exists());
+
+        let loaded = registry.load_context_read_only(inactive.id).unwrap();
+
+        assert_eq!(loaded.id(), inactive.id);
+        assert!(!journal_path.exists());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn load_context_read_only_does_not_repair_corrupt_session_files() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-read-only-no-repair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, _active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let inactive = registry
+            .create_session(Some("Inactive".to_string()))
+            .unwrap();
+        let storage_dir = super::session_dir(&data_dir.join(super::SESSIONS_DIR), inactive.id);
+        let snapshot_path = super::snapshot_path(&storage_dir);
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let corrupt_snapshot = b"{not-json";
+        let corrupt_journal = b"{\"type\":\"insert\"}\n{not-json}\n";
+        std::fs::write(&snapshot_path, corrupt_snapshot).unwrap();
+        std::fs::write(&journal_path, corrupt_journal).unwrap();
+
+        let loaded = registry.load_context_read_only(inactive.id).unwrap();
+
+        assert_eq!(loaded.id(), inactive.id);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), corrupt_snapshot);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), corrupt_journal);
+        let has_repair_artifact = std::fs::read_dir(&storage_dir).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.starts_with(".snapshot.corrupt-")
+                || name.starts_with(".transactions.journal.corrupt-")
+        });
+        assert!(!has_repair_artifact);
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
@@ -3336,6 +3506,7 @@ mod tests {
             &mut replayed,
             None,
             100,
+            true,
         )
         .expect("directory journal should be moved aside");
 

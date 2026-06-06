@@ -2684,7 +2684,7 @@ async fn resolve_read_session_for_optional_id(
         return Err(StatusCode::NOT_FOUND.into_response());
     }
     state
-        .session_context_for_id(target_session_id)
+        .read_session_context_for_id(target_session_id)
         .await
         .map_err(|error| session_load_failure_response(target_session_id, error))
 }
@@ -9216,6 +9216,47 @@ mod tests {
             durable.replay.active_tab_id.as_deref(),
             Some("committed-workspace-tab")
         );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn inactive_workspace_read_does_not_create_transaction_journal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-workspace-read-no-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive".to_string()))
+            .unwrap();
+        let journal_path = data_dir
+            .join("sessions")
+            .join(inactive.id.to_string())
+            .join("transactions.journal");
+        assert!(!journal_path.exists());
+
+        let snapshot: WorkspaceStateSnapshot = response_json(
+            super::get_workspace_state(
+                State(state.clone()),
+                Query(super::WorkspaceStateQuery {
+                    session_id: Some(inactive.id),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(snapshot.session_id, Some(inactive.id));
+        assert!(!journal_path.exists());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

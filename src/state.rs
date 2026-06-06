@@ -233,6 +233,32 @@ impl AppState {
         self.session_context_for_id_operation_locked(id).await
     }
 
+    pub async fn read_session_context_for_id(&self, id: uuid::Uuid) -> Result<Arc<SessionContext>> {
+        let active = self.session().await;
+        if id == active.id() {
+            return Ok(active);
+        }
+
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
+        let operation_lock = self.session_operation_lock(id).await;
+        let _operation_guard = operation_lock.lock().await;
+        {
+            let mut contexts = self.session_contexts.lock().await;
+            if let Some(session) = contexts.get(&id) {
+                if self.sessions.contains_session(id) {
+                    return Ok(session.clone());
+                }
+                contexts.remove(&id);
+            }
+        }
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
+        self.sessions.load_context_read_only(id)
+    }
+
     pub async fn session_context_for_id_operation_locked(
         &self,
         id: uuid::Uuid,
