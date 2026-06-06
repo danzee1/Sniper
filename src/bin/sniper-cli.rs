@@ -1176,6 +1176,7 @@ struct InterceptActionResult {
     ok: bool,
     action: &'static str,
     id: Uuid,
+    session_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -1415,7 +1416,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
             print_json(&record)
         }
         HistoryCommand::Replay(args) => {
-            let tab = open_replay_tab(
+            let (session_id, tab) = open_replay_tab(
                 &api,
                 ReplayOpenInput {
                     session_id: args.session_id,
@@ -1428,7 +1429,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
                 },
             )
             .await?;
-            print_json(&tab)
+            print_json_with_session(&tab, session_id)
         }
         HistoryCommand::Fuzzer(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
@@ -1453,7 +1454,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
             workspace.fuzzer.notice.clear();
             workspace.fuzzer.clear_attack_record_reference();
             let snapshot = post_workspace_state(&api, &mut workspace).await?;
-            print_json(&snapshot.fuzzer)
+            print_json_with_session(&snapshot.fuzzer, workspace.session_id)
         }
         HistoryCommand::Annotate(args) => {
             let color_tag: Option<Option<String>> = if args.clear_color {
@@ -1478,7 +1479,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
             let summary: TransactionSummary = api
                 .request_json(Method::PATCH, &path, Some(&payload))
                 .await?;
-            print_json(&summary)
+            print_json_with_session(&summary, session_id)
         }
     }
 }
@@ -1546,9 +1547,12 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
                     },
                 )
                 .await?;
-            print_json(&ScopeOutput {
-                scope_patterns: runtime.scope_patterns,
-            })
+            print_json_with_session(
+                &ScopeOutput {
+                    scope_patterns: runtime.scope_patterns,
+                },
+                session_id,
+            )
         }
     }
 }
@@ -1560,7 +1564,7 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             print_json(&workspace.replay)
         }
         ReplayCommand::Open(args) => {
-            let tab = open_replay_tab(
+            let (session_id, tab) = open_replay_tab(
                 &api,
                 ReplayOpenInput {
                     session_id: args.session_id,
@@ -1573,7 +1577,7 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 },
             )
             .await?;
-            print_json(&tab)
+            print_json_with_session(&tab, session_id)
         }
         ReplayCommand::Update(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
@@ -1631,7 +1635,7 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             }
             let snapshot = post_workspace_state(&api, &mut workspace).await?;
             let tab = find_replay_tab(&snapshot.replay, &args.tab_id)?;
-            print_json(tab)
+            print_json_with_session(tab, workspace.session_id)
         }
         ReplayCommand::Send(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
@@ -1685,18 +1689,28 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
 
             let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
             if let Some(error) = replay_error {
+                let mut output = json!({
+                    "error": error.clone(),
+                    "record": record,
+                    "session_id": workspace.session_id,
+                });
                 if let Some(save_error) = workspace_save_error {
+                    attach_workspace_save_error(&mut output, &save_error);
+                    print_json(&output)?;
                     bail!(
                         "replay failed after storing transaction record: {error}; workspace state was not saved: {save_error}"
                     );
                 }
-                print_json(&json!({ "error": error, "record": record }))?;
+                print_json(&output)?;
                 bail!("replay failed after storing transaction record: {error}");
             } else {
+                let mut output = json_value_with_session(&record, workspace.session_id)?;
                 if let Some(save_error) = workspace_save_error {
+                    attach_workspace_save_error(&mut output, &save_error);
+                    print_json(&output)?;
                     bail!("replay was sent, but workspace state was not saved: {save_error}");
                 }
-                print_json(&record)?;
+                print_json(&output)?;
                 Ok(())
             }
         }
@@ -1733,7 +1747,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.notice.clear();
             workspace.fuzzer.clear_attack_record_reference();
             let snapshot = post_workspace_state(&api, &mut workspace).await?;
-            print_json(&snapshot.fuzzer)
+            print_json_with_session(&snapshot.fuzzer, workspace.session_id)
         }
         FuzzerCommand::SetPayloads(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
@@ -1742,7 +1756,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.notice.clear();
             workspace.fuzzer.clear_attack_record_reference();
             let snapshot = post_workspace_state(&api, &mut workspace).await?;
-            print_json(&snapshot.fuzzer)
+            print_json_with_session(&snapshot.fuzzer, workspace.session_id)
         }
         FuzzerCommand::Run(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
@@ -1776,18 +1790,34 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.notice.clear();
             let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
 
-            ensure_cli_record_not_failed("fuzzer attack", &record)?;
+            let record_value =
+                serde_json::to_value(&record).context("failed to inspect JSON status")?;
+            if let Some(mut output) = failed_record_output("fuzzer attack", &record_value) {
+                attach_session_id(&mut output, workspace.session_id);
+                if let Some(save_error) = &workspace_save_error {
+                    attach_workspace_save_error(&mut output, save_error);
+                }
+                print_json(&output)?;
+                if let Some(save_error) = workspace_save_error {
+                    bail!("fuzzer attack failed; workspace state was not saved: {save_error}");
+                }
+                bail!("fuzzer attack failed");
+            }
+            let mut record_output = json_value_with_session(&record, workspace.session_id)?;
             if let Some(save_error) = workspace_save_error {
+                attach_workspace_save_error(&mut record_output, &save_error);
+                print_json(&record_output)?;
                 bail!("fuzzer attack completed, but workspace state was not saved: {save_error}");
             }
             if args.r#async {
                 print_json(&json!({
                     "async_requested": true,
+                    "session_id": workspace.session_id,
                     "message": "Fuzzer attack completed. The current Sniper API creates attacks synchronously, so the CLI waits until the server returns the attack record.",
                     "attack": record,
                 }))?;
             } else {
-                print_json(&record)?;
+                print_json(&record_output)?;
             }
             Ok(())
         }
@@ -1855,7 +1885,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                     },
                 )
                 .await?;
-            print_json(&runtime)
+            print_json_with_session(&runtime, session_id)
         }
         InterceptCommand::Off(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -1870,7 +1900,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                     },
                 )
                 .await?;
-            print_json(&runtime)
+            print_json_with_session(&runtime, session_id)
         }
         InterceptCommand::List(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -1898,6 +1928,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                 ok: true,
                 action: "forward",
                 id: args.id,
+                session_id,
             })
         }
         InterceptCommand::Drop(args) => {
@@ -1908,6 +1939,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                 ok: true,
                 action: "drop",
                 id: args.id,
+                session_id,
             })
         }
     }
@@ -1998,6 +2030,7 @@ async fn handle_response_intercept(
                 ok: true,
                 action: "forward",
                 id: args.id,
+                session_id,
             })
         }
         ResponseInterceptCommand::Drop(args) => {
@@ -2011,13 +2044,14 @@ async fn handle_response_intercept(
                 ok: true,
                 action: "drop",
                 id: args.id,
+                session_id,
             })
         }
         ResponseInterceptCommand::ForwardAll(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/response-intercepts/forward-all", session_id);
             api.post_status(&path, &json!({})).await?;
-            print_json(&json!({ "ok": true, "action": "forward-all" }))
+            print_json(&json!({ "ok": true, "action": "forward-all", "session_id": session_id }))
         }
     }
 }
@@ -2043,13 +2077,13 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
             });
             let path = session_query_path("/api/intercept-rules", session_id);
             api.post_status(&path, &rule).await?;
-            print_json(&rule)
+            print_json_with_session(&rule, session_id)
         }
         InterceptRuleCommand::Delete(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path(&format!("/api/intercept-rules/{}", args.id), session_id);
             api.delete_status(&path).await?;
-            print_json(&json!({ "ok": true, "deleted": args.id }))
+            print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
         }
     }
 }
@@ -2092,17 +2126,18 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
                 },
             )
             .await?;
-            print_json(&def)
+            print_json_with_session(&def, session_id)
         }
         SequenceCommand::Run(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let result: serde_json::Value = api
+            let mut result: serde_json::Value = api
                 .post_json_long(
                     &format!("/api/sequences/{}/run", args.id),
                     &SessionIdPayload { session_id },
                 )
                 .await?;
-            ensure_json_status_not_failed("sequence run", &result)?;
+            attach_session_id(&mut result, session_id);
+            print_failed_json_record_and_bail("sequence run", &result)?;
             print_json(&result)?;
             Ok(())
         }
@@ -2116,7 +2151,7 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path(&format!("/api/sequences/{}", args.id), session_id);
             api.delete_status(&path).await?;
-            print_json(&json!({ "ok": true, "deleted": args.id }))
+            print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
         }
         SequenceCommand::Runs(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -2181,7 +2216,7 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/oast/callbacks/clear", session_id);
             api.post_status(&path, &serde_json::json!({})).await?;
-            print_json(&serde_json::json!({"status": "cleared"}))
+            print_json(&serde_json::json!({"status": "cleared", "session_id": session_id}))
         }
         OastCommand::Configure(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -2214,12 +2249,16 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
                 // Just show current settings
                 let path = session_query_path("/api/runtime", session_id);
                 let runtime: serde_json::Value = api.get_json(&path).await?;
-                print_json(&oast_fields_for_output(runtime))
+                let mut output = Value::Object(oast_fields_for_output(runtime));
+                attach_session_id(&mut output, session_id);
+                print_json(&output)
             } else {
                 let result: serde_json::Value = api
                     .post_json("/api/runtime", &serde_json::Value::Object(update))
                     .await?;
-                print_json(&oast_fields_for_output(result))
+                let mut output = Value::Object(oast_fields_for_output(result));
+                attach_session_id(&mut output, session_id);
+                print_json(&output)
             }
         }
     }
@@ -2235,7 +2274,10 @@ struct ReplayOpenInput {
     port: Option<String>,
 }
 
-async fn open_replay_tab(api: &ApiClient, input: ReplayOpenInput) -> Result<ReplayTabState> {
+async fn open_replay_tab(
+    api: &ApiClient,
+    input: ReplayOpenInput,
+) -> Result<(Option<Uuid>, ReplayTabState)> {
     let ReplayOpenInput {
         session_id,
         transaction_id,
@@ -2276,7 +2318,7 @@ async fn open_replay_tab(api: &ApiClient, input: ReplayOpenInput) -> Result<Repl
     workspace.replay.tabs.push(tab.clone());
     let snapshot = post_workspace_state(api, &mut workspace).await?;
     let tab = find_replay_tab(&snapshot.replay, &tab.id)?;
-    Ok(tab.clone())
+    Ok((workspace.session_id, tab.clone()))
 }
 
 fn replay_tab_target_as_request(tab: &ReplayTabState) -> Option<EditableRequest> {
@@ -3551,16 +3593,51 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     stdout.write_all(b"\n").context("failed to write stdout")
 }
 
-fn ensure_cli_record_not_failed<T: Serialize>(label: &str, value: &T) -> Result<()> {
-    let value = serde_json::to_value(value).context("failed to inspect JSON status")?;
-    ensure_json_status_not_failed(label, &value)
+fn print_json_with_session<T: Serialize>(value: &T, session_id: Option<Uuid>) -> Result<()> {
+    let output = json_value_with_session(value, session_id)?;
+    print_json(&output)
 }
 
-fn ensure_json_status_not_failed(label: &str, value: &Value) -> Result<()> {
-    if value.get("status").and_then(Value::as_str) == Some("failed") {
+fn json_value_with_session<T: Serialize>(value: &T, session_id: Option<Uuid>) -> Result<Value> {
+    let mut output = serde_json::to_value(value).context("failed to encode JSON output")?;
+    attach_session_id(&mut output, session_id);
+    Ok(output)
+}
+
+fn attach_session_id(output: &mut Value, session_id: Option<Uuid>) {
+    if let Some(session_id) = session_id {
+        if let Value::Object(map) = output {
+            map.insert("session_id".to_string(), json!(session_id));
+        }
+    }
+}
+
+fn print_failed_json_record_and_bail(label: &str, value: &Value) -> Result<()> {
+    if let Some(output) = failed_record_output(label, value) {
+        print_json(&output)?;
         bail!("{label} failed");
     }
     Ok(())
+}
+
+fn failed_record_output(label: &str, value: &Value) -> Option<Value> {
+    if value.get("status").and_then(Value::as_str) == Some("failed") {
+        Some(json!({
+            "error": format!("{label} failed"),
+            "record": value,
+        }))
+    } else {
+        None
+    }
+}
+
+fn attach_workspace_save_error(output: &mut Value, error: &anyhow::Error) {
+    if let Value::Object(map) = output {
+        map.insert(
+            "workspace_save_error".to_string(),
+            Value::String(error.to_string()),
+        );
+    }
 }
 
 fn find_replay_tab<'a>(
@@ -3823,23 +3900,23 @@ fn parse_response_status_line(status_line: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_session_id_from_summaries, api_url, build_annotations_payload,
-        build_editable_raw_request, build_editable_raw_request_with_version,
-        default_editable_request, ensure_json_status_not_failed, explicit_or_active_session_id,
-        fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
-        install_skills, normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
-        oast_fields_for_output, parse_editable_raw_request,
-        parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
-        parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
-        push_replay_history_entry, read_limited_to_end, read_payloads_input,
-        read_raw_request_input, read_raw_response_input, read_text_input, replay_send_http_version,
-        replay_tab_target_as_request, replay_tab_target_matches_request,
-        replay_update_should_preserve_current_port, session_query_path,
-        sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
-        sync_replay_tab_target_to_request, transaction_detail_path, websocket_detail_path,
-        websocket_list_path, workspace_conflict_message, Cli, Command, HistoryCommand,
-        HistoryListResponse, SequenceCommand, SequenceCreateInput, SkillsInstallArgs,
-        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        active_session_id_from_summaries, api_url, attach_workspace_save_error,
+        build_annotations_payload, build_editable_raw_request,
+        build_editable_raw_request_with_version, default_editable_request,
+        explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
+        fuzzer_target_request_authority_for_request, install_skills, normalize_api_base_url,
+        normalize_replay_port, normalize_target_inputs, oast_fields_for_output,
+        parse_editable_raw_request, parse_editable_raw_request_bytes_with_version,
+        parse_editable_raw_request_with_version, parse_editable_raw_response,
+        parse_editable_raw_response_bytes, prepare_cli_workspace_save, push_replay_history_entry,
+        read_limited_to_end, read_payloads_input, read_raw_request_input, read_raw_response_input,
+        read_text_input, replay_send_http_version, replay_tab_target_as_request,
+        replay_tab_target_matches_request, replay_update_should_preserve_current_port,
+        session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
+        strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
+        websocket_detail_path, websocket_list_path, workspace_conflict_message, Cli, Command,
+        HistoryCommand, HistoryListResponse, SequenceCommand, SequenceCreateInput,
+        SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -4136,17 +4213,23 @@ mod tests {
     }
 
     #[test]
-    fn cli_status_helper_rejects_failed_records() {
-        assert!(ensure_json_status_not_failed(
+    fn cli_status_helper_wraps_failed_records_for_json_output() {
+        assert!(failed_record_output(
             "sequence run",
             &serde_json::json!({ "status": "completed" }),
         )
-        .is_ok());
-        assert!(ensure_json_status_not_failed(
+        .is_none());
+        let mut output = failed_record_output(
             "sequence run",
-            &serde_json::json!({ "status": "failed" }),
+            &serde_json::json!({ "id": "run-1", "status": "failed" }),
         )
-        .is_err());
+        .expect("failed record should produce an error payload");
+        assert_eq!(output["error"], "sequence run failed");
+        assert_eq!(output["record"]["id"], "run-1");
+        assert_eq!(output["record"]["status"], "failed");
+
+        attach_workspace_save_error(&mut output, &anyhow::anyhow!("workspace conflict"));
+        assert_eq!(output["workspace_save_error"], "workspace conflict");
     }
 
     #[test]

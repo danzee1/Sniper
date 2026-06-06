@@ -58,6 +58,9 @@ const MAX_WORKSPACE_REPLAY_HISTORY_ENTRIES_PER_TAB: usize = 500;
 const MAX_WORKSPACE_TEXT_FIELD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WORKSPACE_FUZZER_PAYLOAD_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WORKSPACE_FUZZER_PAYLOAD_LINES: usize = 5_000;
+const MAX_WORKSPACE_WS_HEADERS: usize = 200;
+const MAX_WORKSPACE_WS_HEADER_BYTES: usize = 64 * 1024;
+const MAX_WORKSPACE_WS_HEADERS_BYTES: usize = 256 * 1024;
 const MAX_WORKSPACE_WS_SETUP_QUEUE_ITEMS: usize = 250;
 const MAX_WORKSPACE_WS_SETUP_ITEM_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -827,6 +830,13 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
         if tab.custom_label.chars().count() > 80 {
             return Err(format!("replay tab {} custom label is too long", tab.id));
         }
+        let is_websocket_tab = tab.tab_type == "websocket";
+        if !is_websocket_tab && replay_tab_has_websocket_payload(tab) {
+            return Err(format!(
+                "non-websocket replay tab {} must not include websocket state",
+                tab.id
+            ));
+        }
         add_workspace_text_bytes(
             &mut stored_bytes_total,
             "replay tab request text",
@@ -851,6 +861,29 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
             &tab.ws_editor_text,
             MAX_WORKSPACE_TEXT_FIELD_BYTES,
         )?;
+        if is_websocket_tab {
+            if tab.ws_headers.len() > MAX_WORKSPACE_WS_HEADERS {
+                return Err(format!(
+                    "WebSocket replay tab has too many headers: {}",
+                    tab.ws_headers.len()
+                ));
+            }
+            let mut ws_headers_bytes_total = 0usize;
+            for header in &tab.ws_headers {
+                let header_bytes = add_workspace_json_bytes(
+                    &mut stored_bytes_total,
+                    "WebSocket header",
+                    header,
+                    MAX_WORKSPACE_WS_HEADER_BYTES,
+                )?;
+                ws_headers_bytes_total = ws_headers_bytes_total.saturating_add(header_bytes);
+                if ws_headers_bytes_total > MAX_WORKSPACE_WS_HEADERS_BYTES {
+                    return Err(format!(
+                        "WebSocket replay headers exceed {MAX_WORKSPACE_WS_HEADERS_BYTES} stored bytes"
+                    ));
+                }
+            }
+        }
         if tab.history_entries.len() > MAX_WORKSPACE_REPLAY_HISTORY_ENTRIES_PER_TAB {
             return Err(format!(
                 "replay tab {} has too many history entries: {}",
@@ -877,7 +910,7 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
                 MAX_WORKSPACE_WS_SETUP_ITEM_BYTES,
             )?;
         }
-        if tab.tab_type == "websocket" {
+        if is_websocket_tab {
             let ws_stats = validate_workspace_ws_tab(tab)
                 .map_err(|error| format!("invalid websocket replay tab: {error}"))?;
             ws_frame_total = ws_frame_total.saturating_add(ws_stats.frames);
@@ -997,6 +1030,21 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
     Ok(())
 }
 
+fn replay_tab_has_websocket_payload(tab: &crate::workspace::ReplayTabState) -> bool {
+    !tab.ws_scheme.is_empty()
+        || !tab.ws_host.is_empty()
+        || !tab.ws_port.is_null()
+        || !tab.ws_path.is_empty()
+        || !tab.ws_headers.is_empty()
+        || !tab.ws_handshake_text.is_empty()
+        || tab.ws_handshake_edited
+        || !tab.ws_editor_text.is_empty()
+        || !tab.ws_message_type.is_empty()
+        || tab.ws_editor_body_encoded
+        || !tab.ws_setup_queue.is_empty()
+        || !tab.ws_frames.is_empty()
+}
+
 fn add_workspace_text_bytes(
     total: &mut usize,
     label: &str,
@@ -1015,14 +1063,15 @@ fn add_workspace_json_bytes<T: Serialize>(
     label: &str,
     value: &T,
     field_limit: usize,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<usize, String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("failed to measure {label}: {error}"))?
         .len();
     if bytes > field_limit {
         return Err(format!("{label} cannot exceed {field_limit} stored bytes"));
     }
-    add_workspace_stored_bytes(total, label, bytes)
+    add_workspace_stored_bytes(total, label, bytes)?;
+    Ok(bytes)
 }
 
 fn add_workspace_stored_bytes(
@@ -5443,6 +5492,58 @@ mod tests {
 
         let error = super::validate_workspace_state(&snapshot).unwrap_err();
         assert!(error.contains("id must be a UUID"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_websocket_state_on_non_websocket_tabs() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "http-draft".to_string(),
+            sequence: 1,
+            ws_frames: vec![WsReplayFrame {
+                index: 0,
+                captured_at: Utc::now().to_rfc3339(),
+                direction: WebSocketFrameDirection::ClientToServer,
+                kind: WebSocketFrameKind::Text,
+                body: "hello".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 5,
+                preview_truncated: false,
+            }],
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("must not include websocket state"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_oversized_websocket_headers() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: Uuid::new_v4().to_string(),
+            tab_type: "websocket".to_string(),
+            sequence: 1,
+            ws_headers: (0..=super::MAX_WORKSPACE_WS_HEADERS)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": format!("X-Test-{index}"),
+                        "value": "ok"
+                    })
+                })
+                .collect(),
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("too many headers"));
+
+        snapshot.replay.tabs[0].ws_headers = vec![serde_json::json!({
+            "name": "X-Large",
+            "value": "x".repeat(super::MAX_WORKSPACE_WS_HEADER_BYTES)
+        })];
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("WebSocket header cannot exceed"));
     }
 
     #[test]

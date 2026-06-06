@@ -1392,34 +1392,82 @@ function bindEvents() {
   // Pane context menu (right-click on Request/Response code-view)
   const paneCtx = document.getElementById("paneContextMenu");
   if (paneCtx) {
+    let paneContextMenuTarget = null;
     [els.requestView, els.responseView, els.requestViewCM, els.responseViewCM].forEach((view) => {
       if (!view) return;
       view.addEventListener("contextmenu", (e) => {
         if (!state.selectedId) return;
         e.preventDefault();
+        paneContextMenuTarget = {
+          id: state.selectedId,
+          sessionId: currentSessionId(),
+        };
         paneCtx.classList.remove("hidden");
         const mw = paneCtx.offsetWidth, mh = paneCtx.offsetHeight;
         paneCtx.style.left = `${Math.min(e.clientX, window.innerWidth - mw - 8)}px`;
         paneCtx.style.top = `${Math.min(e.clientY, window.innerHeight - mh - 8)}px`;
       });
     });
-    document.addEventListener("click", () => paneCtx.classList.add("hidden"));
+    document.addEventListener("click", () => {
+      paneCtx.classList.add("hidden");
+      paneContextMenuTarget = null;
+    });
     paneCtx.addEventListener("click", (e) => {
       const btn = e.target.closest("[data-pane-action]");
-      if (!btn || !state.selectedId) return;
+      const target = paneContextMenuTarget;
+      if (!btn || !target?.id) return;
       const action = btn.dataset.paneAction;
       paneCtx.classList.add("hidden");
-      if (action === "copy-url") copySelectedTransactionUrl();
-      else if (action === "send-to-replay") openReplayFromSelection().catch(handleSendActionError);
-      else if (action === "send-to-fuzzer") openFuzzerFromSelection().catch(handleSendActionError);
-      else if (action.startsWith("copy-response-")) copyResponseContent(action.replace("copy-", ""));
+      paneContextMenuTarget = null;
+      if (target.sessionId !== currentSessionId()) {
+        showToast("The selected session changed. Open the menu again.", "error");
+        return;
+      }
+      if (action === "copy-url") copyTransactionUrl(target.id);
+      else if (action === "send-to-replay") {
+        loadTransactionRecordById(target.id, target.sessionId)
+          .then((record) => {
+            if (!record) throw new Error("Selected transaction could not be loaded.");
+            if (record.kind === "tunnel") throw new Error("Tunnel records cannot be sent to Replay.");
+            openTransactionRecordInReplay(record);
+          })
+          .catch(handleSendActionError);
+      } else if (action === "send-to-fuzzer") {
+        loadTransactionRecordById(target.id, target.sessionId)
+          .then((record) => {
+            if (!record) throw new Error("Selected transaction could not be loaded.");
+            openFuzzerFromRecord(record);
+          })
+          .catch(handleSendActionError);
+      } else if (action === "send-to-sequence") {
+        loadTransactionRecordById(target.id, target.sessionId)
+          .then((record) => {
+            if (!record) throw new Error("Selected transaction could not be loaded.");
+            return sendRecordToSequence(record);
+          })
+          .catch(handleSendActionError);
+      } else if (action.startsWith("copy-response-")) {
+        loadTransactionRecordById(target.id, target.sessionId)
+          .then((record) => copyResponseContentForRecord(record, action.replace("copy-", "")))
+          .catch(handleSendActionError);
+      }
       else if (action.startsWith("copy-as-")) {
         const fmt = action.replace("copy-as-", "");
-        const text = selectedRecordToFormat(fmt);
+        const text = state.selectedRecord?.id === target.id
+          ? recordToFormat(state.selectedRecord, fmt)
+          : "";
         if (text) {
           copyTextToClipboard(text)
             .then(() => showToast(`Copied as ${fmt}`))
             .catch(() => showToast("Failed to copy", "error"));
+        } else {
+          historyRequestToFormat(target.id, fmt).then((asyncText) => {
+            if (asyncText) {
+              copyTextToClipboard(asyncText)
+                .then(() => showToast(`Copied as ${fmt}`))
+                .catch(() => showToast("Failed to copy", "error"));
+            }
+          });
         }
       }
     });
@@ -3498,25 +3546,38 @@ async function loadSelectedTransactionRecord() {
     return state.selectedRecord;
   }
 
-  const sessionId = currentSessionId();
-  const response = await fetch(transactionPath(id, sessionId));
-  if (sessionId !== currentSessionId()) {
-    return null;
-  }
-  if (!response.ok) {
+  const record = await loadTransactionRecordById(id);
+  if (!record) {
     if (state.selectedId === id) {
       renderEmptyDetail();
     }
     return null;
   }
 
-  const record = await response.json();
-  if (state.selectedId === id && sessionId === currentSessionId()) {
+  if (state.selectedId === id) {
     state.selectedRecord = record;
     renderDetail(record);
     return record;
   }
   return null;
+}
+
+async function loadTransactionRecordById(id, sessionId = currentSessionId()) {
+  if (!id || !sessionId) {
+    return null;
+  }
+  const response = await fetch(transactionPath(id, sessionId));
+  if (sessionId !== currentSessionId()) {
+    return null;
+  }
+  if (!response.ok) {
+    return null;
+  }
+  const record = await response.json();
+  if (sessionId !== currentSessionId()) {
+    return null;
+  }
+  return record;
 }
 
 async function loadIntercepts(preserveSelection = true) {
@@ -9526,6 +9587,10 @@ async function openFuzzerFromSelection() {
   if (!record) {
     throw new Error("Selected transaction could not be loaded.");
   }
+  openFuzzerFromRecord(record);
+}
+
+function openFuzzerFromRecord(record) {
   if (record.kind === "tunnel") {
     throw new Error("Tunnel records cannot be sent to Fuzzer.");
   }
@@ -9554,6 +9619,10 @@ async function sendToSequenceFromSelection() {
   if (!record) {
     throw new Error("Selected transaction could not be loaded.");
   }
+  await sendRecordToSequence(record);
+}
+
+async function sendRecordToSequence(record) {
   if (record.kind === "tunnel") {
     throw new Error("Tunnel records cannot be sent to Sequence.");
   }
@@ -16854,6 +16923,7 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
   item.addEventListener("click", () => {
     const action = item.dataset.action;
     const targetId = contextMenuTargetId;
+    const targetSessionId = contextMenuSessionId;
     if (!targetId) return;
     if (!contextMenuSessionIsCurrent()) {
       closeContextMenu();
@@ -16861,12 +16931,29 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
     }
     state.selectedId = targetId;
     closeContextMenu();
+    const loadTargetRecord = () => loadTransactionRecordById(targetId, targetSessionId);
     if (action === "send-to-replay") {
-      openReplayFromSelection().catch(handleSendActionError);
+      loadTargetRecord()
+        .then((record) => {
+          if (!record) throw new Error("Selected transaction could not be loaded.");
+          if (record.kind === "tunnel") throw new Error("Tunnel records cannot be sent to Replay.");
+          openTransactionRecordInReplay(record);
+        })
+        .catch(handleSendActionError);
     } else if (action === "send-to-fuzzer") {
-      openFuzzerFromSelection().catch(handleSendActionError);
+      loadTargetRecord()
+        .then((record) => {
+          if (!record) throw new Error("Selected transaction could not be loaded.");
+          openFuzzerFromRecord(record);
+        })
+        .catch(handleSendActionError);
     } else if (action === "send-to-sequence") {
-      sendToSequenceFromSelection().catch(handleSendActionError);
+      loadTargetRecord()
+        .then((record) => {
+          if (!record) throw new Error("Selected transaction could not be loaded.");
+          return sendRecordToSequence(record);
+        })
+        .catch(handleSendActionError);
     } else if (action === "copy-url") {
       copyTransactionUrl(targetId);
     } else if (action?.startsWith("copy-as-")) {
@@ -16931,7 +17018,14 @@ els.contextMenuNote.addEventListener("keydown", (event) => {
 
 /* ─── WS Frame context menu ─── */
 
+let wsFrameContextMenuTarget = null;
+
 function openWsFrameContextMenu(x, y) {
+  const session = state.selectedWebsocketRecord;
+  wsFrameContextMenuTarget = {
+    sessionId: session?.id || state.selectedWebsocketId || null,
+    frameIdx: state.selectedFrameIdx,
+  };
   const menu = els.wsFrameContextMenu;
   menu.classList.remove("hidden");
   const menuWidth = menu.offsetWidth;
@@ -16944,11 +17038,19 @@ function openWsFrameContextMenu(x, y) {
 
 function closeWsFrameContextMenu() {
   els.wsFrameContextMenu.classList.add("hidden");
+  wsFrameContextMenuTarget = null;
 }
 
 document.getElementById("wsFrameToReplayBtn").addEventListener("click", () => {
+  const target = wsFrameContextMenuTarget;
   closeWsFrameContextMenu();
-  sendWsFrameToReplay(state.selectedFrameIdx);
+  if (!target) return;
+  const session = state.selectedWebsocketRecord;
+  if (target.sessionId && session?.id && session.id !== target.sessionId) {
+    showToast("WebSocket session changed. Open the frame menu again.", "error");
+    return;
+  }
+  sendWsFrameToReplay(target.frameIdx);
 });
 
 document.addEventListener("click", (event) => {
@@ -17023,6 +17125,8 @@ function sendWsFrameToReplay(frameIdx) {
 
 /* ─── Replay request context menu ─── */
 
+let replayContextMenuTabId = null;
+
 // Lazy-initialised: the element may not yet exist when top-level code runs,
 // and bindEvents() → initReplayContextMenu() is called early in init().
 function getReplayContextMenu() {
@@ -17036,6 +17140,7 @@ function showReplayContextMenu(event) {
   event.preventDefault();
   const tab = getActiveReplayTab();
   if (!tab) return;
+  replayContextMenuTabId = tab.id;
 
   // Highlight current method
   const currentMethod = (tab.requestText.match(/^([A-Z]+)\s/)?.[1] || "GET").toUpperCase();
@@ -17052,31 +17157,48 @@ function showReplayContextMenu(event) {
 
 function closeReplayContextMenu() {
   getReplayContextMenu().classList.add("hidden");
+  replayContextMenuTabId = null;
 }
 
-function changeReplayMethod(newMethod) {
-  const tab = getActiveReplayTab();
-  if (!tab) return;
+function getReplayTabById(tabId) {
+  return state.replayTabs.find((tab) => tab.id === tabId) || null;
+}
 
+function syncReplayRequestEditorForTab(tab) {
+  if (!tab) return;
+  if (state.activeReplayTabId !== tab.id) {
+    refreshReplayTabLabel(tab.id);
+    return;
+  }
   const cv = getCMView("replayReq");
-  const text = cv ? cv.getContent() : (tab.requestText || (els.replayRequestEditor ? els.replayRequestEditor.value : "") || "");
+  if (cv) {
+    cv.setContent(tab.requestText);
+  } else if (els.replayRequestEditor) {
+    els.replayRequestEditor.value = tab.requestText;
+    renderReplayRequestHighlight(tab.requestText);
+  }
+  updateReplaySearchPane("request", tab.requestText);
+  syncReplayToolbar(tab);
+  renderReplayTabs();
+}
+
+function changeReplayMethod(newMethod, tabId = state.activeReplayTabId) {
+  const tab = getReplayTabById(tabId);
+  if (!tab || tab.type === "websocket") return;
+
+  const isActiveTab = state.activeReplayTabId === tab.id;
+  const cv = isActiveTab ? getCMView("replayReq") : null;
+  const text = cv
+    ? cv.getContent()
+    : (isActiveTab && els.replayRequestEditor ? els.replayRequestEditor.value : tab.requestText) || "";
   const updated = text.replace(/^[A-Z]+(\s)/i, newMethod + "$1");
   tab.requestText = updated;
   clearReplayResponseForDraftChange(tab);
-  if (cv) {
-    cv.setContent(updated);
-  } else if (els.replayRequestEditor) {
-    els.replayRequestEditor.value = updated;
-    renderReplayRequestHighlight(updated);
-  }
-  updateReplaySearchPane("request", updated);
-  syncReplayToolbar(tab);
-  renderReplayTabs();
+  syncReplayRequestEditorForTab(tab);
   scheduleWorkspaceStateSave();
 }
 
-function replayRequestToCurl() {
-  const tab = getActiveReplayTab();
+function replayRequestToCurl(tab = getActiveReplayTab()) {
   if (!tab) return "";
   const blocked = replayExportBlockedReason(tab);
   if (blocked) {
@@ -17308,8 +17430,7 @@ function urlNeedsPathAsIs(url) {
   return /(?:^|\/)\.\.?(?=\/|\?|$)/.test(rawPathFromUrlString(url || "") || "");
 }
 
-function replayRequestToFormat(format) {
-  const tab = getActiveReplayTab();
+function replayRequestToFormat(format, tab = getActiveReplayTab()) {
   if (!tab) return "";
   const blocked = replayExportBlockedReason(tab);
   if (blocked) {
@@ -17350,6 +17471,10 @@ function copySelectedTransactionUrl() {
 
 function copyResponseContent(format) {
   const record = getCurrentSelectedRecord();
+  copyResponseContentForRecord(record, format);
+}
+
+function copyResponseContentForRecord(record, format) {
   if (!record?.response) return;
   let text = "";
   if (format === "response-headers") {
@@ -17370,6 +17495,10 @@ function copyResponseContent(format) {
 // Synchronous version using already-loaded selectedRecord (preserves user gesture for clipboard)
 function selectedRecordToFormat(format) {
   const record = getCurrentSelectedRecord();
+  return recordToFormat(record, format);
+}
+
+function recordToFormat(record, format) {
   if (!record) return "";
   const blocked = historyRequestExportBlockedReason(record);
   if (blocked) {
@@ -17440,8 +17569,7 @@ function copyTransactionUrl(transactionId) {
   copyTextToClipboard(url).then(() => showToast("Copied URL")).catch(() => {});
 }
 
-function copyReplayUrl() {
-  const tab = getActiveReplayTab();
+function copyReplayUrl(tab = getActiveReplayTab()) {
   if (!tab) return;
   const target = getReplayExportTarget(tab);
   const scheme = target.scheme || "https";
@@ -17937,7 +18065,10 @@ function initReplayContextMenu() {
   // Method buttons
   getReplayContextMenu().querySelectorAll(".method-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      changeReplayMethod(btn.dataset.method);
+      const tabId = replayContextMenuTabId;
+      if (tabId) {
+        changeReplayMethod(btn.dataset.method, tabId);
+      }
       closeReplayContextMenu();
     });
   });
@@ -17946,7 +18077,8 @@ function initReplayContextMenu() {
   getReplayContextMenu().querySelectorAll("[data-replay-action]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const action = btn.dataset.replayAction;
-      const tab = getActiveReplayTab();
+      const tabId = replayContextMenuTabId;
+      const tab = getReplayTabById(tabId);
       if (!tab) { closeReplayContextMenu(); return; }
 
       if (action === "toggle-body") {
@@ -17958,24 +18090,18 @@ function initReplayContextMenu() {
           // Add empty body section
           tab.requestText = text + "\n\n";
         }
-        const cv = getCMView("replayReq");
-        if (cv) {
-          cv.setContent(tab.requestText);
-        } else if (els.replayRequestEditor) {
-          els.replayRequestEditor.value = tab.requestText;
-          renderReplayRequestHighlight(tab.requestText);
-        }
         clearReplayResponseForDraftChange(tab);
+        syncReplayRequestEditorForTab(tab);
         scheduleWorkspaceStateSave();
       } else if (action === "add-content-type-json") {
-        setReplayHeader("Content-Type", "application/json");
+        setReplayHeader("Content-Type", "application/json", tab.id);
       } else if (action === "add-content-type-form") {
-        setReplayHeader("Content-Type", "application/x-www-form-urlencoded");
+        setReplayHeader("Content-Type", "application/x-www-form-urlencoded", tab.id);
       } else if (action === "copy-url") {
-        copyReplayUrl();
+        copyReplayUrl(tab);
       } else if (action === "copy-as-curl" || action === "copy-as-python" || action === "copy-as-fetch" || action === "copy-as-powershell") {
         const format = action.replace("copy-as-", "");
-        const text = replayRequestToFormat(format);
+        const text = replayRequestToFormat(format, tab);
         if (text) {
           copyTextToClipboard(text).then(() => showToast(`Copied as ${format}`)).catch(() => {});
         }
@@ -17995,8 +18121,8 @@ function initReplayContextMenu() {
   });
 }
 
-function setReplayHeader(name, value) {
-  const tab = getActiveReplayTab();
+function setReplayHeader(name, value, tabId = state.activeReplayTabId) {
+  const tab = getReplayTabById(tabId);
   if (!tab) return;
 
   const text = tab.requestText || "";
@@ -18018,14 +18144,7 @@ function setReplayHeader(name, value) {
 
   tab.requestText = lines.join("\n") + body;
   clearReplayResponseForDraftChange(tab);
-  const cv = getCMView("replayReq");
-  if (cv) {
-    cv.setContent(tab.requestText);
-  } else if (els.replayRequestEditor) {
-    els.replayRequestEditor.value = tab.requestText;
-    renderReplayRequestHighlight(tab.requestText);
-  }
-  updateReplaySearchPane("request", tab.requestText);
+  syncReplayRequestEditorForTab(tab);
   scheduleWorkspaceStateSave();
 }
 
