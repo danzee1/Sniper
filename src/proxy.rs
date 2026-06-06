@@ -259,7 +259,8 @@ pub async fn rebind_proxy(
         state.as_ref(),
         "Proxy listener rebind closed the live WebSocket relay.",
     )
-    .await;
+    .await
+    .map_err(|error| error.to_string())?;
     drain_proxy_connections(Duration::from_millis(200)).await;
 
     let bound_addr = listener
@@ -4522,7 +4523,7 @@ pub async fn drain_proxy_connections(timeout: Duration) {
     }
 }
 
-pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) {
+pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) -> Result<()> {
     let relays = {
         let relays = LIVE_WEBSOCKET_RELAYS
             .lock()
@@ -4534,6 +4535,7 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) {
     };
 
     let mut sessions_to_persist = HashMap::new();
+    let mut relay_ids_by_session: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for (relay_id, relay) in relays {
         relay.abort.abort();
         if let Some(websocket_id) = relay.captured_websocket_id {
@@ -4547,11 +4549,18 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) {
                     Some(note.to_string()),
                 )
                 .await;
-            sessions_to_persist.insert(relay.session.id(), Arc::clone(&relay.session));
+            let session_id = relay.session.id();
+            sessions_to_persist.insert(session_id, Arc::clone(&relay.session));
+            relay_ids_by_session
+                .entry(session_id)
+                .or_default()
+                .push(relay_id);
+        } else {
+            forget_live_websocket_relay(relay_id);
         }
-        forget_live_websocket_relay(relay_id);
     }
 
+    let mut failures = Vec::new();
     for (session_id, session) in sessions_to_persist {
         if let Err(error) = state.persist_session_context(&session).await {
             warn!(
@@ -4559,7 +4568,22 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) {
                 session_id = %session_id,
                 "failed to persist closed live websocket relays"
             );
+            failures.push(format!("{session_id}: {error:#}"));
+        } else if let Some(relay_ids) = relay_ids_by_session.remove(&session_id) {
+            for relay_id in relay_ids {
+                forget_live_websocket_relay(relay_id);
+            }
         }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to persist closed live websocket relays for {} session(s): {}",
+            failures.len(),
+            failures.join("; ")
+        )
     }
 }
 
@@ -5632,7 +5656,8 @@ mod tests {
             state.as_ref(),
             "test shutdown closed the live WebSocket relay.",
         )
-        .await;
+        .await
+        .unwrap();
 
         let live = session.websockets.get(websocket_id).await.unwrap();
         assert!(live.closed_at.is_some());
@@ -5642,6 +5667,69 @@ mod tests {
         let durable = reloaded.websockets.get(websocket_id).await.unwrap();
         assert!(durable.closed_at.is_some());
 
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn close_live_websocket_relays_reports_persist_failure_and_keeps_retry_state() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-close-live-ws-persist-failure-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let websocket_id = Uuid::new_v4();
+        session
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now(),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                path: "/ws".to_string(),
+                status: Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(
+            websocket_id,
+            Some(websocket_id),
+            &session,
+            Instant::now(),
+            abort,
+        );
+        let registry_path = data_dir
+            .join(crate::session::SESSIONS_DIR)
+            .join("registry.json");
+        std::fs::remove_file(&registry_path).unwrap();
+        std::fs::create_dir(&registry_path).unwrap();
+
+        let error = close_live_websocket_relays(
+            state.as_ref(),
+            "test shutdown closed the live WebSocket relay.",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to persist closed live websocket relays"));
+        assert!(session_has_live_websocket_relays(session.id()));
+
+        forget_live_websocket_relay(websocket_id);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -5681,7 +5769,8 @@ mod tests {
             state.as_ref(),
             "test shutdown closed the live WebSocket relay.",
         )
-        .await;
+        .await
+        .unwrap();
         state.delete_session(original_id).await.unwrap();
 
         let _ = std::fs::remove_dir_all(data_dir);
@@ -5719,7 +5808,8 @@ mod tests {
             state.as_ref(),
             "test shutdown closed the live WebSocket relay.",
         )
-        .await;
+        .await
+        .unwrap();
         state.delete_session(original_id).await.unwrap();
 
         let _ = std::fs::remove_dir_all(data_dir);

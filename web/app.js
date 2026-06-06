@@ -3795,6 +3795,7 @@ async function loadTransactionDetail(id) {
         precomputeItemIndexes();
         invalidateVisibleEntriesCache();
         refreshHistoryPagingCursorFromItems();
+        renderHistory();
       }
       if (state.selectedId === id) {
         state.selectedRecord = null;
@@ -4297,6 +4298,26 @@ async function loadMoreWebsockets() {
   await loadWebsockets(true, { append: true, offset: nextOffset });
 }
 
+function adjustWebsocketPagingAfterLocalRemoval(removedCount = 1) {
+  const count = Math.max(0, Number(removedCount) || 0);
+  if (!count) return;
+  const paging = state.websocketPaging || createWebsocketPagingState();
+  const previousLoadedOffset = Number(paging.loadedOffset ?? paging.limit ?? state.websocketSessions.length + count) || 0;
+  const previousLimit = Number(paging.limit ?? previousLoadedOffset) || 0;
+  const previousTotal = Number(paging.total || 0) || 0;
+  const filteredTotal = isKnownCount(paging.filteredTotal)
+    ? Math.max(0, Number(paging.filteredTotal) - count)
+    : paging.filteredTotal;
+  state.websocketPaging = {
+    ...paging,
+    total: Math.max(state.websocketSessions.length, previousTotal - count),
+    filteredTotal,
+    limit: Math.max(0, previousLimit - count),
+    loadedOffset: Math.max(0, previousLoadedOffset - count),
+    loading: false,
+  };
+}
+
 function websocketQueryBackfillShouldRun(visibleCount) {
   const paging = state.websocketPaging || createWebsocketPagingState();
   return state.activeProxyTab === "websockets-history"
@@ -4545,7 +4566,9 @@ async function loadWebsocketDetail(id, options = {}) {
         return;
       }
       if (response.status === 404) {
+        const previousLength = (state.websocketSessions || []).length;
         state.websocketSessions = (state.websocketSessions || []).filter((item) => item.id !== id);
+        adjustWebsocketPagingAfterLocalRemoval(previousLength - state.websocketSessions.length);
         state.selectedWebsocketId = null;
         state.selectedFrameIdx = null;
         state.selectedWebsocketRecord = null;
@@ -8717,7 +8740,7 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
               <td>${escapeHtml(session.path)}</td>
               <td>${escapeHtml(formatStatus(session.status))}</td>
               <td>${session.frame_count}</td>
-              <td>${session.duration_ms == null ? "live" : `${session.duration_ms} ms`}</td>
+              <td>${session.closed_at == null ? "live" : (session.duration_ms == null ? "closed" : `${session.duration_ms} ms`)}</td>
               <td>${escapeHtml(formatTimestamp(session.started_at))}</td>
             </tr>
           `;

@@ -617,10 +617,20 @@ struct OastConfigureArgs {
 struct WebSocketListArgs {
     #[arg(long)]
     session_id: Option<Uuid>,
+    #[arg(long)]
+    query: Option<String>,
     #[arg(long, value_parser = parse_nonzero_usize)]
     limit: Option<usize>,
     #[arg(long)]
     offset: Option<usize>,
+    #[arg(long)]
+    sort_key: Option<String>,
+    #[arg(long, value_parser = ["asc", "desc"])]
+    sort_direction: Option<String>,
+    #[arg(long)]
+    in_scope_only: bool,
+    #[arg(long)]
+    live_only: bool,
     /// Include pagination metadata instead of printing the legacy array shape.
     #[arg(long)]
     page: bool,
@@ -915,6 +925,8 @@ enum WebSocketListResponse {
         #[serde(default)]
         total: Option<usize>,
         #[serde(default)]
+        filtered_total: Option<usize>,
+        #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
         offset: Option<usize>,
@@ -929,6 +941,7 @@ impl WebSocketListResponse {
             Self::Items(items) if include_page => serde_json::json!({
                 "items": items,
                 "total": null,
+                "filtered_total": null,
                 "limit": null,
                 "offset": null,
                 "has_more": null,
@@ -937,12 +950,14 @@ impl WebSocketListResponse {
             Self::Page {
                 items,
                 total,
+                filtered_total,
                 limit,
                 offset,
                 has_more,
             } if include_page => serde_json::json!({
                 "items": items,
                 "total": total,
+                "filtered_total": filtered_total,
                 "limit": limit,
                 "offset": offset,
                 "has_more": has_more,
@@ -2056,7 +2071,7 @@ async fn handle_websocket(api: ApiClient, command: WebSocketCommand) -> Result<(
     match command {
         WebSocketCommand::List(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = websocket_list_path(session_id, args.limit, args.offset, args.page);
+            let path = websocket_list_path(session_id, &args);
             let websockets: WebSocketListResponse = api.get_json(&path).await?;
             print_json(&websockets.into_cli_output(args.page))
         }
@@ -2565,23 +2580,48 @@ fn transaction_detail_path(transaction_id: Uuid, session_id: Option<Uuid>) -> St
     }
 }
 
-fn websocket_list_path(
-    session_id: Option<Uuid>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    page: bool,
-) -> String {
+fn websocket_list_path(session_id: Option<Uuid>, args: &WebSocketListArgs) -> String {
     let mut params = Vec::new();
     if let Some(session_id) = session_id {
         params.push(("session_id".to_string(), session_id.to_string()));
     }
-    if let Some(limit) = limit {
+    if let Some(query) = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("q".to_string(), query.to_string()));
+    }
+    if let Some(limit) = args.limit {
         params.push(("limit".to_string(), limit.to_string()));
     }
-    if let Some(offset) = offset {
+    if let Some(offset) = args.offset {
         params.push(("offset".to_string(), offset.to_string()));
     }
-    let endpoint = if page || offset.is_some() {
+    if let Some(sort_key) = args
+        .sort_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("sort_key".to_string(), sort_key.to_string()));
+    }
+    if let Some(sort_direction) = args
+        .sort_direction
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("sort_direction".to_string(), sort_direction.to_string()));
+    }
+    if args.in_scope_only {
+        params.push(("in_scope_only".to_string(), "true".to_string()));
+    }
+    if args.live_only {
+        params.push(("live_only".to_string(), "true".to_string()));
+    }
+    let endpoint = if args.page || args.offset.is_some() {
         "/api/websockets-page"
     } else {
         "/api/websockets"
@@ -3135,7 +3175,13 @@ async fn discover_api_base_url(
         }
     }
 
-    discover_api_base_url_from_data_dir(client, default_data_dir()).await
+    discover_api_base_url_from_data_dir(client, cli_data_dir()).await
+}
+
+fn cli_data_dir() -> PathBuf {
+    env::var_os("SNIPER_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_data_dir)
 }
 
 async fn discover_api_base_url_from_data_dir(
@@ -4108,7 +4154,7 @@ mod tests {
     use super::{
         active_session_id_from_summaries, api_url, attach_workspace_save_error,
         build_annotations_payload, build_editable_raw_request,
-        build_editable_raw_request_with_version, build_oast_configure_update,
+        build_editable_raw_request_with_version, build_oast_configure_update, cli_data_dir,
         default_editable_request, discover_api_base_url_from_data_dir,
         explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
         fuzzer_target_request_authority_for_request, install_skills, next_replay_tab_sequence,
@@ -4124,8 +4170,8 @@ mod tests {
         strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
         websocket_detail_path, websocket_list_path, workspace_conflict_message, Cli, Command,
         HistoryCommand, HistoryListResponse, OastConfigureArgs, SequenceCommand,
-        SequenceCreateInput, SessionCommand, SkillsInstallArgs, WebSocketListResponse,
-        CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        SequenceCreateInput, SessionCommand, SkillsInstallArgs, WebSocketListArgs,
+        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -4142,10 +4188,12 @@ mod tests {
     use std::fs;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uuid::Uuid;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_raw_request_respects_host_header() {
@@ -4179,21 +4227,46 @@ mod tests {
     fn websocket_list_path_uses_page_endpoint_when_requested() {
         let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 
+        let page_args = WebSocketListArgs {
+            limit: Some(1),
+            page: true,
+            ..WebSocketListArgs::default()
+        };
         assert_eq!(
-            websocket_list_path(Some(session_id), Some(1), None, true),
+            websocket_list_path(Some(session_id), &page_args),
             "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1"
         );
+        let legacy_args = WebSocketListArgs {
+            limit: Some(1),
+            ..WebSocketListArgs::default()
+        };
         assert_eq!(
-            websocket_list_path(Some(session_id), Some(1), None, false),
+            websocket_list_path(Some(session_id), &legacy_args),
             "/api/websockets?session_id=22222222-2222-2222-2222-222222222222&limit=1"
         );
+        let offset_args = WebSocketListArgs {
+            limit: Some(1),
+            offset: Some(100),
+            ..WebSocketListArgs::default()
+        };
         assert_eq!(
-            websocket_list_path(Some(session_id), Some(1), Some(100), false),
+            websocket_list_path(Some(session_id), &offset_args),
             "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&offset=100"
         );
+        let filtered_args = WebSocketListArgs {
+            query: Some("chat socket".to_string()),
+            limit: Some(1),
+            offset: Some(100),
+            sort_key: Some("host".to_string()),
+            sort_direction: Some("asc".to_string()),
+            in_scope_only: true,
+            live_only: true,
+            page: true,
+            ..WebSocketListArgs::default()
+        };
         assert_eq!(
-            websocket_list_path(Some(session_id), Some(1), Some(100), true),
-            "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&offset=100"
+            websocket_list_path(Some(session_id), &filtered_args),
+            "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&q=chat+socket&limit=1&offset=100&sort_key=host&sort_direction=asc&in_scope_only=true&live_only=true"
         );
     }
 
@@ -5932,6 +6005,7 @@ mod tests {
         let page: WebSocketListResponse = serde_json::from_value(serde_json::json!({
             "items": [item.clone()],
             "total": 1,
+            "filtered_total": 1,
             "limit": 5000,
             "offset": 25,
             "has_more": false
@@ -5948,6 +6022,7 @@ mod tests {
         let page: WebSocketListResponse = serde_json::from_value(serde_json::json!({
             "items": [item.clone()],
             "total": 1,
+            "filtered_total": 1,
             "limit": 5000,
             "offset": 25,
             "has_more": false
@@ -5956,6 +6031,7 @@ mod tests {
         let page_output = page.into_cli_output(true);
         assert_eq!(page_output["items"][0]["host"], "ws.example.test");
         assert_eq!(page_output["total"], 1);
+        assert_eq!(page_output["filtered_total"], 1);
         assert_eq!(page_output["limit"], 5000);
         assert_eq!(page_output["offset"], 25);
         assert_eq!(page_output["has_more"], false);
@@ -6056,6 +6132,21 @@ mod tests {
             "features": ["health"]
         });
         assert!(!sniper_settings_probe_matches(&wrong_service));
+    }
+
+    #[test]
+    fn cli_data_dir_honors_sniper_data_dir_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("SNIPER_DATA_DIR");
+        let root = std::env::temp_dir().join(format!("sniper-cli-env-dir-{}", Uuid::new_v4()));
+
+        std::env::set_var("SNIPER_DATA_DIR", &root);
+        assert_eq!(cli_data_dir(), root);
+
+        match previous {
+            Some(value) => std::env::set_var("SNIPER_DATA_DIR", value),
+            None => std::env::remove_var("SNIPER_DATA_DIR"),
+        }
     }
 
     #[tokio::test]

@@ -771,19 +771,20 @@ impl AppState {
 
     async fn prepare_for_self_update_shutdown(&self) -> Result<()> {
         self.ws_replay.disconnect_all().await;
-        self.abort_proxy_task().await;
-        crate::proxy::close_live_websocket_relays(
-            self,
-            "Sniper self-update restart closed the live WebSocket relay.",
-        )
-        .await;
-        crate::proxy::drain_proxy_connections(Duration::from_secs(1)).await;
         crate::proxy::flush_pending_session_persists(self)
             .await
             .context("failed to flush pending session snapshots before self-update restart")?;
         self.persist_active_session()
             .await
             .context("failed to persist active session before self-update restart")?;
+        crate::proxy::close_live_websocket_relays(
+            self,
+            "Sniper self-update restart closed the live WebSocket relay.",
+        )
+        .await
+        .context("failed to persist closed live WebSocket relays before self-update restart")?;
+        self.abort_proxy_task().await;
+        crate::proxy::drain_proxy_connections(Duration::from_secs(1)).await;
         Ok(())
     }
 

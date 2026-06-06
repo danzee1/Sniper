@@ -219,10 +219,15 @@ fn main() -> Result<()> {
             }
             runtime.block_on(close_state.ws_replay.disconnect_all());
             runtime.block_on(close_state.abort_proxy_task());
-            runtime.block_on(proxy::close_live_websocket_relays(
+            if let Err(error) = runtime.block_on(proxy::close_live_websocket_relays(
                 close_state.as_ref(),
                 "Sniper desktop shutdown closed the live WebSocket relay.",
-            ));
+            )) {
+                error!(
+                    ?error,
+                    "forced desktop teardown could not durably close live WebSocket relays"
+                );
+            }
             runtime.block_on(proxy::drain_proxy_connections(
                 std::time::Duration::from_secs(1),
             ));
@@ -306,14 +311,6 @@ fn persist_desktop_session_state(
     runtime: &tokio::runtime::Runtime,
     state: &AppState,
 ) -> Result<()> {
-    runtime.block_on(state.abort_proxy_task());
-    runtime.block_on(proxy::close_live_websocket_relays(
-        state,
-        "Sniper desktop shutdown closed the live WebSocket relay.",
-    ));
-    runtime.block_on(proxy::drain_proxy_connections(
-        std::time::Duration::from_secs(1),
-    ));
     let flush_result = runtime
         .block_on(proxy::flush_pending_session_persists(state))
         .context("failed to flush pending session snapshots before desktop shutdown");
@@ -321,7 +318,18 @@ fn persist_desktop_session_state(
         .block_on(state.persist_active_session())
         .map(|_| ())
         .context("failed to persist active session before desktop shutdown");
-    combine_desktop_persist_results(flush_result, active_result)
+    combine_desktop_persist_results(flush_result, active_result)?;
+    runtime
+        .block_on(proxy::close_live_websocket_relays(
+            state,
+            "Sniper desktop shutdown closed the live WebSocket relay.",
+        ))
+        .context("failed to persist closed live WebSocket relays before desktop shutdown")?;
+    runtime.block_on(state.abort_proxy_task());
+    runtime.block_on(proxy::drain_proxy_connections(
+        std::time::Duration::from_secs(1),
+    ));
+    Ok(())
 }
 
 fn combine_desktop_persist_results(

@@ -1211,6 +1211,7 @@ fn replay_tab_has_websocket_payload(tab: &crate::workspace::ReplayTabState) -> b
         || !tab.ws_setup_notice.is_empty()
         || !tab.ws_setup_queue.is_empty()
         || !tab.ws_frames.is_empty()
+        || tab.ws_frames_truncated
         || tab.ws_selected_frame_index.is_some()
         || tab.ws_frame_window_start.is_some()
 }
@@ -2475,10 +2476,15 @@ fn merge_workspace_keepalive_tab(
         current.ws_handshake_text = current_ws_handshake_text;
         current.ws_editor_text = current_ws_editor_text;
     }
-    if current.ws_setup_queue.is_empty() && !incoming_ws_setup_queue_complete {
+    let preserve_websocket_state = current.tab_type == "websocket";
+    if preserve_websocket_state
+        && current.ws_setup_queue.is_empty()
+        && !incoming_ws_setup_queue_complete
+    {
         current.ws_setup_queue = current_ws_setup_queue;
     }
-    let preserve_ws_frames = current.ws_frames.is_empty() && !incoming_ws_frames_complete;
+    let preserve_ws_frames =
+        preserve_websocket_state && current.ws_frames.is_empty() && !incoming_ws_frames_complete;
     if preserve_ws_frames {
         current.ws_frames = current_ws_frames;
         if current.ws_selected_frame_index.is_none() {
@@ -6392,6 +6398,19 @@ mod tests {
     }
 
     #[test]
+    fn workspace_validation_rejects_truncated_websocket_marker_on_http_tab() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "http-tab".to_string(),
+            sequence: 1,
+            ws_frames_truncated: true,
+            ..ReplayTabState::default()
+        });
+
+        assert!(super::validate_workspace_state(&snapshot).is_err());
+    }
+
+    #[test]
     fn workspace_keepalive_merge_preserves_state_missing_from_compact_payload() {
         let session_id = uuid::Uuid::new_v4();
         let current = WorkspaceStateSnapshot {
@@ -6570,6 +6589,65 @@ mod tests {
         assert_eq!(tab.ws_selected_frame_index, Some(0));
         assert_eq!(tab.ws_frame_window_start, Some(4));
         assert!(tab.ws_frames_truncated);
+    }
+
+    #[test]
+    fn workspace_keepalive_merge_does_not_preserve_websocket_state_on_http_tab() {
+        let frame = WsReplayFrame {
+            index: 7,
+            captured_at: Utc::now().to_rfc3339(),
+            direction: WebSocketFrameDirection::ServerToClient,
+            kind: WebSocketFrameKind::Text,
+            body: "stale-frame".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 11,
+            preview_truncated: false,
+        };
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("tab".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "tab".to_string(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_setup_queue: vec![serde_json::json!({ "body": "stale" })],
+                    ws_frames: vec![frame],
+                    ws_selected_frame_index: Some(0),
+                    ws_frame_window_start: Some(4),
+                    ws_frames_truncated: true,
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("tab".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "tab".to_string(),
+                    sequence: 1,
+                    request_text: "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        let tab = merged.replay.tabs.first().expect("merged tab");
+        assert_ne!(tab.tab_type, "websocket");
+        assert!(tab.ws_setup_queue.is_empty());
+        assert!(tab.ws_frames.is_empty());
+        assert_eq!(tab.ws_selected_frame_index, None);
+        assert_eq!(tab.ws_frame_window_start, None);
+        assert!(!tab.ws_frames_truncated);
     }
 
     #[test]

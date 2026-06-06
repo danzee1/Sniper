@@ -86,8 +86,8 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
             state.set_proxy_task(proxy_task).await;
 
             let api_result = run_api_until_shutdown(state.clone()).await;
-            shutdown_headless_runtime(&state, oast_task).await;
-            api_result
+            let shutdown_result = shutdown_headless_runtime(&state, oast_task).await;
+            combine_api_and_shutdown_results(api_result, shutdown_result)
         }
         Err(bind_error) => {
             warn!(%bind_error, "proxy listener failed to bind — starting UI only");
@@ -103,8 +103,21 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 .await;
 
             let api_result = run_api_until_shutdown(state.clone()).await;
-            shutdown_headless_runtime(&state, oast_task).await;
-            api_result
+            let shutdown_result = shutdown_headless_runtime(&state, oast_task).await;
+            combine_api_and_shutdown_results(api_result, shutdown_result)
+        }
+    }
+}
+
+fn combine_api_and_shutdown_results(
+    api_result: Result<()>,
+    shutdown_result: Result<()>,
+) -> Result<()> {
+    match (api_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(api_error), Err(shutdown_error)) => {
+            Err(api_error.context(format!("headless shutdown also failed: {shutdown_error:#}")))
         }
     }
 }
@@ -157,7 +170,10 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-async fn shutdown_headless_runtime(state: &AppState, oast_task: tokio::task::JoinHandle<()>) {
+async fn shutdown_headless_runtime(
+    state: &AppState,
+    oast_task: tokio::task::JoinHandle<()>,
+) -> Result<()> {
     oast_task.abort();
     if let Err(error) = oast_task.await {
         if !error.is_cancelled() {
@@ -168,45 +184,50 @@ async fn shutdown_headless_runtime(state: &AppState, oast_task: tokio::task::Joi
         }
     }
     state.ws_replay.disconnect_all().await;
-    state.abort_proxy_task().await;
-    proxy::close_live_websocket_relays(
+    let flush_result = proxy::flush_pending_session_persists(state)
+        .await
+        .context("failed to flush pending session snapshots before headless shutdown");
+    let active_result = state
+        .persist_active_session()
+        .await
+        .map(|_| ())
+        .context("failed to persist active session before headless shutdown");
+    if let Err(error) = combine_api_and_shutdown_results(flush_result, active_result) {
+        warn!(
+            ?error,
+            "leaving runtime state after failed headless session persistence"
+        );
+        return Err(error);
+    }
+    if let Err(error) = proxy::close_live_websocket_relays(
         state,
         "Sniper headless shutdown closed the live WebSocket relay.",
     )
-    .await;
+    .await
+    .context("failed to persist closed live WebSocket relays before headless shutdown")
+    {
+        warn!(
+            ?error,
+            "leaving runtime state after failed live WebSocket relay persistence"
+        );
+        return Err(error);
+    }
+    state.abort_proxy_task().await;
     proxy::drain_proxy_connections(Duration::from_secs(1)).await;
-    let mut session_persisted = true;
-    if let Err(error) = proxy::flush_pending_session_persists(state).await {
-        session_persisted = false;
-        warn!(
-            ?error,
-            "failed to flush pending session snapshots before headless shutdown"
-        );
-    }
-    if let Err(error) = state.persist_active_session().await {
-        session_persisted = false;
-        warn!(
-            ?error,
-            "failed to persist active session before headless shutdown"
-        );
-    }
-    if !session_persisted {
-        warn!("leaving runtime state after failed headless session persistence");
-    } else {
-        match runtime_state::remove_runtime_state_if_owner(
-            &state.config.data_dir,
-            state.runtime_instance_id,
-        ) {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!("runtime state was replaced before headless shutdown; leaving it intact")
-            }
-            Err(error) => warn!(
-                ?error,
-                "failed to remove runtime state during headless shutdown"
-            ),
+    match runtime_state::remove_runtime_state_if_owner(
+        &state.config.data_dir,
+        state.runtime_instance_id,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!("runtime state was replaced before headless shutdown; leaving it intact")
         }
+        Err(error) => warn!(
+            ?error,
+            "failed to remove runtime state during headless shutdown"
+        ),
     }
+    Ok(())
 }
 
 pub fn init_tracing() {
