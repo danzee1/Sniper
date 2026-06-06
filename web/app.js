@@ -75,6 +75,7 @@ const DISPLAY_MONO_FONT_OPTIONS = new Set([
   "notomonokr",
 ]);
 const OAST_TOKEN_REDACTION = "********";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HISTORY_COLUMN_RULES = {
   index: { default: 48, min: 40, max: 88 },
   host: { default: 320, min: 160, max: 720 },
@@ -1034,12 +1035,7 @@ function bindEvents() {
   els.historyTableBody.addEventListener("click", (event) => {
     const row = event.target.closest(".history-row");
     if (!row) return;
-    state.selectedId = row.dataset.id;
-    state.selectedRecord = null;
-    updateHistorySelection(state.selectedId);
-    renderLoadingDetail("Loading selected transaction...");
-    scrollSelectedHistoryRowIntoView();
-    loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
+    selectHistoryTransaction(row.dataset.id, { scroll: true }).catch((error) => console.error(error));
     // Keep focus on the table so arrow keys navigate rows, not code-view lines
     els.trafficRegion.focus({ preventScroll: true });
   });
@@ -1047,11 +1043,7 @@ function bindEvents() {
     const row = event.target.closest(".history-row");
     if (!row) return;
     event.preventDefault();
-    state.selectedId = row.dataset.id;
-    state.selectedRecord = null;
-    updateHistorySelection(state.selectedId);
-    renderLoadingDetail("Loading selected transaction...");
-    loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
+    selectHistoryTransaction(row.dataset.id).catch((error) => console.error(error));
     openContextMenu(event.clientX, event.clientY, row.dataset.id);
   });
 
@@ -2517,7 +2509,7 @@ function hydrateReplayTab(tab) {
   if (tab.type === "websocket") {
     const wsScheme = tab.ws_scheme || "wss";
     return {
-      id: typeof tab.id === "string" && tab.id ? tab.id : crypto.randomUUID(),
+      id: isUuidString(tab.id) ? tab.id : crypto.randomUUID(),
       type: "websocket",
       sequence: Number.isFinite(tab.sequence) ? tab.sequence : state.replayTabSequence + 1,
       customLabel: normalizeReplayTabCustomLabel(tab.custom_label || ""),
@@ -2624,6 +2616,10 @@ function createWorkspaceClientId() {
     return window.crypto.randomUUID();
   }
   return `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function isUuidString(value) {
+  return typeof value === "string" && UUID_PATTERN.test(value);
 }
 
 function snapshotWorkspaceState(options = {}) {
@@ -3429,7 +3425,7 @@ async function loadTransactions(preserveSelection = true, options = {}) {
       if (preserveSelection && state.selectedRecord && state.selectedRecord.id === state.selectedId) {
         return;
       }
-      await loadTransactionDetail(state.selectedId);
+      await selectHistoryTransaction(state.selectedId);
     } else {
       renderEmptyDetail();
     }
@@ -3462,6 +3458,22 @@ async function loadTransactionDetail(id) {
   state.selectedRecord = record;
   renderDetail(state.selectedRecord);
   return record;
+}
+
+async function selectHistoryTransaction(id, options = {}) {
+  state.selectedId = id ?? null;
+  state.selectedRecord = null;
+  state.loadingDetailId = null;
+  updateHistorySelection(state.selectedId);
+  if (!state.selectedId) {
+    renderEmptyDetail();
+    return null;
+  }
+  renderLoadingDetail("Loading selected transaction...");
+  if (options.scroll) {
+    scrollSelectedHistoryRowIntoView();
+  }
+  return loadTransactionDetail(state.selectedId);
 }
 
 async function loadSelectedTransactionRecord() {
@@ -4095,7 +4107,7 @@ function applyWebsocketSummaryEvent(event) {
     if (!state.selectedWebsocketId) {
       syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
     } else {
-      renderWebsocketSessions();
+      syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
     }
   }
 }
@@ -4488,16 +4500,7 @@ function moveHistorySelectionIfMissing(fallback = "first") {
   const nextItem = fallback === "last"
     ? state.items[state.items.length - 1]
     : state.items[0];
-  state.selectedId = nextItem?.id ?? null;
-  state.selectedRecord = null;
-  state.loadingDetailId = null;
-  updateHistorySelection(state.selectedId);
-  if (state.selectedId) {
-    renderLoadingDetail("Loading selected transaction...");
-    loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
-  } else {
-    renderEmptyDetail();
-  }
+  selectHistoryTransaction(nextItem?.id ?? null).catch((error) => console.error(error));
   return true;
 }
 
@@ -6024,6 +6027,7 @@ function jumpToTransaction(recordId) {
   state.selectedId = recordId;
   state.selectedRecord = null;
   renderProxyPanels();
+  renderLoadingDetail("Loading selected transaction...");
   loadTransactionDetail(recordId).then(async (record) => {
     if (!record || state.selectedId !== recordId) return;
     const revealed = await ensureHistoryWindowContainsRecord(record);
@@ -7169,10 +7173,7 @@ async function moveHistorySelection(offset) {
     const loadedIndex = visibleEntries.findIndex((entry) => entry.item.id === selectedIdBeforeLoad);
     const loadedNextId = loadedIndex >= 0 ? visibleEntries[loadedIndex + 1]?.item.id : null;
     if (loadedNextId) {
-      state.selectedId = loadedNextId;
-      updateHistorySelection(loadedNextId);
-      scrollSelectedHistoryRowIntoView();
-      await loadTransactionDetail(loadedNextId);
+      await selectHistoryTransaction(loadedNextId, { scroll: true });
     }
     return;
   }
@@ -7189,10 +7190,7 @@ async function moveHistorySelection(offset) {
       ? visibleEntries[loadedIndex - 1]?.item.id
       : visibleEntries[visibleEntries.length - 1]?.item.id;
     if (loadedPreviousId) {
-      state.selectedId = loadedPreviousId;
-      updateHistorySelection(loadedPreviousId);
-      scrollSelectedHistoryRowIntoView();
-      await loadTransactionDetail(loadedPreviousId);
+      await selectHistoryTransaction(loadedPreviousId, { scroll: true });
     }
     return;
   }
@@ -7206,10 +7204,7 @@ async function moveHistorySelection(offset) {
     return;
   }
 
-  state.selectedId = nextId;
-  updateHistorySelection(nextId);
-  scrollSelectedHistoryRowIntoView();
-  await loadTransactionDetail(nextId);
+  await selectHistoryTransaction(nextId, { scroll: true });
 }
 
 function scrollSelectedHistoryRowIntoView() {
@@ -8064,6 +8059,7 @@ function renderWebsocketSessions(options = {}) {
     && !frames.some((frame) => frame.index === state.selectedFrameIdx)
   ) {
     state.selectedFrameIdx = null;
+    hideFrameDetail();
   }
   const renderedFrames = websocketRenderedFrameWindow(frames, state.selectedFrameIdx);
   const fullFrameCount = Number.isFinite(Number(session.frame_count))
@@ -10546,11 +10542,25 @@ async function saveProxySettings() {
     oast_server_url: document.getElementById("proxySettingOastServerUrl")?.value?.trim() || "",
     oast_polling_interval_secs: oastInterval,
   };
-  if (state.oastTokenClearPending) {
+  if (state.oastTokenClearPending || oastProvider === "boast") {
     runtimeUpdate.oast_token = "";
   } else if (oastProvider !== "boast" && oastTokenValue && oastTokenValue !== OAST_TOKEN_REDACTION) {
     runtimeUpdate.oast_token = oastTokenValue;
   }
+
+  const tokenWillBeUpdated = Object.prototype.hasOwnProperty.call(runtimeUpdate, "oast_token");
+  const startupResponse = await fetch("/api/startup-settings", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(startupUpdate),
+  });
+
+  if (!startupResponse.ok) {
+    throw new Error(await startupResponse.text());
+  }
+  const startupResult = await startupResponse.json();
 
   const runtimeResponse = await fetch("/api/runtime", {
     method: "POST",
@@ -10564,20 +10574,6 @@ async function saveProxySettings() {
     throw new Error(await runtimeResponse.text());
   }
   const runtimeResult = await runtimeResponse.json();
-
-  const startupResponse = await fetch("/api/startup-settings", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(startupUpdate),
-  });
-
-  if (!startupResponse.ok) {
-    throw new Error(await startupResponse.text());
-  }
-
-  const startupResult = await startupResponse.json();
   if (sessionId !== currentSessionId()) {
     return startupResult;
   }
@@ -10592,6 +10588,12 @@ async function saveProxySettings() {
 
   renderInterceptStatus();
   renderProxySettings();
+  if (tokenWillBeUpdated) {
+    const oastTokenInput = document.getElementById("proxySettingOastToken");
+    if (oastTokenInput) {
+      oastTokenInput.value = "";
+    }
+  }
   invalidateVisibleEntriesCache();
   scheduleRefresh();
   return startupResult;

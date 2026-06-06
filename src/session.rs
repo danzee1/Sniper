@@ -1548,13 +1548,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         )
     })?;
     if let Some(parent) = path.parent() {
-        if let Err(error) = sync_directory(parent, "session JSON directory") {
-            warn!(
-                %error,
-                path = %path.display(),
-                "session JSON was replaced but directory sync failed"
-            );
-        }
+        sync_directory(parent, "session JSON directory")?;
     }
     Ok(())
 }

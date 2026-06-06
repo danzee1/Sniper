@@ -1112,8 +1112,48 @@ async fn post_workspace_state(
     api: &ApiClient,
     workspace: &mut WorkspaceStateSnapshot,
 ) -> Result<WorkspaceStateSnapshot> {
+    const PATH: &str = "/api/workspace-state";
     prepare_cli_workspace_save(workspace);
-    api.post_json("/api/workspace-state", workspace).await
+    let response = api
+        .client
+        .post(api.url(PATH))
+        .json(workspace)
+        .send()
+        .await
+        .context("failed to POST workspace state")?;
+    let status = response.status();
+    if status == StatusCode::CONFLICT {
+        let current = response
+            .json::<WorkspaceStateSnapshot>()
+            .await
+            .context("workspace state conflict, but failed to decode current workspace state")?;
+        bail!("{}", workspace_conflict_message(&current));
+    }
+    if !status.is_success() {
+        let message = response.text().await.unwrap_or_else(|_| String::new());
+        let detail = if message.trim().is_empty() {
+            status.to_string()
+        } else {
+            message
+        };
+        bail!("request to {} failed ({}): {}", PATH, status, detail);
+    }
+    response
+        .json::<WorkspaceStateSnapshot>()
+        .await
+        .context("failed to decode JSON response from workspace state")
+}
+
+fn workspace_conflict_message(current: &WorkspaceStateSnapshot) -> String {
+    let session = current
+        .session_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let client = current.client_id.as_deref().unwrap_or("none");
+    format!(
+        "workspace state revision conflict: current revision {}, session_id {}, client_id {}, client_version {}; reload workspace state and retry",
+        current.revision, session, client, current.client_version,
+    )
 }
 
 async fn load_workspace_state(
@@ -1647,18 +1687,18 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
 
             let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
             if let Some(error) = replay_error {
-                print_json(&json!({ "error": error, "record": record }))?;
                 if let Some(save_error) = workspace_save_error {
                     bail!(
                         "replay failed after storing transaction record: {error}; workspace state was not saved: {save_error}"
                     );
                 }
+                print_json(&json!({ "error": error, "record": record }))?;
                 bail!("replay failed after storing transaction record: {error}");
             } else {
-                print_json(&record)?;
                 if let Some(save_error) = workspace_save_error {
                     bail!("replay was sent, but workspace state was not saved: {save_error}");
                 }
+                print_json(&record)?;
                 Ok(())
             }
         }
@@ -1739,6 +1779,9 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
 
             ensure_cli_record_not_failed("fuzzer attack", &record)?;
+            if let Some(save_error) = workspace_save_error {
+                bail!("fuzzer attack completed, but workspace state was not saved: {save_error}");
+            }
             if args.r#async {
                 print_json(&json!({
                     "async_requested": true,
@@ -1747,9 +1790,6 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 }))?;
             } else {
                 print_json(&record)?;
-            }
-            if let Some(save_error) = workspace_save_error {
-                bail!("fuzzer attack completed, but workspace state was not saved: {save_error}");
             }
             Ok(())
         }
@@ -3764,9 +3804,9 @@ mod tests {
         replay_update_should_preserve_current_port, session_query_path,
         sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
         sync_replay_tab_target_to_request, transaction_detail_path, websocket_detail_path,
-        websocket_list_path, Cli, Command, HistoryCommand, HistoryListResponse, SequenceCommand,
-        SequenceCreateInput, SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
-        MAX_CLI_INPUT_BYTES,
+        websocket_list_path, workspace_conflict_message, Cli, Command, HistoryCommand,
+        HistoryListResponse, SequenceCommand, SequenceCreateInput, SkillsInstallArgs,
+        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -4915,6 +4955,25 @@ mod tests {
         assert_eq!(workspace.session_id, session_id);
         assert_eq!(workspace.client_id.as_deref(), Some("sniper-cli"));
         assert_eq!(workspace.client_version, 42);
+    }
+
+    #[test]
+    fn cli_workspace_conflict_message_includes_current_snapshot_identity() {
+        let session_id = uuid::Uuid::new_v4();
+        let workspace = WorkspaceStateSnapshot {
+            revision: 9,
+            session_id: Some(session_id),
+            client_id: Some("browser-client".to_string()),
+            client_version: 77,
+            ..Default::default()
+        };
+
+        let message = workspace_conflict_message(&workspace);
+
+        assert!(message.contains("current revision 9"));
+        assert!(message.contains(&session_id.to_string()));
+        assert!(message.contains("client_id browser-client"));
+        assert!(message.contains("client_version 77"));
     }
 
     #[test]

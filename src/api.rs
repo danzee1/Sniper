@@ -821,6 +821,9 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
         if !tab_ids.insert(tab.id.as_str()) {
             return Err(format!("duplicate replay tab id: {}", tab.id));
         }
+        if tab.tab_type == "websocket" && Uuid::parse_str(&tab.id).is_err() {
+            return Err(format!("websocket replay tab {} id must be a UUID", tab.id));
+        }
         if tab.custom_label.chars().count() > 80 {
             return Err(format!("replay tab {} custom label is too long", tab.id));
         }
@@ -5389,7 +5392,7 @@ mod tests {
     fn workspace_validation_rejects_invalid_websocket_tab_fields() {
         let mut snapshot = WorkspaceStateSnapshot::default();
         snapshot.replay.tabs.push(ReplayTabState {
-            id: "ws-draft".to_string(),
+            id: Uuid::new_v4().to_string(),
             tab_type: "websocket".to_string(),
             sequence: 1,
             ws_scheme: "wss".to_string(),
@@ -5425,6 +5428,24 @@ mod tests {
     }
 
     #[test]
+    fn workspace_validation_rejects_non_uuid_websocket_replay_tab_id() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "ws-draft".to_string(),
+            tab_type: "websocket".to_string(),
+            sequence: 1,
+            ws_scheme: "wss".to_string(),
+            ws_host: "example.test".to_string(),
+            ws_port: serde_json::json!(443),
+            ws_path: "/".to_string(),
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("id must be a UUID"));
+    }
+
+    #[test]
     fn workspace_validation_checks_websocket_replay_frames() {
         let mut snapshot = WorkspaceStateSnapshot::default();
         let frame = WsReplayFrame {
@@ -5438,7 +5459,7 @@ mod tests {
             preview_truncated: false,
         };
         snapshot.replay.tabs.push(ReplayTabState {
-            id: "ws-draft".to_string(),
+            id: Uuid::new_v4().to_string(),
             tab_type: "websocket".to_string(),
             sequence: 1,
             ws_scheme: "wss".to_string(),
@@ -5470,7 +5491,7 @@ mod tests {
         let mut oversized_workspace = WorkspaceStateSnapshot::default();
         oversized_workspace.replay.tabs = (0..3)
             .map(|tab_index| ReplayTabState {
-                id: format!("ws-draft-{tab_index}"),
+                id: Uuid::new_v4().to_string(),
                 tab_type: "websocket".to_string(),
                 sequence: tab_index + 1,
                 ws_frames: vec![frame.clone(); super::MAX_WORKSPACE_WS_FRAMES],

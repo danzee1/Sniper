@@ -841,12 +841,18 @@ fn tighten_private_dir(_path: &Path) -> io::Result<()> {
 }
 
 fn open_private_append_file(path: &Path) -> io::Result<fs::File> {
+    let created = !path.exists();
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     options.mode(0o600);
     let file = options.open(path)?;
     tighten_private_file(path)?;
+    if created {
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+    }
     Ok(file)
 }
 
