@@ -492,7 +492,7 @@ async fn intercept_forward_keeps_client_request_alive() {
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     let request = format!(
-        "GET http://{upstream_addr}/ HTTP/1.1\r\nHost: intercepted.example.test\r\nConnection: close\r\n\r\n"
+        "GET http://{upstream_addr}/ HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
@@ -526,7 +526,7 @@ async fn intercept_forward_keeps_client_request_alive() {
         .unwrap();
     let response = String::from_utf8_lossy(&buffer);
     assert!(response.contains("200 OK"), "response was: {response}");
-    assert!(response.contains("intercepted.example.test"));
+    assert!(response.contains(&upstream_addr.to_string()));
 
     proxy_handle.abort();
     upstream_handle.abort();

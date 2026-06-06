@@ -145,8 +145,7 @@ pub struct ScannerStore {
     entries: RwLock<VecDeque<ScannerFinding>>,
     events: broadcast::Sender<FindingSummary>,
     config: RwLock<ScannerConfig>,
-    /// Dedup set: key = "record_id:host:path:category:title"
-    seen: RwLock<HashSet<String>>,
+    seen: RwLock<HashSet<FindingDedupKey>>,
     clear_generation: AtomicU64,
 }
 
@@ -282,11 +281,23 @@ impl ScannerStore {
     }
 }
 
-fn finding_dedup_key(finding: &ScannerFinding) -> String {
-    format!(
-        "{}:{}:{}:{}:{}",
-        finding.record_id, finding.host, finding.path, finding.category, finding.title
-    )
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FindingDedupKey {
+    record_id: Uuid,
+    host: String,
+    path: String,
+    category: String,
+    title: String,
+}
+
+fn finding_dedup_key(finding: &ScannerFinding) -> FindingDedupKey {
+    FindingDedupKey {
+        record_id: finding.record_id,
+        host: finding.host.clone(),
+        path: finding.path.clone(),
+        category: finding.category.clone(),
+        title: finding.title.clone(),
+    }
 }
 
 // ── Scanner engine ──
@@ -2208,6 +2219,24 @@ mod tests {
 
         let findings = store.list(None).await;
         assert_eq!(findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_store_dedup_key_preserves_field_boundaries() {
+        let store = ScannerStore::new(10);
+        let record_id = Uuid::new_v4();
+        let mut first = finding("c");
+        first.record_id = record_id;
+        first.category = "a:b".to_string();
+        let mut second = finding("b:c");
+        second.record_id = record_id;
+        second.category = "a".to_string();
+
+        assert!(store.push(first).await);
+        assert!(store.push(second).await);
+
+        let findings = store.list(None).await;
+        assert_eq!(findings.len(), 2);
     }
 
     #[tokio::test]

@@ -982,6 +982,27 @@ async fn handle_forwardable_request(
     }
     let on_upgrade = is_websocket.then(|| hyper::upgrade::on(&mut request));
     let (parts, body) = request.into_parts();
+    if let Err(error) = validate_forwardable_host_headers(&parts.uri, &parts.headers) {
+        return record_http_rejection(
+            &state,
+            &session,
+            RejectedRequestIdentity::from_request(
+                &parts.method,
+                &parts.uri,
+                &parts.headers,
+                default_scheme,
+                authority_override.as_deref(),
+            ),
+            &parts.headers,
+            &[],
+            started_at,
+            started,
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+            "invalid Host header",
+        )
+        .await;
+    }
     let absolute_uri = match resolve_absolute_uri(
         &parts.uri,
         &parts.headers,
@@ -1163,6 +1184,42 @@ fn resolve_absolute_uri(
         .path_and_query(path)
         .build()
         .map_err(|error| anyhow!("failed to build absolute URI: {error}"))
+}
+
+fn validate_forwardable_host_headers(uri: &Uri, headers: &HeaderMap) -> Result<()> {
+    let mut host_headers = headers.get_all(HOST).iter();
+    let host_header = host_headers.next();
+    if host_headers.next().is_some() {
+        bail!("multiple Host headers are not supported");
+    }
+
+    if uri.scheme().is_none() || uri.authority().is_none() {
+        return Ok(());
+    }
+    let Some(host_header) = host_header else {
+        return Ok(());
+    };
+
+    let host_header = host_header.to_str().context("invalid Host header")?;
+    let header_authority: Authority = host_header
+        .parse()
+        .with_context(|| format!("invalid Host header: {host_header}"))?;
+    let uri_authority = uri
+        .authority()
+        .context("absolute-form request URI is missing authority")?;
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let uri_port = uri_authority
+        .port_u16()
+        .unwrap_or(default_port_for_scheme(scheme)?);
+    let header_port = header_authority
+        .port_u16()
+        .unwrap_or(default_port_for_scheme(scheme)?);
+    if !authority_hosts_equivalent(uri_authority.host(), header_authority.host())
+        || uri_port != header_port
+    {
+        bail!("absolute-form request authority does not match Host header: {host_header}");
+    }
+    Ok(())
 }
 
 fn validate_absolute_uri_matches_authority_override(

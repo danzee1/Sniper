@@ -2412,7 +2412,7 @@ async fn open_replay_tab(
     )
     .await?;
     let normalized = normalize_target_inputs(scheme, host, port, base_request.as_ref())?;
-    let sequence = workspace.replay.tab_sequence + 1;
+    let sequence = next_replay_tab_sequence(&workspace.replay)?;
     let tab = ReplayTabState {
         id: Uuid::new_v4().to_string(),
         sequence,
@@ -2434,6 +2434,19 @@ async fn open_replay_tab(
     let snapshot = post_workspace_state(api, &mut workspace).await?;
     let tab = find_replay_tab(&snapshot.replay, &tab.id)?;
     Ok((workspace.session_id, tab.clone()))
+}
+
+fn next_replay_tab_sequence(replay: &ReplayWorkspaceState) -> Result<usize> {
+    let current = replay
+        .tabs
+        .iter()
+        .map(|tab| tab.sequence)
+        .max()
+        .unwrap_or(0)
+        .max(replay.tab_sequence);
+    current
+        .checked_add(1)
+        .context("replay tab sequence is too large; save the workspace from the app to repair it")
 }
 
 fn replay_tab_target_as_request(tab: &ReplayTabState) -> Option<EditableRequest> {
@@ -4035,8 +4048,8 @@ mod tests {
         build_editable_raw_request_with_version, build_oast_configure_update,
         default_editable_request, explicit_or_active_session_id, failed_record_output,
         fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
-        install_skills, normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
-        oast_fields_for_output, parse_editable_raw_request,
+        install_skills, next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
+        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
         push_replay_history_entry, read_limited_to_end, read_payloads_input,
@@ -4058,7 +4071,8 @@ mod tests {
     use sniper::session::SessionSummary;
     use sniper::skills;
     use sniper::workspace::{
-        FuzzerWorkspaceState, ReplayHistoryEntryState, ReplayTabState, WorkspaceStateSnapshot,
+        FuzzerWorkspaceState, ReplayHistoryEntryState, ReplayTabState, ReplayWorkspaceState,
+        WorkspaceStateSnapshot,
     };
     use std::fs;
     use uuid::Uuid;
@@ -5274,6 +5288,34 @@ mod tests {
         assert_eq!(workspace.session_id, session_id);
         assert_eq!(workspace.client_id.as_deref(), Some("sniper-cli"));
         assert_eq!(workspace.client_version, 42);
+    }
+
+    #[test]
+    fn replay_tab_sequence_reports_overflow() {
+        let replay = ReplayWorkspaceState {
+            tab_sequence: 41,
+            ..ReplayWorkspaceState::default()
+        };
+        assert_eq!(next_replay_tab_sequence(&replay).unwrap(), 42);
+
+        let replay = ReplayWorkspaceState {
+            tab_sequence: 1,
+            tabs: vec![ReplayTabState {
+                sequence: 42,
+                ..ReplayTabState::default()
+            }],
+            ..ReplayWorkspaceState::default()
+        };
+        assert_eq!(next_replay_tab_sequence(&replay).unwrap(), 43);
+
+        let replay = ReplayWorkspaceState {
+            tab_sequence: usize::MAX,
+            ..ReplayWorkspaceState::default()
+        };
+        let error = next_replay_tab_sequence(&replay).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("replay tab sequence is too large"));
     }
 
     #[test]

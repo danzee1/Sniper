@@ -928,6 +928,9 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
             snapshot.replay.tabs.len()
         ));
     }
+    if snapshot.replay.tab_sequence == usize::MAX {
+        return Err("replay tab sequence is too large".to_string());
+    }
     if let Some(active_tab_id) = snapshot.replay.active_tab_id.as_deref() {
         validate_workspace_string_bytes(
             "active replay tab id",
@@ -6277,6 +6280,14 @@ mod tests {
             ..ReplayTabState::default()
         });
         assert!(super::validate_workspace_state(&snapshot).is_err());
+    }
+
+    #[test]
+    fn workspace_validation_rejects_unusable_replay_tab_sequence() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tab_sequence = usize::MAX;
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("replay tab sequence is too large"));
     }
 
     #[tokio::test]

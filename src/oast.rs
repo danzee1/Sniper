@@ -203,6 +203,9 @@ impl OastStore {
             return false;
         }
         let mut entries = self.entries.write().await;
+        if generation.is_some_and(|expected| self.clear_generation() != expected) {
+            return false;
+        }
         if entries
             .iter()
             .any(|existing| callback_dedup_key(existing) == dedup_key)
@@ -371,7 +374,7 @@ impl OastStore {
     /// Returns (correlation_id, payload_suffix) if an Interactsh session is registered.
     pub async fn get_registration_info(&self) -> Option<(String, String)> {
         let config = self.config.read().await;
-        if !config.enabled {
+        if !config.enabled || config.provider != OastProvider::Interactsh {
             return None;
         }
         let reg = self.registration.read().await;
@@ -1162,13 +1165,18 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
             let interval = Duration::from_secs(config.polling_interval_secs.max(1));
 
             // Detect config change (provider or URL changed)
-            let config_changed = prev_provider.as_ref() != Some(&config.provider)
+            let registration_missing = config.provider == OastProvider::Interactsh
+                && !store.registration_matches_config(&config).await;
+            let config_identity_changed = prev_provider.as_ref() != Some(&config.provider)
                 || prev_url.as_deref() != Some(&config.server_url)
                 || prev_token.as_deref() != Some(&config.token);
+            let config_changed = config_identity_changed || registration_missing;
 
             if config_changed {
                 // Deregister old Interactsh session if switching away
-                if prev_provider.as_ref() == Some(&OastProvider::Interactsh) {
+                if prev_provider.as_ref() == Some(&OastProvider::Interactsh)
+                    && config_identity_changed
+                {
                     deregister_current_interactsh(&store, &prev_url, &client).await;
                 }
 
@@ -1297,10 +1305,13 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             continue;
         }
 
+        let registration_missing = config.provider == OastProvider::Interactsh
+            && !session.oast.registration_matches_config(&config).await;
         let config_changed = session_changed
             || prev_provider.as_ref() != Some(&config.provider)
             || prev_url.as_deref() != Some(&config.server_url)
-            || prev_token.as_deref() != Some(&config.token);
+            || prev_token.as_deref() != Some(&config.token)
+            || registration_missing;
 
         if config_changed {
             let registration_config_changed = prev_provider.as_ref() != Some(&config.provider)
@@ -1539,6 +1550,7 @@ async fn deregister_current_interactsh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn interactsh_config(token: &str) -> OastConfig {
         OastConfig {
@@ -1751,6 +1763,90 @@ mod tests {
         let mut changed_url = config;
         changed_url.server_url = "https://other.example.test".to_string();
         assert!(!store.registration_matches_config(&changed_url).await);
+    }
+
+    #[tokio::test]
+    async fn registration_info_requires_interactsh_provider() {
+        let store = OastStore::new(16);
+        let mut config = interactsh_config("token-a");
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+
+        store.update_config(config.clone()).await;
+        store
+            .set_registration(RegistrationState::Interactsh {
+                server_url: config.server_url.clone(),
+                token: config.token.clone(),
+                correlation_id: "cid".to_string(),
+                secret_key: "secret".to_string(),
+                private_key,
+            })
+            .await;
+        assert!(store.get_registration_info().await.is_some());
+
+        config.provider = OastProvider::Custom;
+        store.update_config(config).await;
+        assert!(store.get_registration_info().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn interactsh_registration_retries_after_initial_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let register_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_attempts = register_attempts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0_u8; 8192];
+                let read = socket.read(&mut buffer).await;
+                let Ok(read) = read else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let response = if request.starts_with("POST /register ") {
+                    let attempt = server_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                            .to_string()
+                    }
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}"
+                        .to_string()
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let store = Arc::new(OastStore::new_with_config(
+            16,
+            OastConfig {
+                enabled: true,
+                server_url: format!("http://{addr}"),
+                token: String::new(),
+                polling_interval_secs: 1,
+                provider: OastProvider::Interactsh,
+            },
+        ));
+        let poller = start_oast_poller(store.clone());
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if store.get_registration_info().await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("registration should retry after a transient failure");
+
+        assert!(register_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        poller.abort();
+        server.abort();
     }
 
     #[tokio::test]
