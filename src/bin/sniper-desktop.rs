@@ -177,6 +177,7 @@ fn main() -> Result<()> {
     };
 
     let close_state = state.clone();
+    let close_data_dir = close_state.config.data_dir.clone();
     let shutdown_done = Arc::new(AtomicBool::new(false));
     let mut ui_task = Some(ui_task);
     let mut oast_task = Some(oast_task);
@@ -187,7 +188,7 @@ fn main() -> Result<()> {
         let _keep_proxy_task = &proxy_task;
         *control_flow = ControlFlow::Wait;
 
-        let mut shutdown_once = || {
+        let mut teardown_once = || {
             if shutdown_done.swap(true, Ordering::AcqRel) {
                 return;
             }
@@ -222,22 +223,7 @@ fn main() -> Result<()> {
             runtime.block_on(proxy::drain_proxy_connections(
                 std::time::Duration::from_secs(1),
             ));
-            if let Err(error) =
-                runtime.block_on(proxy::flush_pending_session_persists(close_state.as_ref()))
-            {
-                warn!(
-                    ?error,
-                    "failed to flush pending session snapshots before desktop shutdown"
-                );
-            }
-            if let Err(error) = runtime.block_on(close_state.persist_active_session()) {
-                warn!(
-                    ?error,
-                    "failed to persist active session before desktop shutdown"
-                );
-            }
-            // Clean up runtime-state so CLI doesn't connect to a stale port.
-            remove_runtime_state_file(&close_state.config.data_dir);
+            complete_desktop_shutdown(shutdown_done.as_ref(), &close_data_dir);
         };
 
         match event {
@@ -245,11 +231,31 @@ fn main() -> Result<()> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                shutdown_once();
-                *control_flow = ControlFlow::Exit;
+                if shutdown_done.load(Ordering::Acquire) {
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                match persist_desktop_session_state(&runtime, close_state.as_ref()) {
+                    Ok(()) => {
+                        teardown_once();
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    Err(error) => {
+                        *control_flow = block_desktop_shutdown(error);
+                    }
+                }
             }
             Event::LoopDestroyed => {
-                shutdown_once();
+                if !shutdown_done.load(Ordering::Acquire) {
+                    if let Err(error) = persist_desktop_session_state(&runtime, close_state.as_ref())
+                    {
+                        error!(
+                            ?error,
+                            "desktop shutdown finished without durable session persistence during forced teardown"
+                        );
+                    }
+                }
+                teardown_once();
             }
             _ => {}
         }
@@ -270,6 +276,48 @@ fn remove_runtime_state_file(data_dir: &Path) {
             "failed to remove runtime state before desktop shutdown"
         );
     }
+}
+
+fn persist_desktop_session_state(
+    runtime: &tokio::runtime::Runtime,
+    state: &AppState,
+) -> Result<()> {
+    let flush_result = runtime
+        .block_on(proxy::flush_pending_session_persists(state))
+        .context("failed to flush pending session snapshots before desktop shutdown");
+    let active_result = runtime
+        .block_on(state.persist_active_session())
+        .map(|_| ())
+        .context("failed to persist active session before desktop shutdown");
+    combine_desktop_persist_results(flush_result, active_result)
+}
+
+fn combine_desktop_persist_results(
+    flush_result: Result<()>,
+    active_result: Result<()>,
+) -> Result<()> {
+    match (flush_result, active_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(flush_error), Err(active_error)) => {
+            Err(anyhow::anyhow!("{flush_error:#}; {active_error:#}"))
+        }
+    }
+}
+
+fn block_desktop_shutdown(error: anyhow::Error) -> ControlFlow {
+    error!(
+        ?error,
+        "blocked desktop close because session state was not durably persisted"
+    );
+    ControlFlow::Wait
+}
+
+fn complete_desktop_shutdown(shutdown_done: &AtomicBool, data_dir: &Path) {
+    // Clean up runtime-state only after session data is durably written, so
+    // a failed close can be retried or diagnosed by the CLI.
+    remove_runtime_state_file(data_dir);
+    shutdown_done.store(true, Ordering::Release);
 }
 
 #[cfg(target_os = "macos")]
@@ -625,6 +673,7 @@ fn is_same_origin(url: &str, expected_origin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        block_desktop_shutdown, combine_desktop_persist_results, complete_desktop_shutdown,
         handle_navigation_request, handle_new_window_request, is_blocked_desktop_navigation_scheme,
         is_same_origin, load_shell_rc_contents, shell_single_quote, should_install_cli_path,
         upsert_managed_path_line, write_shell_rc_atomically,
@@ -697,6 +746,45 @@ mod tests {
             .contains(".tmp")));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn desktop_shutdown_completion_removes_runtime_state_and_marks_done() {
+        let root = std::env::temp_dir().join(format!(
+            "sniper-desktop-shutdown-ok-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime_state_path = super::runtime_state::runtime_state_path(&root);
+        std::fs::write(&runtime_state_path, "{}").unwrap();
+        let shutdown_done = std::sync::atomic::AtomicBool::new(false);
+
+        complete_desktop_shutdown(&shutdown_done, &root);
+
+        assert!(shutdown_done.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!runtime_state_path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn desktop_shutdown_block_keeps_event_loop_waiting() {
+        let control_flow = block_desktop_shutdown(anyhow::anyhow!("persist failed"));
+
+        assert!(matches!(control_flow, tao::event_loop::ControlFlow::Wait));
+    }
+
+    #[test]
+    fn desktop_shutdown_persist_result_reports_both_failures() {
+        let error = combine_desktop_persist_results(
+            Err(anyhow::anyhow!("flush failed")),
+            Err(anyhow::anyhow!("active failed")),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("flush failed"));
+        assert!(error.contains("active failed"));
     }
 
     #[test]

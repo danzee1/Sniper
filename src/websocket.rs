@@ -125,6 +125,19 @@ impl WebSocketStore {
             .cloned()
     }
 
+    pub async fn get_windowed(
+        &self,
+        id: Uuid,
+        frame_limit: Option<usize>,
+    ) -> Option<WebSocketSessionRecord> {
+        self.sessions
+            .read()
+            .await
+            .iter()
+            .find(|session| session.id == id)
+            .map(|session| clone_session_with_frame_window(session, frame_limit))
+    }
+
     pub async fn snapshot(&self, limit: Option<usize>) -> Vec<WebSocketSessionRecord> {
         let sessions = self.sessions.read().await;
         let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
@@ -167,6 +180,34 @@ impl WebSocketStore {
 
     pub fn subscribe(&self) -> broadcast::Receiver<WebSocketSessionSummary> {
         self.events.subscribe()
+    }
+}
+
+fn clone_session_with_frame_window(
+    session: &WebSocketSessionRecord,
+    frame_limit: Option<usize>,
+) -> WebSocketSessionRecord {
+    let frames = match frame_limit {
+        Some(0) => Vec::new(),
+        Some(limit) if session.frames.len() > limit => {
+            session.frames[session.frames.len() - limit..].to_vec()
+        }
+        _ => session.frames.clone(),
+    };
+
+    WebSocketSessionRecord {
+        id: session.id,
+        started_at: session.started_at,
+        closed_at: session.closed_at,
+        duration_ms: session.duration_ms,
+        scheme: session.scheme.clone(),
+        host: session.host.clone(),
+        path: session.path.clone(),
+        status: session.status,
+        request: session.request.clone(),
+        response: session.response.clone(),
+        frames,
+        notes: session.notes.clone(),
     }
 }
 
@@ -275,6 +316,38 @@ mod tests {
         assert_eq!(restored[0].frames.len(), 2);
         assert_eq!(restored[0].frames[0].index, 2);
         assert_eq!(restored[0].frames[1].index, 3);
+    }
+
+    #[tokio::test]
+    async fn get_windowed_returns_only_requested_tail_frames() {
+        let record = session(vec![frame(1), frame(2), frame(3), frame(4)]);
+        let record_id = record.id;
+        let store = WebSocketStore::from_sessions(10, 10, vec![record]);
+
+        let detail = store.get_windowed(record_id, Some(2)).await.unwrap();
+
+        assert_eq!(
+            detail
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_tracks_last_retained_frame_index_after_frame_cap() {
+        let record = session(vec![frame(1), frame(2)]);
+        let record_id = record.id;
+        let store = WebSocketStore::from_sessions(10, 2, vec![record]);
+
+        assert!(store.append_frame(record_id, frame(3)).await);
+
+        let page = store.list_page(Some(10)).await;
+        let summary = &page.items[0];
+        assert_eq!(summary.frame_count, 2);
+        assert_eq!(summary.last_frame_index, Some(3));
     }
 
     #[tokio::test]

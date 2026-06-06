@@ -3506,16 +3506,8 @@ async fn get_websocket(
     if let Err(error) = validate_optional_limit(query.frame_limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    match session.websockets.get(id).await {
-        Some(mut record) => {
-            if let Some(limit) = query.frame_limit {
-                if record.frames.len() > limit {
-                    let start = record.frames.len() - limit;
-                    record.frames = record.frames.split_off(start);
-                }
-            }
-            Json(record).into_response()
-        }
+    match session.websockets.get_windowed(id, query.frame_limit).await {
+        Some(record) => Json(record).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -7480,6 +7472,7 @@ mod tests {
         .await;
         let page: super::WebSocketPageResponse = response_json(list_response).await;
         assert_eq!(page.items[0].frame_count, 5);
+        assert_eq!(page.items[0].last_frame_index, Some(5));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

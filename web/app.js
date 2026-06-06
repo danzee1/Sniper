@@ -3752,11 +3752,20 @@ async function loadWebsocketDetail(id) {
       return;
     }
     const summary = state.websocketSessions.find((item) => item.id === id);
+    const loadedLastFrameIndex = Array.isArray(detail.frames) && detail.frames.length
+      ? Number(detail.frames[detail.frames.length - 1]?.index)
+      : null;
     state.selectedWebsocketRecord = {
       ...detail,
       frame_count: Number.isFinite(Number(summary?.frame_count))
         ? Number(summary.frame_count)
         : (Array.isArray(detail.frames) ? detail.frames.length : 0),
+      last_frame_index: Number.isFinite(Number(summary?.last_frame_index))
+        ? Number(summary.last_frame_index)
+        : loadedLastFrameIndex,
+      loaded_last_frame_index: Number.isFinite(loadedLastFrameIndex)
+        ? loadedLastFrameIndex
+        : null,
       note_count: Number.isFinite(Number(summary?.note_count))
         ? Number(summary.note_count)
         : (Array.isArray(detail.notes) ? detail.notes.length : 0),
@@ -7780,6 +7789,7 @@ async function syncVisibleWebsocketSelection(preserveSelection = true) {
     && state.selectedWebsocketRecord
     && (
       Number(state.selectedWebsocketRecord.frame_count || 0) !== Number(selectedSummary.frame_count || 0)
+      || Number(state.selectedWebsocketRecord.loaded_last_frame_index ?? -1) !== Number(selectedSummary.last_frame_index ?? -1)
       || state.selectedWebsocketRecord.status !== selectedSummary.status
       || (state.selectedWebsocketRecord.closed_at || null) !== (selectedSummary.closed_at || null)
       || (state.selectedWebsocketRecord.duration_ms ?? null) !== (selectedSummary.duration_ms ?? null)

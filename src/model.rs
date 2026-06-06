@@ -528,6 +528,7 @@ impl WebSocketSessionRecord {
             path: self.path.clone(),
             status: self.status,
             frame_count: self.frames.len(),
+            last_frame_index: self.frames.last().map(|frame| frame.index),
             note_count: self.notes.len(),
         }
     }
@@ -544,6 +545,8 @@ pub struct WebSocketSessionSummary {
     pub path: String,
     pub status: Option<u16>,
     pub frame_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_frame_index: Option<usize>,
     pub note_count: usize,
 }
 
