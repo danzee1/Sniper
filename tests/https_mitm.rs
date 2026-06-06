@@ -84,6 +84,63 @@ async fn proxy_mitm_captures_inner_https_requests() {
     upstream.handle.abort();
 }
 
+#[tokio::test]
+async fn mitm_connect_tls_failure_after_200_records_connect_success_status() {
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-mitm-post-ok-failure-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(
+            b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let connect_response = read_headers(&mut stream).await;
+    assert!(connect_response.starts_with("HTTP/1.1 200"));
+
+    stream
+        .write_all(b"not a tls client hello\r\n")
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut ignored = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut ignored)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let session = state.session().await;
+    let list = session.store.list(&ListFilters::default()).await;
+    let record = list
+        .iter()
+        .find(|record| record.method == "CONNECT" && record.host == "example.test:443")
+        .expect("CONNECT post-200 TLS failure should be recorded");
+    assert_eq!(record.status, Some(200));
+    let detail = session.store.get(record.id).await.unwrap();
+    assert!(detail.notes.iter().any(|note| {
+        note.contains("TLS handshake failed") && note.contains("CONNECT 200 had already been sent")
+    }));
+
+    proxy_handle.abort();
+}
+
 struct HttpsUpstream {
     handle: tokio::task::JoinHandle<()>,
     port: u16,

@@ -44,6 +44,7 @@ use tokio_tungstenite::{
         client::IntoClientRequest,
         handshake::derive_accept_key,
         protocol::{Message as WebSocketMessage, Role},
+        Error as TungsteniteError,
     },
     MaybeTlsStream, WebSocketStream,
 };
@@ -936,21 +937,17 @@ async fn handle_connect(
             .await
             {
                 warn!(%peer_addr, ?error, target = %failure_target, "HTTPS MITM handler failed");
-                let record = with_record_http_versions(
-                    TransactionRecord::tunnel(
-                        failure_started_at,
-                        failure_target,
-                        Some(StatusCode::BAD_GATEWAY.as_u16()),
-                        failure_started.elapsed().as_millis() as u64,
-                        failure_capture,
-                        vec![format!("HTTPS MITM failed: {error}")],
-                    ),
-                    Some(failure_request_http_version),
-                    Some(Version::HTTP_11),
-                );
-                if insert_transaction_quiet(&failure_session, record, "https mitm failure").await {
-                    persist_session_quiet(&failure_state, &failure_session).await;
-                }
+                record_connect_post_ok_tunnel_failure(
+                    &failure_state,
+                    &failure_session,
+                    failure_target,
+                    failure_capture,
+                    failure_started_at,
+                    failure_started,
+                    format!("HTTPS MITM failed: {error}"),
+                    failure_request_http_version,
+                )
+                .await;
             }
         });
     }
@@ -1639,7 +1636,7 @@ async fn record_connect_rejection(
     response
 }
 
-async fn record_connect_tunnel_failure(
+async fn record_connect_post_ok_tunnel_failure(
     state: &Arc<AppState>,
     session: &Arc<SessionContext>,
     target: String,
@@ -1649,11 +1646,12 @@ async fn record_connect_tunnel_failure(
     note: String,
     request_http_version: Version,
 ) {
+    let note = format!("{note}; CONNECT 200 had already been sent to the client");
     let record = with_record_http_versions(
         TransactionRecord::tunnel(
             started_at,
             target,
-            Some(StatusCode::BAD_GATEWAY.as_u16()),
+            Some(StatusCode::OK.as_u16()),
             started.elapsed().as_millis() as u64,
             request_capture,
             vec![note],
@@ -1661,7 +1659,7 @@ async fn record_connect_tunnel_failure(
         Some(request_http_version),
         Some(Version::HTTP_11),
     );
-    if insert_transaction_quiet(session, record, "connect tunnel failure").await {
+    if insert_transaction_quiet(session, record, "connect post-ok tunnel failure").await {
         persist_session_quiet(state, session).await;
     }
 }
@@ -1709,7 +1707,7 @@ async fn serve_special_host_tls(
         Ok(upgraded) => upgraded,
         Err(error) => {
             let message = format!("CONNECT upgrade failed for special host: {error}");
-            record_connect_tunnel_failure(
+            record_connect_post_ok_tunnel_failure(
                 &state,
                 &session,
                 connect_target.clone(),
@@ -1728,7 +1726,7 @@ async fn serve_special_host_tls(
         Ok(acceptor) => acceptor,
         Err(error) => {
             let message = format!("failed to build special host TLS certificate: {error}");
-            record_connect_tunnel_failure(
+            record_connect_post_ok_tunnel_failure(
                 &state,
                 &session,
                 connect_target.clone(),
@@ -1746,7 +1744,7 @@ async fn serve_special_host_tls(
         Ok(tls_stream) => tls_stream,
         Err(error) => {
             let message = format!("TLS handshake failed for special host: {error}");
-            record_connect_tunnel_failure(
+            record_connect_post_ok_tunnel_failure(
                 &state,
                 &session,
                 connect_target.clone(),
@@ -1826,7 +1824,7 @@ async fn serve_passthrough_tunnel(
         Ok(upgraded) => upgraded,
         Err(error) => {
             let message = format!("CONNECT upgrade failed for passthrough tunnel: {error}");
-            record_connect_tunnel_failure(
+            record_connect_post_ok_tunnel_failure(
                 &state,
                 &session,
                 target,
@@ -1851,20 +1849,17 @@ async fn serve_passthrough_tunnel(
             )]
         }
         Err(error) => {
-            vec![format!("SSL passthrough tunnel error: {error}")]
+            vec![format!(
+                "SSL passthrough tunnel error after CONNECT 200 was sent: {error}"
+            )]
         }
-    };
-    let tunnel_status = if result.is_ok() {
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_GATEWAY
     };
 
     let record = with_record_http_versions(
         TransactionRecord::tunnel(
             started_at,
             target,
-            Some(tunnel_status.as_u16()),
+            Some(StatusCode::OK.as_u16()),
             started.elapsed().as_millis() as u64,
             request_capture,
             notes,
@@ -2374,7 +2369,46 @@ async fn forward_websocket_request(
     .await
     {
         Ok(response) => response,
-        Err(error) => {
+        Err(UpstreamWebSocketConnectError::Http {
+            status,
+            headers,
+            body,
+        }) => {
+            let response_capture = MessageRecord::from_headers_and_body(
+                &headers,
+                body.as_ref(),
+                state.config.body_preview_bytes,
+            );
+            let record = with_record_http_versions(
+                TransactionRecord::http(
+                    started_at,
+                    forwarded_request.method.clone(),
+                    forwarded_request.scheme.clone(),
+                    forwarded_request.host.clone(),
+                    normalize_request_path(&forwarded_request.path),
+                    Some(status.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    merge_notes(
+                        request_notes,
+                        vec![format!(
+                            "Upstream WebSocket handshake returned HTTP {status}"
+                        )],
+                    ),
+                    original_request_capture,
+                    None,
+                ),
+                Some(request_http_version),
+                Some(Version::HTTP_11),
+            );
+            if insert_transaction_quiet(&session, record, "websocket upstream http response").await
+            {
+                persist_session_quiet(&state, &session).await;
+            }
+            return rebuild_response(headers, status, body, &forwarded_request.method);
+        }
+        Err(UpstreamWebSocketConnectError::Other(error)) => {
             let message = format!("WebSocket connect failed: {error}");
             let (client_response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
@@ -3858,11 +3892,23 @@ struct ConnectedWebSocket {
     upstream_headers: HeaderMap,
 }
 
+enum UpstreamWebSocketConnectError {
+    Http {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+    Other(anyhow::Error),
+}
+
 async fn connect_upstream_websocket(
     request: &EditableRequest,
     upstream_insecure: bool,
-) -> Result<ConnectedWebSocket> {
-    let mut upstream_request = websocket_url(request)?.into_client_request()?;
+) -> std::result::Result<ConnectedWebSocket, UpstreamWebSocketConnectError> {
+    let url = websocket_url(request).map_err(UpstreamWebSocketConnectError::Other)?;
+    let mut upstream_request = url
+        .into_client_request()
+        .map_err(|error| UpstreamWebSocketConnectError::Other(anyhow!(error)))?;
     {
         let forwarded_headers = websocket_forward_headers_from_records(&request.headers);
         let headers = upstream_request.headers_mut();
@@ -3875,14 +3921,31 @@ async fn connect_upstream_websocket(
         }
     }
 
-    let (websocket, response) = connect_async_tls_with_config(
+    let (websocket, response) = match connect_async_tls_with_config(
         upstream_request,
         None,
         false,
         crate::ws_tls::insecure_connector(upstream_insecure),
     )
     .await
-    .context("upstream WebSocket handshake failed")?;
+    {
+        Ok(response) => response,
+        Err(TungsteniteError::Http(response)) => {
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = Bytes::from(response.into_body().unwrap_or_default());
+            return Err(UpstreamWebSocketConnectError::Http {
+                status,
+                headers,
+                body,
+            });
+        }
+        Err(error) => {
+            return Err(UpstreamWebSocketConnectError::Other(
+                anyhow!(error).context("upstream WebSocket handshake failed"),
+            ));
+        }
+    };
 
     Ok(ConnectedWebSocket {
         websocket,

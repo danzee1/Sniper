@@ -73,6 +73,82 @@ async fn proxy_captures_basic_http_exchange() {
 }
 
 #[tokio::test]
+async fn websocket_upstream_http_handshake_failure_preserves_status_and_body() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nX-Upstream-Reject: auth\r\nContent-Length: 12\r\nConnection: close\r\n\r\nnot allowed\n",
+            )
+            .await
+            .unwrap();
+    });
+
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-websocket-http-failure-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!(
+        "GET http://{upstream_addr}/socket HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(
+        response.contains("401 Unauthorized"),
+        "unexpected websocket failure response: {response:?}"
+    );
+    assert!(response.contains("not allowed"));
+    assert!(!response.contains("502 Bad Gateway"));
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let session = state.session().await;
+    let list = session.store.list(&ListFilters::default()).await;
+    let record = list
+        .iter()
+        .find(|record| record.method == "GET" && record.path == "/socket")
+        .expect("websocket handshake failure should be recorded");
+    assert_eq!(record.status, Some(401));
+    let detail = session.store.get(record.id).await.unwrap();
+    assert!(detail
+        .notes
+        .iter()
+        .any(|note| note.contains("Upstream WebSocket handshake returned HTTP 401")));
+    assert_eq!(
+        detail
+            .response
+            .as_ref()
+            .map(|response| response.body_preview.as_str()),
+        Some("not allowed\n")
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_streams_open_upstream_response_before_eof() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();

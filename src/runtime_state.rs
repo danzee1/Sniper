@@ -224,6 +224,21 @@ pub fn remove_runtime_state_if_matches(
     Ok(true)
 }
 
+pub fn remove_runtime_state_if_same_ui_addr(
+    data_dir: &Path,
+    expected_ui_addr: SocketAddr,
+) -> Result<bool> {
+    let Some(current) = load_runtime_state(data_dir)? else {
+        return Ok(false);
+    };
+    let expected_ui_addr = advertise_local_api_addr(expected_ui_addr).to_string();
+    if current.ui_addr != expected_ui_addr {
+        return Ok(false);
+    }
+    remove_runtime_state(data_dir)?;
+    Ok(true)
+}
+
 fn runtime_state_matches(left: &RuntimeStateSnapshot, right: &RuntimeStateSnapshot) -> bool {
     left.proxy_addr == right.proxy_addr
         && left.ui_addr == right.ui_addr
@@ -244,7 +259,7 @@ mod tests {
 
     use super::{
         advertise_local_api_addr, load_runtime_state, persist_runtime_state, remove_runtime_state,
-        runtime_state_path, RuntimeStateSnapshot,
+        remove_runtime_state_if_same_ui_addr, runtime_state_path, RuntimeStateSnapshot,
     };
 
     #[test]
@@ -332,6 +347,52 @@ mod tests {
 
         assert!(super::remove_runtime_state_if_matches(&temp_dir, &replacement).unwrap());
         assert!(!runtime_state_path(&temp_dir).exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_remove_if_same_ui_addr_deletes_matching_owner() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-remove-ui-match-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot = RuntimeStateSnapshot::with_proxy_status(
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "0.0.0.0:9000".parse::<SocketAddr>().unwrap(),
+            false,
+        );
+        persist_runtime_state(&temp_dir, &snapshot).unwrap();
+
+        assert!(
+            remove_runtime_state_if_same_ui_addr(&temp_dir, "127.0.0.1:9000".parse().unwrap())
+                .unwrap()
+        );
+        assert!(!runtime_state_path(&temp_dir).exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_remove_if_same_ui_addr_preserves_other_owner() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-remove-ui-mismatch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot = RuntimeStateSnapshot::new(
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
+        );
+        persist_runtime_state(&temp_dir, &snapshot).unwrap();
+
+        assert!(!remove_runtime_state_if_same_ui_addr(
+            &temp_dir,
+            "127.0.0.1:9000".parse().unwrap()
+        )
+        .unwrap());
+        assert!(runtime_state_path(&temp_dir).exists());
+        let loaded = load_runtime_state(&temp_dir).unwrap().unwrap();
+        assert_eq!(loaded.ui_addr, snapshot.ui_addr);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
