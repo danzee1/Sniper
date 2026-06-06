@@ -2,6 +2,7 @@ use std::{
     env,
     io::Write,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -9,7 +10,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use sniper::{api, config::AppConfig, proxy, runtime_state, skills, state::AppState};
+use sniper::{
+    api, certificate::default_data_dir, config::AppConfig, proxy, runtime_state, skills,
+    state::AppState,
+};
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -27,8 +31,43 @@ enum DesktopUserEvent {
     ShutdownSignal,
 }
 
+const APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
+const OPEN_PATH: &str = "/usr/bin/open";
+
+fn desktop_data_dir_from_env() -> PathBuf {
+    env::var_os("SNIPER_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_data_dir)
+}
+
+fn request_existing_desktop_focus() {
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(error) = Command::new(OPEN_PATH)
+            .args(["-b", APP_BUNDLE_IDENTIFIER])
+            .status()
+        {
+            warn!(
+                ?error,
+                "failed to request focus for existing Sniper desktop"
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
     sniper::init_tracing();
+
+    let data_dir = desktop_data_dir_from_env();
+    let Some(_runtime_owner_lock) = runtime_state::try_acquire_runtime_owner_lock(&data_dir)?
+    else {
+        warn!(
+            data_dir = %data_dir.display(),
+            "another Sniper runtime is already using this data directory"
+        );
+        request_existing_desktop_focus();
+        return Ok(());
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

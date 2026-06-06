@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 const RUNTIME_STATE_FILE: &str = "runtime-state.json";
 const RUNTIME_STATE_LOCK_FILE: &str = ".runtime-state.lock";
+const RUNTIME_OWNER_LOCK_FILE: &str = ".runtime-owner.lock";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshot {
@@ -308,6 +309,62 @@ fn runtime_state_matches(left: &RuntimeStateSnapshot, right: &RuntimeStateSnapsh
         && left.process_path == right.process_path
 }
 
+pub struct RuntimeOwnerLock {
+    #[allow(dead_code)]
+    file: fs::File,
+}
+
+pub fn try_acquire_runtime_owner_lock(data_dir: &Path) -> Result<Option<RuntimeOwnerLock>> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
+    let lock_path = data_dir.join(RUNTIME_OWNER_LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open runtime owner lock {}", lock_path.display()))?;
+    if try_lock_runtime_owner_file(&file, &lock_path)? {
+        Ok(Some(RuntimeOwnerLock { file }))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_runtime_owner_file(file: &fs::File, lock_path: &Path) -> Result<bool> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(false),
+        _ => Err(error)
+            .with_context(|| format!("failed to lock runtime owner {}", lock_path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_runtime_owner_file(_file: &fs::File, _lock_path: &Path) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+impl Drop for RuntimeOwnerLock {
+    fn drop(&mut self) {
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        if result != 0 {
+            warn!(
+                error = ?std::io::Error::last_os_error(),
+                "failed to unlock runtime owner"
+            );
+        }
+    }
+}
+
 fn sync_directory(path: &Path, label: &str) -> Result<()> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -370,7 +427,8 @@ mod tests {
     use super::{
         advertise_local_api_addr, load_runtime_state, persist_runtime_state, remove_runtime_state,
         remove_runtime_state_if_owner, remove_runtime_state_if_same_ui_addr, runtime_state_path,
-        RuntimeStateSnapshot, RUNTIME_STATE_LOCK_FILE,
+        try_acquire_runtime_owner_lock, RuntimeStateSnapshot, RUNTIME_OWNER_LOCK_FILE,
+        RUNTIME_STATE_LOCK_FILE,
     };
 
     #[test]
@@ -396,6 +454,25 @@ mod tests {
         assert!(runtime_state_path(&temp_dir).exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_owner_lock_rejects_second_owner_until_released() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-owner-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let first = try_acquire_runtime_owner_lock(&temp_dir).unwrap().unwrap();
+
+        assert!(temp_dir.join(RUNTIME_OWNER_LOCK_FILE).exists());
+        assert!(try_acquire_runtime_owner_lock(&temp_dir).unwrap().is_none());
+
+        drop(first);
+        assert!(try_acquire_runtime_owner_lock(&temp_dir).unwrap().is_some());
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]

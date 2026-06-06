@@ -40,6 +40,14 @@ pub async fn run() -> Result<()> {
 }
 
 pub async fn run_with_config(config: AppConfig) -> Result<()> {
+    let Some(_runtime_owner_lock) =
+        runtime_state::try_acquire_runtime_owner_lock(&config.data_dir)?
+    else {
+        anyhow::bail!(
+            "another Sniper runtime is already using data dir {}; use a different SNIPER_DATA_DIR or stop the existing process",
+            config.data_dir.display()
+        );
+    };
     let state = Arc::new(AppState::new(config.clone())?);
     let oast_task = oast::start_oast_poller_for_state(state.clone());
 

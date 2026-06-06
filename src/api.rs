@@ -2352,8 +2352,9 @@ fn merge_workspace_keepalive_snapshot(
     let mut incoming_tab_ids = HashSet::new();
     let mut skipped_new_tab_ids = HashSet::new();
     for incoming_tab in incoming.replay.tabs {
+        let incoming_tab_id = incoming_tab.id.clone();
         if keepalive.replay_tabs_complete {
-            incoming_tab_ids.insert(incoming_tab.id.clone());
+            incoming_tab_ids.insert(incoming_tab_id.clone());
         }
         match current
             .replay
@@ -2364,12 +2365,12 @@ fn merge_workspace_keepalive_snapshot(
             Some(current_tab) => {
                 merge_workspace_keepalive_tab(current_tab, incoming_tab, keepalive)
             }
-            None if keepalive_can_create_replay_tab(&incoming_tab, keepalive) => {
-                current.replay.tabs.push(incoming_tab)
-            }
-            None => {
-                skipped_new_tab_ids.insert(incoming_tab.id);
-            }
+            None => match keepalive_new_replay_tab(incoming_tab, keepalive) {
+                Some(tab) => current.replay.tabs.push(tab),
+                None => {
+                    skipped_new_tab_ids.insert(incoming_tab_id);
+                }
+            },
         }
     }
     if current
@@ -2400,18 +2401,23 @@ fn merge_workspace_keepalive_snapshot(
     current
 }
 
-fn keepalive_can_create_replay_tab(
-    tab: &ReplayTabState,
+fn keepalive_new_replay_tab(
+    mut tab: ReplayTabState,
     keepalive: WorkspaceKeepaliveMetadata,
-) -> bool {
+) -> Option<ReplayTabState> {
     if tab.tab_type == "websocket" {
-        return keepalive.ws_text_complete()
-            && tab.ws_setup_queue_complete.unwrap_or(true)
-            && tab.ws_frames_complete.unwrap_or(true);
+        if !keepalive.ws_text_complete() {
+            return None;
+        }
+        if !tab.ws_frames_complete.unwrap_or(true) {
+            tab.ws_frames_truncated = true;
+        }
+        return Some(tab);
     }
-    keepalive.text_complete()
+    (keepalive.text_complete()
         && tab.history_entries_complete.unwrap_or(true)
-        && tab.response_record_complete.unwrap_or(true)
+        && tab.response_record_complete.unwrap_or(true))
+    .then_some(tab)
 }
 
 fn complete_workspace_keepalive_fuzzer(
@@ -7491,6 +7497,48 @@ mod tests {
 
         assert!(merged.replay.tabs.is_empty());
         assert!(merged.replay.active_tab_id.is_none());
+    }
+
+    #[test]
+    fn workspace_keepalive_creates_missing_websocket_tab_when_arrays_are_compact() {
+        let current = WorkspaceStateSnapshot::default();
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws-new".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws-new".to_string(),
+                    tab_type: "websocket".to_string(),
+                    custom_label: "Replay WS".to_string(),
+                    sequence: 1,
+                    ws_scheme: "wss".to_string(),
+                    ws_host: "example.test".to_string(),
+                    ws_path: "/socket".to_string(),
+                    ws_handshake_text: "GET /socket HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                        .to_string(),
+                    ws_editor_text: "hello".to_string(),
+                    ws_setup_queue_complete: Some(false),
+                    ws_frames_complete: Some(false),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        assert_eq!(merged.replay.tabs.len(), 1);
+        assert_eq!(merged.replay.active_tab_id.as_deref(), Some("ws-new"));
+        let tab = &merged.replay.tabs[0];
+        assert_eq!(tab.tab_type, "websocket");
+        assert_eq!(tab.ws_host, "example.test");
+        assert!(tab.ws_setup_queue.is_empty());
+        assert!(tab.ws_frames.is_empty());
+        assert!(tab.ws_frames_truncated);
     }
 
     #[test]

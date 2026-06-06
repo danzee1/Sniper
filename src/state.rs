@@ -505,6 +505,7 @@ impl AppState {
 
     pub async fn runtime_info(&self) -> RuntimeInfo {
         let session = self.session().await;
+        let active_session = session.summary(true);
         let active_addr = self.get_active_proxy_addr().await;
         let ui_addr = self.get_active_ui_addr().await;
         RuntimeInfo {
@@ -549,7 +550,7 @@ impl AppState {
             certificate: self.certificates.export().clone(),
             runtime: session.runtime.snapshot().await.redacted_for_read(),
             startup: self.startup.view(active_addr).await,
-            active_session: self.active_session_summary().await,
+            active_session,
         }
     }
 
