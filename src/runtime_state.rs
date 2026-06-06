@@ -85,6 +85,15 @@ pub fn load_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if path.exists() => {
+            warn!(
+                ?error,
+                path = %path.display(),
+                "discarding unreadable runtime state"
+            );
+            move_invalid_runtime_state_aside(data_dir, &path);
+            return Ok(None);
+        }
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to read runtime state at {}", path.display()));
@@ -161,6 +170,13 @@ pub fn persist_runtime_state(data_dir: &Path, snapshot: &RuntimeStateSnapshot) -
         file.sync_all()
             .with_context(|| format!("failed to sync runtime state {}", tmp_path.display()))?;
     }
+    if path.is_dir() {
+        warn!(
+            path = %path.display(),
+            "moving directory runtime state aside before replace"
+        );
+        move_invalid_runtime_state_aside(data_dir, &path);
+    }
     fs::rename(&tmp_path, &path)
         .with_context(|| format!("failed to replace runtime state at {}", path.display()))?;
     sync_directory(data_dir, "runtime state directory")?;
@@ -169,6 +185,22 @@ pub fn persist_runtime_state(data_dir: &Path, snapshot: &RuntimeStateSnapshot) -
 
 pub fn remove_runtime_state(data_dir: &Path) -> Result<()> {
     let path = runtime_state_path(data_dir);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect runtime state {}", path.display()));
+        }
+    };
+    if metadata.is_dir() {
+        warn!(
+            path = %path.display(),
+            "moving directory runtime state aside before remove"
+        );
+        move_invalid_runtime_state_aside(data_dir, &path);
+        return sync_directory(data_dir, "runtime state directory");
+    }
     match fs::remove_file(&path) {
         Ok(()) => sync_directory(data_dir, "runtime state directory"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -330,6 +362,82 @@ mod tests {
         let loaded = load_runtime_state(&temp_dir).unwrap();
 
         assert!(loaded.is_none());
+        assert!(!runtime_state_path(&temp_dir).exists());
+        assert!(fs::read_dir(&temp_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-state.corrupt-")
+        }));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_ignores_and_moves_directory_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(runtime_state_path(&temp_dir)).unwrap();
+
+        let loaded = load_runtime_state(&temp_dir).unwrap();
+
+        assert!(loaded.is_none());
+        assert!(!runtime_state_path(&temp_dir).exists());
+        assert!(fs::read_dir(&temp_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-state.corrupt-")
+        }));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_persist_replaces_directory_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-persist-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(runtime_state_path(&temp_dir)).unwrap();
+        let snapshot = RuntimeStateSnapshot::new(
+            "127.0.0.1:18080".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:23001".parse::<SocketAddr>().unwrap(),
+        );
+
+        persist_runtime_state(&temp_dir, &snapshot).unwrap();
+        let loaded = load_runtime_state(&temp_dir).unwrap().unwrap();
+
+        assert_eq!(loaded.ui_addr, "127.0.0.1:23001");
+        assert!(runtime_state_path(&temp_dir).is_file());
+        assert!(fs::read_dir(&temp_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-state.corrupt-")
+        }));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_remove_moves_directory_path() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-remove-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(runtime_state_path(&temp_dir)).unwrap();
+
+        remove_runtime_state(&temp_dir).unwrap();
+
         assert!(!runtime_state_path(&temp_dir).exists());
         assert!(fs::read_dir(&temp_dir).unwrap().any(|entry| {
             entry

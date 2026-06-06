@@ -110,6 +110,28 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
     let mut request = request;
     let mut notes = Vec::new();
     let mut body_changed = false;
+    let mut headers_changed = false;
+    let needs_request_body = rules.iter().any(|rule| {
+        rule.enabled
+            && matches!(rule.scope, MatchReplaceScope::Request)
+            && matches!(
+                rule.target,
+                MatchReplaceTarget::Any | MatchReplaceTarget::Body
+            )
+    });
+    let decoded_body_for_rules = needs_request_body
+        .then(|| {
+            request
+                .try_body_bytes()
+                .ok()
+                .and_then(|body| decode_content_encoding_records(&request.headers, body.as_ref()))
+        })
+        .flatten();
+    let mut decoded_body_text_for_rules = decoded_body_for_rules
+        .as_ref()
+        .and_then(|decoded| std::str::from_utf8(decoded).ok())
+        .map(ToOwned::to_owned);
+    let mut decoded_body_changed = false;
 
     for rule in rules
         .into_iter()
@@ -135,8 +157,9 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
         ) {
             for header in &mut request.headers {
                 if let Ok((value, changed)) = replace_text(&header.name, &rule) {
-                    if changed {
+                    if changed && valid_header_name(&value) {
                         header.name = value;
+                        headers_changed = true;
                         matched = true;
                     }
                 }
@@ -156,11 +179,12 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
 
             for header in &mut request.headers {
                 if let Ok((value, changed)) = replace_text(&header.value, &rule) {
-                    if changed {
+                    if changed && valid_header_value(&value) {
                         header.value = value;
                         if header.name.eq_ignore_ascii_case("host") {
                             request.host = header.value.clone();
                         }
+                        headers_changed = true;
                         matched = true;
                     }
                 }
@@ -170,13 +194,23 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
         if matches!(
             rule.target,
             MatchReplaceTarget::Any | MatchReplaceTarget::Body
-        ) && matches!(request.body_encoding, BodyEncoding::Utf8)
-        {
-            if let Ok((value, changed)) = replace_text(&request.body, &rule) {
-                if changed {
-                    request.body = value;
-                    matched = true;
-                    body_changed = true;
+        ) {
+            if let Some(body_text) = decoded_body_text_for_rules.as_mut() {
+                if let Ok((value, changed)) = replace_text(body_text, &rule) {
+                    if changed {
+                        *body_text = value;
+                        matched = true;
+                        body_changed = true;
+                        decoded_body_changed = true;
+                    }
+                }
+            } else if matches!(request.body_encoding, BodyEncoding::Utf8) {
+                if let Ok((value, changed)) = replace_text(&request.body, &rule) {
+                    if changed {
+                        request.body = value;
+                        matched = true;
+                        body_changed = true;
+                    }
                 }
             }
         }
@@ -189,8 +223,18 @@ fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -
         }
     }
 
-    if body_changed {
-        normalize_content_length_records(&mut request.headers, request.body.len());
+    if decoded_body_changed {
+        if let Some(body_text) = decoded_body_text_for_rules {
+            request.body = body_text;
+            request.body_encoding = BodyEncoding::Utf8;
+            strip_content_encoding_records(&mut request.headers);
+        }
+    }
+
+    if body_changed || headers_changed {
+        if let Ok(body) = request.try_body_bytes() {
+            normalize_content_length_records(&mut request.headers, body.len());
+        }
     }
 
     AppliedRequest { request, notes }
@@ -233,7 +277,7 @@ fn apply_response_rules(
         ) {
             for header in &mut headers {
                 if let Ok((value, changed)) = replace_text(&header.name, &rule) {
-                    if changed {
+                    if changed && valid_header_name(&value) {
                         header.name = value;
                         matched = true;
                     }
@@ -247,7 +291,7 @@ fn apply_response_rules(
         ) {
             for header in &mut headers {
                 if let Ok((value, changed)) = replace_text(&header.value, &rule) {
-                    if changed {
+                    if changed && valid_header_value(&value) {
                         header.value = value;
                         matched = true;
                     }
@@ -319,6 +363,14 @@ fn normalize_content_length_records(headers: &mut Vec<HeaderRecord>, body_len: u
     }
 }
 
+fn valid_header_name(value: &str) -> bool {
+    http::HeaderName::from_bytes(value.as_bytes()).is_ok()
+}
+
+fn valid_header_value(value: &str) -> bool {
+    http::HeaderValue::from_str(value).is_ok()
+}
+
 fn replace_text(value: &str, rule: &MatchReplaceRule) -> Result<(String, bool)> {
     if rule.search.is_empty() {
         return Ok((value.to_string(), false));
@@ -380,6 +432,7 @@ fn header_map(headers: Vec<HeaderRecord>) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use flate2::{
         write::{GzEncoder, ZlibEncoder},
         Compression,
@@ -480,6 +533,201 @@ mod tests {
                 .map(|header| header.value.as_str()),
             Some("11")
         );
+    }
+
+    #[tokio::test]
+    async fn request_body_rule_applies_to_gzip_body_and_strips_encoding() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "rewrite compressed request".to_string(),
+                scope: MatchReplaceScope::Request,
+                target: MatchReplaceTarget::Body,
+                search: "tiny".to_string(),
+                replace: "larger-body".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let compressed = gzip(b"tiny");
+        let applied = store
+            .apply_request(EditableRequest {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                headers: vec![
+                    HeaderRecord {
+                        name: "Content-Encoding".to_string(),
+                        value: "gzip".to_string(),
+                    },
+                    HeaderRecord {
+                        name: "Content-Length".to_string(),
+                        value: compressed.len().to_string(),
+                    },
+                ],
+                body: STANDARD.encode(&compressed),
+                body_encoding: BodyEncoding::Base64,
+                preview_truncated: false,
+            })
+            .await;
+
+        assert_eq!(applied.request.body, "larger-body");
+        assert_eq!(applied.request.body_encoding, BodyEncoding::Utf8);
+        assert!(applied
+            .request
+            .headers
+            .iter()
+            .all(|header| !header.name.eq_ignore_ascii_case("content-encoding")));
+        assert_eq!(
+            applied
+                .request
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                .map(|header| header.value.as_str()),
+            Some("11")
+        );
+        assert_eq!(applied.notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_body_rule_leaves_unmatched_gzip_body_untouched() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "no match".to_string(),
+                scope: MatchReplaceScope::Request,
+                target: MatchReplaceTarget::Body,
+                search: "absent".to_string(),
+                replace: "larger-body".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let compressed = gzip(b"tiny");
+        let applied = store
+            .apply_request(EditableRequest {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                headers: vec![
+                    HeaderRecord {
+                        name: "Content-Encoding".to_string(),
+                        value: "gzip".to_string(),
+                    },
+                    HeaderRecord {
+                        name: "Content-Length".to_string(),
+                        value: compressed.len().to_string(),
+                    },
+                ],
+                body: STANDARD.encode(&compressed),
+                body_encoding: BodyEncoding::Base64,
+                preview_truncated: false,
+            })
+            .await;
+
+        assert_eq!(applied.request.body_encoding, BodyEncoding::Base64);
+        assert_eq!(applied.request.try_body_bytes().unwrap(), compressed);
+        assert_eq!(
+            applied
+                .request
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+                .map(|header| header.value.as_str()),
+            Some("gzip")
+        );
+        assert!(applied.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_header_value_rule_normalizes_existing_content_length() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "bad content length edit".to_string(),
+                scope: MatchReplaceScope::Request,
+                target: MatchReplaceTarget::HeaderValue,
+                search: "4".to_string(),
+                replace: "999".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let applied = store
+            .apply_request(EditableRequest {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/".to_string(),
+                headers: vec![HeaderRecord {
+                    name: "Content-Length".to_string(),
+                    value: "4".to_string(),
+                }],
+                body: "body".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+                preview_truncated: false,
+            })
+            .await;
+
+        assert_eq!(
+            applied
+                .request
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                .map(|header| header.value.as_str()),
+            Some("4")
+        );
+        assert_eq!(applied.notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_header_name_replacement_is_ignored() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "invalid header".to_string(),
+                scope: MatchReplaceScope::Request,
+                target: MatchReplaceTarget::HeaderName,
+                search: "X-Test".to_string(),
+                replace: "Bad Header".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let applied = store
+            .apply_request(EditableRequest {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![HeaderRecord {
+                    name: "X-Test".to_string(),
+                    value: "kept".to_string(),
+                }],
+                body: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                preview_truncated: false,
+            })
+            .await;
+
+        assert_eq!(applied.request.headers[0].name, "X-Test");
+        assert!(applied.notes.is_empty());
     }
 
     #[tokio::test]

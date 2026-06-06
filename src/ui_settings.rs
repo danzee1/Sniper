@@ -32,6 +32,25 @@ const DISPLAY_MONO_FONT_OPTIONS: &[&str] = &[
     "nanumgothiccoding",
     "notomonokr",
 ];
+const ACTIVE_TOOL_OPTIONS: &[&str] = &[
+    "dashboard",
+    "target",
+    "proxy",
+    "fuzzer",
+    "sequence",
+    "replay",
+    "tools",
+    "logger",
+];
+const ACTIVE_PROXY_TAB_OPTIONS: &[&str] = &[
+    "intercept",
+    "http-history",
+    "websockets-history",
+    "replace",
+    "findings",
+    "oast",
+    "proxy-settings",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -101,6 +120,8 @@ impl WorkbenchPaneWidthsSnapshot {
 #[serde(default)]
 pub struct AppUiSettingsSnapshot {
     pub display_settings: DisplaySettingsSnapshot,
+    pub active_tool: String,
+    pub active_proxy_tab: String,
     pub history_column_widths: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ws_column_widths: BTreeMap<String, u16>,
@@ -118,6 +139,8 @@ impl Default for AppUiSettingsSnapshot {
     fn default() -> Self {
         Self {
             display_settings: DisplaySettingsSnapshot::default(),
+            active_tool: "proxy".to_string(),
+            active_proxy_tab: "http-history".to_string(),
             history_column_widths: default_history_column_widths(),
             ws_column_widths: default_ws_column_widths(),
             history_column_order: Vec::new(),
@@ -135,6 +158,12 @@ impl AppUiSettingsSnapshot {
         let mut sanitized = Self::default();
 
         sanitized.display_settings = self.display_settings.sanitized();
+        sanitized.active_tool = sanitize_option(self.active_tool, "proxy", ACTIVE_TOOL_OPTIONS);
+        sanitized.active_proxy_tab = sanitize_option(
+            self.active_proxy_tab,
+            "http-history",
+            ACTIVE_PROXY_TAB_OPTIONS,
+        );
         sanitized.workbench_height = self
             .workbench_height
             .filter(|height| *height > 0)
@@ -274,6 +303,15 @@ fn persist_ui_settings(path: &Path, snapshot: &AppUiSettingsSnapshot) -> Result<
         file.sync_all()
             .with_context(|| format!("failed to sync ui settings {}", tmp_path.display()))?;
     }
+    if path.is_dir() {
+        warn!(
+            path = %path.display(),
+            "moving directory ui settings aside before replace"
+        );
+        if let Some(parent) = path.parent() {
+            move_corrupt_ui_settings_aside(parent, path);
+        }
+    }
     fs::rename(&tmp_path, path).with_context(|| {
         format!(
             "failed to rename ui settings {} to {}",
@@ -362,6 +400,8 @@ mod tests {
         let mut snapshot = AppUiSettingsSnapshot::default();
         snapshot.display_settings.theme = "white".to_string();
         snapshot.display_settings.size_px = 15;
+        snapshot.active_tool = "replay".to_string();
+        snapshot.active_proxy_tab = "websockets-history".to_string();
         snapshot
             .history_column_widths
             .insert("host".to_string(), 444);
@@ -386,6 +426,8 @@ mod tests {
 
         assert_eq!(persisted.display_settings.theme, "white");
         assert_eq!(persisted.display_settings.size_px, 15);
+        assert_eq!(persisted.active_tool, "replay");
+        assert_eq!(persisted.active_proxy_tab, "websockets-history");
         assert_eq!(persisted.history_column_widths.get("host"), Some(&444));
         assert_eq!(persisted.ws_column_widths.get("frame_count"), Some(&123));
         assert_eq!(persisted.workbench_height, Some(333));
@@ -409,6 +451,8 @@ mod tests {
         snapshot.display_settings.theme = "neon".to_string();
         snapshot.display_settings.ui_font = "comic".to_string();
         snapshot.display_settings.mono_font = "fantasy".to_string();
+        snapshot.active_tool = "missing-tool".to_string();
+        snapshot.active_proxy_tab = "missing-tab".to_string();
 
         store
             .replace_snapshot(snapshot)
@@ -421,6 +465,8 @@ mod tests {
         assert_eq!(persisted.display_settings.theme, "charcoal");
         assert_eq!(persisted.display_settings.ui_font, "plex");
         assert_eq!(persisted.display_settings.mono_font, "jetbrains");
+        assert_eq!(persisted.active_tool, "proxy");
+        assert_eq!(persisted.active_proxy_tab, "http-history");
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -493,6 +539,37 @@ mod tests {
 
         assert_eq!(snapshot.display_settings.theme, "charcoal");
         assert!(data_dir.join(super::UI_SETTINGS_FILE).is_file());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn ui_settings_store_replace_recovers_from_directory_path() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-ui-settings-{}", uuid::Uuid::new_v4()));
+        let store = AppUiSettingsStore::load_or_create(&data_dir)
+            .expect("ui settings store should be created");
+        std::fs::remove_file(data_dir.join(super::UI_SETTINGS_FILE))
+            .expect("initial ui settings file should be removed");
+        std::fs::create_dir_all(data_dir.join(super::UI_SETTINGS_FILE))
+            .expect("ui settings directory should be created");
+
+        let mut snapshot = store.snapshot().await;
+        snapshot.active_tool = "replay".to_string();
+        let saved = store
+            .replace_snapshot(snapshot)
+            .await
+            .expect("directory ui settings should be replaced");
+
+        assert_eq!(saved.active_tool, "replay");
+        assert!(data_dir.join(super::UI_SETTINGS_FILE).is_file());
+        assert!(std::fs::read_dir(&data_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ui-settings.corrupt-")
+        }));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

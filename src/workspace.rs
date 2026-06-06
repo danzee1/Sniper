@@ -119,6 +119,10 @@ pub struct ReplayTabState {
     pub ws_setup_queue: Vec<serde_json::Value>,
     #[serde(default)]
     pub ws_frames: Vec<WsReplayFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_selected_frame_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_frame_window_start: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -230,7 +234,12 @@ pub fn can_replace_snapshot(
     snapshot: &WorkspaceStateSnapshot,
     current: &WorkspaceStateSnapshot,
 ) -> bool {
-    snapshot.revision == current.revision
+    if snapshot.revision == current.revision {
+        return true;
+    }
+    snapshot.client_id.is_some()
+        && snapshot.client_id == current.client_id
+        && snapshot.client_version > current.client_version
 }
 
 impl Default for WorkspaceStateStore {
@@ -242,7 +251,8 @@ impl Default for WorkspaceStateStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        FuzzerWorkspaceState, ReplayHistoryEntryState, WorkspaceStateSnapshot, WorkspaceStateStore,
+        FuzzerWorkspaceState, ReplayHistoryEntryState, ReplayTabState, ReplayWorkspaceState,
+        WorkspaceStateSnapshot, WorkspaceStateStore,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -300,7 +310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_replace_rejects_stale_revision_even_with_newer_same_client_version() {
+    async fn workspace_replace_accepts_stale_revision_with_newer_same_client_version() {
         let store = WorkspaceStateStore::new();
         let first = store
             .replace_snapshot_checked(WorkspaceStateSnapshot {
@@ -312,7 +322,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.revision, 1);
 
-        let stale = store
+        let committed = store
             .replace_snapshot_checked(WorkspaceStateSnapshot {
                 revision: 0,
                 client_id: Some("client-a".to_string()),
@@ -324,12 +334,15 @@ mod tests {
                 ..WorkspaceStateSnapshot::default()
             })
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(stale.revision, 1);
-        assert_eq!(stale.client_id.as_deref(), Some("client-a"));
-        assert_eq!(stale.client_version, 1);
-        assert!(stale.replay.active_tab_id.is_none());
+        assert_eq!(committed.revision, 2);
+        assert_eq!(committed.client_id.as_deref(), Some("client-a"));
+        assert_eq!(committed.client_version, 2);
+        assert_eq!(
+            committed.replay.active_tab_id.as_deref(),
+            Some("latest-client-edit")
+        );
     }
 
     #[tokio::test]
@@ -424,7 +437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_replace_persisting_rejects_stale_newer_same_client_snapshot() {
+    async fn workspace_replace_persisting_accepts_stale_newer_same_client_snapshot() {
         let store = WorkspaceStateStore::new();
         store
             .replace_snapshot_checked(WorkspaceStateSnapshot {
@@ -449,16 +462,18 @@ mod tests {
                 },
                 |candidate| async move { Ok::<_, ()>(candidate.revision) },
             )
-            .await;
+            .await
+            .unwrap();
 
-        let stale = match result {
-            Err(super::WorkspaceReplaceError::Conflict(stale)) => stale,
-            _ => panic!("expected stale newer same-client snapshot to conflict"),
-        };
-        assert_eq!(stale.revision, 1);
-        assert_eq!(stale.client_id.as_deref(), Some("client-a"));
-        assert_eq!(stale.client_version, 1);
-        assert!(stale.replay.active_tab_id.is_none());
+        let (committed, persisted_revision) = result;
+        assert_eq!(persisted_revision, 2);
+        assert_eq!(committed.revision, 2);
+        assert_eq!(committed.client_id.as_deref(), Some("client-a"));
+        assert_eq!(committed.client_version, 2);
+        assert_eq!(
+            committed.replay.active_tab_id.as_deref(),
+            Some("beacon-edit")
+        );
     }
 
     #[test]
@@ -475,5 +490,37 @@ mod tests {
 
         let serialized = serde_json::to_value(&entry).expect("entry should serialize");
         assert!(serialized.get("request").is_none());
+    }
+
+    #[test]
+    fn websocket_replay_selection_state_round_trips() {
+        let snapshot = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                tabs: vec![ReplayTabState {
+                    tab_type: "websocket".to_string(),
+                    ws_selected_frame_index: Some(42),
+                    ws_frame_window_start: Some(10),
+                    ..ReplayTabState::default()
+                }],
+                ..ReplayWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let encoded = serde_json::to_value(&snapshot).expect("workspace should serialize");
+        assert_eq!(
+            encoded["replay"]["tabs"][0]["ws_selected_frame_index"],
+            json!(42)
+        );
+        assert_eq!(
+            encoded["replay"]["tabs"][0]["ws_frame_window_start"],
+            json!(10)
+        );
+
+        let decoded: WorkspaceStateSnapshot =
+            serde_json::from_value(encoded).expect("workspace should deserialize");
+        let tab = &decoded.replay.tabs[0];
+        assert_eq!(tab.ws_selected_frame_index, Some(42));
+        assert_eq!(tab.ws_frame_window_start, Some(10));
     }
 }

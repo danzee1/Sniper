@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tracing::warn;
 use uuid::Uuid;
@@ -135,11 +135,33 @@ struct StoredSessionSnapshot {
     oast_cleared_callback_keys: Vec<crate::oast::OastCallbackDedupKey>,
     #[serde(default)]
     oast_registration: Option<crate::oast::StoredOastRegistration>,
+    #[serde(default, deserialize_with = "deserialize_workspace_state_lossy")]
     workspace: WorkspaceStateSnapshot,
     #[serde(skip)]
     replayed_transaction_journal: bool,
     #[serde(skip)]
     replayed_transaction_ids: HashSet<Uuid>,
+}
+
+fn deserialize_workspace_state_lossy<'de, D>(
+    deserializer: D,
+) -> std::result::Result<WorkspaceStateSnapshot, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(WorkspaceStateSnapshot::default());
+    };
+    match serde_json::from_value(value) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => {
+            warn!(
+                ?error,
+                "discarding invalid workspace state from session snapshot"
+            );
+            Ok(WorkspaceStateSnapshot::default())
+        }
+    }
 }
 
 pub struct SessionContext {
@@ -330,6 +352,18 @@ impl SessionContext {
                     path = %path.display(),
                     "falling back to full session persist because workspace snapshot is missing"
                 );
+                self.persist_with_workspace_snapshot_locked(workspace)
+                    .await?;
+                return Ok(());
+            }
+            Err(error) if path.exists() => {
+                warn!(
+                    ?error,
+                    session_id = %self.id,
+                    path = %path.display(),
+                    "falling back to full session persist after workspace snapshot became unreadable"
+                );
+                move_corrupt_session_file_aside(&self.storage_dir, &path, "snapshot");
                 self.persist_with_workspace_snapshot_locked(workspace)
                     .await?;
                 return Ok(());
@@ -1777,6 +1811,67 @@ mod tests {
     }
 
     #[test]
+    fn load_session_snapshot_discards_malformed_workspace_only() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "sniper-load-malformed-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let request = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "Host".to_string(),
+                value: "example.test".to_string(),
+            }],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let transaction = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "example.test".to_string(),
+            "/kept".to_string(),
+            Some(200),
+            1,
+            request,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+        let transaction_id = transaction.id;
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &serde_json::json!({
+                "transactions": [transaction],
+                "workspace": {
+                    "replay": {
+                        "tabs": [{
+                            "type": "websocket",
+                            "ws_selected_frame_index": -1
+                        }]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let loaded = super::load_session_snapshot(&storage_dir, 100).unwrap();
+
+        assert_eq!(loaded.transactions.len(), 1);
+        assert_eq!(loaded.transactions[0].id, transaction_id);
+        assert!(loaded.workspace.replay.tabs.is_empty());
+        assert!(super::snapshot_path(&storage_dir).exists());
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
     fn restored_open_websockets_are_marked_closed_after_restart() {
         let started_at = Utc::now() - ChronoDuration::seconds(5);
         let records = super::close_restored_open_websockets(vec![WebSocketSessionRecord {
@@ -1926,6 +2021,61 @@ mod tests {
         );
         let records = loaded.store.snapshot(Some(10)).await;
         assert!(records.iter().any(|restored| restored.id == record_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_only_persist_recovers_snapshot_directory_path() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-workspace-snapshot-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let snapshot_path = super::snapshot_path(active.storage_dir());
+        std::fs::remove_file(&snapshot_path).unwrap();
+        std::fs::create_dir(&snapshot_path).expect("snapshot directory should be created");
+
+        let mut workspace = active.workspace.snapshot().await;
+        workspace.client_id = Some("test-ui".to_string());
+        workspace.client_version = 1;
+        workspace.replay = ReplayWorkspaceState {
+            active_tab_id: Some("recovered-workspace-tab".to_string()),
+            tabs: vec![ReplayTabState {
+                id: "recovered-workspace-tab".to_string(),
+                sequence: 1,
+                ..ReplayTabState::default()
+            }],
+            ..ReplayWorkspaceState::default()
+        };
+
+        let committed = active
+            .replace_workspace_snapshot_checked_and_persist(workspace)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            committed.replay.active_tab_id.as_deref(),
+            Some("recovered-workspace-tab")
+        );
+        assert!(snapshot_path.is_file());
+        let has_corrupt_backup = std::fs::read_dir(active.storage_dir())
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".snapshot.corrupt-")
+            });
+        assert!(has_corrupt_backup);
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let durable_workspace = loaded.workspace.snapshot().await;
+        assert_eq!(
+            durable_workspace.replay.active_tab_id.as_deref(),
+            Some("recovered-workspace-tab")
+        );
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

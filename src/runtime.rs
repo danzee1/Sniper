@@ -171,7 +171,7 @@ impl RuntimeSettings {
             .unwrap_or_else(|| candidate.oast_provider.clone());
         let requested_real_oast_token = requested_oast_token
             .as_deref()
-            .is_some_and(|token| token != OAST_TOKEN_REDACTION);
+            .is_some_and(|token| token != OAST_TOKEN_REDACTION && !token.is_empty());
         if target_oast_provider == crate::oast::OastProvider::Boast && requested_real_oast_token {
             bail!("BOAST provider does not use an OAST token");
         }
@@ -450,6 +450,22 @@ mod tests {
         assert!(error.to_string().contains("BOAST provider"));
         let snapshot = settings.snapshot().await;
         assert_eq!(snapshot.oast_provider, crate::oast::OastProvider::Custom);
+        assert!(snapshot.oast_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_accepts_empty_boast_token_update() {
+        let settings = RuntimeSettings::new();
+        let snapshot = settings
+            .update(RuntimeSettingsUpdate {
+                oast_provider: Some(crate::oast::OastProvider::Boast),
+                oast_token: Some(String::new()),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.oast_provider, crate::oast::OastProvider::Boast);
         assert!(snapshot.oast_token.is_empty());
     }
 

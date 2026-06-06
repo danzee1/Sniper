@@ -167,6 +167,7 @@ const HISTORY_BUFFER_ROWS = 30;
 const FINDINGS_ROW_HEIGHT = 27;
 const FINDINGS_BUFFER_ROWS = 20;
 const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "fuzzer", "sequence", "replay", "tools", "logger"]);
+const IMPLEMENTED_PROXY_TABS = new Set(["intercept", "http-history", "websockets-history", "replace", "findings", "oast", "proxy-settings"]);
 const DECODER_SCRIPT_SOURCES = [
   "/decoder/lib/jquery-1.7.2.min.js",
   "/decoder/lib/cryptojs/components/core-min.js",
@@ -393,6 +394,7 @@ const state = {
   responseInterceptEditorSeedId: null,
   websocketSessions: [],
   websocketPaging: createWebsocketPagingState(),
+  websocketHistoryDirty: false,
   websocketQuery: "",
   websocketSortKey: "started_at",
   websocketSortDirection: "desc",
@@ -868,13 +870,21 @@ async function init() {
   hydrateDisplaySettingsForm();
   await loadSessions();
   await loadSettings();
+  const shouldLoadInitialHttpHistory = isHttpHistoryVisible();
+  const shouldLoadInitialWebsocketHistory = isWebsocketHistoryVisible();
+  if (!shouldLoadInitialHttpHistory) {
+    state.historyDirty = true;
+  }
+  if (!shouldLoadInitialWebsocketHistory) {
+    state.websocketHistoryDirty = true;
+  }
   const loads = [
     loadWorkspaceState(),
-    loadTransactions(false),
+    shouldLoadInitialHttpHistory ? loadTransactions(false) : Promise.resolve(),
     loadIntercepts(false),
     loadResponseIntercepts(false),
     loadInterceptRules(),
-    loadWebsockets(false),
+    shouldLoadInitialWebsocketHistory ? loadWebsockets(false) : Promise.resolve(),
     loadEventLog(),
     loadMatchReplaceRules(),
     loadSequences(),
@@ -891,15 +901,6 @@ async function init() {
   auxTimer = window.setInterval(() => {
     pollAuxiliaryData().catch((error) => console.error(error));
   }, 1200);
-  // Sync active tabs from DOM in case WKWebView restored a cached page state
-  const domActiveTool = document.querySelector(".main-tab.active");
-  if (domActiveTool?.dataset?.tool && domActiveTool.dataset.tool !== state.activeTool) {
-    state.activeTool = domActiveTool.dataset.tool;
-  }
-  const domActiveProxyTab = document.querySelector(".sub-tab.active");
-  if (domActiveProxyTab?.dataset?.proxyTab && domActiveProxyTab.dataset.proxyTab !== state.activeProxyTab) {
-    state.activeProxyTab = domActiveProxyTab.dataset.proxyTab;
-  }
   renderToolPanels();
   renderProxyPanels();
   renderInspectorPanels();
@@ -951,6 +952,7 @@ function bindEvents() {
   mainTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
       state.activeTool = tab.dataset.tool;
+      scheduleUiSettingsSave();
       renderToolPanels();
       if (state.activeTool === "dashboard") {
         loadSessions().catch((error) => console.error(error));
@@ -970,6 +972,7 @@ function bindEvents() {
   proxyTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
       state.activeProxyTab = tab.dataset.proxyTab;
+      scheduleUiSettingsSave();
       renderProxyPanels();
       if (state.activeProxyTab === "intercept") {
         loadIntercepts(true).catch((error) => console.error(error));
@@ -2093,6 +2096,7 @@ function bindEvents() {
         if (nextPosition < 0) return;
         const nextFrameIndex = frames[nextPosition].index;
         tab.wsSelectedFrameIndex = nextFrameIndex;
+        scheduleWorkspaceStateSave();
         renderWsFrameList();
         const target = els.wsFrameList.querySelector(`[data-frame-index="${nextFrameIndex}"]`);
         if (target) { target.scrollIntoView({ block: "nearest" }); }
@@ -2575,6 +2579,7 @@ function hydrateReplayTab(tab) {
 
   if (tab.type === "websocket") {
     const wsScheme = tab.ws_scheme || "wss";
+    const wsFrames = normalizeWebsocketFrames(tab.ws_frames);
     return {
       id: isUuidString(tab.id) ? tab.id : crypto.randomUUID(),
       type: "websocket",
@@ -2596,8 +2601,9 @@ function hydrateReplayTab(tab) {
         ? tab.ws_setup_queue.map((item) => ({ ...normalizeWsSetupItem(item), sent: false }))
         : [],
       wsStatus: "disconnected",
-      wsFrames: normalizeWebsocketFrames(tab.ws_frames),
-      wsSelectedFrameIndex: -1,
+      wsFrames,
+      wsSelectedFrameIndex: normalizeWsReplaySavedFrameIndex(wsFrames, tab.ws_selected_frame_index),
+      wsFrameWindowStart: normalizeWsReplaySavedFrameWindowStart(wsFrames, tab.ws_frame_window_start),
       wsError: null,
       wsSessionId: null,
       wsPollTimer: null,
@@ -2706,6 +2712,7 @@ function snapshotWorkspaceState(options = {}) {
     replay: {
       tabs: state.replayTabs.map((tab) => {
         if (tab.type === "websocket") {
+          const wsFrames = snapshotWsReplayFrames(tab, wsFrameBudget);
           return {
             id: tab.id,
             type: "websocket",
@@ -2729,7 +2736,9 @@ function snapshotWorkspaceState(options = {}) {
               body_encoded: !!item.bodyEncoded,
               autoSend: !!item.autoSend,
             })),
-            ws_frames: snapshotWsReplayFrames(tab, wsFrameBudget),
+            ws_frames: wsFrames,
+            ws_selected_frame_index: snapshotWsReplaySelectedFrameIndex(tab, wsFrames),
+            ws_frame_window_start: snapshotWsReplayFrameWindowStart(tab, wsFrames),
           };
         }
         const historyEntries = Array.isArray(tab.historyEntries)
@@ -2998,13 +3007,6 @@ function workspaceUnloadPayload(primarySnapshot) {
   const payload = JSON.stringify(primarySnapshot);
   if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
     return payload;
-  }
-  const compactPayload = JSON.stringify(snapshotWorkspaceState({
-    wsFrameLimit: 0,
-    wsBodyByteLimit: 0,
-  }));
-  if (utf8ByteLength(compactPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
-    return compactPayload;
   }
   return null;
 }
@@ -3798,7 +3800,7 @@ async function addInterceptRule() {
   const sessionId = currentSessionId();
   const rule = {
     id: crypto.randomUUID(),
-    enabled: true,
+    enabled: false,
     scope: "request",
     host_pattern: "",
     path_pattern: "",
@@ -3936,6 +3938,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
       hasMore: Boolean(page.has_more) && loadedLimit < WEBSOCKET_MAX_LOADED_SESSIONS,
       loading: false,
     };
+    state.websocketHistoryDirty = false;
     await syncVisibleWebsocketSelection(preserveSelection);
   } catch (error) {
     if (generation === _websocketLoadGeneration && sessionId === currentSessionId()) {
@@ -4293,7 +4296,7 @@ function applyWebsocketSummaryEvent(event) {
     scheduleSelectedWebsocketDetailRefresh(summary.id);
   }
 
-  if (state.activeTool === "proxy" && state.activeProxyTab === "websockets-history") {
+  if (isWebsocketHistoryVisible()) {
     if (!state.selectedWebsocketId) {
       syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
     } else {
@@ -4428,7 +4431,7 @@ async function pollAuxiliaryData() {
     tasks.push(loadResponseIntercepts(true));
   }
 
-  if (state.activeTool === "proxy" && state.activeProxyTab === "websockets-history") {
+  if (isWebsocketHistoryVisible()) {
     if (now - _lastWebsocketFallbackPoll >= WEBSOCKET_POLL_FALLBACK_MS) {
       _lastWebsocketFallbackPoll = now;
       tasks.push(loadWebsockets(true));
@@ -4540,7 +4543,11 @@ function connectEvents() {
       return;
     }
     _lastWebsocketFallbackPoll = Date.now();
-    loadWebsockets(true).catch((error) => console.error(error));
+    if (isWebsocketHistoryVisible()) {
+      loadWebsockets(true).catch((error) => console.error(error));
+    } else {
+      state.websocketHistoryDirty = true;
+    }
   });
 
   eventSource.addEventListener("session_changed", () => {
@@ -4872,6 +4879,10 @@ function isHttpHistoryVisible() {
   return state.activeTool === "proxy" && state.activeProxyTab === "http-history";
 }
 
+function isWebsocketHistoryVisible() {
+  return state.activeTool === "proxy" && state.activeProxyTab === "websockets-history";
+}
+
 /** Incremental refresh: fetch only recent transactions and merge into cache. */
 let _incrementalTimer = 0;
 let _transactionDeltaTimer = 0;
@@ -5186,9 +5197,7 @@ function scheduleIncrementalRefresh() {
 let _searchActiveUntil = 0;
 
 function renderToolPanels() {
-  if (!IMPLEMENTED_TOOLS.has(state.activeTool)) {
-    state.activeTool = "proxy";
-  }
+  state.activeTool = sanitizeActiveTool(state.activeTool);
 
   mainTabs.forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.tool === state.activeTool);
@@ -7111,6 +7120,7 @@ function initFindingsResizer() {
 }
 
 function renderProxyPanels() {
+  state.activeProxyTab = sanitizeActiveProxyTab(state.activeProxyTab);
   proxyTabs.forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.proxyTab === state.activeProxyTab);
   });
@@ -12744,6 +12754,16 @@ function sanitizeDisplaySettings(candidate) {
   };
 }
 
+function sanitizeActiveTool(value) {
+  const tool = String(value || "").trim();
+  return IMPLEMENTED_TOOLS.has(tool) ? tool : "proxy";
+}
+
+function sanitizeActiveProxyTab(value) {
+  const proxyTab = String(value || "").trim();
+  return IMPLEMENTED_PROXY_TABS.has(proxyTab) ? proxyTab : "http-history";
+}
+
 function loadHistoryColumnWidths() {
   state.historyColumnWidths = createDefaultHistoryColumnWidths();
   state.historyColumnOrder = [...DEFAULT_HISTORY_COLUMN_ORDER];
@@ -13002,6 +13022,8 @@ function applyUiSettingsSnapshot(snapshot) {
     uiFont: snapshot?.display_settings?.ui_font,
     monoFont: snapshot?.display_settings?.mono_font,
   });
+  state.activeTool = sanitizeActiveTool(snapshot?.active_tool);
+  state.activeProxyTab = sanitizeActiveProxyTab(snapshot?.active_proxy_tab);
   state.historyColumnWidths = sanitizeHistoryColumnWidths(snapshot?.history_column_widths);
   state.historyColumnOrder = sanitizeHistoryColumnOrder(snapshot?.history_column_order);
   if (snapshot?.ws_column_widths && typeof snapshot.ws_column_widths === "object") {
@@ -13039,6 +13061,8 @@ function snapshotUiSettings() {
       ui_font: state.displaySettings.uiFont,
       mono_font: state.displaySettings.monoFont,
     },
+    active_tool: sanitizeActiveTool(state.activeTool),
+    active_proxy_tab: sanitizeActiveProxyTab(state.activeProxyTab),
     history_column_widths: { ...state.historyColumnWidths },
     history_column_order: [...state.historyColumnOrder],
     ws_column_widths: { ...state.wsColumnWidths },
@@ -15820,6 +15844,24 @@ function snapshotWsReplayFrames(tab, budget = null) {
   return selected.reverse();
 }
 
+function snapshotWsReplaySelectedFrameIndex(tab, frames) {
+  const selectedIndex = Number(tab?.wsSelectedFrameIndex);
+  if (!Number.isInteger(selectedIndex) || selectedIndex < 0) {
+    return null;
+  }
+  return frames.some((frame) => frame.index === selectedIndex) ? selectedIndex : null;
+}
+
+function snapshotWsReplayFrameWindowStart(tab, frames) {
+  const start = Number(tab?.wsFrameWindowStart);
+  const maxStart = wsReplayFrameWindowMaxStart(frames);
+  if (!Number.isFinite(start) || start < 0 || maxStart <= 0) {
+    return null;
+  }
+  const normalized = clamp(Math.floor(start), 0, maxStart);
+  return normalized >= maxStart ? null : normalized;
+}
+
 function normalizeWsMessageType(value) {
   const normalized = String(value || "").trim().toLowerCase();
   return ["binary", "ping", "pong"].includes(normalized) ? normalized : "text";
@@ -16507,6 +16549,27 @@ function wsReplayFrameWindowMaxStart(frames) {
   return Math.max(0, frames.length - WS_REPLAY_MAX_RENDERED_FRAMES);
 }
 
+function normalizeWsReplaySavedFrameIndex(frames, candidate) {
+  const index = Number(candidate);
+  if (!Number.isInteger(index) || index < 0) {
+    return -1;
+  }
+  return frames.some((frame) => frame.index === index) ? index : -1;
+}
+
+function normalizeWsReplaySavedFrameWindowStart(frames, candidate) {
+  if (candidate == null) {
+    return null;
+  }
+  const start = Number(candidate);
+  const maxStart = wsReplayFrameWindowMaxStart(frames);
+  if (!Number.isFinite(start) || start < 0 || maxStart <= 0) {
+    return null;
+  }
+  const normalized = clamp(Math.floor(start), 0, maxStart);
+  return normalized >= maxStart ? null : normalized;
+}
+
 function normalizeWsReplayFrameWindowStart(frames, preferredStart) {
   const defaultStart = wsReplayFrameWindowMaxStart(frames);
   if (preferredStart == null) {
@@ -16570,6 +16633,7 @@ function pageWsReplayFrameWindow(tab, direction, anchor) {
   if (nextStart === currentStart) return false;
   tab.wsFrameWindowStart = nextStart >= maxStart ? null : nextStart;
   tab.wsSelectedFrameIndex = -1;
+  scheduleWorkspaceStateSave();
   tab.wsFrameWindowPaging = true;
   try {
     renderWsFrameList();
@@ -16660,6 +16724,7 @@ function renderWsFrameList() {
     if (!bubble || !els.wsFrameList.contains(bubble)) return;
     const idx = parseInt(bubble.dataset.frameIndex, 10);
     tab.wsSelectedFrameIndex = idx;
+    scheduleWorkspaceStateSave();
     els.wsFrameList.querySelectorAll(".ws-frame-bubble").forEach((node) => node.classList.remove("selected"));
     bubble.classList.add("selected");
     renderWsFrameDetail();
