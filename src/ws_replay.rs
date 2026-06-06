@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::model::{BodyEncoding, WebSocketFrameDirection, WebSocketFrameKind};
 
 const MAX_WS_REPLAY_FRAMES_PER_CONNECTION: usize = 10_000;
+const MAX_WS_REPLAY_FRAMES_PER_RESPONSE: usize = 1_000;
 const MAX_WS_REPLAY_FRAME_PREVIEW_BYTES: usize = 64 * 1024;
 const WS_REPLAY_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
@@ -86,7 +87,7 @@ impl WsReplayConnection {
         WsReplaySnapshot {
             id,
             status: self.status.clone(),
-            frames: self.frames.clone(),
+            frames: replay_frame_tail(&self.frames),
             error: self.error.clone(),
         }
     }
@@ -546,7 +547,8 @@ impl WsReplayStore {
         let conn = self.connection(id).await?;
         let c = conn.read().await;
         let first_new = c.frames.partition_point(|frame| frame.index < since_index);
-        let new_frames = c.frames[first_new..].to_vec();
+        let end = (first_new + MAX_WS_REPLAY_FRAMES_PER_RESPONSE).min(c.frames.len());
+        let new_frames = c.frames[first_new..end].to_vec();
         Some((c.status.clone(), c.error.clone(), new_frames))
     }
 
@@ -676,6 +678,13 @@ fn abort_connection_after_close(abort: AbortHandle, graceful_close: bool) {
     });
 }
 
+fn replay_frame_tail(frames: &[WsReplayFrame]) -> Vec<WsReplayFrame> {
+    let start = frames
+        .len()
+        .saturating_sub(MAX_WS_REPLAY_FRAMES_PER_RESPONSE);
+    frames[start..].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +698,19 @@ mod tests {
             sender,
             task_abort: None,
             error: None,
+        }
+    }
+
+    fn test_frame(index: usize) -> WsReplayFrame {
+        WsReplayFrame {
+            index,
+            captured_at: Utc::now().to_rfc3339(),
+            direction: WebSocketFrameDirection::ServerToClient,
+            kind: WebSocketFrameKind::Text,
+            body: format!("frame-{index}"),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            preview_truncated: false,
         }
     }
 
@@ -710,6 +732,34 @@ mod tests {
         assert_eq!(status, WsReplayStatus::Error);
         assert_eq!(error.as_deref(), Some("connection refused"));
         assert!(frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frames_since_and_snapshot_are_response_capped() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let mut connection = test_connection(WsReplayStatus::Connected, None);
+        connection.frames = (0..=MAX_WS_REPLAY_FRAMES_PER_RESPONSE + 5)
+            .map(test_frame)
+            .collect();
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(connection)));
+
+        let (_, _, frames) = store.frames_since(id, 0).await.unwrap();
+        assert_eq!(frames.len(), MAX_WS_REPLAY_FRAMES_PER_RESPONSE);
+        assert_eq!(frames[0].index, 0);
+        assert_eq!(frames[MAX_WS_REPLAY_FRAMES_PER_RESPONSE - 1].index, 999);
+
+        let snapshot = store.snapshot(id).await.unwrap();
+        assert_eq!(snapshot.frames.len(), MAX_WS_REPLAY_FRAMES_PER_RESPONSE);
+        assert_eq!(snapshot.frames[0].index, 6);
+        assert_eq!(
+            snapshot.frames[MAX_WS_REPLAY_FRAMES_PER_RESPONSE - 1].index,
+            1005
+        );
     }
 
     #[tokio::test]

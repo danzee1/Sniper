@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 
     let mut config = AppConfig::from_env_for_desktop()?;
 
-    let proxy_listener = match runtime.block_on(TcpListener::bind(config.proxy_addr)) {
+    let proxy_listener = match runtime.block_on(proxy::bind_proxy_listener(config.proxy_addr)) {
         Ok(listener) => {
             config.proxy_addr = listener
                 .local_addr()

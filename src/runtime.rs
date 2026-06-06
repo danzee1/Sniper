@@ -72,6 +72,27 @@ impl RuntimeSettingsSnapshot {
         }
         self
     }
+
+    pub fn sanitized_for_load(mut self) -> Self {
+        self.scope_patterns =
+            normalize_bounded_scope_patterns("scope pattern", self.scope_patterns)
+                .unwrap_or_default();
+        self.passthrough_hosts =
+            normalize_bounded_scope_patterns("passthrough host", self.passthrough_hosts)
+                .unwrap_or_default();
+        if validate_runtime_text_field("OAST server URL", &self.oast_server_url).is_err() {
+            self.oast_server_url.clear();
+        }
+        if validate_runtime_text_field("OAST token", &self.oast_token).is_err() {
+            self.oast_token.clear();
+        }
+        if !(MIN_OAST_POLLING_INTERVAL_SECS..=MAX_OAST_POLLING_INTERVAL_SECS)
+            .contains(&self.oast_polling_interval_secs)
+        {
+            self.oast_polling_interval_secs = default_oast_interval();
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -101,7 +122,7 @@ impl RuntimeSettings {
 
     pub fn from_snapshot(snapshot: RuntimeSettingsSnapshot) -> Self {
         Self {
-            inner: RwLock::new(snapshot),
+            inner: RwLock::new(snapshot.sanitized_for_load()),
         }
     }
 
@@ -123,6 +144,8 @@ impl RuntimeSettings {
         }
         let mut current = self.inner.write().await;
         let mut candidate = current.clone();
+        let requested_oast_provider = update.oast_provider.clone();
+        let requested_oast_token = update.oast_token.clone();
 
         if let Some(intercept_enabled) = update.intercept_enabled {
             candidate.intercept_enabled = intercept_enabled;
@@ -157,16 +180,23 @@ impl RuntimeSettings {
             validate_runtime_text_field("OAST server URL", &oast_server_url)?;
             candidate.oast_server_url = oast_server_url;
         }
-        if let Some(oast_token) = update.oast_token {
+        if let Some(oast_token) = requested_oast_token.as_deref() {
             if oast_token != OAST_TOKEN_REDACTION {
-                validate_runtime_text_field("OAST token", &oast_token)?;
-                candidate.oast_token = oast_token;
+                validate_runtime_text_field("OAST token", oast_token)?;
+                candidate.oast_token = oast_token.to_string();
             }
         }
         if let Some(oast_polling_interval_secs) = update.oast_polling_interval_secs {
             candidate.oast_polling_interval_secs = oast_polling_interval_secs;
         }
-        if let Some(oast_provider) = update.oast_provider {
+        if let Some(oast_provider) = requested_oast_provider {
+            let provider_changed = oast_provider != candidate.oast_provider;
+            let has_real_token = requested_oast_token
+                .as_deref()
+                .is_some_and(|token| token != OAST_TOKEN_REDACTION);
+            if provider_changed && !has_real_token {
+                candidate.oast_token.clear();
+            }
             candidate.oast_provider = oast_provider;
         }
 
@@ -179,7 +209,7 @@ impl RuntimeSettings {
         snapshot: RuntimeSettingsSnapshot,
     ) -> RuntimeSettingsSnapshot {
         let mut current = self.inner.write().await;
-        *current = snapshot;
+        *current = snapshot.sanitized_for_load();
         current.clone()
     }
 
@@ -324,6 +354,78 @@ mod tests {
 
         assert_eq!(snapshot.oast_token, "secret-token");
         assert_eq!(redacted.oast_token, OAST_TOKEN_REDACTION);
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_from_snapshot_sanitizes_durable_fields() {
+        let settings = RuntimeSettings::from_snapshot(RuntimeSettingsSnapshot {
+            intercept_enabled: true,
+            scope_patterns: vec![" Example.COM ".to_string()],
+            passthrough_hosts: vec![
+                "example.test".to_string();
+                super::MAX_RUNTIME_PATTERN_ENTRIES + 1
+            ],
+            oast_server_url: "u".repeat(super::MAX_RUNTIME_TEXT_FIELD_BYTES + 1),
+            oast_token: "t".repeat(super::MAX_RUNTIME_TEXT_FIELD_BYTES + 1),
+            oast_polling_interval_secs: 0,
+            ..RuntimeSettingsSnapshot::default()
+        });
+        let snapshot = settings.snapshot().await;
+
+        assert!(snapshot.intercept_enabled);
+        assert_eq!(snapshot.scope_patterns, vec!["example.com"]);
+        assert!(snapshot.passthrough_hosts.is_empty());
+        assert!(snapshot.oast_server_url.is_empty());
+        assert!(snapshot.oast_token.is_empty());
+        assert_eq!(
+            snapshot.oast_polling_interval_secs,
+            super::default_oast_interval()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_clears_stale_oast_token_on_provider_change() {
+        let settings = RuntimeSettings::from_snapshot(RuntimeSettingsSnapshot {
+            oast_provider: crate::oast::OastProvider::Custom,
+            oast_token: "stale-token".to_string(),
+            ..RuntimeSettingsSnapshot::default()
+        });
+        let snapshot = settings
+            .update(RuntimeSettingsUpdate {
+                oast_provider: Some(crate::oast::OastProvider::Interactsh),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.oast_provider,
+            crate::oast::OastProvider::Interactsh
+        );
+        assert!(snapshot.oast_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_keeps_real_oast_token_on_provider_change() {
+        let settings = RuntimeSettings::from_snapshot(RuntimeSettingsSnapshot {
+            oast_provider: crate::oast::OastProvider::Custom,
+            oast_token: "old-token".to_string(),
+            ..RuntimeSettingsSnapshot::default()
+        });
+        let snapshot = settings
+            .update(RuntimeSettingsUpdate {
+                oast_provider: Some(crate::oast::OastProvider::Interactsh),
+                oast_token: Some("new-token".to_string()),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.oast_provider,
+            crate::oast::OastProvider::Interactsh
+        );
+        assert_eq!(snapshot.oast_token, "new-token");
     }
 
     #[tokio::test]

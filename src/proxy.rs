@@ -112,7 +112,7 @@ struct UpstreamError {
 }
 
 pub async fn run_proxy_listener(state: Arc<AppState>) -> Result<TcpListener> {
-    let listener = TcpListener::bind(state.config.proxy_addr)
+    let listener = bind_proxy_listener(state.config.proxy_addr)
         .await
         .with_context(|| {
             format!(
@@ -132,7 +132,7 @@ pub async fn run_proxy(state: Arc<AppState>) -> Result<()> {
 
 /// Bind a TCP listener with `SO_REUSEADDR` so that recently-closed sockets
 /// on the same port don't block us.
-async fn bind_tcp_reuse(addr: SocketAddr) -> std::io::Result<TcpListener> {
+pub async fn bind_proxy_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = if addr.is_ipv6() {
         tokio::net::TcpSocket::new_v6()?
     } else {
@@ -174,7 +174,7 @@ pub async fn rebind_proxy(
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            match bind_tcp_reuse(new_addr).await {
+            match bind_proxy_listener(new_addr).await {
                 Ok(l) => {
                     listener = Some(l);
                     break;
@@ -194,7 +194,7 @@ pub async fn rebind_proxy(
                 %bind_err,
                 "rebind failed, attempting to restore old listener"
             );
-            match bind_tcp_reuse(current).await {
+            match bind_proxy_listener(current).await {
                 Ok(restored) => {
                     let restored_addr = restored.local_addr().unwrap_or(current);
                     state.set_active_proxy_addr(restored_addr).await;

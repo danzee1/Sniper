@@ -337,7 +337,7 @@ impl TransactionStore {
                     true
                 }
             },
-            None => false,
+            None => true,
         };
         let summary = record.summary();
         let mut inner = self.inner.write().await;
@@ -1666,6 +1666,18 @@ mod tests {
         let snapshot = store.snapshot_for_persistence(None).await.unwrap();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].host, "lost.example");
+    }
+
+    #[tokio::test]
+    async fn insert_requests_snapshot_fallback_without_journal_writer() {
+        let store = TransactionStore::from_records_with_max_entries(Vec::new(), None);
+
+        let needs_snapshot_fallback = store.insert(test_record("snapshot.example")).await;
+
+        assert!(needs_snapshot_fallback);
+        let listed = store.list(&ListFilters::default()).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].host, "snapshot.example");
     }
 
     #[tokio::test]

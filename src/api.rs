@@ -85,6 +85,7 @@ const MAX_MATCH_REPLACE_RULES: usize = 500;
 const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
 const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
+const MAX_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const OPEN_PATH: &str = "/usr/bin/open";
 
 #[derive(RustEmbed)]
@@ -1931,7 +1932,16 @@ async fn reveal_session_folder(
 
     match state.session_storage_path(id) {
         Ok(path) => {
-            let _ = std::process::Command::new(OPEN_PATH).arg(&path).spawn();
+            if let Err(error) = spawn_open_command(OPEN_PATH, std::iter::once(path.as_os_str())) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "failed to reveal session folder {}: {error}",
+                        path.display()
+                    ),
+                )
+                    .into_response();
+            }
             Json(serde_json::json!({ "ok": true, "path": path.display().to_string() }))
                 .into_response()
         }
@@ -2551,12 +2561,27 @@ async fn download_root_der(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-async fn reveal_certificate_folder(State(state): State<Arc<AppState>>) -> StatusCode {
+async fn reveal_certificate_folder(State(state): State<Arc<AppState>>) -> Response {
     let export = state.certificates.export();
-    let _ = std::process::Command::new(OPEN_PATH)
-        .args(["-R", &export.pem_path])
-        .spawn();
-    StatusCode::NO_CONTENT
+    match spawn_open_command(OPEN_PATH, ["-R", export.pem_path.as_str()]) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to reveal certificate folder: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+fn spawn_open_command<I, S>(program: &str, args: I) -> std::io::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    std::process::Command::new(program)
+        .args(args)
+        .spawn()
+        .map(|_| ())
 }
 
 async fn list_match_replace_rules(
@@ -3614,13 +3639,17 @@ async fn get_websocket(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let frame_limit = query
-        .frame_limit
-        .or(Some(DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT));
+    let frame_limit = Some(websocket_detail_frame_limit(query.frame_limit));
     match session.websockets.get_windowed(id, frame_limit).await {
         Some(record) => Json(record).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+fn websocket_detail_frame_limit(frame_limit: Option<usize>) -> usize {
+    frame_limit
+        .unwrap_or(DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT)
+        .min(MAX_WEBSOCKET_DETAIL_FRAME_LIMIT)
 }
 
 // --- WebSocket Replay handlers ---
@@ -4571,6 +4600,16 @@ mod tests {
         },
         ws_replay::WsReplayFrame,
     };
+
+    #[test]
+    fn spawn_open_command_reports_launch_failure() {
+        let result = super::spawn_open_command(
+            "/path/that/does/not/exist/sniper-open",
+            std::iter::empty::<&str>(),
+        );
+
+        assert!(result.is_err());
+    }
 
     async fn response_json<T: DeserializeOwned>(response: axum::response::Response) -> T {
         assert!(response.status().is_success());
@@ -7859,6 +7898,23 @@ mod tests {
         assert_eq!(default_detail.frames.len(), 1000);
         assert_eq!(default_detail.frames[0].index, 3);
         assert_eq!(default_detail.frames[999].index, 1002);
+
+        let oversized_detail_response = super::get_websocket(
+            State(state.clone()),
+            Path(websocket_id.to_string()),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                limit: None,
+                offset: None,
+                frame_limit: Some(50_000),
+            }),
+        )
+        .await;
+        assert_eq!(oversized_detail_response.status(), super::StatusCode::OK);
+        let oversized_detail: WebSocketSessionRecord =
+            response_json(oversized_detail_response).await;
+        assert_eq!(oversized_detail.frames.len(), 1000);
+        assert_eq!(oversized_detail.frames[0].index, 3);
 
         let legacy_list_response = super::list_websockets(
             State(state.clone()),

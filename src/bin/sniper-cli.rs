@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
 const DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
+const MAX_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const MAX_CLI_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -599,6 +600,8 @@ struct WebSocketListArgs {
     session_id: Option<Uuid>,
     #[arg(long, value_parser = parse_nonzero_usize)]
     limit: Option<usize>,
+    #[arg(long)]
+    offset: Option<usize>,
     /// Include pagination metadata instead of printing the legacy array shape.
     #[arg(long)]
     page: bool,
@@ -895,6 +898,8 @@ enum WebSocketListResponse {
         #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
         has_more: Option<bool>,
     },
 }
@@ -906,6 +911,7 @@ impl WebSocketListResponse {
                 "items": items,
                 "total": null,
                 "limit": null,
+                "offset": null,
                 "has_more": null,
             }),
             Self::Items(items) => serde_json::json!(items),
@@ -913,11 +919,13 @@ impl WebSocketListResponse {
                 items,
                 total,
                 limit,
+                offset,
                 has_more,
             } if include_page => serde_json::json!({
                 "items": items,
                 "total": total,
                 "limit": limit,
+                "offset": offset,
                 "has_more": has_more,
             }),
             Self::Page { items, .. } => serde_json::json!(items),
@@ -2027,7 +2035,7 @@ async fn handle_websocket(api: ApiClient, command: WebSocketCommand) -> Result<(
     match command {
         WebSocketCommand::List(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = websocket_list_path(session_id, args.limit, args.page);
+            let path = websocket_list_path(session_id, args.limit, args.offset, args.page);
             let websockets: WebSocketListResponse = api.get_json(&path).await?;
             print_json(&websockets.into_cli_output(args.page))
         }
@@ -2352,11 +2360,6 @@ fn build_oast_configure_update(
             "oast_token".into(),
             serde_json::Value::String(token.to_string()),
         );
-    } else if args.provider.is_some() {
-        update.insert(
-            "oast_token".into(),
-            serde_json::Value::String(String::new()),
-        );
     }
     if let Some(interval) = args.interval {
         update.insert(
@@ -2525,13 +2528,21 @@ fn transaction_detail_path(transaction_id: Uuid, session_id: Option<Uuid>) -> St
     }
 }
 
-fn websocket_list_path(session_id: Option<Uuid>, limit: Option<usize>, page: bool) -> String {
+fn websocket_list_path(
+    session_id: Option<Uuid>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    page: bool,
+) -> String {
     let mut params = Vec::new();
     if let Some(session_id) = session_id {
         params.push(("session_id".to_string(), session_id.to_string()));
     }
     if let Some(limit) = limit {
         params.push(("limit".to_string(), limit.to_string()));
+    }
+    if let Some(offset) = offset {
+        params.push(("offset".to_string(), offset.to_string()));
     }
     let endpoint = if page {
         "/api/websockets-page"
@@ -2557,9 +2568,7 @@ fn websocket_detail_path(
     }
     params.push((
         "frame_limit".to_string(),
-        frame_limit
-            .unwrap_or(DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT)
-            .to_string(),
+        websocket_detail_frame_limit(frame_limit).to_string(),
     ));
     let query = encode_query(params);
     if query.is_empty() {
@@ -2567,6 +2576,12 @@ fn websocket_detail_path(
     } else {
         format!("/api/websockets/{websocket_id}?{query}")
     }
+}
+
+fn websocket_detail_frame_limit(frame_limit: Option<usize>) -> usize {
+    frame_limit
+        .unwrap_or(DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT)
+        .min(MAX_WEBSOCKET_DETAIL_FRAME_LIMIT)
 }
 
 fn session_query_path(path: &str, session_id: Option<Uuid>) -> String {
@@ -4078,12 +4093,16 @@ mod tests {
         let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 
         assert_eq!(
-            websocket_list_path(Some(session_id), Some(1), true),
+            websocket_list_path(Some(session_id), Some(1), None, true),
             "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1"
         );
         assert_eq!(
-            websocket_list_path(Some(session_id), Some(1), false),
+            websocket_list_path(Some(session_id), Some(1), None, false),
             "/api/websockets?session_id=22222222-2222-2222-2222-222222222222&limit=1"
+        );
+        assert_eq!(
+            websocket_list_path(Some(session_id), Some(1), Some(100), true),
+            "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&offset=100"
         );
     }
 
@@ -4103,6 +4122,10 @@ mod tests {
         assert_eq!(
             websocket_detail_path(websocket_id, Some(session_id), None),
             "/api/websockets/11111111-1111-1111-1111-111111111111?session_id=22222222-2222-2222-2222-222222222222&frame_limit=1000"
+        );
+        assert_eq!(
+            websocket_detail_path(websocket_id, None, Some(50_000)),
+            "/api/websockets/11111111-1111-1111-1111-111111111111?frame_limit=1000"
         );
     }
 
@@ -4302,7 +4325,7 @@ mod tests {
     }
 
     #[test]
-    fn oast_configure_provider_change_clears_omitted_token() {
+    fn oast_configure_provider_change_leaves_token_policy_to_runtime() {
         let update = build_oast_configure_update(
             &OastConfigureArgs {
                 provider: Some("interactsh".to_string()),
@@ -4315,7 +4338,7 @@ mod tests {
             update.get("oast_provider"),
             Some(&serde_json::json!("interactsh"))
         );
-        assert_eq!(update.get("oast_token"), Some(&serde_json::json!("")));
+        assert!(update.get("oast_token").is_none());
     }
 
     #[test]
@@ -5711,6 +5734,7 @@ mod tests {
             "items": [item.clone()],
             "total": 1,
             "limit": 5000,
+            "offset": 25,
             "has_more": false
         }))
         .unwrap();
@@ -5726,6 +5750,7 @@ mod tests {
             "items": [item.clone()],
             "total": 1,
             "limit": 5000,
+            "offset": 25,
             "has_more": false
         }))
         .unwrap();
@@ -5733,8 +5758,8 @@ mod tests {
         assert_eq!(page_output["items"][0]["host"], "ws.example.test");
         assert_eq!(page_output["total"], 1);
         assert_eq!(page_output["limit"], 5000);
+        assert_eq!(page_output["offset"], 25);
         assert_eq!(page_output["has_more"], false);
-        assert!(page_output.get("offset").is_none());
     }
 
     #[test]

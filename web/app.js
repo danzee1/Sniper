@@ -941,6 +941,8 @@ function bindEvents() {
   window.addEventListener("beforeunload", flushWorkspaceStateOnUnload);
   window.addEventListener("pagehide", flushUiSettingsOnUnload);
   window.addEventListener("beforeunload", flushUiSettingsOnUnload);
+  window.addEventListener("pagehide", flushAnnotationsOnUnload);
+  window.addEventListener("beforeunload", flushAnnotationsOnUnload);
 
   mainTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -6351,7 +6353,7 @@ function openTransactionRecordInReplay(record) {
 
 function isWebSocketUpgradeRecord(record) {
   return Number(record?.status) === 101 || normalizedHeaders(record?.request?.headers).some(
-    (h) => headerNameEquals(h, "upgrade") && String(h.value || "").toLowerCase() === "websocket"
+    (h) => headerNameEquals(h, "upgrade") && headerValueContainsToken(h.value, "websocket")
   );
 }
 
@@ -13286,6 +13288,15 @@ function headerNameEquals(header, name) {
   return String(header?.name || "").toLowerCase() === String(name || "").toLowerCase();
 }
 
+function headerValueContainsToken(value, token) {
+  const expected = String(token || "").trim().toLowerCase();
+  if (!expected) return false;
+  return String(value || "")
+    .split(",")
+    .map((part) => part.trim().toLowerCase())
+    .includes(expected);
+}
+
 function buildRawResponse(record) {
   if (!record.response) {
     return "No response was captured for this exchange.";
@@ -17062,6 +17073,22 @@ function flushContextMenuPendingNote() {
     return;
   }
   updateAnnotations(pending.id, { user_note: pending.value || null }, pending.sessionId);
+}
+
+function flushAnnotationsOnUnload() {
+  flushContextMenuPendingNote();
+  if (!state._pendingAnnotations) {
+    return;
+  }
+  for (const [transactionId, entry] of state._pendingAnnotations.entries()) {
+    if (!entry?.sessionId || !entry.payload) continue;
+    fetch(sessionQueryPath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, entry.sessionId), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry.payload),
+      keepalive: true,
+    }).catch(() => {});
+  }
 }
 
 async function flushPendingAnnotations(transactionId) {
