@@ -765,18 +765,11 @@ impl SessionRegistry {
         *registry = next;
         drop(registry);
 
-        if let Some(quarantine_dir) = quarantined_storage {
-            if let Err(error) = fs::remove_dir_all(&quarantine_dir) {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to delete session storage directory {}",
-                        quarantine_dir.display()
-                    )
-                });
-            }
-        }
+        let storage_removed = quarantined_storage
+            .as_deref()
+            .is_none_or(|quarantine_dir| remove_quarantined_session_storage(id, quarantine_dir));
         let mut registry = self.inner.write().expect("session registry lock poisoned");
-        if registry.deleted_session_ids.contains(&id) {
+        if storage_removed && registry.deleted_session_ids.contains(&id) {
             let mut cleaned = registry.clone();
             cleaned
                 .deleted_session_ids
@@ -948,9 +941,69 @@ fn registered_session_storage_is_valid(root_dir: &Path, id: Uuid) -> bool {
     }
 }
 
+fn remove_quarantined_session_storage(id: Uuid, quarantine_dir: &Path) -> bool {
+    match fs::remove_dir_all(quarantine_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => {
+            warn!(
+                %error,
+                session_id = %id,
+                path = %quarantine_dir.display(),
+                "session registry delete committed but quarantined storage cleanup failed"
+            );
+            false
+        }
+    }
+}
+
 fn deleted_session_storage_still_exists(root_dir: &Path, id: Uuid) -> bool {
-    let path = session_dir(root_dir, id);
-    let metadata = match fs::symlink_metadata(&path) {
+    let mut still_exists = remove_deleted_session_storage_path(&session_dir(root_dir, id), id);
+    still_exists |= remove_quarantined_deleted_session_storage(root_dir, id);
+    still_exists
+}
+
+fn remove_quarantined_deleted_session_storage(root_dir: &Path, id: Uuid) -> bool {
+    let entries = match fs::read_dir(root_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            warn!(
+                %error,
+                session_id = %id,
+                path = %root_dir.display(),
+                "failed to inspect session root for quarantined tombstoned storage"
+            );
+            return true;
+        }
+    };
+    let prefix = format!(".deleted-{id}-");
+    let mut still_exists = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    %error,
+                    session_id = %id,
+                    path = %root_dir.display(),
+                    "failed to inspect quarantined tombstoned session storage entry"
+                );
+                still_exists = true;
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        if !file_name.to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        still_exists |= remove_deleted_session_storage_path(&entry.path(), id);
+    }
+    still_exists
+}
+
+fn remove_deleted_session_storage_path(path: &Path, id: Uuid) -> bool {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
         Err(error) => {
@@ -965,9 +1018,9 @@ fn deleted_session_storage_still_exists(root_dir: &Path, id: Uuid) -> bool {
     };
 
     let removal = if metadata.file_type().is_symlink() || metadata.is_file() {
-        fs::remove_file(&path)
+        fs::remove_file(path)
     } else {
-        fs::remove_dir_all(&path)
+        fs::remove_dir_all(path)
     };
 
     match removal {
@@ -2216,6 +2269,52 @@ mod tests {
         assert!(registry.contains_session(created.id));
 
         let _ = std::fs::remove_file(storage_path);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn quarantined_session_cleanup_failure_is_nonfatal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-quarantine-cleanup-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let quarantine_path = data_dir.join(".deleted-session");
+        std::fs::write(&quarantine_path, b"not a directory").unwrap();
+
+        assert!(!super::remove_quarantined_session_storage(
+            uuid::Uuid::new_v4(),
+            &quarantine_path
+        ));
+
+        assert!(quarantine_path.is_file());
+        let _ = std::fs::remove_file(quarantine_path);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn registry_normalization_removes_quarantined_tombstoned_storage() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-quarantine-normalize-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let deleted_id = uuid::Uuid::new_v4();
+        let quarantine_path =
+            root_dir.join(format!(".deleted-{deleted_id}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&quarantine_path).unwrap();
+        std::fs::write(quarantine_path.join("snapshot.json"), b"{}").unwrap();
+        let mut snapshot = super::SessionRegistrySnapshot {
+            active_session_id: uuid::Uuid::new_v4(),
+            sessions: Vec::new(),
+            deleted_session_ids: vec![deleted_id],
+        };
+
+        assert!(super::normalize_registry_snapshot(&root_dir, &mut snapshot));
+
+        assert!(snapshot.deleted_session_ids.is_empty());
+        assert!(!quarantine_path.exists());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

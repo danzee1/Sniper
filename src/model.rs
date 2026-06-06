@@ -193,6 +193,38 @@ impl EditableRequest {
             .find(|header| header.name.eq_ignore_ascii_case("content-type"))
             .map(|header| header.value.clone())
     }
+
+    pub fn normalize_content_length(&mut self) {
+        if !self
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length"))
+        {
+            return;
+        }
+        let Ok(body) = self.try_body_bytes() else {
+            return;
+        };
+        normalize_content_length_records(&mut self.headers, body.len());
+    }
+}
+
+fn normalize_content_length_records(headers: &mut Vec<HeaderRecord>, body_len: usize) {
+    let mut had_content_length = false;
+    headers.retain(|header| {
+        if header.name.eq_ignore_ascii_case("content-length") {
+            had_content_length = true;
+            false
+        } else {
+            true
+        }
+    });
+    if had_content_length {
+        headers.push(HeaderRecord {
+            name: "Content-Length".to_string(),
+            value: body_len.to_string(),
+        });
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

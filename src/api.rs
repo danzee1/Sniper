@@ -21,7 +21,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, patch, post},
+    routing::{any, delete, get, patch, post},
     Json, Router,
 };
 use indexmap::IndexMap;
@@ -246,7 +246,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/replay/ws-snapshot/:id", get(ws_replay_snapshot))
         .route("/api/replay/ws-frames/:id", get(ws_replay_frames))
         .route("/api/events", get(events))
-        .fallback(get(spa_or_api_not_found))
+        .fallback(any(spa_or_api_not_found))
         .layer(middleware::from_fn(local_api_write_guard))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)) // 64 MB
         .with_state(state)
@@ -279,6 +279,9 @@ async fn local_api_write_guard(request: Request, next: Next) -> Response {
 async fn spa_or_api_not_found(request: Request) -> Response {
     if request.uri().path().starts_with("/api/") {
         return (StatusCode::NOT_FOUND, "API endpoint not found").into_response();
+    }
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return (StatusCode::NOT_FOUND, "Route not found").into_response();
     }
     index().await.into_response()
 }
@@ -4749,6 +4752,41 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn api_fallback_handles_non_get_unknown_api_paths() {
+        let config = test_app_config("sniper-api-fallback-post");
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::router(state)).await.unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/api/not-real"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_rejects_non_get_unknown_paths() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/not-real")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = super::spa_or_api_not_found(request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn local_api_host_guard_allows_loopback_literals_and_localhost() {
         let mut headers = HeaderMap::new();
@@ -7529,16 +7567,13 @@ mod tests {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
                     method: "POST".to_string(),
-                    path: "/".to_string(),
-                    headers: vec![HeaderRecord {
-                        name: "Content-Length".to_string(),
-                        value: "9".to_string(),
-                    }],
-                    body: "$payload$".to_string(),
+                    path: "/$payload$".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
                     body_encoding: BodyEncoding::Utf8,
                     preview_truncated: false,
                 },
-                payloads: vec!["abc".to_string()],
+                payloads: vec!["bad path".to_string()],
                 source_transaction_id: None,
                 http_version: None,
                 target: None,

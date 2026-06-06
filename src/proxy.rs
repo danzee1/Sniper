@@ -1927,6 +1927,7 @@ async fn forward_websocket_request(
     started: Instant,
     secure_special_host: bool,
 ) -> Response<Body> {
+    let client_request_headers = parts.headers.clone();
     let editable_request = editable_request_from_parts(&parts, &request_bytes, &absolute_uri);
     let forwarded_request = match maybe_intercept_request(
         state.clone(),
@@ -2097,7 +2098,7 @@ async fn forward_websocket_request(
     };
 
     let response_headers = match build_websocket_client_response_headers(
-        &request_headers,
+        &client_request_headers,
         response.upstream_headers.clone(),
     ) {
         Ok(headers) => headers,
@@ -2140,9 +2141,11 @@ async fn forward_websocket_request(
             )
             .await;
     }
-    if let Some(error) =
-        websocket_response_validation_error(&request_headers, &applied_response.headers)
-    {
+    if let Some(error) = websocket_response_validation_error(
+        &client_request_headers,
+        &response.upstream_headers,
+        &applied_response.headers,
+    ) {
         let message = format!("Invalid WebSocket handshake response: {error}");
         let (client_response, response_capture) =
             synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
@@ -3464,13 +3467,18 @@ fn build_websocket_client_response_headers(
     request_headers: &HeaderMap,
     upstream_headers: HeaderMap,
 ) -> Result<HeaderMap> {
-    let websocket_key = request_headers
-        .get(SEC_WEBSOCKET_KEY)
-        .context("missing Sec-WebSocket-Key")?
-        .to_str()
-        .context("invalid Sec-WebSocket-Key")?;
+    let websocket_key = single_header_value(request_headers, SEC_WEBSOCKET_KEY)
+        .context("missing or invalid Sec-WebSocket-Key")?;
     let mut headers = upstream_headers;
     strip_hop_by_hop_headers(&mut headers);
+    if headers.contains_key(SEC_WEBSOCKET_PROTOCOL) {
+        let protocol = single_header_value(&headers, SEC_WEBSOCKET_PROTOCOL)
+            .context("invalid upstream Sec-WebSocket-Protocol")?
+            .trim();
+        if protocol.is_empty() {
+            anyhow::bail!("invalid upstream Sec-WebSocket-Protocol");
+        }
+    }
     headers.remove(SEC_WEBSOCKET_ACCEPT);
     headers.remove(SEC_WEBSOCKET_EXTENSIONS);
     headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
@@ -3489,16 +3497,14 @@ fn build_websocket_client_response_headers(
 
 fn websocket_response_validation_error(
     request_headers: &HeaderMap,
+    upstream_headers: &HeaderMap,
     response_headers: &HeaderMap,
 ) -> Option<&'static str> {
     if !is_websocket_upgrade_headers(response_headers) {
         return Some("missing WebSocket upgrade response headers");
     }
 
-    let request_key = match request_headers
-        .get(SEC_WEBSOCKET_KEY)
-        .and_then(|value| value.to_str().ok())
-    {
+    let request_key = match single_header_value(request_headers, SEC_WEBSOCKET_KEY) {
         Some(value) => value,
         None => return Some("missing request Sec-WebSocket-Key"),
     };
@@ -3511,15 +3517,23 @@ fn websocket_response_validation_error(
     if response_headers.contains_key(SEC_WEBSOCKET_EXTENSIONS) {
         return Some("WebSocket extensions must not be negotiated by match/replace");
     }
-    if response_headers.contains_key(SEC_WEBSOCKET_PROTOCOL) {
-        let Some(protocol) =
-            single_header_value(response_headers, SEC_WEBSOCKET_PROTOCOL).map(str::trim)
-        else {
-            return Some("invalid Sec-WebSocket-Protocol");
-        };
-        if protocol.is_empty() {
-            return Some("invalid Sec-WebSocket-Protocol");
+    let response_protocol = if response_headers.contains_key(SEC_WEBSOCKET_PROTOCOL) {
+        match single_header_value(response_headers, SEC_WEBSOCKET_PROTOCOL).map(str::trim) {
+            Some(protocol) if !protocol.is_empty() => Some(protocol),
+            _ => return Some("invalid Sec-WebSocket-Protocol"),
         }
+    } else {
+        None
+    };
+    let upstream_protocol = if upstream_headers.contains_key(SEC_WEBSOCKET_PROTOCOL) {
+        match single_header_value(upstream_headers, SEC_WEBSOCKET_PROTOCOL).map(str::trim) {
+            Some(protocol) if !protocol.is_empty() => Some(protocol),
+            _ => return Some("invalid upstream Sec-WebSocket-Protocol"),
+        }
+    } else {
+        None
+    };
+    if let Some(protocol) = response_protocol {
         let offered = request_headers
             .get_all(SEC_WEBSOCKET_PROTOCOL)
             .iter()
@@ -3530,6 +3544,9 @@ fn websocket_response_validation_error(
         if !offered {
             return Some("Sec-WebSocket-Protocol was not offered by the client");
         }
+    }
+    if response_protocol != upstream_protocol {
+        return Some("Sec-WebSocket-Protocol changed after upstream negotiation");
     }
 
     None
@@ -5767,6 +5784,42 @@ mod tests {
     }
 
     #[test]
+    fn websocket_response_uses_original_client_key_for_accept() {
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        let mut rewritten_headers = HeaderMap::new();
+        rewritten_headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
+        );
+
+        let response_headers =
+            build_websocket_client_response_headers(&client_headers, HeaderMap::new()).unwrap();
+
+        assert_ne!(
+            response_headers.get(SEC_WEBSOCKET_ACCEPT).unwrap(),
+            &HeaderValue::from_str(&derive_accept_key(
+                single_header_value(&rewritten_headers, SEC_WEBSOCKET_KEY)
+                    .unwrap()
+                    .as_bytes()
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            response_headers.get(SEC_WEBSOCKET_ACCEPT).unwrap(),
+            &HeaderValue::from_str(&derive_accept_key(
+                single_header_value(&client_headers, SEC_WEBSOCKET_KEY)
+                    .unwrap()
+                    .as_bytes()
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn websocket_response_validation_rejects_mutated_accept_header() {
         let mut request_headers = HeaderMap::new();
         request_headers.insert(
@@ -5778,7 +5831,11 @@ mod tests {
         response_headers.insert(SEC_WEBSOCKET_ACCEPT, HeaderValue::from_static("bad"));
 
         assert_eq!(
-            websocket_response_validation_error(&request_headers, &response_headers),
+            websocket_response_validation_error(
+                &request_headers,
+                &HeaderMap::new(),
+                &response_headers
+            ),
             Some("invalid Sec-WebSocket-Accept")
         );
     }
@@ -5798,7 +5855,11 @@ mod tests {
         );
 
         assert_eq!(
-            websocket_response_validation_error(&request_headers, &response_headers),
+            websocket_response_validation_error(
+                &request_headers,
+                &HeaderMap::new(),
+                &response_headers
+            ),
             Some("WebSocket extensions must not be negotiated by match/replace")
         );
     }
@@ -5819,13 +5880,21 @@ mod tests {
         response_headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("other"));
 
         assert_eq!(
-            websocket_response_validation_error(&request_headers, &response_headers),
+            websocket_response_validation_error(
+                &request_headers,
+                &HeaderMap::new(),
+                &response_headers
+            ),
             Some("Sec-WebSocket-Protocol was not offered by the client")
         );
 
         response_headers.append(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat"));
         assert_eq!(
-            websocket_response_validation_error(&request_headers, &response_headers),
+            websocket_response_validation_error(
+                &request_headers,
+                &HeaderMap::new(),
+                &response_headers
+            ),
             Some("invalid Sec-WebSocket-Protocol")
         );
         response_headers.remove(SEC_WEBSOCKET_PROTOCOL);
@@ -5833,9 +5902,59 @@ mod tests {
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static("superchat"),
         );
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("superchat"),
+        );
         assert_eq!(
-            websocket_response_validation_error(&request_headers, &response_headers),
+            websocket_response_validation_error(
+                &request_headers,
+                &upstream_headers,
+                &response_headers
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn websocket_response_validation_rejects_protocol_changed_after_upstream() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        request_headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("chat, superchat"),
+        );
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat"));
+        let mut response_headers =
+            build_websocket_client_response_headers(&request_headers, upstream_headers.clone())
+                .unwrap();
+        response_headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("superchat"),
+        );
+
+        assert_eq!(
+            websocket_response_validation_error(
+                &request_headers,
+                &upstream_headers,
+                &response_headers
+            ),
+            Some("Sec-WebSocket-Protocol changed after upstream negotiation")
+        );
+
+        response_headers.remove(SEC_WEBSOCKET_PROTOCOL);
+        assert_eq!(
+            websocket_response_validation_error(
+                &request_headers,
+                &upstream_headers,
+                &response_headers
+            ),
+            Some("Sec-WebSocket-Protocol changed after upstream negotiation")
         );
     }
 

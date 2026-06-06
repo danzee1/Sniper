@@ -404,8 +404,10 @@ async fn rollback_failed_fuzzer_persist(
 }
 
 fn count_request_markers(request: &EditableRequest) -> usize {
-    let mut count =
-        count_markers(&request.host) + count_markers(&request.path) + count_markers(&request.body);
+    let mut count = count_markers(&request.host)
+        + count_markers(&request.method)
+        + count_markers(&request.path)
+        + count_markers(&request.body);
     for header in &request.headers {
         count += count_markers(&header.name);
         count += count_markers(&header.value);
@@ -521,6 +523,7 @@ fn expanded_value_len(value: &str, payload_len: usize) -> usize {
 fn apply_payload_to_request(template: &EditableRequest, payload: &str) -> Result<EditableRequest> {
     let mut request = template.clone();
     request.host = replace_markers(&request.host, payload)?;
+    request.method = replace_markers(&request.method, payload)?;
     request.path = replace_markers(&request.path, payload)?;
     request.body = replace_markers(&request.body, payload)?;
     for header in &mut request.headers {
@@ -535,6 +538,7 @@ fn apply_payload_to_request(template: &EditableRequest, payload: &str) -> Result
     {
         request.host = host;
     }
+    request.normalize_content_length();
     Ok(request)
 }
 
@@ -577,7 +581,7 @@ mod tests {
         let request = EditableRequest {
             scheme: "https".to_string(),
             host: "example.com".to_string(),
-            method: "GET".to_string(),
+            method: "$payload$".to_string(),
             path: "/items/$payload$".to_string(),
             headers: vec![HeaderRecord {
                 name: "x-test".to_string(),
@@ -588,8 +592,9 @@ mod tests {
             preview_truncated: false,
         };
 
-        assert_eq!(count_request_markers(&request), 3);
+        assert_eq!(count_request_markers(&request), 4);
         let applied = apply_payload_to_request(&request, "abc").unwrap();
+        assert_eq!(applied.method, "abc");
         assert_eq!(applied.path, "/items/abc");
         assert_eq!(applied.headers[0].value, "abc");
         assert_eq!(applied.body, "{\"id\":\"abc\"}");
@@ -597,6 +602,41 @@ mod tests {
         let applied = apply_payload_to_request(&request, " admin ").unwrap();
         assert_eq!(applied.path, "/items/ admin ");
         assert_eq!(applied.headers[0].value, " admin ");
+    }
+
+    #[test]
+    fn fuzzer_normalizes_content_length_after_body_payload_expansion() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/search".to_string(),
+            headers: vec![HeaderRecord {
+                name: "Content-Length".to_string(),
+                value: "11".to_string(),
+            }],
+            body: "q=$payload$".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+
+        let applied = apply_payload_to_request(&request, "abcd").unwrap();
+
+        assert_eq!(applied.body, "q=abcd");
+        assert_eq!(
+            applied
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                .map(|header| header.value.as_str()),
+            Some("6")
+        );
+        validate_expanded_requests(
+            &request,
+            &["abcd".to_string()],
+            crate::api::validate_editable_request,
+        )
+        .unwrap();
     }
 
     #[test]

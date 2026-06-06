@@ -308,6 +308,7 @@ fn apply_variables_to_request(
     {
         applied.host = host;
     }
+    applied.normalize_content_length();
     applied
 }
 
@@ -725,6 +726,37 @@ mod tests {
             applied.headers.first().map(|header| header.value.as_str()),
             Some("new.example")
         );
+    }
+
+    #[test]
+    fn sequence_variables_normalize_content_length_after_body_expansion() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "POST".to_string(),
+            path: "/login".to_string(),
+            headers: vec![HeaderRecord {
+                name: "Content-Length".to_string(),
+                value: "11".to_string(),
+            }],
+            body: "q={{token}}".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let variables = HashMap::from([("token".to_string(), "abcd".to_string())]);
+
+        let applied = apply_variables_to_request(&request, &variables);
+
+        assert_eq!(applied.body, "q=abcd");
+        assert_eq!(
+            applied
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                .map(|header| header.value.as_str()),
+            Some("6")
+        );
+        crate::api::validate_editable_request(&applied).unwrap();
     }
 
     #[test]
