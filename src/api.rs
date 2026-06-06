@@ -757,6 +757,75 @@ fn validate_editable_response(response: &EditableResponse) -> std::result::Resul
     validate_editable_body_framing(&response.headers, body.len())
 }
 
+fn canonicalize_intercept_forward_request(
+    mut request: EditableRequest,
+) -> std::result::Result<EditableRequest, String> {
+    let body = request
+        .try_body_bytes()
+        .map_err(|_| "request body is not valid base64".to_string())?;
+    canonicalize_plain_chunked_transfer_encoding(&mut request.headers, body.len())?;
+    validate_editable_request(&request)?;
+    Ok(request)
+}
+
+fn canonicalize_intercept_forward_response(
+    mut response: EditableResponse,
+) -> std::result::Result<EditableResponse, String> {
+    let body = response
+        .try_body_bytes()
+        .map_err(|_| "response body is not valid base64".to_string())?;
+    canonicalize_plain_chunked_transfer_encoding(&mut response.headers, body.len())?;
+    validate_editable_response(&response)?;
+    Ok(response)
+}
+
+fn canonicalize_plain_chunked_transfer_encoding(
+    headers: &mut Vec<HeaderRecord>,
+    body_len: usize,
+) -> std::result::Result<(), String> {
+    let codings = editable_transfer_encoding_tokens(headers)?;
+    if codings.is_empty() {
+        return Ok(());
+    }
+    if codings.len() != 1 || !codings[0].eq_ignore_ascii_case("chunked") {
+        return Err(format!(
+            "unsupported Transfer-Encoding chain for editable message: {}",
+            codings.join(", ")
+        ));
+    }
+
+    headers.retain(|header| {
+        !header.name.eq_ignore_ascii_case("transfer-encoding")
+            && !header.name.eq_ignore_ascii_case("content-length")
+    });
+    headers.push(HeaderRecord {
+        name: header::CONTENT_LENGTH.as_str().to_string(),
+        value: body_len.to_string(),
+    });
+    Ok(())
+}
+
+fn editable_transfer_encoding_tokens(
+    headers: &[HeaderRecord],
+) -> std::result::Result<Vec<String>, String> {
+    let mut codings = Vec::new();
+    for header in headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        HeaderValue::from_str(&header.value)
+            .map_err(|_| "invalid Transfer-Encoding header".to_string())?;
+        codings.extend(
+            header
+                .value
+                .split(',')
+                .map(|coding| coding.trim().to_ascii_lowercase())
+                .filter(|coding| !coding.is_empty()),
+        );
+    }
+    Ok(codings)
+}
+
 fn validate_editable_body_framing(
     headers: &[HeaderRecord],
     body_len: usize,
@@ -2918,9 +2987,10 @@ async fn forward_intercept(
     if session.intercepts.get(id).await.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Err(error) = validate_editable_request(&payload.request) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
-    }
+    let request = match canonicalize_intercept_forward_request(payload.request) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
 
     let _operation_guard =
         match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
@@ -2932,7 +3002,7 @@ async fn forward_intercept(
         .event_log
         .snapshot(Some(state.config.max_entries))
         .await;
-    if let Err(error) = session.intercepts.forward(id, payload.request).await {
+    if let Err(error) = session.intercepts.forward(id, request).await {
         return intercept_action_error_status(&error).into_response();
     }
     session
@@ -3168,9 +3238,10 @@ async fn forward_response_intercept(
     if session.response_intercepts.get(id).await.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Err(error) = validate_editable_response(&payload.response) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
-    }
+    let response_payload = match canonicalize_intercept_forward_response(payload.response) {
+        Ok(response) => response,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
 
     let _operation_guard =
         match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
@@ -3184,7 +3255,7 @@ async fn forward_response_intercept(
         .await;
     if let Err(error) = session
         .response_intercepts
-        .forward(id, payload.response)
+        .forward(id, response_payload)
         .await
     {
         return intercept_action_error_status(&error).into_response();
@@ -5319,6 +5390,87 @@ mod tests {
         ])
         .expect("valid replay headers should pass");
         assert_eq!(headers, vec![("x-test".to_string(), "ok".to_string())]);
+    }
+
+    #[test]
+    fn intercept_forward_canonicalizes_plain_chunked_request() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "POST".to_string(),
+            path: "/submit".to_string(),
+            headers: vec![
+                HeaderRecord {
+                    name: "host".to_string(),
+                    value: "example.test".to_string(),
+                },
+                HeaderRecord {
+                    name: "transfer-encoding".to_string(),
+                    value: "chunked".to_string(),
+                },
+            ],
+            body: "hello".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+
+        let request = super::canonicalize_intercept_forward_request(request).unwrap();
+
+        assert!(!request
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding")));
+        assert_eq!(
+            request
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                .map(|header| header.value.as_str()),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn intercept_forward_rejects_unsupported_transfer_encoding_chain() {
+        let mut request = test_editable_request("/submit");
+        request.method = "POST".to_string();
+        request.headers.push(HeaderRecord {
+            name: "transfer-encoding".to_string(),
+            value: "gzip, chunked".to_string(),
+        });
+        request.body = "compressed".to_string();
+
+        let error = super::canonicalize_intercept_forward_request(request).unwrap_err();
+
+        assert!(error.contains("unsupported Transfer-Encoding chain"));
+    }
+
+    #[test]
+    fn response_intercept_forward_canonicalizes_plain_chunked_response() {
+        let response = EditableResponse {
+            status: 200,
+            headers: vec![HeaderRecord {
+                name: "transfer-encoding".to_string(),
+                value: "chunked".to_string(),
+            }],
+            body: "hello".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+        };
+
+        let response = super::canonicalize_intercept_forward_response(response).unwrap();
+
+        assert!(!response
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding")));
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                .map(|header| header.value.as_str()),
+            Some("5")
+        );
     }
 
     #[test]

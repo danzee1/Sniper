@@ -1011,6 +1011,21 @@ async fn handle_forwardable_request(
             .await
         }
     };
+    if let Err(message) = validate_supported_transfer_encoding(&parts.headers) {
+        return record_http_rejection(
+            &state,
+            &session,
+            RejectedRequestIdentity::from_absolute_uri(&parts.method, &absolute_uri),
+            &parts.headers,
+            &[],
+            started_at,
+            started,
+            StatusCode::BAD_REQUEST,
+            message,
+            "unsupported request transfer encoding",
+        )
+        .await;
+    }
     let request_bytes = match collect_body(body).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1321,6 +1336,33 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
             headers.remove(name);
         }
     }
+}
+
+fn validate_supported_transfer_encoding(headers: &HeaderMap) -> std::result::Result<(), String> {
+    let codings = transfer_encoding_tokens(headers)?;
+    if codings.is_empty() || (codings.len() == 1 && codings[0].eq_ignore_ascii_case("chunked")) {
+        return Ok(());
+    }
+    Err(format!(
+        "unsupported Transfer-Encoding chain: {}",
+        codings.join(", ")
+    ))
+}
+
+fn transfer_encoding_tokens(headers: &HeaderMap) -> std::result::Result<Vec<String>, String> {
+    let mut codings = Vec::new();
+    for value in headers.get_all(TRANSFER_ENCODING) {
+        let value = value
+            .to_str()
+            .map_err(|_| "invalid Transfer-Encoding header".to_string())?;
+        codings.extend(
+            value
+                .split(',')
+                .map(|coding| coding.trim().to_ascii_lowercase())
+                .filter(|coding| !coding.is_empty()),
+        );
+    }
+    Ok(codings)
 }
 
 fn text_response(status: StatusCode, message: impl Into<String>) -> Response<Body> {
@@ -2653,6 +2695,38 @@ async fn execute_streaming_http_exchange(
             let response_version = response.version();
             let response_headers = response.headers().clone();
             let method_text = method.to_string();
+            if let Err(error) = validate_supported_transfer_encoding(&response_headers) {
+                let message = format!("Unsupported upstream response transfer encoding: {error}");
+                notes.push(message.clone());
+                session
+                    .event_log
+                    .push(
+                        EventLevel::Warn,
+                        "proxy",
+                        "Unsupported upstream response transfer encoding",
+                        message.clone(),
+                    )
+                    .await;
+                let (response, response_capture) =
+                    synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+                let record = TransactionRecord::http(
+                    started_at,
+                    method.to_string(),
+                    request.scheme,
+                    request.host,
+                    path,
+                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    notes,
+                    original_request_capture,
+                    None,
+                )
+                .with_http_version(response_version);
+                store_record_and_scan(&state, &session, record).await;
+                return response;
+            }
             let persist_generation = remember_persist_context(&session);
             let context = StreamedRecordContext {
                 state: state.clone(),
@@ -2995,6 +3069,42 @@ async fn execute_http_exchange(
             let status = response.status();
             let resp_version = response.version();
             let response_headers = response.headers().clone();
+            if let Err(error) = validate_supported_transfer_encoding(&response_headers) {
+                let message = format!("Unsupported upstream response transfer encoding: {error}");
+                notes.push(message.clone());
+                session
+                    .event_log
+                    .push(
+                        EventLevel::Warn,
+                        "proxy",
+                        "Unsupported upstream response transfer encoding",
+                        message.clone(),
+                    )
+                    .await;
+                let (_response, response_capture) =
+                    synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+                return ExecutedExchange {
+                    record: TransactionRecord::http(
+                        started_at,
+                        method.to_string(),
+                        request.scheme,
+                        request.host,
+                        path,
+                        Some(StatusCode::BAD_GATEWAY.as_u16()),
+                        started.elapsed().as_millis() as u64,
+                        request_capture,
+                        Some(response_capture),
+                        notes,
+                        original_request_capture,
+                        None,
+                    )
+                    .with_http_version(resp_version),
+                    response: Err(UpstreamError {
+                        status: StatusCode::BAD_GATEWAY,
+                        message,
+                    }),
+                };
+            }
             match read_response_body_limited(response, MAX_PROXY_BUFFERED_RESPONSE_BODY_BYTES).await
             {
                 Ok(response_bytes) => {
@@ -4645,6 +4755,25 @@ mod tests {
             name: name.to_string(),
             value: value.to_string(),
         }
+    }
+
+    #[test]
+    fn transfer_encoding_validation_allows_identity_and_plain_chunked() {
+        let mut headers = HeaderMap::new();
+        assert!(validate_supported_transfer_encoding(&headers).is_ok());
+
+        headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        assert!(validate_supported_transfer_encoding(&headers).is_ok());
+    }
+
+    #[test]
+    fn transfer_encoding_validation_rejects_unsupported_coding_chains() {
+        let mut headers = HeaderMap::new();
+        headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("gzip, chunked"));
+
+        let error = validate_supported_transfer_encoding(&headers).unwrap_err();
+
+        assert!(error.contains("gzip, chunked"));
     }
 
     fn editable_request(host: &str) -> EditableRequest {
