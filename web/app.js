@@ -17223,6 +17223,7 @@ async function wsConnect() {
     tab.wsFrames = [];
     tab.wsFramesTruncated = false;
     tab.wsSelectedFrameIndex = -1;
+    tab.wsFrameWindowStart = null;
     scheduleWorkspaceStateSave();
     renderWsFrameList();
     startWsPoll(tab);
@@ -17553,7 +17554,7 @@ function applyWsReplayFramePollResponse(tab, data, sinceIndex) {
       ? firstRetainedIndex
       : Number(incomingFrames[0]?.index);
     tab.wsError = Number.isFinite(firstAvailable)
-      ? `WebSocket replay transcript is missing frames before #${firstAvailable}.`
+      ? `WebSocket replay transcript is missing frames before #${firstAvailable + 1}.`
       : "WebSocket replay transcript is missing earlier frames.";
     scheduleWorkspaceStateSave();
     if (state.activeReplayTabId === tab.id) {

@@ -685,13 +685,13 @@ impl AppState {
         drop(file);
         validate_downloaded_update_size(downloaded, response_content_length, total_size)?;
 
-        // Mount the DMG (no -quiet so we get stdout with mount point)
+        // Mount the DMG and ask hdiutil for machine-readable output.
         tx.send(UpdateProgress::step("Installing update..."))
             .await
             .ok();
 
         let mount_output = Command::new(HDIUTIL_PATH)
-            .args(["attach", "-nobrowse"])
+            .args(["attach", "-nobrowse", "-plist"])
             .arg(&dmg_path)
             .output()
             .context("failed to mount DMG")?;
@@ -703,30 +703,25 @@ impl AppState {
             );
         }
 
-        // Find the mount point from stdout
-        let stdout = String::from_utf8_lossy(&mount_output.stdout);
-        let mount_point = stdout
-            .lines()
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(3, '\t').collect();
-                parts.get(2).map(|s| s.trim().to_string())
-            })
-            .find(|p| p.starts_with("/Volumes/"));
-        let Some(mount_point) = mount_point else {
-            cleanup_update_artifacts(None, &tmp_dir).await;
-            anyhow::bail!("could not find DMG mount point");
-        };
-        artifact_guard.set_mount_point(mount_point.clone());
-
-        let new_app_path = match find_update_app_bundle(Path::new(&mount_point)) {
-            Ok(path) => path,
+        let attach_info = match parse_hdiutil_attach_output(&mount_output.stdout) {
+            Ok(attach_info) => attach_info,
             Err(error) => {
-                cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+                cleanup_update_artifacts(&[], &tmp_dir).await;
+                return Err(error);
+            }
+        };
+        let detach_targets = attach_info.detach_targets.clone();
+        artifact_guard.set_detach_targets(detach_targets.clone());
+
+        let new_app_path = match find_update_app_bundle_in_mounts(&attach_info.mount_points) {
+            Ok((_mount_point, app_path)) => app_path,
+            Err(error) => {
+                cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
                 return Err(error);
             }
         };
         if !new_app_path.exists() {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             anyhow::bail!("downloaded app bundle disappeared from mounted DMG");
         }
 
@@ -734,7 +729,7 @@ impl AppState {
             .await
             .ok();
         if let Err(error) = verify_app_signature(&new_app_path, "downloaded app") {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             return Err(error);
         }
         if allow_ad_hoc_self_update() {
@@ -743,13 +738,13 @@ impl AppState {
             );
         } else {
             if let Err(error) = assess_app_gatekeeper(&new_app_path, "downloaded app") {
-                cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+                cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
                 return Err(error);
             }
         }
         if let Err(error) = verify_app_identity(&new_app_path, &release.tag_name, "downloaded app")
         {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             return Err(error);
         }
         if let Err(error) = verify_app_executable_arch_for_release_asset(
@@ -757,11 +752,11 @@ impl AppState {
             &dmg_asset.name,
             "downloaded app",
         ) {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             return Err(error);
         }
         if let Err(error) = verify_app_signing_team_matches(&new_app_path, &app_bundle) {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             return Err(error);
         }
 
@@ -776,7 +771,7 @@ impl AppState {
             .context("failed to stage new app bundle")?;
 
         if !stage_output.status.success() {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             anyhow::bail!(
                 "staging ditto failed: {}",
                 String::from_utf8_lossy(&stage_output.stderr)
@@ -787,33 +782,33 @@ impl AppState {
             .await
             .ok();
         if let Err(error) = verify_app_signature(&staged_app, "staged app") {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             return Err(error);
         }
         if let Err(error) = verify_app_identity(&staged_app, &release.tag_name, "staged app") {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             return Err(error);
         }
         if let Err(error) =
             verify_app_executable_arch_for_release_asset(&staged_app, &dmg_asset.name, "staged app")
         {
-            cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+            cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
             return Err(error);
         }
 
         let expected_team = match app_signing_team_identifier(&app_bundle, "current app") {
             Ok(team) => team.unwrap_or_default(),
             Err(error) => {
-                cleanup_update_artifacts(Some(&mount_point), &tmp_dir).await;
+                cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
                 return Err(error);
             }
         };
 
-        detach_update_dmg(&mount_point).await;
-        artifact_guard.clear_mount_point();
+        detach_update_targets(&detach_targets).await;
+        artifact_guard.clear_detach_targets();
 
         if let Err(error) = self.prepare_for_self_update_shutdown().await {
-            cleanup_update_artifacts(None, &tmp_dir).await;
+            cleanup_update_artifacts(&[], &tmp_dir).await;
             return Err(error);
         }
 
@@ -825,7 +820,7 @@ impl AppState {
             &release.tag_name,
             &expected_team,
         ) {
-            cleanup_update_artifacts(None, &tmp_dir).await;
+            cleanup_update_artifacts(&[], &tmp_dir).await;
             self.restore_proxy_after_self_update_prepare_failure().await;
             return Err(error);
         }
@@ -1006,7 +1001,7 @@ impl Drop for SelfUpdateGuard {
 
 struct UpdateArtifactGuard {
     tmp_dir: std::path::PathBuf,
-    mount_point: Option<String>,
+    detach_targets: Vec<String>,
     disarmed: bool,
 }
 
@@ -1014,17 +1009,17 @@ impl UpdateArtifactGuard {
     fn new(tmp_dir: std::path::PathBuf) -> Self {
         Self {
             tmp_dir,
-            mount_point: None,
+            detach_targets: Vec::new(),
             disarmed: false,
         }
     }
 
-    fn set_mount_point(&mut self, mount_point: String) {
-        self.mount_point = Some(mount_point);
+    fn set_detach_targets(&mut self, detach_targets: Vec<String>) {
+        self.detach_targets = detach_targets;
     }
 
-    fn clear_mount_point(&mut self) {
-        self.mount_point = None;
+    fn clear_detach_targets(&mut self) {
+        self.detach_targets.clear();
     }
 
     fn disarm(&mut self) {
@@ -1037,9 +1032,9 @@ impl Drop for UpdateArtifactGuard {
         if self.disarmed {
             return;
         }
-        if let Some(mount_point) = self.mount_point.as_deref() {
+        for target in &self.detach_targets {
             let _ = std::process::Command::new(HDIUTIL_PATH)
-                .args(["detach", mount_point])
+                .args(["detach", "-quiet", target])
                 .status();
         }
         let _ = std::fs::remove_dir_all(&self.tmp_dir);
@@ -1114,6 +1109,60 @@ struct GitHubAsset {
     size: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HdiutilAttachOutput {
+    #[serde(rename = "system-entities", default)]
+    system_entities: Vec<HdiutilSystemEntity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HdiutilSystemEntity {
+    #[serde(rename = "dev-entry")]
+    dev_entry: Option<String>,
+    #[serde(rename = "mount-point")]
+    mount_point: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HdiutilAttachInfo {
+    mount_points: Vec<String>,
+    detach_targets: Vec<String>,
+}
+
+fn parse_hdiutil_attach_output(output: &[u8]) -> Result<HdiutilAttachInfo> {
+    let attach_output: HdiutilAttachOutput =
+        plist::from_bytes(output).context("failed to parse hdiutil attach plist output")?;
+
+    let mut mount_points = Vec::new();
+    let mut detach_targets = Vec::new();
+    for entity in attach_output.system_entities {
+        if let Some(mount_point) = entity
+            .mount_point
+            .filter(|mount_point| mount_point.starts_with("/Volumes/"))
+        {
+            push_unique(&mut detach_targets, mount_point.clone());
+            mount_points.push(mount_point);
+        }
+        if let Some(dev_entry) = entity
+            .dev_entry
+            .filter(|dev_entry| dev_entry.starts_with("/dev/"))
+        {
+            push_unique(&mut detach_targets, dev_entry);
+        }
+    }
+
+    Ok(HdiutilAttachInfo {
+        mount_points,
+        detach_targets,
+    })
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
 fn select_release_dmg_asset<'a>(
     assets: &'a [GitHubAsset],
     release_tag: &str,
@@ -1158,6 +1207,25 @@ fn validate_downloaded_update_size(
         }
     }
     Ok(())
+}
+
+fn find_update_app_bundle_in_mounts(mount_points: &[String]) -> Result<(String, PathBuf)> {
+    if mount_points.is_empty() {
+        anyhow::bail!("could not find DMG mount point");
+    }
+
+    let mut errors = Vec::new();
+    for mount_point in mount_points {
+        match find_update_app_bundle(Path::new(mount_point)) {
+            Ok(app_path) => return Ok((mount_point.clone(), app_path)),
+            Err(error) => errors.push(format!("{mount_point}: {error}")),
+        }
+    }
+
+    anyhow::bail!(
+        "could not find Sniper.app in mounted DMG volume(s): {}",
+        errors.join("; ")
+    )
 }
 
 fn find_update_app_bundle(mount_point: &Path) -> Result<PathBuf> {
@@ -1353,17 +1421,21 @@ impl UpdateProgress {
     }
 }
 
-async fn cleanup_update_artifacts(mount_point: Option<&str>, tmp_dir: &Path) {
-    if let Some(mount_point) = mount_point {
-        detach_update_dmg(mount_point).await;
-    }
+async fn cleanup_update_artifacts(detach_targets: &[String], tmp_dir: &Path) {
+    detach_update_targets(detach_targets).await;
     let _ = tokio::fs::remove_dir_all(tmp_dir).await;
 }
 
-async fn detach_update_dmg(mount_point: &str) {
+async fn detach_update_targets(detach_targets: &[String]) {
+    for target in detach_targets {
+        detach_update_dmg(target).await;
+    }
+}
+
+async fn detach_update_dmg(target: &str) {
     let _ = tokio::process::Command::new(HDIUTIL_PATH)
         .args(["detach", "-quiet"])
-        .arg(mount_point)
+        .arg(target)
         .output()
         .await;
 }
@@ -1754,14 +1826,14 @@ fn proxy_url_targets_loopback(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_release_is_newer, find_update_app_bundle, native_release_asset_arch,
-        parse_codesign_team_identifier, proxy_url_targets_loopback,
-        release_asset_archs_match_binary_archs, release_asset_matches_arch,
-        release_proxy_env_targets_loopback, release_update_available, select_release_dmg_asset,
-        self_update_bundle_is_writable, update_installer_script, validate_downloaded_update_size,
-        verify_app_identity, AppState, GitHubAsset, GitHubRelease, UpdateArtifactGuard,
-        CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE,
-        HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+        ensure_release_is_newer, find_update_app_bundle, find_update_app_bundle_in_mounts,
+        native_release_asset_arch, parse_codesign_team_identifier, parse_hdiutil_attach_output,
+        proxy_url_targets_loopback, release_asset_archs_match_binary_archs,
+        release_asset_matches_arch, release_proxy_env_targets_loopback, release_update_available,
+        select_release_dmg_asset, self_update_bundle_is_writable, update_installer_script,
+        validate_downloaded_update_size, verify_app_identity, AppState, GitHubAsset, GitHubRelease,
+        UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER,
+        EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
     use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
@@ -1852,6 +1924,65 @@ mod tests {
         ] {
             assert!(path.starts_with('/'), "{path} should be absolute");
         }
+    }
+
+    #[test]
+    fn self_update_parses_hdiutil_attach_plist_mounts_and_detach_targets() {
+        let output = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>system-entities</key>
+  <array>
+    <dict>
+      <key>dev-entry</key>
+      <string>/dev/disk4</string>
+    </dict>
+    <dict>
+      <key>dev-entry</key>
+      <string>/dev/disk4s1</string>
+      <key>mount-point</key>
+      <string>/Volumes/Sniper 0.2.5</string>
+    </dict>
+  </array>
+</dict>
+</plist>
+"#;
+
+        let info = parse_hdiutil_attach_output(output).unwrap();
+
+        assert_eq!(info.mount_points, vec!["/Volumes/Sniper 0.2.5"]);
+        assert_eq!(
+            info.detach_targets,
+            vec!["/dev/disk4", "/Volumes/Sniper 0.2.5", "/dev/disk4s1"]
+        );
+    }
+
+    #[test]
+    fn self_update_tracks_detach_targets_without_mount_point() {
+        let output = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>system-entities</key>
+  <array>
+    <dict>
+      <key>dev-entry</key>
+      <string>/dev/disk4s1</string>
+    </dict>
+  </array>
+</dict>
+</plist>
+"#;
+
+        let info = parse_hdiutil_attach_output(output).unwrap();
+
+        assert!(info.mount_points.is_empty());
+        assert_eq!(info.detach_targets, vec!["/dev/disk4s1"]);
+        assert!(find_update_app_bundle_in_mounts(&info.mount_points)
+            .unwrap_err()
+            .to_string()
+            .contains("could not find DMG mount point"));
     }
 
     #[test]

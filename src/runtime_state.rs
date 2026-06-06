@@ -101,8 +101,13 @@ pub fn runtime_state_path(data_dir: &Path) -> PathBuf {
     data_dir.join(RUNTIME_STATE_FILE)
 }
 
+fn runtime_state_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(RUNTIME_STATE_LOCK_FILE)
+}
+
 pub fn load_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot>> {
-    if !runtime_state_path(data_dir).exists() {
+    let path = runtime_state_path(data_dir);
+    if !path.exists() && !runtime_state_lock_path(data_dir).exists() {
         return Ok(None);
     }
     let _lock = lock_runtime_state(data_dir)?;
@@ -317,7 +322,7 @@ struct RuntimeStateLock {
 fn lock_runtime_state(data_dir: &Path) -> Result<RuntimeStateLock> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
-    let lock_path = data_dir.join(RUNTIME_STATE_LOCK_FILE);
+    let lock_path = runtime_state_lock_path(data_dir);
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -360,7 +365,7 @@ impl Drop for RuntimeStateLock {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::SocketAddr};
+    use std::{fs, net::SocketAddr, sync::mpsc, time::Duration};
 
     use super::{
         advertise_local_api_addr, load_runtime_state, persist_runtime_state, remove_runtime_state,
@@ -585,6 +590,41 @@ mod tests {
         assert!(loaded.is_none());
         assert!(!empty_dir.join(RUNTIME_STATE_LOCK_FILE).exists());
         let _ = fs::remove_dir_all(&empty_dir);
+    }
+
+    #[test]
+    fn runtime_state_load_waits_on_existing_lock_before_declaring_missing() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-existing-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let lock = super::lock_runtime_state(&temp_dir).unwrap();
+        let snapshot = RuntimeStateSnapshot::new(
+            "127.0.0.1:18080".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:23001".parse::<SocketAddr>().unwrap(),
+        );
+        let (tx, rx) = mpsc::channel();
+        let load_dir = temp_dir.clone();
+        let handle = std::thread::spawn(move || {
+            tx.send(load_runtime_state(&load_dir).unwrap()).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(rx.try_recv().is_err());
+
+        fs::write(
+            runtime_state_path(&temp_dir),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+
+        let loaded = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(loaded.ui_addr, snapshot.ui_addr);
+        handle.join().unwrap();
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
