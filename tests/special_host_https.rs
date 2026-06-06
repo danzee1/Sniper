@@ -79,6 +79,50 @@ async fn https_sniper_serves_the_certificate_portal() {
     proxy_handle.abort();
 }
 
+#[tokio::test]
+async fn https_sniper_records_non_default_connect_port() {
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-special-host-port-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(
+            b"CONNECT sniper:8443 HTTP/1.1\r\nHost: sniper:8443\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let connect_response = read_connect_response(&mut stream).await;
+    assert!(connect_response.starts_with("HTTP/1.1 200"));
+    drop(stream);
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let session = state.session().await;
+    let list = session.store.list(&ListFilters::default()).await;
+    assert!(list.iter().any(|record| {
+        record.method == "CONNECT" && record.host == "sniper:8443" && record.path.is_empty()
+    }));
+
+    proxy_handle.abort();
+}
+
 async fn read_connect_response(stream: &mut TcpStream) -> String {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 1024];

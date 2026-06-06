@@ -297,6 +297,7 @@ fn persist_desktop_session_state(
     runtime: &tokio::runtime::Runtime,
     state: &AppState,
 ) -> Result<()> {
+    runtime.block_on(state.abort_proxy_task());
     runtime.block_on(proxy::close_live_websocket_relays(
         state,
         "Sniper desktop shutdown closed the live WebSocket relay.",
@@ -712,9 +713,22 @@ mod tests {
         begin_desktop_teardown, block_desktop_shutdown, combine_desktop_persist_results,
         complete_desktop_shutdown, finish_desktop_teardown, handle_navigation_request,
         handle_new_window_request, is_blocked_desktop_navigation_scheme, is_same_origin,
-        load_shell_rc_contents, shell_single_quote, should_install_cli_path,
-        upsert_managed_path_line, write_shell_rc_atomically,
+        load_shell_rc_contents, persist_desktop_session_state, shell_single_quote,
+        should_install_cli_path, upsert_managed_path_line, write_shell_rc_atomically, AppConfig,
+        AppState,
     };
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct AbortFlag(Arc<AtomicBool>);
+
+    impl Drop for AbortFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     #[test]
     fn shell_single_quote_escapes_embedded_quotes() {
@@ -865,6 +879,38 @@ mod tests {
 
         assert!(error.contains("flush failed"));
         assert!(error.contains("active failed"));
+    }
+
+    #[test]
+    fn desktop_persist_aborts_proxy_task_before_returning_success() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "sniper-desktop-persist-stops-proxy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 4096,
+            data_dir: root.clone(),
+        })
+        .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = AbortFlag(Arc::clone(&dropped));
+        let handle = runtime.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        runtime.block_on(state.set_proxy_task(handle));
+
+        persist_desktop_session_state(&runtime, &state).unwrap();
+
+        assert!(dropped.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

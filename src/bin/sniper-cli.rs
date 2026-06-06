@@ -356,11 +356,24 @@ struct ReplayOpenArgs {
 }
 
 #[derive(Args, Debug, Default)]
-#[command(group(
-    ArgGroup::new("request_source")
-        .args(["request_file", "stdin"])
-        .multiple(false)
-))]
+#[command(
+    group(
+        ArgGroup::new("request_source")
+            .args(["request_file", "stdin"])
+            .multiple(false)
+    ),
+    group(
+        ArgGroup::new("target_update")
+            .args(["scheme", "host", "port"])
+            .multiple(true)
+    ),
+    group(
+        ArgGroup::new("update_input")
+            .args(["request_file", "stdin", "scheme", "host", "port"])
+            .required(true)
+            .multiple(true)
+    )
+)]
 struct ReplayUpdateArgs {
     #[arg(long)]
     tab_id: String,
@@ -436,6 +449,7 @@ struct FuzzerListArgs {
 #[command(group(
     ArgGroup::new("request_source")
         .args(["transaction_id", "request_file", "stdin"])
+        .required(true)
         .multiple(false)
 ))]
 struct FuzzerSetTemplateArgs {
@@ -5616,6 +5630,9 @@ mod tests {
     #[test]
     fn cli_rejects_ambiguous_input_sources() {
         let id = Uuid::new_v4().to_string();
+        assert!(
+            Cli::try_parse_from(["sniper-cli", "replay", "update", "--tab-id", "tab-1"]).is_err()
+        );
         assert!(Cli::try_parse_from([
             "sniper-cli",
             "replay",
@@ -5635,6 +5652,7 @@ mod tests {
             "--stdin",
         ])
         .is_err());
+        assert!(Cli::try_parse_from(["sniper-cli", "fuzzer", "set-template"]).is_err());
         assert!(Cli::try_parse_from([
             "sniper-cli",
             "fuzzer",

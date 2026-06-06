@@ -98,6 +98,7 @@ struct WsReplayConnection {
     frame_counter: usize,
     sender: Option<WsSender>,
     task_abort: Option<AbortHandle>,
+    writer_abort: Option<AbortHandle>,
     error: Option<String>,
 }
 
@@ -229,6 +230,7 @@ impl WsReplayConnection {
             WsReplayStatus::Disconnected | WsReplayStatus::Error
         ) && self.sender.is_none()
             && self.task_abort.is_none()
+            && self.writer_abort.is_none()
     }
 }
 
@@ -257,6 +259,7 @@ impl WsReplayStore {
             frame_counter: 0,
             sender: None,
             task_abort: None,
+            writer_abort: None,
             error: None,
         }));
         self.connections.write().await.insert(id, conn);
@@ -284,7 +287,7 @@ impl WsReplayStore {
                 }
             }
         }
-        self.prune_terminal_connections().await;
+        self.prune_terminal_connections(owner_session_id).await;
 
         let (task_abort, abort_registration) = AbortHandle::new_pair();
 
@@ -296,6 +299,7 @@ impl WsReplayStore {
             frame_counter: 0,
             sender: None,
             task_abort: Some(task_abort),
+            writer_abort: None,
             error: None,
         }));
         let previous = self
@@ -326,6 +330,7 @@ impl WsReplayStore {
                         let (tx, mut rx) = mpsc::channel::<WsReplayOutboundMessage>(
                             WS_REPLAY_OUTBOUND_QUEUE_CAPACITY,
                         );
+                        let (writer_abort, writer_abort_registration) = AbortHandle::new_pair();
 
                         {
                             let mut c = conn.write().await;
@@ -336,46 +341,52 @@ impl WsReplayStore {
                             }
                             c.status = WsReplayStatus::Connected;
                             c.sender = Some(tx);
+                            c.writer_abort = Some(writer_abort);
                         }
 
                         let (mut write, mut read) = ws_stream.split();
 
                         // Spawn writer task
                         let conn_for_writer = conn.clone();
-                        let mut write_task = tokio::spawn(async move {
-                            while let Some(outbound) = rx.recv().await {
-                                let (msg, recorded_index) = match outbound {
-                                    WsReplayOutboundMessage::Message(msg) => (msg, None),
-                                    WsReplayOutboundMessage::Close { recorded_index } => {
-                                        (WsMessage::Close(None), recorded_index)
+                        let mut write_task = tokio::spawn(Abortable::new(
+                            async move {
+                                while let Some(outbound) = rx.recv().await {
+                                    let (msg, recorded_index) = match outbound {
+                                        WsReplayOutboundMessage::Message(msg) => (msg, None),
+                                        WsReplayOutboundMessage::Close { recorded_index } => {
+                                            (WsMessage::Close(None), recorded_index)
+                                        }
+                                    };
+                                    let recorded_msg = msg.clone();
+                                    let recorded_index = if recorded_index.is_some() {
+                                        recorded_index
+                                    } else {
+                                        let mut c = conn_for_writer.write().await;
+                                        c.push_frame(
+                                            WebSocketFrameDirection::ClientToServer,
+                                            &recorded_msg,
+                                        )
+                                    };
+                                    if let Err(error) = write.send(msg).await {
+                                        let mut c = conn_for_writer.write().await;
+                                        if let Some(index) = recorded_index {
+                                            c.remove_frame(index);
+                                        }
+                                        c.status = WsReplayStatus::Error;
+                                        c.error = Some(format!(
+                                            "failed to send WebSocket frame: {error}"
+                                        ));
+                                        c.sender = None;
+                                        break;
                                     }
-                                };
-                                let recorded_msg = msg.clone();
-                                let recorded_index = if recorded_index.is_some() {
-                                    recorded_index
-                                } else {
-                                    let mut c = conn_for_writer.write().await;
-                                    c.push_frame(
-                                        WebSocketFrameDirection::ClientToServer,
-                                        &recorded_msg,
-                                    )
-                                };
-                                if let Err(error) = write.send(msg).await {
-                                    let mut c = conn_for_writer.write().await;
-                                    if let Some(index) = recorded_index {
-                                        c.remove_frame(index);
-                                    }
-                                    c.status = WsReplayStatus::Error;
-                                    c.error =
-                                        Some(format!("failed to send WebSocket frame: {error}"));
-                                    c.sender = None;
-                                    break;
                                 }
-                            }
-                            if let Err(error) = write.close().await {
-                                warn!(?error, "failed to close WebSocket replay writer");
-                            }
-                        });
+                                if let Err(error) = write.close().await {
+                                    warn!(?error, "failed to close WebSocket replay writer");
+                                }
+                                conn_for_writer.write().await.writer_abort = None;
+                            },
+                            writer_abort_registration,
+                        ));
 
                         // Read incoming messages
                         let mut read_error = None;
@@ -433,6 +444,7 @@ impl WsReplayStore {
                         }
                         c.sender = None;
                         c.task_abort = None;
+                        c.writer_abort = None;
                     }
                     Err(e) => {
                         if !connection_is_current(&connections, id, &conn).await {
@@ -446,6 +458,7 @@ impl WsReplayStore {
                         c.error = Some(e.to_string());
                         c.sender = None;
                         c.task_abort = None;
+                        c.writer_abort = None;
                     }
                 }
             },
@@ -505,7 +518,7 @@ impl WsReplayStore {
         }
     }
 
-    async fn prune_terminal_connections(&self) {
+    async fn prune_terminal_connections(&self, owner_session_id: Uuid) {
         let candidates = {
             let connections = self.connections.read().await;
             connections
@@ -513,18 +526,27 @@ impl WsReplayStore {
                 .map(|(id, conn)| (*id, conn.clone()))
                 .collect::<Vec<_>>()
         };
-        let mut remove_ids = Vec::new();
+        let mut remove_candidates = Vec::new();
         for (id, conn) in candidates {
-            if conn.read().await.is_terminal() {
-                remove_ids.push(id);
+            let should_remove = {
+                let connection = conn.read().await;
+                connection.owner_session_id == owner_session_id && connection.is_terminal()
+            };
+            if should_remove {
+                remove_candidates.push((id, conn));
             }
         }
-        if remove_ids.is_empty() {
+        if remove_candidates.is_empty() {
             return;
         }
         let mut connections = self.connections.write().await;
-        for id in remove_ids {
-            connections.remove(&id);
+        for (id, candidate) in remove_candidates {
+            if connections
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &candidate))
+            {
+                connections.remove(&id);
+            }
         }
     }
 
@@ -577,7 +599,7 @@ impl WsReplayStore {
     /// Disconnect an active connection.
     pub async fn disconnect(&self, id: Uuid) -> Result<()> {
         if let Some(conn) = self.connection(id).await {
-            let (abort, graceful_close) = {
+            let (abort, writer_abort, graceful_close) = {
                 let mut c = conn.write().await;
                 let graceful_close = if let Some(sender) = c.sender.take() {
                     let recorded_index = c.push_frame(
@@ -597,9 +619,13 @@ impl WsReplayStore {
                     false
                 };
                 let abort = c.task_abort.take();
+                let writer_abort = (!graceful_close).then(|| c.writer_abort.take()).flatten();
                 c.status = WsReplayStatus::Disconnected;
-                (abort, graceful_close)
+                (abort, writer_abort, graceful_close)
             };
+            if let Some(writer_abort) = writer_abort {
+                writer_abort.abort();
+            }
             if let Some(abort) = abort {
                 abort_connection_after_close(abort, graceful_close);
             }
@@ -731,8 +757,12 @@ async fn disconnect_connection_handle(conn: WsReplayConnectionHandle) {
     } else {
         false
     };
+    let writer_abort = (!graceful_close).then(|| c.writer_abort.take()).flatten();
     if let Some(abort) = c.task_abort.take() {
         abort_connection_after_close(abort, graceful_close);
+    }
+    if let Some(writer_abort) = writer_abort {
+        writer_abort.abort();
     }
     c.status = WsReplayStatus::Disconnected;
 }
@@ -773,6 +803,7 @@ mod tests {
             frame_counter: 0,
             sender,
             task_abort: None,
+            writer_abort: None,
             error: None,
         }
     }
@@ -1055,6 +1086,8 @@ mod tests {
     async fn connect_prunes_terminal_connections_before_connection_cap() {
         let store = WsReplayStore::new();
         let owner = Uuid::new_v4();
+        let other_owner = Uuid::new_v4();
+        let other_terminal_id = Uuid::new_v4();
         {
             let mut connections = store.connections.write().await;
             for _ in 0..MAX_WS_REPLAY_CONNECTIONS {
@@ -1063,6 +1096,10 @@ mod tests {
                 connection.error = Some("connection refused".to_string());
                 connections.insert(Uuid::new_v4(), Arc::new(RwLock::new(connection)));
             }
+            let mut other_terminal = test_connection(WsReplayStatus::Error, None);
+            other_terminal.owner_session_id = other_owner;
+            other_terminal.error = Some("other session error".to_string());
+            connections.insert(other_terminal_id, Arc::new(RwLock::new(other_terminal)));
         }
 
         let id = Uuid::new_v4();
@@ -1071,7 +1108,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.connections.read().await.len(), 1);
+        assert_eq!(store.connections.read().await.len(), 2);
+        assert!(store.snapshot(other_terminal_id).await.is_some());
         store.remove(id).await;
     }
 
@@ -1186,6 +1224,67 @@ mod tests {
             }) if index == close_frame.index
         ));
         assert!(!abort.is_aborted());
+    }
+
+    #[tokio::test]
+    async fn disconnect_full_queue_aborts_writer_and_drops_synthetic_close() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(WsReplayOutboundMessage::Message(WsMessage::Text(
+            "queued".into(),
+        )))
+        .unwrap();
+        let (task_abort, _task_registration) = AbortHandle::new_pair();
+        let (writer_abort, _writer_registration) = AbortHandle::new_pair();
+        let mut connection_state = test_connection(WsReplayStatus::Connected, Some(tx));
+        connection_state.task_abort = Some(task_abort.clone());
+        connection_state.writer_abort = Some(writer_abort.clone());
+        let connection = Arc::new(RwLock::new(connection_state));
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, connection.clone());
+
+        store.disconnect(id).await.unwrap();
+
+        assert!(task_abort.is_aborted());
+        assert!(writer_abort.is_aborted());
+        assert_eq!(connection.read().await.status, WsReplayStatus::Disconnected);
+        assert!(connection.read().await.frames.is_empty());
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Message(WsMessage::Text(text))) if text == "queued"
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_full_queue_aborts_writer_and_removes_connection() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(WsReplayOutboundMessage::Message(WsMessage::Text(
+            "queued".into(),
+        )))
+        .unwrap();
+        let (task_abort, _task_registration) = AbortHandle::new_pair();
+        let (writer_abort, _writer_registration) = AbortHandle::new_pair();
+        let mut connection_state = test_connection(WsReplayStatus::Connected, Some(tx));
+        connection_state.task_abort = Some(task_abort.clone());
+        connection_state.writer_abort = Some(writer_abort.clone());
+        let connection = Arc::new(RwLock::new(connection_state));
+        store.connections.write().await.insert(id, connection);
+
+        store.remove(id).await;
+
+        assert!(task_abort.is_aborted());
+        assert!(writer_abort.is_aborted());
+        assert!(store.snapshot(id).await.is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Message(WsMessage::Text(text))) if text == "queued"
+        ));
     }
 
     #[tokio::test]

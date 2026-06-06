@@ -302,6 +302,9 @@ fn host_from_request_authority(authority: &str) -> Option<String> {
     if authority.is_empty() {
         return None;
     }
+    if authority.contains('@') {
+        return None;
+    }
     if let Some(bracketed) = authority.strip_prefix('[') {
         let (host, rest) = bracketed.split_once(']')?;
         if host.is_empty() || rest.contains(']') {
@@ -409,6 +412,9 @@ fn authorities_equivalent_for_origin(left: &str, right: &str, scheme: &str) -> b
 }
 
 fn authority_to_origin_parts(authority: &str, scheme: &str) -> Option<(String, u16)> {
+    if authority.contains('@') {
+        return None;
+    }
     let parsed = url::Url::parse(&format!("{scheme}://{authority}")).ok()?;
     let host = parsed.host_str()?.to_ascii_lowercase();
     let port = parsed
@@ -4955,6 +4961,22 @@ mod tests {
 
         headers.insert("host", HeaderValue::from_static("127.0.0.1:23001:extra"));
         assert!(!super::request_host_is_allowed_local_api(&headers, &uri));
+
+        headers.insert("host", HeaderValue::from_static("user@127.0.0.1:23001"));
+        assert!(!super::request_host_is_allowed_local_api(&headers, &uri));
+
+        headers.insert("host", HeaderValue::from_static("user@localhost:23001"));
+        assert!(!super::request_host_is_allowed_local_api(&headers, &uri));
+    }
+
+    #[test]
+    fn local_api_write_guard_rejects_origin_match_through_userinfo_authority() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("user@127.0.0.1:23001"));
+        headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:23001"));
+        let uri = Uri::from_static("/api/runtime");
+
+        assert!(!super::is_allowed_browser_write(&headers, &uri));
     }
 
     #[tokio::test]

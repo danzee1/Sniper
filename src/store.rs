@@ -174,7 +174,7 @@ impl CachedSummary {
             .to_ascii_lowercase();
         let path_extension = extract_path_extension(&summary.path);
         let path_lower = summary.path.to_ascii_lowercase();
-        let port = extract_host_port(&summary.host).map(str::to_string);
+        let port = effective_summary_port(&summary);
         let mime = infer_summary_mime(&summary);
         let total_bytes = summary_total_bytes(&summary);
         let is_tls = is_tls_summary(&summary);
@@ -1396,6 +1396,20 @@ fn matches_port_filter(actual: Option<&str>, port: Option<&str>) -> bool {
     actual.unwrap_or("") == expected
 }
 
+fn effective_summary_port(summary: &TransactionSummary) -> Option<String> {
+    extract_host_port(&summary.host)
+        .map(str::to_string)
+        .or_else(|| default_port_for_scheme(&summary.scheme).map(str::to_string))
+}
+
+fn default_port_for_scheme(scheme: &str) -> Option<&'static str> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "ws" => Some("80"),
+        "https" | "wss" => Some("443"),
+        _ => None,
+    }
+}
+
 fn matches_color_tags(color_tag: Option<&str>, color_tags: &[String]) -> bool {
     if color_tags.is_empty() {
         return true;
@@ -1574,6 +1588,10 @@ mod tests {
     use crate::model::{BodyEncoding, HeaderRecord, MessageRecord, TransactionRecord};
 
     fn test_record(host: &str) -> TransactionRecord {
+        test_record_with_scheme(host, "https")
+    }
+
+    fn test_record_with_scheme(host: &str, scheme: &str) -> TransactionRecord {
         let message = MessageRecord {
             headers: Vec::new(),
             body_preview: String::new(),
@@ -1587,7 +1605,7 @@ mod tests {
         TransactionRecord::http(
             Utc::now(),
             "GET".into(),
-            "https".into(),
+            scheme.into(),
             host.into(),
             "/".into(),
             Some(200),
@@ -2817,6 +2835,35 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].host, "[::1]:9443");
+    }
+
+    #[tokio::test]
+    async fn port_filter_matches_default_ports_for_bare_hosts() {
+        let store = TransactionStore::new();
+        store
+            .insert(test_record_with_scheme("plain-http.example", "http"))
+            .await;
+        store
+            .insert(test_record_with_scheme("secure-https.example", "https"))
+            .await;
+
+        let http = store
+            .list(&ListFilters {
+                port: Some("80".into()),
+                ..Default::default()
+            })
+            .await;
+        let https = store
+            .list(&ListFilters {
+                port: Some("443".into()),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(http.len(), 1);
+        assert_eq!(http[0].host, "plain-http.example");
+        assert_eq!(https.len(), 1);
+        assert_eq!(https[0].host, "secure-https.example");
     }
 
     #[tokio::test]

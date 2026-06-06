@@ -586,6 +586,10 @@ impl SessionRegistry {
             }
         };
 
+        if remove_orphan_quarantined_deleted_session_storage(&root_dir) {
+            repair_registry = true;
+        }
+
         if normalize_registry_snapshot(&root_dir, &mut registry) {
             repair_registry = true;
         }
@@ -1000,6 +1004,53 @@ fn remove_quarantined_deleted_session_storage(root_dir: &Path, id: Uuid) -> bool
         still_exists |= remove_deleted_session_storage_path(&entry.path(), id);
     }
     still_exists
+}
+
+fn remove_orphan_quarantined_deleted_session_storage(root_dir: &Path) -> bool {
+    let entries = match fs::read_dir(root_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            warn!(
+                %error,
+                path = %root_dir.display(),
+                "failed to inspect session root for orphaned quarantined storage"
+            );
+            return false;
+        }
+    };
+    let mut removed_any = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    %error,
+                    path = %root_dir.display(),
+                    "failed to inspect orphaned quarantined session storage entry"
+                );
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(id) =
+            quarantined_deleted_session_id_from_name(file_name.to_string_lossy().as_ref())
+        else {
+            continue;
+        };
+        removed_any |= !remove_deleted_session_storage_path(&entry.path(), id);
+    }
+    removed_any
+}
+
+fn quarantined_deleted_session_id_from_name(name: &str) -> Option<Uuid> {
+    let value = name.strip_prefix(".deleted-")?;
+    let id_text = value.get(..36)?;
+    let suffix = value.get(36..)?;
+    if !suffix.starts_with('-') {
+        return None;
+    }
+    Uuid::parse_str(id_text).ok()
 }
 
 fn remove_deleted_session_storage_path(path: &Path, id: Uuid) -> bool {
@@ -2316,6 +2367,52 @@ mod tests {
         assert!(snapshot.deleted_session_ids.is_empty());
         assert!(!quarantine_path.exists());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn registry_load_removes_crash_left_orphan_quarantined_storage() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-orphan-quarantine-load-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let active = super::default_session_metadata("Active");
+        let orphan = super::default_session_metadata("Orphaned delete");
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        super::persist_session_snapshot(
+            &root_dir,
+            &orphan,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("orphan snapshot should be written before quarantine");
+        let orphan_storage = super::session_dir(&root_dir, orphan.id);
+        let quarantine_path = super::deleted_session_dir(&root_dir, orphan.id);
+        std::fs::rename(&orphan_storage, &quarantine_path)
+            .expect("orphan session storage should be quarantined");
+        super::write_json(
+            &root_dir.join(super::REGISTRY_FILE),
+            &serde_json::json!({
+                "active_session_id": active.id,
+                "sessions": [active.clone(), orphan.clone()]
+            }),
+        )
+        .expect("pre-crash registry should be written");
+
+        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("registry should repair orphaned quarantine");
+
+        assert_eq!(loaded_active.id(), active.id);
+        assert!(registry.contains_session(active.id));
+        assert!(!registry.contains_session(orphan.id));
+        assert!(!orphan_storage.exists());
+        assert!(!quarantine_path.exists());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

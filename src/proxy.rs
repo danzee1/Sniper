@@ -819,6 +819,7 @@ async fn handle_connect(
                 upgrade,
                 state,
                 session,
+                target.clone(),
                 request_capture,
                 started_at,
                 started,
@@ -1361,20 +1362,29 @@ fn rebuild_streaming_response(
         sanitized.remove(CONTENT_LENGTH);
     }
 
-    let mut response = Response::new(body);
+    let wire_body = if response_must_not_include_body(status, request_method) {
+        Body::empty()
+    } else {
+        body
+    };
+
+    let mut response = Response::new(wire_body);
     *response.status_mut() = status;
     *response.headers_mut() = sanitized;
     response
 }
 
 fn response_must_not_include_content_length(status: StatusCode) -> bool {
-    status.is_informational() || status == StatusCode::NO_CONTENT
+    status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
 }
 
 fn response_must_not_include_body(status: StatusCode, request_method: &str) -> bool {
     request_method.eq_ignore_ascii_case("HEAD")
         || status.is_informational()
         || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
         || status == StatusCode::NOT_MODIFIED
 }
 
@@ -1643,6 +1653,7 @@ async fn serve_special_host_tls(
     upgrade: hyper::upgrade::OnUpgrade,
     state: Arc<AppState>,
     session: Arc<SessionContext>,
+    connect_target: String,
     connect_capture: MessageRecord,
     started_at: chrono::DateTime<Utc>,
     started: Instant,
@@ -1654,7 +1665,7 @@ async fn serve_special_host_tls(
             record_connect_tunnel_failure(
                 &state,
                 &session,
-                "sniper:443".to_string(),
+                connect_target.clone(),
                 connect_capture,
                 started_at,
                 started,
@@ -1672,7 +1683,7 @@ async fn serve_special_host_tls(
             record_connect_tunnel_failure(
                 &state,
                 &session,
-                "sniper:443".to_string(),
+                connect_target.clone(),
                 connect_capture,
                 started_at,
                 started,
@@ -1689,7 +1700,7 @@ async fn serve_special_host_tls(
             record_connect_tunnel_failure(
                 &state,
                 &session,
-                "sniper:443".to_string(),
+                connect_target.clone(),
                 connect_capture,
                 started_at,
                 started,
@@ -1704,7 +1715,7 @@ async fn serve_special_host_tls(
         &session,
         TransactionRecord::tunnel(
             started_at,
-            "sniper:443".to_string(),
+            connect_target,
             Some(StatusCode::OK.as_u16()),
             started.elapsed().as_millis() as u64,
             connect_capture,
@@ -2750,7 +2761,8 @@ async fn execute_streaming_http_exchange(
         }
     };
 
-    let host_override = request_headers.get(HOST).cloned();
+    let host_override =
+        replay_host_override(&request_headers, outbound_uri_authority, &request.host);
     let mut outbound_headers = request_headers.clone();
     strip_hop_by_hop_headers(&mut outbound_headers);
     outbound_headers.remove(HOST);
@@ -3125,7 +3137,8 @@ async fn execute_http_exchange(
         }
     };
 
-    let host_override = request_headers.get(HOST).cloned();
+    let host_override =
+        replay_host_override(&request_headers, outbound_uri_authority, &request.host);
     let mut outbound_headers = request_headers.clone();
     strip_hop_by_hop_headers(&mut outbound_headers);
     outbound_headers.remove(HOST);
@@ -3506,6 +3519,19 @@ fn build_uri_from_request(
         .path_and_query(normalize_request_path(&request.path))
         .build()
         .map_err(|error| anyhow!("failed to build upstream URI: {error}"))
+}
+
+fn replay_host_override(
+    request_headers: &HeaderMap,
+    outbound_uri_authority: Option<&str>,
+    request_host: &str,
+) -> Option<HeaderValue> {
+    request_headers.get(HOST).cloned().or_else(|| {
+        outbound_uri_authority
+            .is_some()
+            .then(|| HeaderValue::from_str(request_host).ok())
+            .flatten()
+    })
 }
 
 fn normalize_request_path(path: &str) -> String {
@@ -5924,6 +5950,28 @@ mod tests {
     }
 
     #[test]
+    fn replay_target_override_injects_original_host_when_missing() {
+        let headers = HeaderMap::new();
+        let host_override =
+            replay_host_override(&headers, Some("origin.example"), "origin.example:8080")
+                .expect("target override should synthesize original Host");
+
+        assert_eq!(host_override, "origin.example:8080");
+    }
+
+    #[test]
+    fn replay_target_override_keeps_explicit_host_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("signed.example:9443"));
+
+        let host_override =
+            replay_host_override(&headers, Some("origin.example"), "origin.example:8080")
+                .expect("explicit Host should be preserved");
+
+        assert_eq!(host_override, "signed.example:9443");
+    }
+
+    #[test]
     fn replay_outbound_uri_authority_ignores_equivalent_target_override() {
         let request = editable_request("origin.example:8443");
         let target = RequestTargetOverride {
@@ -6043,6 +6091,40 @@ mod tests {
         );
 
         assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "55");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebuild_response_removes_reset_content_body_and_framing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("7"));
+
+        let response = rebuild_response(
+            headers,
+            StatusCode::RESET_CONTENT,
+            Bytes::from_static(b"illegal"),
+            "GET",
+        );
+
+        assert!(!response.headers().contains_key(CONTENT_LENGTH));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebuild_streaming_response_removes_reset_content_framing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("7"));
+
+        let response = rebuild_streaming_response(
+            headers,
+            StatusCode::RESET_CONTENT,
+            Body::from("illegal"),
+            "GET",
+        );
+
+        assert!(!response.headers().contains_key(CONTENT_LENGTH));
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
     }

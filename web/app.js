@@ -4225,9 +4225,7 @@ async function loadWebsocketDetail(id, options = {}) {
       note_count: Number.isFinite(Number(summary?.note_count))
         ? Number(summary.note_count)
         : (Array.isArray(detail.notes) ? detail.notes.length : 0),
-      frames_truncated: Array.isArray(detail.frames)
-        && Number.isFinite(Number(summary?.frame_count))
-        && detail.frames.length < Number(summary.frame_count),
+      frames_truncated: websocketFramesAreTruncated(detail.frames, summary),
     };
     state.selectedWebsocketDetailError = "";
     renderWebsocketSessions();
@@ -4333,9 +4331,7 @@ function applyWebsocketSummaryEvent(event) {
       frame_count: summary.frame_count,
       last_frame_index: summary.last_frame_index,
       note_count: summary.note_count,
-      frames_truncated: Number.isFinite(Number(summary.frame_count))
-        && Array.isArray(state.selectedWebsocketRecord.frames)
-        && state.selectedWebsocketRecord.frames.length < Number(summary.frame_count),
+      frames_truncated: websocketFramesAreTruncated(state.selectedWebsocketRecord.frames, summary),
     };
     if (Number(loadedLastFrameIndex ?? -1) !== Number(summary.last_frame_index ?? -1)) {
       scheduleSelectedWebsocketDetailRefresh(summary.id);
@@ -5165,7 +5161,24 @@ function extractSummaryPathExtension(path) {
 function summaryMatchesPortFilter(item, filters) {
   const expected = String(filters.port || "").trim();
   if (!expected) return true;
-  return extractHostPort(item.host || "") === expected;
+  return effectiveSummaryPort(item) === expected;
+}
+
+function effectiveSummaryPort(item) {
+  return extractHostPort(item?.host || "") || defaultSummaryPortForScheme(item?.scheme || "");
+}
+
+function defaultSummaryPortForScheme(scheme) {
+  switch (String(scheme || "").toLowerCase()) {
+    case "http":
+    case "ws":
+      return "80";
+    case "https":
+    case "wss":
+      return "443";
+    default:
+      return "";
+  }
 }
 
 function summaryMatchesColorTags(item, filters) {
@@ -8389,12 +8402,21 @@ function renderWebsocketSessions(options = {}) {
   const fullFrameCount = Number.isFinite(Number(session.frame_count))
     ? Number(session.frame_count)
     : frames.length;
-  const frameNumberOffset = Math.max(0, fullFrameCount - frames.length);
-  const framePositions = new Map(frames.map((frame, index) => [frame.index, frameNumberOffset + index + 1]));
-  const frameWindowNotice = session.frames_truncated && frameNumberOffset > 0
+  const firstLoadedFrameIndex = frames.length ? Number(frames[0]?.index) : 0;
+  const olderFrameCount = Number.isFinite(firstLoadedFrameIndex)
+    ? Math.max(0, firstLoadedFrameIndex)
+    : Math.max(0, fullFrameCount - frames.length);
+  const framePositions = new Map(frames.map((frame, index) => {
+    const frameIndex = Number(frame.index);
+    return [
+      frame.index,
+      Number.isFinite(frameIndex) ? frameIndex + 1 : olderFrameCount + index + 1,
+    ];
+  }));
+  const frameWindowNotice = (session.frames_truncated || olderFrameCount > 0) && olderFrameCount > 0
     ? `
           <tr class="ws-frame-window-row">
-            <td colspan="5">Showing latest ${frames.length} of ${fullFrameCount} frames (${frameNumberOffset} older not loaded).</td>
+            <td colspan="5">Showing latest ${frames.length} frames (${olderFrameCount} older not loaded).</td>
           </tr>`
     : "";
   els.websocketFramesBody.innerHTML = frames.length
@@ -16083,6 +16105,18 @@ function normalizeWebsocketFrames(frames) {
 
 function getWebsocketFrames(session) {
   return normalizeWebsocketFrames(session?.frames);
+}
+
+function websocketFramesAreTruncated(frames, summary) {
+  if (!Array.isArray(frames) || !frames.length) {
+    return false;
+  }
+  const firstFrameIndex = Number(frames[0]?.index);
+  if (Number.isFinite(firstFrameIndex) && firstFrameIndex > 0) {
+    return true;
+  }
+  return Number.isFinite(Number(summary?.frame_count))
+    && frames.length < Number(summary.frame_count);
 }
 
 function getWsReplayFrames(tab) {
