@@ -12878,6 +12878,10 @@ function duplicateActiveReplayTab() {
       setupQueue: Array.isArray(tab.wsSetupQueue)
         ? tab.wsSetupQueue.map((item) => ({ ...item }))
         : [],
+      capturedFrames: getWsReplayFrames(tab),
+      selectedFrameIndex: tab.wsSelectedFrameIndex,
+      frameWindowStart: tab.wsFrameWindowStart,
+      framesTruncated: !!tab.wsFramesTruncated,
       customLabel: tab.customLabel || "",
     });
     return;
@@ -17200,6 +17204,7 @@ function wsSetupItemFromCapturedFrame(frame) {
 function createWsReplayTab(seed = {}) {
   state.replayTabSequence += 1;
   const selectedFrameIndex = Number(seed.selectedFrameIndex);
+  const seedFrames = normalizeWebsocketFrames(seed.capturedFrames);
   const tab = {
     id: crypto.randomUUID(),
     type: "websocket",
@@ -17214,11 +17219,12 @@ function createWsReplayTab(seed = {}) {
     wsHandshakeText: seed.handshakeText || "",
     wsHandshakeEdited: !!seed.handshakeEdited,
     wsStatus: "disconnected",
-    wsFrames: [],
+    wsFrames: seedFrames,
     wsFrameIndexes: new Set(),
     wsNextFrameIndex: 0,
-    wsFramesTruncated: false,
-    wsSelectedFrameIndex: -1,
+    wsFramesTruncated: !!seed.framesTruncated || websocketFramesAreTruncated(seedFrames, null),
+    wsSelectedFrameIndex: normalizeWsReplaySavedFrameIndex(seedFrames, seed.selectedFrameIndex),
+    wsFrameWindowStart: normalizeWsReplaySavedFrameWindowStart(seedFrames, seed.frameWindowStart),
     wsSessionId: null,
     wsEditorText: seed.editorText || "",
     wsMessageType: normalizeWsMessageType(seed.messageType),
@@ -17231,12 +17237,13 @@ function createWsReplayTab(seed = {}) {
     wsSetupNotice: seed.setupQueueNotice || "",
     wsSetupQueue: Array.isArray(seed.setupQueue)
       ? seed.setupQueue.map((item) => normalizeWsSetupItem(item))
-      : normalizeWebsocketFrames(seed.capturedFrames)
+      : seedFrames
         .filter((f) => f.direction === "client_to_server")
         .filter((f) => !Number.isFinite(selectedFrameIndex) || f.index < selectedFrameIndex)
         .filter((f) => !f.preview_truncated)
         .map((f) => wsSetupItemFromCapturedFrame(f)),
   };
+  rebuildWsReplayFrameTracking(tab);
   state.replayTabs.push(tab);
   state.activeReplayTabId = tab.id;
   scheduleWorkspaceStateSave();

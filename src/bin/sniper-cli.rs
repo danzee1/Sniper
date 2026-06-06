@@ -4248,13 +4248,17 @@ fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult
     let codex_root = install_codex.then(|| {
         args.codex_dir
             .clone()
-            .unwrap_or_else(skills::default_codex_skills_dir)
+            .or_else(skills::default_codex_skills_dir)
+            .context("could not determine Codex skills directory; set HOME or pass --codex-dir")
     });
     let claude_root = install_claude.then(|| {
         args.claude_dir
             .clone()
-            .unwrap_or_else(skills::default_claude_skills_dir)
+            .or_else(skills::default_claude_skills_dir)
+            .context("could not determine Claude skills directory; set HOME or pass --claude-dir")
     });
+    let codex_root = codex_root.transpose()?;
+    let claude_root = claude_root.transpose()?;
     if let (Some(codex_root), Some(claude_root)) = (&codex_root, &claude_root) {
         skills::ensure_distinct_skill_install_targets(codex_root, claude_root)?;
     }
@@ -4448,6 +4452,15 @@ mod tests {
                 previous: std::env::var_os(key),
             };
             std::env::set_var(key, value.into());
+            guard
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::remove_var(key);
             guard
         }
     }
@@ -6851,13 +6864,13 @@ mod tests {
 
     #[test]
     fn codex_default_skills_dir_uses_hidden_folder() {
-        let path = skills::default_codex_skills_dir();
+        let path = skills::default_codex_skills_dir().unwrap();
         assert!(path.to_string_lossy().contains(".codex/skills") || path.ends_with("skills"));
     }
 
     #[test]
     fn claude_default_skills_dir_uses_hidden_folder() {
-        let path = skills::default_claude_skills_dir();
+        let path = skills::default_claude_skills_dir().unwrap();
         assert!(path.to_string_lossy().contains(".claude/skills") || path.ends_with("skills"));
     }
 
@@ -6891,5 +6904,24 @@ mod tests {
         assert!(error.to_string().contains("same SKILL.md path"));
         assert!(!root.join(skills::SKILL_NAME).join("SKILL.md").exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skills_install_all_errors_when_default_home_is_unavailable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::remove("HOME");
+        let _userprofile = EnvVarGuard::remove("USERPROFILE");
+        let _codex_home = EnvVarGuard::remove("CODEX_HOME");
+        let _claude_home = EnvVarGuard::remove("CLAUDE_HOME");
+
+        let error = install_skills(SkillsInstallArgs {
+            all: true,
+            ..SkillsInstallArgs::default()
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("could not determine Codex skills directory"));
     }
 }

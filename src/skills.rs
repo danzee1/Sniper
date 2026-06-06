@@ -26,8 +26,24 @@ pub struct SkillsInstallResult {
     pub installed: Vec<InstalledSkill>,
 }
 
-/// Install skill files into the given root directory while preserving user files.
+/// Install or update the managed skill files into the given root directory.
 pub fn install_skill_folder(root: &Path, name: &str, skill_md: &str) -> Result<PathBuf> {
+    let (skill_dir, skill_path) = prepare_skill_folder(root, name)?;
+    write_skill_markdown(&skill_dir, &skill_path, skill_md)?;
+    Ok(skill_dir)
+}
+
+/// Install the managed skill only when the main SKILL.md is not already present.
+pub fn install_skill_folder_if_missing(root: &Path, name: &str, skill_md: &str) -> Result<PathBuf> {
+    let (skill_dir, skill_path) = prepare_skill_folder(root, name)?;
+    if path_is_occupied(&skill_path)? {
+        return Ok(skill_dir);
+    }
+    write_skill_markdown(&skill_dir, &skill_path, skill_md)?;
+    Ok(skill_dir)
+}
+
+fn prepare_skill_folder(root: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
     validate_skill_folder_name(name)?;
     fs::create_dir_all(root)
         .with_context(|| format!("failed to create skills dir {}", root.display()))?;
@@ -35,10 +51,14 @@ pub fn install_skill_folder(root: &Path, name: &str, skill_md: &str) -> Result<P
     fs::create_dir_all(&skill_dir)
         .with_context(|| format!("failed to create {}", skill_dir.display()))?;
     let skill_path = skill_dir.join("SKILL.md");
+    Ok((skill_dir, skill_path))
+}
+
+fn write_skill_markdown(skill_dir: &Path, skill_path: &Path, skill_md: &str) -> Result<()> {
     let tmp_path = skill_dir.join(format!("SKILL.{}.tmp", uuid::Uuid::new_v4()));
     fs::write(&tmp_path, skill_md)
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    if let Err(error) = fs::rename(&tmp_path, &skill_path) {
+    if let Err(error) = fs::rename(&tmp_path, skill_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(error).with_context(|| {
             format!(
@@ -48,7 +68,16 @@ pub fn install_skill_folder(root: &Path, name: &str, skill_md: &str) -> Result<P
             )
         });
     }
-    Ok(skill_dir)
+    Ok(())
+}
+
+fn path_is_occupied(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect existing path {}", path.display())),
+    }
 }
 
 fn validate_skill_folder_name(name: &str) -> Result<()> {
@@ -63,18 +92,18 @@ fn validate_skill_folder_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn default_codex_skills_dir() -> PathBuf {
+pub fn default_codex_skills_dir() -> Option<PathBuf> {
     if let Some(codex_home) = agent_home_dir(env::var_os("CODEX_HOME")) {
-        return PathBuf::from(codex_home).join("skills");
+        return Some(PathBuf::from(codex_home).join("skills"));
     }
-    user_home_dir().join(".codex/skills")
+    user_home_dir().map(|home| home.join(".codex/skills"))
 }
 
-pub fn default_claude_skills_dir() -> PathBuf {
+pub fn default_claude_skills_dir() -> Option<PathBuf> {
     if let Some(claude_home) = agent_home_dir(env::var_os("CLAUDE_HOME")) {
-        return PathBuf::from(claude_home).join("skills");
+        return Some(PathBuf::from(claude_home).join("skills"));
     }
-    user_home_dir().join(".claude/skills")
+    user_home_dir().map(|home| home.join(".claude/skills"))
 }
 
 fn agent_home_dir(value: Option<OsString>) -> Option<OsString> {
@@ -85,11 +114,10 @@ fn agent_home_dir(value: Option<OsString>) -> Option<OsString> {
     Some(value)
 }
 
-pub fn user_home_dir() -> PathBuf {
+pub fn user_home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn ensure_distinct_skill_install_targets(codex_root: &Path, claude_root: &Path) -> Result<()> {
@@ -133,7 +161,13 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
 /// Install both Claude and Codex skills silently.
 /// Returns the list of installed skills, or an empty vec if nothing was installed.
 pub fn auto_install_all() -> Vec<InstalledSkill> {
-    auto_install_all_to(default_claude_skills_dir(), default_codex_skills_dir())
+    let Some(claude_root) = default_claude_skills_dir() else {
+        return Vec::new();
+    };
+    let Some(codex_root) = default_codex_skills_dir() else {
+        return Vec::new();
+    };
+    auto_install_all_to(claude_root, codex_root)
 }
 
 fn auto_install_all_to(claude_root: PathBuf, codex_root: PathBuf) -> Vec<InstalledSkill> {
@@ -143,14 +177,17 @@ fn auto_install_all_to(claude_root: PathBuf, codex_root: PathBuf) -> Vec<Install
         return installed;
     }
 
-    if let Ok(path) = install_skill_folder(&claude_root, SKILL_NAME, CLAUDE_SKILL_TEMPLATE) {
+    if let Ok(path) =
+        install_skill_folder_if_missing(&claude_root, SKILL_NAME, CLAUDE_SKILL_TEMPLATE)
+    {
         installed.push(InstalledSkill {
             agent: "claude",
             path: path.display().to_string(),
         });
     }
 
-    if let Ok(path) = install_skill_folder(&codex_root, SKILL_NAME, CODEX_SKILL_TEMPLATE) {
+    if let Ok(path) = install_skill_folder_if_missing(&codex_root, SKILL_NAME, CODEX_SKILL_TEMPLATE)
+    {
         installed.push(InstalledSkill {
             agent: "codex",
             path: path.display().to_string(),
@@ -218,6 +255,33 @@ mod tests {
             .join(super::SKILL_NAME)
             .join("SKILL.md")
             .exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_install_all_preserves_existing_skill_markdown() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-skill-preserve-{}", uuid::Uuid::new_v4()));
+        let claude_root = root.join("claude");
+        let codex_root = root.join("codex");
+        let claude_skill = claude_root.join(super::SKILL_NAME).join("SKILL.md");
+        let codex_skill = codex_root.join(super::SKILL_NAME).join("SKILL.md");
+        std::fs::create_dir_all(claude_skill.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(codex_skill.parent().unwrap()).unwrap();
+        std::fs::write(&claude_skill, "# custom claude skill\n").unwrap();
+        std::fs::write(&codex_skill, "# custom codex skill\n").unwrap();
+
+        let installed = auto_install_all_to(claude_root, codex_root);
+
+        assert_eq!(installed.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&claude_skill).unwrap(),
+            "# custom claude skill\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&codex_skill).unwrap(),
+            "# custom codex skill\n"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

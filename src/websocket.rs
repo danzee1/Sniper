@@ -23,6 +23,7 @@ pub struct WebSocketStore {
 struct WebSocketStoreInner {
     order: VecDeque<Uuid>,
     sessions: HashMap<Uuid, WebSocketSessionEntry>,
+    started_at_desc_ordered: bool,
 }
 
 impl WebSocketStoreInner {
@@ -30,6 +31,7 @@ impl WebSocketStoreInner {
         Self {
             order: VecDeque::with_capacity(capacity),
             sessions: HashMap::with_capacity(capacity),
+            started_at_desc_ordered: true,
         }
     }
 }
@@ -157,14 +159,25 @@ impl WebSocketStore {
     pub async fn open(&self, mut session: WebSocketSessionRecord) {
         trim_frame_overflow(&mut session.frames, self.max_frames_per_session);
         let summary = session.summary();
+        let started_at = session.started_at;
         let mut inner = self.inner.write().await;
         remove_ordered_session(&mut inner, session.id);
+        if inner.started_at_desc_ordered {
+            inner.started_at_desc_ordered = inner
+                .order
+                .front()
+                .and_then(|id| inner.sessions.get(id))
+                .is_none_or(|current_newest| started_at >= current_newest.started_at);
+        }
         let id = session.id;
         inner.order.push_front(id);
         inner
             .sessions
             .insert(id, WebSocketSessionEntry::from(session));
-        trim_overflow(&mut inner, self.max_entries);
+        let removed_any = trim_overflow(&mut inner, self.max_entries);
+        if removed_any && !inner.started_at_desc_ordered {
+            inner.started_at_desc_ordered = compute_storage_order_matches_started_at_desc(&inner);
+        }
         let _ = self.events.send(summary);
     }
 
@@ -196,7 +209,11 @@ impl WebSocketStore {
             }
             let summary = session.summary();
             let _ = self.events.send(summary);
-            trim_overflow(&mut inner, self.max_entries);
+            let removed_any = trim_overflow(&mut inner, self.max_entries);
+            if removed_any && !inner.started_at_desc_ordered {
+                inner.started_at_desc_ordered =
+                    compute_storage_order_matches_started_at_desc(&inner);
+            }
             true
         } else {
             false
@@ -402,6 +419,7 @@ fn inner_from_records(
             .sessions
             .insert(id, WebSocketSessionEntry::from(record));
     }
+    inner.started_at_desc_ordered = compute_storage_order_matches_started_at_desc(&inner);
     inner
 }
 
@@ -508,12 +526,12 @@ fn storage_order_satisfies_websocket_sort(
     }
     match sort_key {
         "index" => true,
-        "started_at" => storage_order_matches_started_at_desc(inner),
+        "started_at" => inner.started_at_desc_ordered,
         _ => false,
     }
 }
 
-fn storage_order_matches_started_at_desc(inner: &WebSocketStoreInner) -> bool {
+fn compute_storage_order_matches_started_at_desc(inner: &WebSocketStoreInner) -> bool {
     let mut previous_started_at: Option<DateTime<Utc>> = None;
     for session in inner.order.iter().filter_map(|id| inner.sessions.get(id)) {
         if previous_started_at
@@ -656,7 +674,8 @@ fn host_without_port(host: &str) -> &str {
     trimmed
 }
 
-fn trim_closed_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) {
+fn trim_closed_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) -> bool {
+    let mut removed_any = false;
     while inner.order.len() > max_entries {
         let Some(index) = inner.order.iter().rposition(|id| {
             inner
@@ -668,17 +687,21 @@ fn trim_closed_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) {
         };
         if let Some(id) = inner.order.remove(index) {
             inner.sessions.remove(&id);
+            removed_any = true;
         }
     }
+    removed_any
 }
 
-fn trim_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) {
-    trim_closed_overflow(inner, max_entries);
+fn trim_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) -> bool {
+    let mut removed_any = trim_closed_overflow(inner, max_entries);
     while inner.order.len() > max_entries {
         if let Some(id) = inner.order.pop_back() {
             inner.sessions.remove(&id);
+            removed_any = true;
         }
     }
+    removed_any
 }
 
 #[cfg(test)]
@@ -818,6 +841,7 @@ mod tests {
         oldest.started_at = base - chrono::Duration::seconds(20);
         let store = WebSocketStore::from_sessions(10, 10, vec![newest, middle, oldest]);
 
+        assert!(store.inner.read().await.started_at_desc_ordered);
         let page = store
             .list_page_filtered(&WebSocketListFilters {
                 limit: Some(1),
@@ -851,6 +875,7 @@ mod tests {
         oldest.started_at = base - chrono::Duration::seconds(20);
         let store = WebSocketStore::from_sessions(10, 10, vec![newest, oldest, middle]);
 
+        assert!(!store.inner.read().await.started_at_desc_ordered);
         let page = store
             .list_page_filtered(&WebSocketListFilters {
                 limit: Some(3),
@@ -871,6 +896,38 @@ mod tests {
                 "oldest.example.test"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn open_marks_started_at_desc_order_dirty_for_out_of_order_session() {
+        let base = Utc::now();
+        let mut newest = session(vec![frame(1)]);
+        newest.started_at = base;
+        let mut older = session(vec![frame(1)]);
+        older.started_at = base - chrono::Duration::seconds(10);
+        let store = WebSocketStore::from_sessions(10, 10, vec![newest]);
+
+        store.open(older).await;
+
+        assert!(!store.inner.read().await.started_at_desc_ordered);
+    }
+
+    #[tokio::test]
+    async fn open_recomputes_started_at_desc_order_after_retention_removes_dirty_record() {
+        let base = Utc::now();
+        let mut newest = session(vec![frame(1)]);
+        newest.started_at = base;
+        let mut older = session(vec![frame(1)]);
+        older.started_at = base - chrono::Duration::seconds(10);
+        let mut future = session(vec![frame(1)]);
+        future.started_at = base + chrono::Duration::seconds(10);
+        let store = WebSocketStore::from_sessions(2, 10, vec![newest]);
+
+        store.open(older).await;
+        assert!(!store.inner.read().await.started_at_desc_ordered);
+        store.open(future).await;
+
+        assert!(store.inner.read().await.started_at_desc_ordered);
     }
 
     #[tokio::test]
