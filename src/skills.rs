@@ -96,23 +96,13 @@ pub fn ensure_distinct_skill_install_targets(codex_root: &Path, claude_root: &Pa
     let codex_target = codex_root.join(SKILL_NAME).join("SKILL.md");
     let claude_target = claude_root.join(SKILL_NAME).join("SKILL.md");
     let canonical_conflict = match (
-        canonicalize_if_exists(&codex_target),
-        canonicalize_if_exists(&claude_target),
+        canonicalize_existing_prefix(&codex_target),
+        canonicalize_existing_prefix(&claude_target),
     ) {
         (Some(codex_target), Some(claude_target)) => codex_target == claude_target,
         _ => false,
     };
-    let canonical_root_conflict = match (
-        canonicalize_if_exists(codex_root),
-        canonicalize_if_exists(claude_root),
-    ) {
-        (Some(codex_root), Some(claude_root)) => {
-            codex_root.join(SKILL_NAME).join("SKILL.md")
-                == claude_root.join(SKILL_NAME).join("SKILL.md")
-        }
-        _ => false,
-    };
-    if codex_target == claude_target || canonical_conflict || canonical_root_conflict {
+    if codex_target == claude_target || canonical_conflict {
         bail!(
             "codex and claude skill destinations resolve to the same SKILL.md path: {}",
             codex_target.display()
@@ -121,8 +111,23 @@ pub fn ensure_distinct_skill_install_targets(codex_root: &Path, claude_root: &Pa
     Ok(())
 }
 
-fn canonicalize_if_exists(path: &Path) -> Option<PathBuf> {
-    fs::canonicalize(path).ok()
+fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    if let Ok(path) = fs::canonicalize(path) {
+        return Some(path);
+    }
+
+    let mut current = path;
+    let mut missing = Vec::new();
+    while !current.exists() {
+        missing.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+
+    let mut canonical = fs::canonicalize(current).ok()?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Some(canonical)
 }
 
 /// Install both Claude and Codex skills silently.
@@ -209,6 +214,33 @@ mod tests {
 
         assert!(installed.is_empty());
         assert!(!root
+            .join("skills")
+            .join(super::SKILL_NAME)
+            .join("SKILL.md")
+            .exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_install_all_skips_symlinked_missing_skill_roots() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "sniper-skill-symlink-same-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let shared_home = root.join("shared-home");
+        let codex_home = root.join("codex-home");
+        let claude_home = root.join("claude-home");
+        std::fs::create_dir_all(&shared_home).unwrap();
+        symlink(&shared_home, &codex_home).unwrap();
+        symlink(&shared_home, &claude_home).unwrap();
+
+        let installed = auto_install_all_to(claude_home.join("skills"), codex_home.join("skills"));
+
+        assert!(installed.is_empty());
+        assert!(!shared_home
             .join("skills")
             .join(super::SKILL_NAME)
             .join("SKILL.md")

@@ -2651,7 +2651,7 @@ function hydrateReplayTab(tab) {
   if (tab.type === "websocket") {
     const wsScheme = tab.ws_scheme || "wss";
     const wsFrames = normalizeWebsocketFrames(tab.ws_frames);
-    return {
+    const replayTab = {
       id: isUuidString(tab.id) ? tab.id : crypto.randomUUID(),
       type: "websocket",
       sequence: Number.isFinite(tab.sequence) ? tab.sequence : state.replayTabSequence + 1,
@@ -2684,6 +2684,8 @@ function hydrateReplayTab(tab) {
       wsSetupPending: false,
       wsSetupRunning: false,
     };
+    rebuildWsReplayFrameTracking(replayTab);
+    return replayTab;
   }
 
   const fallbackRequest = tab.base_request ? cloneEditableRequest(tab.base_request) : createDefaultEditableRequest();
@@ -16933,12 +16935,59 @@ function wsFrameIndexValue(frame, fallbackIndex = 0) {
 }
 
 function wsReplayFrameIndexSet(tab) {
+  return rebuildWsReplayFrameTracking(tab);
+}
+
+function rebuildWsReplayFrameTracking(tab) {
   const indexes = new Set();
+  let nextIndex = 0;
   const frames = getRawWsReplayFrames(tab);
   for (let index = 0; index < frames.length; index += 1) {
-    indexes.add(wsFrameIndexValue(frames[index], index));
+    const frameIndex = wsFrameIndexValue(frames[index], index);
+    indexes.add(frameIndex);
+    nextIndex = Math.max(nextIndex, frameIndex + 1);
+  }
+  if (tab && typeof tab === "object") {
+    tab.wsFrameIndexes = indexes;
+    tab.wsNextFrameIndex = nextIndex;
   }
   return indexes;
+}
+
+function ensureWsReplayFrameTracking(tab) {
+  if (
+    !tab
+    || !(tab.wsFrameIndexes instanceof Set)
+    || !Number.isFinite(Number(tab.wsNextFrameIndex))
+  ) {
+    return rebuildWsReplayFrameTracking(tab);
+  }
+  return tab.wsFrameIndexes;
+}
+
+function resetWsReplayFrameTracking(tab) {
+  if (!tab || typeof tab !== "object") return;
+  tab.wsFrameIndexes = new Set();
+  tab.wsNextFrameIndex = 0;
+}
+
+function trackWsReplayFrameIndex(tab, frame, fallbackIndex = 0) {
+  const indexes = ensureWsReplayFrameTracking(tab);
+  const frameIndex = wsFrameIndexValue(frame, fallbackIndex);
+  indexes.add(frameIndex);
+  tab.wsNextFrameIndex = Math.max(Number(tab.wsNextFrameIndex) || 0, frameIndex + 1);
+  return frameIndex;
+}
+
+function forgetWsReplayFrameIndex(tab, frame, fallbackIndex = 0) {
+  if (!tab?.wsFrameIndexes) return;
+  tab.wsFrameIndexes.delete(wsFrameIndexValue(frame, fallbackIndex));
+}
+
+function updateWsReplayNextFrameIndex(tab, nextIndex) {
+  if (!tab || !Number.isFinite(Number(nextIndex))) return;
+  ensureWsReplayFrameTracking(tab);
+  tab.wsNextFrameIndex = Math.max(Number(tab.wsNextFrameIndex) || 0, Number(nextIndex));
 }
 
 function utf8ByteLength(value) {
@@ -17166,6 +17215,8 @@ function createWsReplayTab(seed = {}) {
     wsHandshakeEdited: !!seed.handshakeEdited,
     wsStatus: "disconnected",
     wsFrames: [],
+    wsFrameIndexes: new Set(),
+    wsNextFrameIndex: 0,
     wsFramesTruncated: false,
     wsSelectedFrameIndex: -1,
     wsSessionId: null,
@@ -17276,6 +17327,7 @@ async function wsConnect() {
       throw new Error(text);
     }
     tab.wsFrames = [];
+    resetWsReplayFrameTracking(tab);
     tab.wsFramesTruncated = false;
     tab.wsSelectedFrameIndex = -1;
     tab.wsFrameWindowStart = null;
@@ -17619,8 +17671,16 @@ function applyWsReplayFramePollResponse(tab, data, sinceIndex) {
 
   let addedFrames = false;
   if (incomingFrames.length > 0) {
-    const existing = wsReplayFrameIndexSet(tab);
-    const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
+    const existing = ensureWsReplayFrameTracking(tab);
+    const fresh = [];
+    for (const frame of incomingFrames) {
+      const frameIndex = wsFrameIndexValue(frame, fresh.length);
+      if (existing.has(frameIndex)) {
+        continue;
+      }
+      trackWsReplayFrameIndex(tab, frame, fresh.length);
+      fresh.push(frame);
+    }
     if (fresh.length) {
       if (!Array.isArray(tab.wsFrames)) tab.wsFrames = [];
       tab.wsFrames.push(...fresh);
@@ -17633,15 +17693,12 @@ function applyWsReplayFramePollResponse(tab, data, sinceIndex) {
     }
   }
 
-  let nextIndex = Math.max(
-    sinceIndex,
-    nextWsFrameIndex({ wsFrames: incomingFrames }),
-    nextWsFrameIndex(tab),
-  );
+  let nextIndex = Math.max(sinceIndex, Number(tab.wsNextFrameIndex) || nextWsFrameIndex(tab));
   const responseNextIndex = Number(data?.next_index);
   if (Number.isFinite(responseNextIndex)) {
     nextIndex = Math.max(nextIndex, responseNextIndex);
   }
+  updateWsReplayNextFrameIndex(tab, nextIndex);
   return {
     addedFrames,
     nextIndex,
@@ -17659,10 +17716,17 @@ function stopWsPoll(tab) {
 }
 
 function nextWsFrameIndex(tab) {
+  if (tab?.wsFrameIndexes instanceof Set && Number.isFinite(Number(tab.wsNextFrameIndex))) {
+    return Math.max(0, Number(tab.wsNextFrameIndex));
+  }
   const frames = getRawWsReplayFrames(tab);
   let next = frames.length;
   for (let fallbackIndex = 0; fallbackIndex < frames.length; fallbackIndex += 1) {
     next = Math.max(next, wsFrameIndexValue(frames[fallbackIndex], fallbackIndex) + 1);
+  }
+  if (tab && typeof tab === "object") {
+    tab.wsNextFrameIndex = next;
+    rebuildWsReplayFrameTracking(tab);
   }
   return next;
 }
@@ -17672,7 +17736,10 @@ function trimWsReplayFrames(tab) {
   tab.wsFrames = getWsReplayFrames(tab);
   const overflow = tab.wsFrames.length - WS_REPLAY_MAX_LOADED_FRAMES;
   if (overflow <= 0) return;
-  tab.wsFrames.splice(0, overflow);
+  const removedFrames = tab.wsFrames.splice(0, overflow);
+  for (let index = 0; index < removedFrames.length; index += 1) {
+    forgetWsReplayFrameIndex(tab, removedFrames[index], index);
+  }
   if (tab.wsFrameWindowStart != null) {
     const windowStart = Number(tab.wsFrameWindowStart);
     tab.wsFrameWindowStart = Number.isFinite(windowStart)

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    env,
+    env, fs,
+    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -45,6 +46,7 @@ const SPCTL_PATH: &str = "/usr/sbin/spctl";
 const PLIST_BUDDY_PATH: &str = "/usr/libexec/PlistBuddy";
 const LIPO_PATH: &str = "/usr/bin/lipo";
 const SH_PATH: &str = "/bin/sh";
+const SELF_UPDATE_INSTALLER_LOG_FILE: &str = "self-update-installer.log";
 
 fn proxy_listener_status_word(generation: u64, online: bool) -> u64 {
     (generation << 1) | u64::from(online)
@@ -833,6 +835,20 @@ impl AppState {
                 return Err(error);
             }
         };
+        let installer_log_path = self_update_installer_log_path(&self.config.data_dir);
+        let installer_log = match open_self_update_installer_log(&installer_log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                cleanup_update_artifacts(&detach_targets, &tmp_dir).await;
+                return Err(error);
+            }
+        };
+        tx.send(UpdateProgress::step(&format!(
+            "Installer log: {}",
+            installer_log_path.display()
+        )))
+        .await
+        .ok();
 
         detach_update_targets(&detach_targets).await;
         artifact_guard.clear_detach_targets();
@@ -849,6 +865,7 @@ impl AppState {
             &tmp_dir,
             &release.tag_name,
             &expected_team,
+            installer_log,
         ) {
             cleanup_update_artifacts(&[], &tmp_dir).await;
             self.restore_proxy_after_self_update_prepare_failure().await;
@@ -1470,6 +1487,63 @@ async fn detach_update_dmg(target: &str) {
         .await;
 }
 
+fn self_update_installer_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(SELF_UPDATE_INSTALLER_LOG_FILE)
+}
+
+fn open_self_update_installer_log(path: &Path) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create self-update installer log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "failed to open self-update installer log {}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to set private permissions on self-update installer log {}",
+                path.display()
+            )
+        })?;
+    }
+    writeln!(
+        file,
+        "--- Sniper self-update installer {} ---",
+        chrono::Utc::now().to_rfc3339()
+    )
+    .with_context(|| {
+        format!(
+            "failed to write self-update installer log marker {}",
+            path.display()
+        )
+    })?;
+    file.flush().with_context(|| {
+        format!(
+            "failed to flush self-update installer log marker {}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
 fn spawn_update_installer_after_exit(
     pid: u32,
     staged_app: &Path,
@@ -1477,7 +1551,11 @@ fn spawn_update_installer_after_exit(
     tmp_dir: &Path,
     expected_version: &str,
     expected_team: &str,
+    installer_log: fs::File,
 ) -> Result<()> {
+    let installer_err_log = installer_log
+        .try_clone()
+        .context("failed to clone self-update installer log handle")?;
     std::process::Command::new(SH_PATH)
         .args([
             "-c",
@@ -1491,8 +1569,8 @@ fn spawn_update_installer_after_exit(
             expected_team,
         ])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(installer_log))
+        .stderr(std::process::Stdio::from(installer_err_log))
         .spawn()
         .context("failed to spawn self-update installer")?;
     Ok(())
@@ -1509,6 +1587,9 @@ case "$expected_version" in
 esac
 expected_team="$6"
 backup="${bundle}.previous.$$"
+log_installer() {
+  echo "sniper-installer: $1"
+}
 matching_sniper_pids() {
   sniper_executable="$bundle/Contents/MacOS/Sniper"
   /bin/ps -axww -o pid= -o command= | /usr/bin/awk -v exe="$sniper_executable" '
@@ -1543,12 +1624,15 @@ launch_health_check() {
     launch_attempts=$((launch_attempts + 1))
     sleep 0.2
   done
+  log_installer "launch health check timed out"
   return 1
 }
+log_installer "waiting for old process $pid to exit"
 wait_attempts=0
 while kill -0 "$pid" 2>/dev/null; do
   wait_attempts=$((wait_attempts + 1))
   if [ "$wait_attempts" -ge 150 ]; then
+    log_installer "timed out waiting for old process $pid"
     rm -rf "$tmp"
     exit 1
   fi
@@ -1558,10 +1642,12 @@ sleep 0.5
 rm -rf "$backup"
 if [ -e "$bundle" ]; then
   if ! mv "$bundle" "$backup"; then
+    log_installer "failed to move existing app bundle to backup"
     rm -rf "$tmp"
     exit 1
   fi
 fi
+log_installer "installing staged app"
 if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --strict "$bundle"; then
   installed_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
   installed_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
@@ -1578,22 +1664,31 @@ if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --str
     [ "$installed_version" = "$expected_version" ] && \
     { [ -z "$expected_team" ] || [ "$installed_team" = "$expected_team" ]; } && \
     { [ -z "$expected_team" ] || /usr/sbin/spctl --assess --type execute "$bundle"; }; then
-  if launch_health_check; then
-    rm -rf "$backup" "$tmp"
-    exit 0
+    if launch_health_check; then
+      log_installer "update installed and launched successfully"
+      rm -rf "$backup" "$tmp"
+      exit 0
+    fi
+    log_installer "launch health check failed"
+  else
+    log_installer "installed app validation failed"
   fi
-  fi
+else
+  log_installer "failed to copy or verify staged app"
 fi
 rm -rf "$bundle"
 if [ -e "$backup" ]; then
   if mv "$backup" "$bundle"; then
+    log_installer "restored previous app bundle after update failure"
     /usr/bin/codesign --verify --deep --strict "$bundle" && /usr/bin/open "$bundle" || true
   else
+    log_installer "failed to restore previous app bundle"
     rm -rf "$tmp"
     exit 1
   fi
 fi
 rm -rf "$tmp"
+log_installer "self-update installer failed"
 exit 1
 "#
 }
@@ -1863,10 +1958,11 @@ fn proxy_url_targets_loopback(value: &str) -> bool {
 mod tests {
     use super::{
         ensure_release_is_newer, find_update_app_bundle, find_update_app_bundle_in_mounts,
-        native_release_asset_arch, parse_codesign_team_identifier, parse_hdiutil_attach_output,
-        proxy_url_targets_loopback, release_asset_archs_match_binary_archs,
-        release_asset_matches_arch, release_proxy_env_targets_loopback, release_update_available,
-        select_release_dmg_asset, self_update_bundle_is_writable, update_installer_script,
+        native_release_asset_arch, open_self_update_installer_log, parse_codesign_team_identifier,
+        parse_hdiutil_attach_output, proxy_url_targets_loopback,
+        release_asset_archs_match_binary_archs, release_asset_matches_arch,
+        release_proxy_env_targets_loopback, release_update_available, select_release_dmg_asset,
+        self_update_bundle_is_writable, self_update_installer_log_path, update_installer_script,
         validate_downloaded_update_size, verify_app_identity, AppState, GitHubAsset, GitHubRelease,
         UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER,
         EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
@@ -2768,7 +2864,20 @@ mod tests {
         assert!(script.contains("mv \"$bundle\" \"$backup\""));
         assert!(script.contains("if ! mv \"$bundle\" \"$backup\""));
         assert!(script.contains("if mv \"$backup\" \"$bundle\"; then"));
-        assert!(script.contains("rm -rf \"$tmp\"\n    exit 1"));
+        assert!(script.contains("log_installer()"));
+        assert!(script.contains("sniper-installer: $1"));
+        assert!(script.contains("log_installer \"waiting for old process $pid to exit\""));
+        assert!(script.contains("log_installer \"timed out waiting for old process $pid\""));
+        assert!(script.contains("log_installer \"installing staged app\""));
+        assert!(script.contains("log_installer \"launch health check timed out\""));
+        assert!(script.contains("log_installer \"launch health check failed\""));
+        assert!(script.contains("log_installer \"installed app validation failed\""));
+        assert!(script.contains("log_installer \"failed to copy or verify staged app\""));
+        assert!(
+            script.contains("log_installer \"restored previous app bundle after update failure\"")
+        );
+        assert!(script.contains("log_installer \"failed to restore previous app bundle\""));
+        assert!(script.contains("log_installer \"self-update installer failed\""));
         assert!(script.contains("/usr/bin/codesign --verify --deep --strict \"$bundle\""));
         assert!(script.contains("sniper_executable=\"$bundle/Contents/MacOS/Sniper\""));
         assert!(script.contains("/bin/ps -axww -o pid= -o command="));
@@ -2801,6 +2910,38 @@ mod tests {
         assert!(script.contains("sleep 2"));
         assert!(script.contains("v*|V*) expected_version="));
         assert!(script.contains("v*|V*) installed_version="));
+    }
+
+    #[test]
+    fn self_update_installer_log_is_private_and_rejects_symlink() {
+        use std::io::Write as _;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sniper-self-update-log-{}", uuid::Uuid::new_v4()));
+        let log_path = self_update_installer_log_path(&temp_dir);
+        {
+            let mut log = open_self_update_installer_log(&log_path).unwrap();
+            writeln!(log, "child output").unwrap();
+        }
+
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(body.contains("--- Sniper self-update installer "));
+        assert!(body.contains("child output"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+            assert_eq!(
+                std::fs::metadata(&log_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let symlink_path = temp_dir.join("symlink.log");
+            symlink(&log_path, &symlink_path).unwrap();
+            assert!(open_self_update_installer_log(&symlink_path).is_err());
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
