@@ -1,4 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock};
@@ -111,9 +114,22 @@ impl WebSocketSessionEntry {
 pub struct WebSocketListPage {
     pub items: Vec<WebSocketSessionSummary>,
     pub total: usize,
+    pub filtered_total: Option<usize>,
     pub offset: usize,
     pub limit: usize,
     pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WebSocketListFilters {
+    pub query: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub sort_key: Option<String>,
+    pub sort_direction: Option<String>,
+    pub scope_patterns: Vec<String>,
+    pub in_scope_only: bool,
+    pub live_only: bool,
 }
 
 impl WebSocketStore {
@@ -196,21 +212,62 @@ impl WebSocketStore {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> WebSocketListPage {
+        self.list_page_filtered(&WebSocketListFilters {
+            limit,
+            offset,
+            ..WebSocketListFilters::default()
+        })
+        .await
+    }
+
+    pub async fn list_page_filtered(&self, filters: &WebSocketListFilters) -> WebSocketListPage {
         let inner = self.inner.read().await;
         let total = inner.order.len();
-        let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
-        let offset = offset.unwrap_or(0).min(total);
-        let end = offset.saturating_add(limit).min(total);
-        let items = (offset..end)
-            .filter_map(|index| inner.order.get(index))
-            .filter_map(|id| inner.sessions.get(id).map(WebSocketSessionEntry::summary))
+        let limit = filters
+            .limit
+            .unwrap_or(self.max_entries)
+            .min(self.max_entries);
+        let normalized_query = filters
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let mut matched: Vec<(usize, WebSocketSessionSummary)> = inner
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| {
+                inner
+                    .sessions
+                    .get(id)
+                    .map(WebSocketSessionEntry::summary)
+                    .map(|summary| (index, summary))
+            })
+            .filter(|(_, summary)| {
+                websocket_summary_matches_filters(summary, filters, normalized_query.as_deref())
+            })
             .collect();
+        sort_websocket_summaries(
+            &mut matched,
+            filters.sort_key.as_deref(),
+            filters.sort_direction.as_deref(),
+        );
+        let filtered_total = matched.len();
+        let offset = filters.offset.unwrap_or(0).min(filtered_total);
+        let items = matched
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, summary)| summary)
+            .collect::<Vec<_>>();
         WebSocketListPage {
             items,
             total,
+            filtered_total: Some(filtered_total),
             offset,
             limit,
-            has_more: offset.saturating_add(limit) < total,
+            has_more: limit != 0 && offset.saturating_add(limit) < filtered_total,
         }
     }
 
@@ -366,6 +423,137 @@ fn remove_ordered_session(inner: &mut WebSocketStoreInner, id: Uuid) {
     }
 }
 
+fn websocket_summary_matches_filters(
+    summary: &WebSocketSessionSummary,
+    filters: &WebSocketListFilters,
+    normalized_query: Option<&str>,
+) -> bool {
+    if filters.in_scope_only && !summary_matches_scope(&summary.host, &filters.scope_patterns) {
+        return false;
+    }
+    if filters.live_only && summary.duration_ms.is_some() {
+        return false;
+    }
+    if let Some(query) = normalized_query {
+        if !websocket_summary_search_haystack(summary).contains(query) {
+            return false;
+        }
+    }
+    true
+}
+
+fn websocket_summary_search_haystack(summary: &WebSocketSessionSummary) -> String {
+    [
+        summary.scheme.clone(),
+        summary.host.clone(),
+        summary.path.clone(),
+        summary
+            .status
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        summary.frame_count.to_string(),
+        summary
+            .duration_ms
+            .map(|value| format!("{value} ms"))
+            .unwrap_or_else(|| "live".to_string()),
+        summary.started_at.to_rfc3339(),
+    ]
+    .join("\n")
+    .to_ascii_lowercase()
+}
+
+fn sort_websocket_summaries(
+    entries: &mut [(usize, WebSocketSessionSummary)],
+    sort_key: Option<&str>,
+    sort_direction: Option<&str>,
+) {
+    let Some(sort_key) = sort_key.filter(|key| !key.trim().is_empty()) else {
+        return;
+    };
+    let descending = !matches!(sort_direction, Some("asc"));
+    entries.sort_by(|left, right| {
+        let ordering = compare_websocket_summary(sort_key, left, right);
+        let ordering = if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        ordering.then_with(|| left.0.cmp(&right.0))
+    });
+}
+
+fn compare_websocket_summary(
+    sort_key: &str,
+    left: &(usize, WebSocketSessionSummary),
+    right: &(usize, WebSocketSessionSummary),
+) -> Ordering {
+    match sort_key {
+        "index" => left.0.cmp(&right.0),
+        "host" => left
+            .1
+            .host
+            .to_ascii_lowercase()
+            .cmp(&right.1.host.to_ascii_lowercase()),
+        "path" => left
+            .1
+            .path
+            .to_ascii_lowercase()
+            .cmp(&right.1.path.to_ascii_lowercase()),
+        "status" => left.1.status.cmp(&right.1.status),
+        "frame_count" => left.1.frame_count.cmp(&right.1.frame_count),
+        "duration_ms" => left
+            .1
+            .duration_ms
+            .unwrap_or(u64::MAX)
+            .cmp(&right.1.duration_ms.unwrap_or(u64::MAX)),
+        "started_at" => left.1.started_at.cmp(&right.1.started_at),
+        _ => left.0.cmp(&right.0),
+    }
+}
+
+fn summary_matches_scope(host: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+
+    let hostname = normalize_host_for_matching(host);
+    patterns.iter().any(|pattern| {
+        let normalized = normalize_host_for_matching(pattern);
+        if let Some(suffix) = normalized.strip_prefix("*.") {
+            hostname == suffix || hostname.ends_with(&format!(".{suffix}"))
+        } else {
+            hostname == normalized
+        }
+    })
+}
+
+fn normalize_host_for_matching(host: &str) -> String {
+    let mut value = host.trim().to_ascii_lowercase();
+    if let Some((_, rest)) = value.split_once("://") {
+        value = rest.to_string();
+    } else if let Some(rest) = value.strip_prefix("//") {
+        value = rest.to_string();
+    }
+    let host = value.split(['/', '?', '#']).next().unwrap_or("").trim();
+    host_without_port(host).to_string()
+}
+
+fn host_without_port(host: &str) -> &str {
+    let trimmed = host.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    if trimmed.matches(':').count() == 1 {
+        return trimmed
+            .split_once(':')
+            .map(|(value, _)| value)
+            .unwrap_or(trimmed);
+    }
+    trimmed
+}
+
 fn trim_closed_overflow(inner: &mut WebSocketStoreInner, max_entries: usize) {
     while inner.order.len() > max_entries {
         let Some(index) = inner.order.iter().rposition(|id| {
@@ -430,7 +618,87 @@ mod tests {
     fn closed_session(frames: Vec<WebSocketFrameRecord>) -> WebSocketSessionRecord {
         let mut record = session(frames);
         record.closed_at = Some(Utc::now());
+        record.duration_ms = Some(25);
         record
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_searches_sorts_and_offsets_after_filtering() {
+        let mut live = session(vec![frame(1)]);
+        live.host = "zeta.example.test".to_string();
+        live.path = "/chat".to_string();
+        live.started_at = Utc::now();
+
+        let mut closed = closed_session(vec![frame(1), frame(2)]);
+        closed.host = "api.example.test".to_string();
+        closed.path = "/socket".to_string();
+        closed.status = Some(500);
+        closed.duration_ms = Some(12);
+        closed.started_at = Utc::now();
+
+        let store = WebSocketStore::from_sessions(10, 10, vec![live, closed]);
+
+        let page = store
+            .list_page_filtered(&WebSocketListFilters {
+                query: Some("500".to_string()),
+                limit: Some(10),
+                sort_key: Some("host".to_string()),
+                sort_direction: Some("asc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.filtered_total, Some(1));
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].host, "api.example.test");
+
+        let sorted_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(1),
+                offset: Some(1),
+                sort_key: Some("host".to_string()),
+                sort_direction: Some("asc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(sorted_page.filtered_total, Some(2));
+        assert_eq!(sorted_page.items.len(), 1);
+        assert_eq!(sorted_page.items[0].host, "zeta.example.test");
+        assert!(!sorted_page.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_supports_live_only_and_scope_filters() {
+        let mut live = session(vec![frame(1)]);
+        live.host = "chat.example.test".to_string();
+
+        let mut closed = closed_session(vec![frame(1)]);
+        closed.host = "out.example.test".to_string();
+
+        let store = WebSocketStore::from_sessions(10, 10, vec![live, closed]);
+
+        let live_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                live_only: true,
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(live_page.filtered_total, Some(1));
+        assert_eq!(live_page.items[0].host, "chat.example.test");
+
+        let scope_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                in_scope_only: true,
+                scope_patterns: vec!["chat.example.test".to_string()],
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(scope_page.filtered_total, Some(1));
+        assert_eq!(scope_page.items[0].host, "chat.example.test");
     }
 
     #[tokio::test]

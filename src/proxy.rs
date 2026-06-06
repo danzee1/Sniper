@@ -301,7 +301,12 @@ async fn persist_proxy_runtime_state(
     let ui_addr = state.get_active_ui_addr().await;
     if let Err(error) = runtime_state::persist_runtime_state(
         &state.config.data_dir,
-        &RuntimeStateSnapshot::with_proxy_status(proxy_addr, ui_addr, proxy_online),
+        &RuntimeStateSnapshot::with_proxy_status_and_instance(
+            proxy_addr,
+            ui_addr,
+            proxy_online,
+            state.runtime_instance_id,
+        ),
     ) {
         warn!(?error, context, "failed to persist runtime state");
     }

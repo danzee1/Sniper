@@ -9,11 +9,14 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+use uuid::Uuid;
 
 const RUNTIME_STATE_FILE: &str = "runtime-state.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshot {
+    #[serde(default = "default_instance_id")]
+    pub instance_id: Uuid,
     pub proxy_addr: String,
     pub ui_addr: String,
     #[serde(default)]
@@ -32,16 +35,13 @@ fn default_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+fn default_instance_id() -> Uuid {
+    Uuid::nil()
+}
+
 impl RuntimeStateSnapshot {
     pub fn new(proxy_addr: SocketAddr, ui_addr: SocketAddr) -> Self {
-        let ui_addr = advertise_local_api_addr(ui_addr);
-        Self {
-            proxy_addr: proxy_addr.to_string(),
-            ui_addr: ui_addr.to_string(),
-            proxy_online: true,
-            updated_at: Utc::now(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
-        }
+        Self::with_proxy_status_and_instance(proxy_addr, ui_addr, true, Uuid::new_v4())
     }
 
     pub fn with_proxy_status(
@@ -49,8 +49,18 @@ impl RuntimeStateSnapshot {
         ui_addr: SocketAddr,
         proxy_online: bool,
     ) -> Self {
+        Self::with_proxy_status_and_instance(proxy_addr, ui_addr, proxy_online, Uuid::new_v4())
+    }
+
+    pub fn with_proxy_status_and_instance(
+        proxy_addr: SocketAddr,
+        ui_addr: SocketAddr,
+        proxy_online: bool,
+        instance_id: Uuid,
+    ) -> Self {
         let ui_addr = advertise_local_api_addr(ui_addr);
         Self {
+            instance_id,
             proxy_addr: proxy_addr.to_string(),
             ui_addr: ui_addr.to_string(),
             proxy_online,
@@ -239,8 +249,20 @@ pub fn remove_runtime_state_if_same_ui_addr(
     Ok(true)
 }
 
+pub fn remove_runtime_state_if_owner(data_dir: &Path, expected_instance_id: Uuid) -> Result<bool> {
+    let Some(current) = load_runtime_state(data_dir)? else {
+        return Ok(false);
+    };
+    if current.instance_id != expected_instance_id {
+        return Ok(false);
+    }
+    remove_runtime_state(data_dir)?;
+    Ok(true)
+}
+
 fn runtime_state_matches(left: &RuntimeStateSnapshot, right: &RuntimeStateSnapshot) -> bool {
-    left.proxy_addr == right.proxy_addr
+    left.instance_id == right.instance_id
+        && left.proxy_addr == right.proxy_addr
         && left.ui_addr == right.ui_addr
         && left.proxy_online == right.proxy_online
         && left.updated_at == right.updated_at
@@ -259,7 +281,8 @@ mod tests {
 
     use super::{
         advertise_local_api_addr, load_runtime_state, persist_runtime_state, remove_runtime_state,
-        remove_runtime_state_if_same_ui_addr, runtime_state_path, RuntimeStateSnapshot,
+        remove_runtime_state_if_owner, remove_runtime_state_if_same_ui_addr, runtime_state_path,
+        RuntimeStateSnapshot,
     };
 
     #[test]
@@ -276,6 +299,7 @@ mod tests {
         persist_runtime_state(&temp_dir, &snapshot).unwrap();
         let loaded = load_runtime_state(&temp_dir).unwrap().unwrap();
 
+        assert_eq!(loaded.instance_id, snapshot.instance_id);
         assert_eq!(loaded.proxy_addr, snapshot.proxy_addr);
         assert_eq!(loaded.ui_addr, snapshot.ui_addr);
         assert!(loaded.proxy_online);
@@ -398,6 +422,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_state_remove_if_owner_deletes_matching_instance() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-remove-owner-match-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot = RuntimeStateSnapshot::new(
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+        );
+        persist_runtime_state(&temp_dir, &snapshot).unwrap();
+
+        assert!(remove_runtime_state_if_owner(&temp_dir, snapshot.instance_id).unwrap());
+        assert!(!runtime_state_path(&temp_dir).exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_remove_if_owner_preserves_other_instance_on_same_ui_addr() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-remove-owner-mismatch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot = RuntimeStateSnapshot::new(
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+        );
+        persist_runtime_state(&temp_dir, &snapshot).unwrap();
+
+        assert!(!remove_runtime_state_if_owner(&temp_dir, uuid::Uuid::new_v4()).unwrap());
+        assert!(runtime_state_path(&temp_dir).exists());
+        let loaded = load_runtime_state(&temp_dir).unwrap().unwrap();
+        assert_eq!(loaded.instance_id, snapshot.instance_id);
+        assert_eq!(loaded.ui_addr, snapshot.ui_addr);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn runtime_state_load_accepts_missing_file() {
         let temp_dir = std::env::temp_dir().join(format!(
             "sniper-runtime-state-missing-{}",
@@ -429,6 +492,7 @@ mod tests {
 
         assert_eq!(loaded.proxy_addr, "127.0.0.1:18080");
         assert_eq!(loaded.ui_addr, "127.0.0.1:23001");
+        assert_eq!(loaded.instance_id, uuid::Uuid::nil());
         assert!(!loaded.proxy_online);
         assert_eq!(loaded.app_version, env!("CARGO_PKG_VERSION"));
 

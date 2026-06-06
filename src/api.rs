@@ -46,6 +46,7 @@ use crate::{
     store::{ListFilters, TransactionListPage},
     target::{TargetHostNode, TargetPathNode},
     ui_settings::AppUiSettingsSnapshot,
+    websocket::WebSocketListFilters,
     workspace::{
         can_replace_snapshot, validate_workspace_serialized_size, FuzzerWorkspaceState,
         ReplayTabState, WorkspaceReplaceError, WorkspaceStateSnapshot,
@@ -126,10 +127,11 @@ async fn persist_bound_runtime_state(
 ) -> Result<()> {
     runtime_state::persist_runtime_state(
         &state.config.data_dir,
-        &RuntimeStateSnapshot::with_proxy_status(
+        &RuntimeStateSnapshot::with_proxy_status_and_instance(
             state.get_active_proxy_addr().await,
             ui_addr,
             state.is_proxy_online(),
+            state.runtime_instance_id,
         ),
     )
 }
@@ -529,6 +531,22 @@ fn transaction_list_filters(query: TransactionQuery, scope_patterns: Vec<String>
         advanced_regex: query.advanced_regex.unwrap_or(false),
         advanced_case_sensitive: query.advanced_case_sensitive.unwrap_or(false),
         advanced_negative: query.advanced_negative.unwrap_or(false),
+    }
+}
+
+fn websocket_list_filters(
+    query: &WebSocketQuery,
+    scope_patterns: Vec<String>,
+) -> WebSocketListFilters {
+    WebSocketListFilters {
+        query: query.q.clone(),
+        limit: query.limit,
+        offset: query.offset,
+        sort_key: query.sort_key.clone(),
+        sort_direction: query.sort_direction.clone(),
+        scope_patterns,
+        in_scope_only: query.in_scope_only.unwrap_or(false),
+        live_only: query.live_only.unwrap_or(false),
     }
 }
 
@@ -1851,18 +1869,24 @@ impl From<TransactionListPage> for TransactionPageResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct WebSocketQuery {
     session_id: Option<Uuid>,
+    q: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
     frame_limit: Option<usize>,
+    sort_key: Option<String>,
+    sort_direction: Option<String>,
+    in_scope_only: Option<bool>,
+    live_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WebSocketPageResponse {
     items: Vec<crate::model::WebSocketSessionSummary>,
     total: usize,
+    filtered_total: Option<usize>,
     offset: usize,
     limit: usize,
     has_more: bool,
@@ -2391,6 +2415,7 @@ fn merge_workspace_keepalive_tab(
     let current_ws_selected_frame_index = current.ws_selected_frame_index;
     let current_ws_frame_window_start = current.ws_frame_window_start;
     let current_ws_frames_truncated = current.ws_frames_truncated;
+    let incoming_response_record_complete = incoming.response_record_complete.unwrap_or(false);
     let incoming_history_entries_complete = incoming.history_entries_complete.unwrap_or(false);
     let incoming_ws_setup_queue_complete = incoming.ws_setup_queue_complete.unwrap_or(false);
     let incoming_ws_frames_complete = incoming.ws_frames_complete.unwrap_or(false);
@@ -2405,7 +2430,10 @@ fn merge_workspace_keepalive_tab(
             current.history_index = current_history_index;
         }
     }
-    if current.response_record.is_none() && !request_text_changed {
+    if current.response_record.is_none()
+        && !request_text_changed
+        && !incoming_response_record_complete
+    {
         current.response_record = current_response_record;
     }
     if current.tab_type != "websocket" && !keepalive.text_complete() {
@@ -4028,10 +4056,9 @@ async fn list_websockets(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let page = session
-        .websockets
-        .list_page(query.limit, query.offset)
-        .await;
+    let runtime = session.runtime.snapshot().await;
+    let filters = websocket_list_filters(&query, runtime.scope_patterns);
+    let page = session.websockets.list_page_filtered(&filters).await;
     Json(page.items).into_response()
 }
 
@@ -4046,13 +4073,13 @@ async fn list_websockets_page(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let page = session
-        .websockets
-        .list_page(query.limit, query.offset)
-        .await;
+    let runtime = session.runtime.snapshot().await;
+    let filters = websocket_list_filters(&query, runtime.scope_patterns);
+    let page = session.websockets.list_page_filtered(&filters).await;
     Json(WebSocketPageResponse {
         items: page.items,
         total: page.total,
+        filtered_total: page.filtered_total,
         offset: page.offset,
         limit: page.limit,
         has_more: page.has_more,
@@ -5132,6 +5159,23 @@ mod tests {
             body: String::new(),
             body_encoding: BodyEncoding::Utf8,
         }
+    }
+
+    fn test_replay_response_record(path: &str, status: u16) -> TransactionRecord {
+        TransactionRecord::http(
+            chrono::Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "example.test".to_string(),
+            path.to_string(),
+            Some(status),
+            1,
+            MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 0),
+            None,
+            Vec::new(),
+            None,
+            None,
+        )
     }
 
     #[test]
@@ -6755,6 +6799,57 @@ mod tests {
 
         let active = merged.replay.tabs.first().expect("active tab");
         assert!(active.request_text.is_empty());
+        assert!(active.response_record.is_none());
+    }
+
+    #[test]
+    fn workspace_keepalive_explicit_null_response_does_not_restore_stale_response() {
+        let request_text = "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n".to_string();
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    base_request: Some(test_editable_request("/old")),
+                    request_text: request_text.clone(),
+                    response_record: Some(test_replay_response_record("/old", 200)),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    base_request: Some(test_editable_request("/old")),
+                    request_text,
+                    response_record: None,
+                    response_record_complete: Some(true),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        let active = merged.replay.tabs.first().expect("active tab");
         assert!(active.response_record.is_none());
     }
 
@@ -9320,6 +9415,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 frame_limit: None,
+                ..Default::default()
             }),
         )
         .await;
@@ -9335,6 +9431,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 frame_limit: None,
+                ..Default::default()
             }),
         )
         .await;
@@ -9346,6 +9443,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 frame_limit: None,
+                ..Default::default()
             }),
         )
         .await;
@@ -9409,6 +9507,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 frame_limit: Some(2),
+                ..Default::default()
             }),
         )
         .await;
@@ -9431,6 +9530,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 frame_limit: Some(0),
+                ..Default::default()
             }),
         )
         .await;
@@ -9446,6 +9546,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 frame_limit: None,
+                ..Default::default()
             }),
         )
         .await;
@@ -9463,6 +9564,7 @@ mod tests {
                 limit: None,
                 offset: None,
                 frame_limit: Some(50_000),
+                ..Default::default()
             }),
         )
         .await;
@@ -9479,6 +9581,7 @@ mod tests {
                 limit: Some(10),
                 offset: None,
                 frame_limit: None,
+                ..Default::default()
             }),
         )
         .await;
@@ -9493,6 +9596,7 @@ mod tests {
                 limit: Some(10),
                 offset: None,
                 frame_limit: None,
+                ..Default::default()
             }),
         )
         .await;

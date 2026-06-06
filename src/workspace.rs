@@ -85,6 +85,8 @@ pub struct ReplayTabState {
     #[serde(default)]
     pub http_version_mode: String,
     pub response_record: Option<TransactionRecord>,
+    #[serde(default, skip_serializing)]
+    pub response_record_complete: Option<bool>,
     pub target_scheme: String,
     pub target_host: String,
     pub target_port: String,

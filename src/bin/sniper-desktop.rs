@@ -1,7 +1,6 @@
 use std::{
     env,
     io::Write,
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -20,6 +19,7 @@ use tao::{
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use url::Url;
+use uuid::Uuid;
 use wry::WebViewBuilder;
 
 fn main() -> Result<()> {
@@ -172,14 +172,14 @@ fn main() -> Result<()> {
                 }
             }
             runtime.block_on(state.abort_proxy_task());
-            remove_runtime_state_file(&state.config.data_dir, state.config.ui_addr);
+            remove_runtime_state_file(&state.config.data_dir, state.runtime_instance_id);
             return Err(anyhow::anyhow!("failed to build desktop webview: {error}"));
         }
     };
 
     let close_state = state.clone();
     let close_data_dir = close_state.config.data_dir.clone();
-    let close_ui_addr = close_state.config.ui_addr;
+    let close_runtime_instance_id = close_state.runtime_instance_id;
     let teardown_started = Arc::new(AtomicBool::new(false));
     let shutdown_done = Arc::new(AtomicBool::new(false));
     let mut ui_task = Some(ui_task);
@@ -229,7 +229,7 @@ fn main() -> Result<()> {
             finish_desktop_teardown(
                 shutdown_done.as_ref(),
                 &close_data_dir,
-                close_ui_addr,
+                close_runtime_instance_id,
                 session_persisted,
             );
         };
@@ -287,8 +287,8 @@ fn desktop_devtools_enabled() -> bool {
             .unwrap_or(false)
 }
 
-fn remove_runtime_state_file(data_dir: &Path, ui_addr: SocketAddr) {
-    match runtime_state::remove_runtime_state_if_same_ui_addr(data_dir, ui_addr) {
+fn remove_runtime_state_file(data_dir: &Path, runtime_instance_id: Uuid) {
+    match runtime_state::remove_runtime_state_if_owner(data_dir, runtime_instance_id) {
         Ok(true) => {}
         Ok(false) => {
             warn!("runtime state was replaced before desktop shutdown; leaving it intact");
@@ -352,11 +352,11 @@ fn begin_desktop_teardown(teardown_started: &AtomicBool) -> bool {
 fn finish_desktop_teardown(
     shutdown_done: &AtomicBool,
     data_dir: &Path,
-    ui_addr: SocketAddr,
+    runtime_instance_id: Uuid,
     session_persisted: bool,
 ) {
     if session_persisted {
-        complete_desktop_shutdown(shutdown_done, data_dir, ui_addr);
+        complete_desktop_shutdown(shutdown_done, data_dir, runtime_instance_id);
     } else {
         warn!(
             "leaving runtime state after failed desktop session persistence during forced teardown"
@@ -364,10 +364,14 @@ fn finish_desktop_teardown(
     }
 }
 
-fn complete_desktop_shutdown(shutdown_done: &AtomicBool, data_dir: &Path, ui_addr: SocketAddr) {
+fn complete_desktop_shutdown(
+    shutdown_done: &AtomicBool,
+    data_dir: &Path,
+    runtime_instance_id: Uuid,
+) {
     // Clean up runtime-state only after session data is durably written, so
     // a failed close can be retried or diagnosed by the CLI.
-    remove_runtime_state_file(data_dir, ui_addr);
+    remove_runtime_state_file(data_dir, runtime_instance_id);
     shutdown_done.store(true, Ordering::Release);
 }
 
@@ -829,7 +833,7 @@ mod tests {
         super::runtime_state::persist_runtime_state(&root, &snapshot).unwrap();
         let shutdown_done = std::sync::atomic::AtomicBool::new(false);
 
-        complete_desktop_shutdown(&shutdown_done, &root, ui_addr);
+        complete_desktop_shutdown(&shutdown_done, &root, snapshot.instance_id);
 
         assert!(shutdown_done.load(std::sync::atomic::Ordering::Acquire));
         assert!(!runtime_state_path.exists());
@@ -845,16 +849,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let runtime_state_path = super::runtime_state::runtime_state_path(&root);
-        let current_ui_addr = "127.0.0.1:23002".parse().unwrap();
-        let old_ui_addr = "127.0.0.1:23001".parse().unwrap();
+        let ui_addr = "127.0.0.1:23001".parse().unwrap();
         let snapshot = super::runtime_state::RuntimeStateSnapshot::new(
             "127.0.0.1:18080".parse().unwrap(),
-            current_ui_addr,
+            ui_addr,
         );
         super::runtime_state::persist_runtime_state(&root, &snapshot).unwrap();
         let shutdown_done = std::sync::atomic::AtomicBool::new(false);
 
-        complete_desktop_shutdown(&shutdown_done, &root, old_ui_addr);
+        complete_desktop_shutdown(&shutdown_done, &root, uuid::Uuid::new_v4());
 
         assert!(shutdown_done.load(std::sync::atomic::Ordering::Acquire));
         assert!(runtime_state_path.exists());
@@ -884,7 +887,7 @@ mod tests {
         let shutdown_done = std::sync::atomic::AtomicBool::new(false);
 
         assert!(begin_desktop_teardown(&teardown_started));
-        finish_desktop_teardown(&shutdown_done, &root, ui_addr, false);
+        finish_desktop_teardown(&shutdown_done, &root, snapshot.instance_id, false);
 
         assert!(teardown_started.load(std::sync::atomic::Ordering::Acquire));
         assert!(!shutdown_done.load(std::sync::atomic::Ordering::Acquire));
@@ -911,7 +914,7 @@ mod tests {
         let shutdown_done = std::sync::atomic::AtomicBool::new(false);
 
         assert!(begin_desktop_teardown(&teardown_started));
-        finish_desktop_teardown(&shutdown_done, &root, ui_addr, true);
+        finish_desktop_teardown(&shutdown_done, &root, snapshot.instance_id, true);
 
         assert!(shutdown_done.load(std::sync::atomic::Ordering::Acquire));
         assert!(!runtime_state_path.exists());

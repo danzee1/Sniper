@@ -301,6 +301,7 @@ function websocketPagePayload(value) {
   return {
     items,
     total: Number.isFinite(Number(payload.total)) ? Number(payload.total) : items.length,
+    filteredTotal: Number.isFinite(Number(payload.filtered_total)) ? Number(payload.filtered_total) : null,
     offset: Number.isFinite(Number(payload.offset)) ? Number(payload.offset) : 0,
     limit: Number.isFinite(Number(payload.limit)) ? Number(payload.limit) : items.length,
     has_more: Boolean(payload.has_more),
@@ -328,7 +329,9 @@ function createHistoryPagingState() {
 
 function createWebsocketPagingState() {
   return {
+    querySignature: "",
     total: 0,
+    filteredTotal: null,
     limit: WEBSOCKET_PAGE_SIZE,
     loadedOffset: 0,
     offset: 0,
@@ -1137,7 +1140,7 @@ function bindEvents() {
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
     clearWebsocketQueryBackfill();
-    syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
+    loadWebsockets(true).catch((error) => console.error(error));
   });
   let websocketScrollRaf = 0;
   document.querySelector("#websocketTable")?.closest(".history-table-shell")?.addEventListener("scroll", (event) => {
@@ -1174,12 +1177,12 @@ function bindEvents() {
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
+    loadWebsockets(true).catch((error) => console.error(error));
   });
   document.getElementById("wsHideClosed")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
+    loadWebsockets(true).catch((error) => console.error(error));
   });
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
@@ -3182,6 +3185,16 @@ function compactWorkspaceUnloadArrayLength(snapshotTab, liveTab, snapshotKey, li
   return Array.isArray(snapshotValue) ? snapshotValue.length : 0;
 }
 
+function compactWorkspaceUnloadReplayResponseComplete(tab, liveTab) {
+  if (liveTab && typeof liveTab === "object" && Object.prototype.hasOwnProperty.call(liveTab, "responseRecord")) {
+    return !liveTab.responseRecord;
+  }
+  if (tab && typeof tab === "object" && Object.prototype.hasOwnProperty.call(tab, "response_record")) {
+    return !tab.response_record;
+  }
+  return true;
+}
+
 function compactWorkspaceUnloadReplayTab(tab, options = {}, liveTab = null) {
   if (!tab || typeof tab !== "object") return null;
   if (tab.type === "websocket") {
@@ -3236,6 +3249,7 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}, liveTab = null) {
     request_text: compactWorkspaceUnloadText(tab.request_text, options),
     http_version_mode: normalizeReplayHttpVersionMode(tab.http_version_mode),
     response_record: null,
+    response_record_complete: compactWorkspaceUnloadReplayResponseComplete(tab, liveTab),
     target_scheme: tab.target_scheme || "https",
     target_host: tab.target_host || "",
     target_port: normalizePortValue(tab.target_port),
@@ -4152,10 +4166,38 @@ async function toggleInterceptRuleEnabled(ruleId, enabled) {
   await loadInterceptRules();
 }
 
+function createWebsocketQueryState() {
+  return {
+    q: String(state.websocketQuery || "").trim(),
+    sortKey: state.websocketSortKey || "started_at",
+    sortDirection: state.websocketSortDirection === "asc" ? "asc" : "desc",
+    inScopeOnly: document.getElementById("wsInScopeOnly")?.classList.contains("active") ?? false,
+    liveOnly: document.getElementById("wsHideClosed")?.classList.contains("active") ?? false,
+  };
+}
+
+function websocketQuerySignature(queryState = createWebsocketQueryState()) {
+  return JSON.stringify(queryState);
+}
+
+function buildWebsocketsPageUrl({ limit, offset, queryState }) {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  if (queryState.q) params.set("q", queryState.q);
+  if (queryState.sortKey) params.set("sort_key", queryState.sortKey);
+  if (queryState.sortDirection) params.set("sort_direction", queryState.sortDirection);
+  if (queryState.inScopeOnly) params.set("in_scope_only", "true");
+  if (queryState.liveOnly) params.set("live_only", "true");
+  return `/api/websockets-page?${params.toString()}`;
+}
+
 async function loadWebsockets(preserveSelection = true, options = {}) {
   const generation = ++_websocketLoadGeneration;
   const summaryMutationGeneration = _websocketSummaryMutationGeneration;
   const sessionId = currentSessionId();
+  const queryState = createWebsocketQueryState();
+  const querySignature = websocketQuerySignature(queryState);
   const append = Boolean(options.append);
   const requestedOffset = append
     ? Math.max(0, Number(options.offset ?? state.websocketPaging?.loadedOffset ?? state.websocketPaging?.limit ?? 0) || 0)
@@ -4166,14 +4208,22 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
   state.websocketPaging = {
     ...createWebsocketPagingState(),
     ...(state.websocketPaging || {}),
+    querySignature,
     offset: requestedOffset,
     loading: true,
   };
   try {
-    const response = await fetch(sessionQueryPath(`/api/websockets-page?limit=${requestedLimit}&offset=${requestedOffset}`, sessionId));
+    const response = await fetch(sessionQueryPath(
+      buildWebsocketsPageUrl({ limit: requestedLimit, offset: requestedOffset, queryState }),
+      sessionId,
+    ));
     await requireOkResponse(response, "Failed to load WebSocket history.");
     const page = websocketPagePayload(await response.json());
-    if (generation !== _websocketLoadGeneration || sessionId !== currentSessionId()) {
+    if (
+      generation !== _websocketLoadGeneration
+      || sessionId !== currentSessionId()
+      || querySignature !== websocketQuerySignature()
+    ) {
       return;
     }
     const pageItems = jsonArray(page.items);
@@ -4192,7 +4242,9 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     const serverHasMore = Boolean(page.has_more);
     const capReached = serverHasMore && loadedLimit >= WEBSOCKET_MAX_LOADED_SESSIONS;
     state.websocketPaging = {
+      querySignature,
       total: Math.max(Number(page.total || 0), state.websocketSessions.length),
+      filteredTotal: page.filteredTotal,
       limit: loadedLimit,
       loadedOffset: loadedLimit,
       offset: pageOffset,
@@ -4206,6 +4258,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     if (generation === _websocketLoadGeneration && sessionId === currentSessionId()) {
       state.websocketPaging = {
         ...(state.websocketPaging || createWebsocketPagingState()),
+        querySignature,
         loading: false,
       };
     }
@@ -4251,6 +4304,30 @@ function websocketFilterIsActive() {
   return Boolean(String(state.websocketQuery || "").trim())
     || Boolean(document.getElementById("wsInScopeOnly")?.classList.contains("active"))
     || Boolean(document.getElementById("wsHideClosed")?.classList.contains("active"));
+}
+
+function websocketSummaryMatchesCurrentQuery(summary) {
+  if (!summary) return false;
+  const queryState = createWebsocketQueryState();
+  if (queryState.inScopeOnly && !isInScopeHost(summary.host)) return false;
+  if (queryState.liveOnly && summary.duration_ms != null) return false;
+  if (queryState.q) {
+    const haystack = [
+      summary.scheme,
+      summary.host,
+      summary.path,
+      formatStatus(summary.status),
+      String(summary.frame_count),
+      summary.duration_ms == null ? "live" : `${summary.duration_ms} ms`,
+      formatTimestamp(summary.started_at),
+      summary.started_at,
+    ]
+      .filter(Boolean)
+      .join("\n")
+      .toLowerCase();
+    if (!haystack.includes(queryState.q.toLowerCase())) return false;
+  }
+  return true;
 }
 
 function clearWebsocketQueryBackfill() {
@@ -4322,6 +4399,7 @@ function isWebsocketSummaryFresher(candidate, baseline) {
 
 function shouldInsertUnknownWebsocketSummary(summary, sessions, paging) {
   if (!summary?.id) return false;
+  if (!websocketSummaryMatchesCurrentQuery(summary)) return false;
   if (!Boolean(paging?.hasMore)) return true;
   if (!Array.isArray(sessions) || !sessions.length) return true;
 
@@ -4519,7 +4597,11 @@ function applyWebsocketSummaryEvent(event) {
 
   const nextSessions = sessions.slice();
   if (existingIndex >= 0) {
-    nextSessions[existingIndex] = summary;
+    if (!websocketSummaryMatchesCurrentQuery(summary)) {
+      nextSessions.splice(existingIndex, 1);
+    } else {
+      nextSessions[existingIndex] = summary;
+    }
   } else {
     const paging = state.websocketPaging || createWebsocketPagingState();
     if (!shouldInsertUnknownWebsocketSummary(summary, sessions, paging)) {
@@ -8549,6 +8631,7 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
     windowed.renderedEntries.length,
     state.websocketSessions.length,
     state.websocketPaging?.total ?? state.websocketSessions.length,
+    state.websocketPaging?.filteredTotal ?? null,
     Boolean(state.websocketPaging?.hasMore),
     Boolean(state.websocketPaging?.capReached),
     state.websocketQuery,
@@ -8560,11 +8643,11 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
     els.websocketTableBody.innerHTML = `
         <tr class="empty-row">
           <td colspan="7">${
-            state.websocketSessions.length
+            state.websocketSessions.length || websocketFilterIsActive()
               ? (websocketFilterIsActive() && state.websocketPaging?.hasMore
-                ? "Searching older WebSocket history for matches..."
+                ? "Loading more matching WebSocket sessions..."
                 : (websocketFilterIsActive() && state.websocketPaging?.capReached
-                  ? "No loaded WebSocket sessions match the current filter; history cap reached."
+                  ? "WebSocket history cap reached for this filter."
                   : "No WebSocket sessions match the current filter."))
               : "No WebSocket sessions have been captured yet."
           }</td>
@@ -8758,7 +8841,7 @@ function renderWebsocketSessions(options = {}) {
 	  });
 }
 
-function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, totalCount, hasMore, capReached, query) {
+function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, totalCount, filteredCount, hasMore, capReached, query) {
   const visibleLabel = renderedCount < visibleCount
     ? `${renderedCount}/${visibleCount} session(s) shown`
     : `${visibleCount} session(s) visible`;
@@ -8768,7 +8851,11 @@ function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, t
   if (document.getElementById("wsHideClosed")?.classList.contains("active")) filters.push("live only");
   if (query) filters.push(query);
   if (filters.length) parts.push(`filter: ${filters.join(", ")}`);
-  if (totalCount) {
+  if (isKnownCount(filteredCount)) {
+    parts.push((hasMore || capReached)
+      ? `${loadedCount}/${filteredCount} matching sessions loaded${capReached ? " (cap reached)" : ""}`
+      : `${filteredCount} matching of ${totalCount || filteredCount} total`);
+  } else if (totalCount) {
     parts.push((hasMore || capReached)
       ? `${loadedCount}/${totalCount} sessions loaded${capReached ? " (cap reached)" : ""}`
       : `${totalCount} total captured`);
@@ -8846,47 +8933,11 @@ function websocketRenderedFrameWindow(frames, selectedFrameIndex) {
 }
 
 function getVisibleWebsocketSessions() {
-  const normalizedQuery = String(state.websocketQuery || "").trim().toLowerCase();
-  const inScopeOnly = document.getElementById("wsInScopeOnly")?.classList.contains("active") ?? false;
-  const liveOnly = document.getElementById("wsHideClosed")?.classList.contains("active") ?? false;
-
-  return state.websocketSessions.filter((session) => {
-    if (inScopeOnly && !isInScopeHost(session.host)) return false;
-    if (liveOnly && session.duration_ms != null) return false;
-    if (normalizedQuery) {
-      const haystack = [
-        session.host,
-        session.path,
-        formatStatus(session.status),
-        String(session.frame_count),
-        session.duration_ms == null ? "live" : `${session.duration_ms} ms`,
-        formatTimestamp(session.started_at),
-      ]
-        .filter(Boolean)
-        .join("\n")
-        .toLowerCase();
-      if (!haystack.includes(normalizedQuery)) return false;
-    }
-    return true;
-  });
+  return Array.isArray(state.websocketSessions) ? state.websocketSessions : [];
 }
 
 function getSortedWebsocketEntries() {
-  const filtered = getVisibleWebsocketSessions();
-  const direction = state.websocketSortDirection === "asc" ? 1 : -1;
-
-  return filtered
-    .map((session, index) => ({ session, index }))
-    .sort((a, b) => {
-      if (state.websocketSortKey === "index") {
-        return (a.index - b.index) * direction;
-      }
-
-      const av = getWebsocketSortValue(a.session, state.websocketSortKey);
-      const bv = getWebsocketSortValue(b.session, state.websocketSortKey);
-      const cmp = compareSortValues(av, bv);
-      return cmp !== 0 ? cmp * direction : a.index - b.index;
-    });
+  return getVisibleWebsocketSessions().map((session, index) => ({ session, index }));
 }
 
 function getWebsocketSortValue(session, key) {
@@ -8908,7 +8959,8 @@ function toggleWebsocketSort(key) {
     state.websocketSortKey = key;
     state.websocketSortDirection = key === "index" ? "asc" : "desc";
   }
-  renderWebsocketSessions({ ensureSelectedVisible: true });
+  clearWebsocketQueryBackfill();
+  loadWebsockets(true).catch((error) => console.error(error));
 }
 
 function updateWebsocketSortIndicators() {

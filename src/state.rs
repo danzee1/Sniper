@@ -71,6 +71,8 @@ pub struct AppState {
     session_contexts: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<SessionContext>>>>,
     /// WebSocket replay connections.
     pub ws_replay: Arc<WsReplayStore>,
+    /// Stable owner token for runtime-state writes from this app process.
+    pub runtime_instance_id: uuid::Uuid,
 }
 
 impl AppState {
@@ -89,6 +91,7 @@ impl AppState {
 
         let active_proxy_addr = config.proxy_addr;
         let active_ui_addr = config.ui_addr;
+        let runtime_instance_id = uuid::Uuid::new_v4();
         Ok(Self {
             config,
             certificates,
@@ -106,6 +109,7 @@ impl AppState {
             session_operation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             session_contexts: Arc::new(AsyncMutex::new(HashMap::new())),
             ws_replay: Arc::new(WsReplayStore::new()),
+            runtime_instance_id,
         })
     }
 
@@ -784,11 +788,22 @@ impl AppState {
     }
 
     fn remove_runtime_state_for_self_update_restart(&self) {
-        if let Err(error) = crate::runtime_state::remove_runtime_state(&self.config.data_dir) {
-            tracing::warn!(
-                ?error,
-                "failed to remove runtime state before self-update restart"
-            );
+        match crate::runtime_state::remove_runtime_state_if_owner(
+            &self.config.data_dir,
+            self.runtime_instance_id,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "runtime state was replaced before self-update restart; leaving it intact"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "failed to remove runtime state before self-update restart"
+                );
+            }
         }
     }
 

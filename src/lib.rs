@@ -158,11 +158,20 @@ async fn shutdown_headless_runtime(state: &AppState, oast_task: tokio::task::Joi
     }
     if !session_persisted {
         warn!("leaving runtime state after failed headless session persistence");
-    } else if let Err(error) = runtime_state::remove_runtime_state(&state.config.data_dir) {
-        warn!(
-            ?error,
-            "failed to remove runtime state during headless shutdown"
-        );
+    } else {
+        match runtime_state::remove_runtime_state_if_owner(
+            &state.config.data_dir,
+            state.runtime_instance_id,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("runtime state was replaced before headless shutdown; leaving it intact")
+            }
+            Err(error) => warn!(
+                ?error,
+                "failed to remove runtime state during headless shutdown"
+            ),
+        }
     }
 }
 
