@@ -997,6 +997,7 @@ async fn handle_forwardable_request(
                 ),
                 request.headers(),
                 &[],
+                Some(request.version()),
                 started_at,
                 started,
                 StatusCode::BAD_REQUEST,
@@ -1021,6 +1022,7 @@ async fn handle_forwardable_request(
             ),
             &parts.headers,
             &[],
+            Some(parts.version),
             started_at,
             started,
             StatusCode::BAD_REQUEST,
@@ -1049,6 +1051,7 @@ async fn handle_forwardable_request(
                 ),
                 &parts.headers,
                 &[],
+                Some(parts.version),
                 started_at,
                 started,
                 StatusCode::BAD_REQUEST,
@@ -1065,6 +1068,7 @@ async fn handle_forwardable_request(
             RejectedRequestIdentity::from_absolute_uri(&parts.method, &absolute_uri),
             &parts.headers,
             &[],
+            Some(parts.version),
             started_at,
             started,
             StatusCode::BAD_REQUEST,
@@ -1084,6 +1088,7 @@ async fn handle_forwardable_request(
                 RejectedRequestIdentity::from_absolute_uri(&parts.method, &absolute_uri),
                 &parts.headers,
                 &[],
+                Some(parts.version),
                 started_at,
                 started,
                 status,
@@ -1553,6 +1558,7 @@ async fn record_http_rejection(
     identity: RejectedRequestIdentity,
     request_headers: &HeaderMap,
     request_body: &[u8],
+    request_http_version: Option<Version>,
     started_at: chrono::DateTime<Utc>,
     started: Instant,
     status: StatusCode,
@@ -1565,19 +1571,23 @@ async fn record_http_rejection(
         state.config.body_preview_bytes,
     );
     let (response, response_capture) = synthetic_error_response(status, &message, state);
-    let record = TransactionRecord::http(
-        started_at,
-        identity.method,
-        identity.scheme,
-        identity.host,
-        normalize_request_path(&identity.path),
-        Some(status.as_u16()),
-        started.elapsed().as_millis() as u64,
-        request_capture,
-        Some(response_capture),
-        vec![format!("Proxy rejected request: {message}")],
-        None,
-        None,
+    let record = with_record_http_versions(
+        TransactionRecord::http(
+            started_at,
+            identity.method,
+            identity.scheme,
+            identity.host,
+            normalize_request_path(&identity.path),
+            Some(status.as_u16()),
+            started.elapsed().as_millis() as u64,
+            request_capture,
+            Some(response_capture),
+            vec![format!("Proxy rejected request: {message}")],
+            None,
+            None,
+        ),
+        request_http_version,
+        Some(Version::HTTP_11),
     );
     if insert_transaction_quiet(session, record, context).await {
         persist_session_quiet(state, session).await;
@@ -1736,6 +1746,7 @@ async fn serve_special_host_tls(
         }
     };
 
+    let request_authority = special_host_record_authority(&connect_target);
     if insert_transaction_quiet(
         &session,
         TransactionRecord::tunnel(
@@ -1756,8 +1767,14 @@ async fn serve_special_host_tls(
     }
 
     let io = TokioIo::new(tls_stream);
+    let special_host_authority = request_authority.clone();
     let service = service_fn(move |request| {
-        handle_special_host_request(request, state.clone(), session.clone())
+        handle_special_host_request(
+            request,
+            state.clone(),
+            session.clone(),
+            special_host_authority.clone(),
+        )
     });
     let mut builder = AutoBuilder::new(TokioExecutor::new());
     builder
@@ -1771,6 +1788,13 @@ async fn serve_special_host_tls(
         );
     }
     Ok(())
+}
+
+fn special_host_record_authority(connect_target: &str) -> String {
+    match connect_target.parse::<Authority>() {
+        Ok(authority) if authority.port_u16() == Some(443) => authority.host().to_string(),
+        _ => connect_target.to_string(),
+    }
 }
 
 async fn serve_passthrough_tunnel(
@@ -1918,10 +1942,12 @@ async fn handle_special_host_request(
     request: Request<Incoming>,
     state: Arc<AppState>,
     session: Arc<SessionContext>,
+    request_authority: String,
 ) -> Result<Response<Body>, Infallible> {
     let started_at = Utc::now();
     let started = Instant::now();
     let (parts, body) = request.into_parts();
+    let request_http_version = parts.version;
     let path = parts
         .uri
         .path_and_query()
@@ -1940,19 +1966,23 @@ async fn handle_special_host_request(
                 synthetic_error_response(error.status(), &message, &state);
             if insert_transaction_quiet(
                 &session,
-                TransactionRecord::http(
-                    started_at,
-                    parts.method.to_string(),
-                    "https".to_string(),
-                    "sniper".to_string(),
-                    path,
-                    Some(error.status().as_u16()),
-                    started.elapsed().as_millis() as u64,
-                    request_capture,
-                    Some(response_capture),
-                    vec![message],
-                    None,
-                    None,
+                with_record_http_versions(
+                    TransactionRecord::http(
+                        started_at,
+                        parts.method.to_string(),
+                        "https".to_string(),
+                        request_authority.clone(),
+                        path,
+                        Some(error.status().as_u16()),
+                        started.elapsed().as_millis() as u64,
+                        request_capture,
+                        Some(response_capture),
+                        vec![message],
+                        None,
+                        None,
+                    ),
+                    Some(request_http_version),
+                    Some(Version::HTTP_11),
                 ),
                 "special host body collection failed",
             )
@@ -1978,19 +2008,23 @@ async fn handle_special_host_request(
 
     if insert_transaction_quiet(
         &session,
-        TransactionRecord::http(
-            started_at,
-            parts.method.to_string(),
-            "https".to_string(),
-            "sniper".to_string(),
-            path,
-            Some(response.status.as_u16()),
-            started.elapsed().as_millis() as u64,
-            request_capture,
-            Some(response_capture),
-            response.notes.clone(),
-            None,
-            None,
+        with_record_http_versions(
+            TransactionRecord::http(
+                started_at,
+                parts.method.to_string(),
+                "https".to_string(),
+                request_authority,
+                path,
+                Some(response.status.as_u16()),
+                started.elapsed().as_millis() as u64,
+                request_capture,
+                Some(response_capture),
+                response.notes.clone(),
+                None,
+                None,
+            ),
+            Some(request_http_version),
+            Some(Version::HTTP_11),
         ),
         "special-host request",
     )
@@ -2055,6 +2089,7 @@ async fn forward_http_request(
                 started_at,
                 started,
                 "Request dropped in intercept.",
+                Some(request_http_version),
             );
             if insert_transaction_quiet(&session, dropped.record, "dropped request").await {
                 persist_session_quiet(&state, &session).await;
@@ -2146,6 +2181,7 @@ async fn forward_http_request(
                         synthetic_error_response(StatusCode::BAD_GATEWAY, message, &state);
                     record.status = Some(StatusCode::BAD_GATEWAY.as_u16());
                     record.response = Some(response_capture);
+                    record = record.with_response_http_version(Version::HTTP_11);
                     record.notes.push(message.to_string());
                     response
                 }
@@ -2190,6 +2226,7 @@ async fn forward_websocket_request(
                 started_at,
                 started,
                 "WebSocket upgrade dropped in intercept.",
+                Some(request_http_version),
             );
             if insert_transaction_quiet(&session, dropped.record, "dropped websocket upgrade").await
             {
@@ -2250,22 +2287,26 @@ async fn forward_websocket_request(
     {
         let (client_response, response_capture) =
             synthetic_error_response(StatusCode::BAD_REQUEST, message, &state);
-        let record = TransactionRecord::http(
-            started_at,
-            forwarded_request.method.clone(),
-            forwarded_request.scheme.clone(),
-            forwarded_request.host.clone(),
-            normalize_request_path(&forwarded_request.path),
-            Some(StatusCode::BAD_REQUEST.as_u16()),
-            started.elapsed().as_millis() as u64,
-            request_capture,
-            Some(response_capture),
-            merge_notes(
-                request_notes,
-                vec![format!("Invalid WebSocket handshake: {message}")],
+        let record = with_record_http_versions(
+            TransactionRecord::http(
+                started_at,
+                forwarded_request.method.clone(),
+                forwarded_request.scheme.clone(),
+                forwarded_request.host.clone(),
+                normalize_request_path(&forwarded_request.path),
+                Some(StatusCode::BAD_REQUEST.as_u16()),
+                started.elapsed().as_millis() as u64,
+                request_capture,
+                Some(response_capture),
+                merge_notes(
+                    request_notes,
+                    vec![format!("Invalid WebSocket handshake: {message}")],
+                ),
+                original_request_capture,
+                None,
             ),
-            original_request_capture,
-            None,
+            Some(request_http_version),
+            Some(Version::HTTP_11),
         );
         if insert_transaction_quiet(&session, record, "invalid edited websocket upgrade").await {
             persist_session_quiet(&state, &session).await;
@@ -2322,19 +2363,23 @@ async fn forward_websocket_request(
             let message = format!("WebSocket connect failed: {error}");
             let (client_response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
-            let record = TransactionRecord::http(
-                started_at,
-                forwarded_request.method.clone(),
-                forwarded_request.scheme.clone(),
-                forwarded_request.host.clone(),
-                normalize_request_path(&forwarded_request.path),
-                Some(StatusCode::BAD_GATEWAY.as_u16()),
-                started.elapsed().as_millis() as u64,
-                request_capture,
-                Some(response_capture),
-                merge_notes(request_notes, vec![message]),
-                original_request_capture,
-                None,
+            let record = with_record_http_versions(
+                TransactionRecord::http(
+                    started_at,
+                    forwarded_request.method.clone(),
+                    forwarded_request.scheme.clone(),
+                    forwarded_request.host.clone(),
+                    normalize_request_path(&forwarded_request.path),
+                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    merge_notes(request_notes, vec![message]),
+                    original_request_capture,
+                    None,
+                ),
+                Some(request_http_version),
+                Some(Version::HTTP_11),
             );
             if insert_transaction_quiet(&session, record, "websocket connect failure").await {
                 persist_session_quiet(&state, &session).await;
@@ -2352,19 +2397,23 @@ async fn forward_websocket_request(
             let message = format!("Invalid WebSocket handshake: {error}");
             let (client_response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
-            let record = TransactionRecord::http(
-                started_at,
-                forwarded_request.method.clone(),
-                forwarded_request.scheme.clone(),
-                forwarded_request.host.clone(),
-                normalize_request_path(&forwarded_request.path),
-                Some(StatusCode::BAD_REQUEST.as_u16()),
-                started.elapsed().as_millis() as u64,
-                request_capture,
-                Some(response_capture),
-                merge_notes(request_notes, vec![message]),
-                original_request_capture,
-                None,
+            let record = with_record_http_versions(
+                TransactionRecord::http(
+                    started_at,
+                    forwarded_request.method.clone(),
+                    forwarded_request.scheme.clone(),
+                    forwarded_request.host.clone(),
+                    normalize_request_path(&forwarded_request.path),
+                    Some(StatusCode::BAD_REQUEST.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    merge_notes(request_notes, vec![message]),
+                    original_request_capture,
+                    None,
+                ),
+                Some(request_http_version),
+                Some(Version::HTTP_11),
             );
             if insert_transaction_quiet(&session, record, "invalid websocket handshake").await {
                 persist_session_quiet(&state, &session).await;
@@ -2402,22 +2451,26 @@ async fn forward_websocket_request(
         let message = format!("Invalid WebSocket handshake response: {error}");
         let (client_response, response_capture) =
             synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
-        let record = TransactionRecord::http(
-            started_at,
-            forwarded_request.method.clone(),
-            forwarded_request.scheme.clone(),
-            forwarded_request.host.clone(),
-            normalize_request_path(&forwarded_request.path),
-            Some(StatusCode::BAD_REQUEST.as_u16()),
-            started.elapsed().as_millis() as u64,
-            request_capture,
-            Some(response_capture),
-            merge_notes(
-                merge_notes(request_notes, applied_response.notes),
-                vec![message],
+        let record = with_record_http_versions(
+            TransactionRecord::http(
+                started_at,
+                forwarded_request.method.clone(),
+                forwarded_request.scheme.clone(),
+                forwarded_request.host.clone(),
+                normalize_request_path(&forwarded_request.path),
+                Some(StatusCode::BAD_REQUEST.as_u16()),
+                started.elapsed().as_millis() as u64,
+                request_capture,
+                Some(response_capture),
+                merge_notes(
+                    merge_notes(request_notes, applied_response.notes),
+                    vec![message],
+                ),
+                original_request_capture,
+                original_response_capture,
             ),
-            original_request_capture,
-            original_response_capture,
+            Some(request_http_version),
+            Some(Version::HTTP_11),
         );
         if insert_transaction_quiet(&session, record, "invalid websocket response").await {
             persist_session_quiet(&state, &session).await;
@@ -2431,22 +2484,26 @@ async fn forward_websocket_request(
         state.config.body_preview_bytes,
     );
     let request_path = normalize_request_path(&forwarded_request.path);
-    let http_record = TransactionRecord::http(
-        started_at,
-        forwarded_request.method.clone(),
-        forwarded_request.scheme.clone(),
-        forwarded_request.host.clone(),
-        request_path.clone(),
-        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
-        started.elapsed().as_millis() as u64,
-        request_capture.clone(),
-        Some(response_capture.clone()),
-        merge_notes(
-            merge_notes(request_notes, applied_response.notes),
-            vec!["WebSocket upgrade proxied and mirrored into WebSockets history.".to_string()],
+    let http_record = with_record_http_versions(
+        TransactionRecord::http(
+            started_at,
+            forwarded_request.method.clone(),
+            forwarded_request.scheme.clone(),
+            forwarded_request.host.clone(),
+            request_path.clone(),
+            Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+            started.elapsed().as_millis() as u64,
+            request_capture.clone(),
+            Some(response_capture.clone()),
+            merge_notes(
+                merge_notes(request_notes, applied_response.notes),
+                vec!["WebSocket upgrade proxied and mirrored into WebSockets history.".to_string()],
+            ),
+            original_request_capture,
+            original_response_capture,
         ),
-        original_request_capture,
-        original_response_capture,
+        Some(request_http_version),
+        Some(Version::HTTP_11),
     );
     insert_transaction_quiet(&session, http_record, "websocket upgrade transaction").await;
     session
@@ -2748,19 +2805,23 @@ async fn execute_streaming_http_exchange(
             notes.push(message.clone());
             let (response, response_capture) =
                 synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
-            let record = TransactionRecord::http(
-                started_at,
-                request.method,
-                request.scheme,
-                request.host,
-                path,
-                Some(StatusCode::BAD_REQUEST.as_u16()),
-                started.elapsed().as_millis() as u64,
-                request_capture,
-                Some(response_capture),
-                notes,
-                original_request_capture,
-                None,
+            let record = with_record_http_versions(
+                TransactionRecord::http(
+                    started_at,
+                    request.method,
+                    request.scheme,
+                    request.host,
+                    path,
+                    Some(StatusCode::BAD_REQUEST.as_u16()),
+                    started.elapsed().as_millis() as u64,
+                    request_capture,
+                    Some(response_capture),
+                    notes,
+                    original_request_capture,
+                    None,
+                ),
+                request_http_version,
+                Some(Version::HTTP_11),
             );
             store_record_and_scan(&state, &session, record).await;
             return response;
@@ -2790,7 +2851,7 @@ async fn execute_streaming_http_exchange(
                     None,
                 ),
                 request_http_version,
-                None,
+                Some(Version::HTTP_11),
             );
             store_record_and_scan(&state, &session, record).await;
             return response;
@@ -2851,7 +2912,7 @@ async fn execute_streaming_http_exchange(
                         None,
                     ),
                     request_http_version,
-                    Some(response_version),
+                    Some(Version::HTTP_11),
                 );
                 store_record_and_scan(&state, &session, record).await;
                 return response;
@@ -2921,7 +2982,7 @@ async fn execute_streaming_http_exchange(
                     None,
                 ),
                 request_http_version,
-                None,
+                Some(Version::HTTP_11),
             );
             store_record_and_scan(&state, &session, record).await;
             response
@@ -3111,7 +3172,7 @@ async fn execute_http_exchange(
                         None,
                     ),
                     request_http_version,
-                    None,
+                    Some(Version::HTTP_11),
                 ),
                 response: Err(UpstreamError {
                     status: StatusCode::BAD_REQUEST,
@@ -3187,7 +3248,7 @@ async fn execute_http_exchange(
                         None,
                     ),
                     request_http_version,
-                    None,
+                    Some(Version::HTTP_11),
                 ),
                 response: Err(UpstreamError {
                     status: StatusCode::BAD_REQUEST,
@@ -3251,7 +3312,7 @@ async fn execute_http_exchange(
                             None,
                         ),
                         request_http_version,
-                        Some(resp_version),
+                        Some(Version::HTTP_11),
                     ),
                     response: Err(UpstreamError {
                         status: StatusCode::BAD_GATEWAY,
@@ -3353,7 +3414,7 @@ async fn execute_http_exchange(
                                 None,
                             ),
                             request_http_version,
-                            Some(resp_version),
+                            Some(Version::HTTP_11),
                         ),
                         response: Err(UpstreamError {
                             status: StatusCode::BAD_GATEWAY,
@@ -3394,7 +3455,7 @@ async fn execute_http_exchange(
                         None,
                     ),
                     request_http_version,
-                    None,
+                    Some(Version::HTTP_11),
                 ),
                 response: Err(UpstreamError {
                     status: StatusCode::BAD_GATEWAY,
@@ -3649,6 +3710,7 @@ fn build_dropped_transaction(
     started_at: chrono::DateTime<Utc>,
     started: Instant,
     note: &str,
+    request_http_version: Option<Version>,
 ) -> DroppedExchange {
     let request_headers = header_map_from_records(&request.headers);
     let request_capture = MessageRecord::from_headers_and_body(
@@ -3663,19 +3725,23 @@ fn build_dropped_transaction(
         state.config.body_preview_bytes,
     );
     DroppedExchange {
-        record: TransactionRecord::http(
-            started_at,
-            request.method,
-            request.scheme,
-            request.host,
-            normalize_request_path(&request.path),
-            Some(StatusCode::FORBIDDEN.as_u16()),
-            started.elapsed().as_millis() as u64,
-            request_capture,
-            Some(response_capture),
-            vec![note.to_string()],
-            None,
-            None,
+        record: with_record_http_versions(
+            TransactionRecord::http(
+                started_at,
+                request.method,
+                request.scheme,
+                request.host,
+                normalize_request_path(&request.path),
+                Some(StatusCode::FORBIDDEN.as_u16()),
+                started.elapsed().as_millis() as u64,
+                request_capture,
+                Some(response_capture),
+                vec![note.to_string()],
+                None,
+                None,
+            ),
+            request_http_version,
+            Some(Version::HTTP_11),
         ),
         response,
     }

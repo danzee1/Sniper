@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{routing::get, Router};
 use sniper::{
     config::AppConfig,
+    intercept::{InterceptRule, InterceptScope},
     proxy::{flush_pending_session_persists, serve_proxy},
     runtime::RuntimeSettingsUpdate,
     state::AppState,
@@ -243,6 +244,117 @@ async fn flush_pending_persists_waits_for_streaming_body_pump_store() {
 }
 
 #[tokio::test]
+async fn response_intercept_drop_records_synthetic_response_version() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-response-intercept-drop-version-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+    let session = state.session().await;
+    session
+        .runtime
+        .update(RuntimeSettingsUpdate {
+            intercept_enabled: Some(true),
+            intercept_scope_only: Some(false),
+            ..RuntimeSettingsUpdate::default()
+        })
+        .await
+        .unwrap();
+    session
+        .intercept_rules
+        .upsert(InterceptRule {
+            id: uuid::Uuid::new_v4(),
+            enabled: true,
+            scope: InterceptScope::Response,
+            host_pattern: String::new(),
+            path_pattern: "/drop-response-version".to_string(),
+            method_filter: Vec::new(),
+        })
+        .await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let client = tokio::spawn(async move {
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "GET http://{upstream_addr}/drop-response-version HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buffer = Vec::new();
+        stream.read_to_end(&mut buffer).await.unwrap();
+        String::from_utf8(buffer).unwrap()
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let pending = session.response_intercepts.list().await;
+            if let Some(item) = pending.first() {
+                session
+                    .response_intercepts
+                    .drop_response(item.id)
+                    .await
+                    .unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("response intercept should be queued");
+
+    let response = client.await.unwrap();
+    assert!(response.contains("502 Bad Gateway"));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let records = session.store.snapshot(Some(10)).await;
+            if let Some(record) = records
+                .iter()
+                .find(|record| record.path == "/drop-response-version")
+            {
+                assert_eq!(record.status, Some(502));
+                assert_eq!(record.http_version.as_deref(), Some("HTTP/1.1"));
+                assert_eq!(record.response_http_version.as_deref(), Some("HTTP/1.1"));
+                assert!(record
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("Response dropped in intercept")));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dropped response record should be stored");
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_records_origin_form_rejection_without_host_header() {
     let config = AppConfig {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
@@ -282,10 +394,58 @@ async fn proxy_records_origin_form_rejection_without_host_header() {
         .find(|record| record.path == "/missing-host")
         .expect("proxy rejection should be recorded");
     assert_eq!(record.status, Some(400));
+    assert_eq!(record.http_version.as_deref(), Some("HTTP/1.1"));
+    assert_eq!(record.response_http_version.as_deref(), Some("HTTP/1.1"));
     assert!(record
         .notes
         .iter()
         .any(|note| note.contains("Proxy rejected request")));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_records_http10_rejection_version() {
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-http10-rejection-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(b"GET /missing-host-http10 HTTP/1.0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.contains("400 Bad Request"));
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let session = state.session().await;
+    let records = session.store.snapshot(Some(10)).await;
+    let record = records
+        .iter()
+        .find(|record| record.path == "/missing-host-http10")
+        .expect("proxy rejection should be recorded");
+    assert_eq!(record.status, Some(400));
+    assert_eq!(record.http_version.as_deref(), Some("HTTP/1.0"));
+    assert_eq!(record.response_http_version.as_deref(), Some("HTTP/1.1"));
 
     proxy_handle.abort();
 }

@@ -2213,8 +2213,10 @@ async fn update_workspace_state(
 
 async fn update_workspace_state_keepalive(
     State(state): State<Arc<AppState>>,
-    Json(snapshot): Json<WorkspaceStateSnapshot>,
+    Json(update): Json<WorkspaceKeepaliveUpdate>,
 ) -> Response {
+    let snapshot = update.snapshot;
+    let keepalive = update.keepalive;
     let Some(target_session_id) = snapshot.session_id else {
         return StatusCode::CONFLICT.into_response();
     };
@@ -2257,7 +2259,7 @@ async fn update_workspace_state_keepalive(
     if !can_replace_snapshot(&incoming, &current) {
         return StatusCode::CONFLICT.into_response();
     }
-    let mut merged = merge_workspace_keepalive_snapshot(current, incoming);
+    let mut merged = merge_workspace_keepalive_snapshot(current, incoming, keepalive);
     merged.session_id = Some(session.id());
     if let Err(error) = validate_workspace_state(&merged) {
         return (StatusCode::BAD_REQUEST, error).into_response();
@@ -2278,9 +2280,34 @@ async fn update_workspace_state_keepalive(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct WorkspaceKeepaliveUpdate {
+    #[serde(flatten)]
+    snapshot: WorkspaceStateSnapshot,
+    #[serde(default)]
+    keepalive: WorkspaceKeepaliveMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct WorkspaceKeepaliveMetadata {
+    #[serde(default)]
+    replay_tabs_complete: bool,
+    #[serde(default)]
+    fuzzer_complete: bool,
+    #[serde(default)]
+    ws_text_complete: Option<bool>,
+}
+
+impl WorkspaceKeepaliveMetadata {
+    fn ws_text_complete(self) -> bool {
+        self.ws_text_complete.unwrap_or(true)
+    }
+}
+
 fn merge_workspace_keepalive_snapshot(
     mut current: WorkspaceStateSnapshot,
     incoming: WorkspaceStateSnapshot,
+    keepalive: WorkspaceKeepaliveMetadata,
 ) -> WorkspaceStateSnapshot {
     current.client_id = incoming.client_id;
     current.client_version = incoming.client_version;
@@ -2290,30 +2317,56 @@ fn merge_workspace_keepalive_snapshot(
         .tab_sequence
         .max(incoming.replay.tab_sequence);
 
+    let mut incoming_tab_ids = HashSet::new();
     for incoming_tab in incoming.replay.tabs {
+        if keepalive.replay_tabs_complete {
+            incoming_tab_ids.insert(incoming_tab.id.clone());
+        }
         match current
             .replay
             .tabs
             .iter_mut()
             .find(|tab| tab.id == incoming_tab.id)
         {
-            Some(current_tab) => merge_workspace_keepalive_tab(current_tab, incoming_tab),
+            Some(current_tab) => {
+                merge_workspace_keepalive_tab(current_tab, incoming_tab, keepalive)
+            }
             None => current.replay.tabs.push(incoming_tab),
         }
     }
+    if keepalive.replay_tabs_complete {
+        current
+            .replay
+            .tabs
+            .retain(|tab| incoming_tab_ids.contains(&tab.id));
+    }
 
-    if fuzzer_keepalive_has_payload(&incoming.fuzzer) {
+    if keepalive.fuzzer_complete {
+        current.fuzzer = complete_workspace_keepalive_fuzzer(incoming.fuzzer);
+    } else if fuzzer_keepalive_has_payload(&incoming.fuzzer) {
         current.fuzzer = merge_workspace_keepalive_fuzzer(current.fuzzer, incoming.fuzzer);
     }
 
     current
 }
 
-fn merge_workspace_keepalive_tab(current: &mut ReplayTabState, incoming: ReplayTabState) {
+fn complete_workspace_keepalive_fuzzer(mut incoming: FuzzerWorkspaceState) -> FuzzerWorkspaceState {
+    incoming.attack_record = None;
+    incoming
+}
+
+fn merge_workspace_keepalive_tab(
+    current: &mut ReplayTabState,
+    incoming: ReplayTabState,
+    keepalive: WorkspaceKeepaliveMetadata,
+) {
     let request_text_changed =
         !incoming.request_text.is_empty() && incoming.request_text != current.request_text;
     let current_history_entries = std::mem::take(&mut current.history_entries);
+    let current_history_index = current.history_index;
     let current_response_record = current.response_record.take();
+    let current_ws_handshake_text = std::mem::take(&mut current.ws_handshake_text);
+    let current_ws_editor_text = std::mem::take(&mut current.ws_editor_text);
     let current_ws_setup_queue = std::mem::take(&mut current.ws_setup_queue);
     let current_ws_frames = std::mem::take(&mut current.ws_frames);
     let current_ws_selected_frame_index = current.ws_selected_frame_index;
@@ -2324,9 +2377,16 @@ fn merge_workspace_keepalive_tab(current: &mut ReplayTabState, incoming: ReplayT
 
     if current.history_entries.is_empty() {
         current.history_entries = current_history_entries;
+        if current.history_index.is_none() {
+            current.history_index = current_history_index;
+        }
     }
     if current.response_record.is_none() && !request_text_changed {
         current.response_record = current_response_record;
+    }
+    if current.tab_type == "websocket" && !keepalive.ws_text_complete() {
+        current.ws_handshake_text = current_ws_handshake_text;
+        current.ws_editor_text = current_ws_editor_text;
     }
     if current.ws_setup_queue.is_empty() {
         current.ws_setup_queue = current_ws_setup_queue;
@@ -6256,6 +6316,7 @@ mod tests {
                             target_port: "443".to_string(),
                             ..crate::workspace::ReplayHistoryEntryState::default()
                         }],
+                        history_index: Some(0),
                         target_scheme: "https".to_string(),
                         target_host: "example.test".to_string(),
                         target_port: "443".to_string(),
@@ -6302,7 +6363,11 @@ mod tests {
             fuzzer: FuzzerWorkspaceState::default(),
         };
 
-        let merged = super::merge_workspace_keepalive_snapshot(current, incoming);
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
 
         assert_eq!(merged.replay.tabs.len(), 2);
         let active = merged
@@ -6314,9 +6379,176 @@ mod tests {
         assert!(active.request_text.contains("/edited"));
         assert!(active.response_record.is_none());
         assert_eq!(active.history_entries.len(), 1);
+        assert_eq!(active.history_index, Some(0));
         assert!(merged.replay.tabs.iter().any(|tab| tab.id == "inactive"));
         assert_eq!(merged.fuzzer.payloads_text, "payload-one");
         assert_eq!(merged.client_version, 13);
+    }
+
+    #[test]
+    fn workspace_keepalive_complete_replay_payload_removes_closed_tabs() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 2,
+                tabs: vec![
+                    ReplayTabState {
+                        id: "active".to_string(),
+                        sequence: 1,
+                        request_text: "GET /active HTTP/1.1\r\n\r\n".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                    ReplayTabState {
+                        id: "closed".to_string(),
+                        sequence: 2,
+                        request_text: "GET /closed HTTP/1.1\r\n\r\n".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                ],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 2,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    request_text: "GET /active-edited HTTP/1.1\r\n\r\n".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                replay_tabs_complete: true,
+                fuzzer_complete: false,
+                ..super::WorkspaceKeepaliveMetadata::default()
+            },
+        );
+
+        assert_eq!(merged.replay.tabs.len(), 1);
+        assert_eq!(merged.replay.tabs[0].id, "active");
+        assert!(merged.replay.tabs[0]
+            .request_text
+            .contains("/active-edited"));
+    }
+
+    #[test]
+    fn workspace_keepalive_complete_fuzzer_payload_clears_stale_fields() {
+        let stale_attack_id = Uuid::new_v4();
+        let stale_source_id = Uuid::new_v4();
+        let current = WorkspaceStateSnapshot {
+            fuzzer: FuzzerWorkspaceState {
+                source_transaction_id: Some(stale_source_id),
+                target: Some(RequestTargetOverride {
+                    scheme: "https".to_string(),
+                    host: "old.example".to_string(),
+                    port: "443".to_string(),
+                }),
+                target_request_authority: Some("old.example".to_string()),
+                notice: "old notice".to_string(),
+                request_text: "FUZZ /old HTTP/1.1\r\n\r\n".to_string(),
+                payloads_text: "old-payload".to_string(),
+                attack_record_id: Some(stale_attack_id),
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            fuzzer: FuzzerWorkspaceState {
+                request_text: "FUZZ /new HTTP/1.1\r\n\r\n".to_string(),
+                payloads_text: String::new(),
+                attack_record_id: None,
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                replay_tabs_complete: false,
+                fuzzer_complete: true,
+                ..super::WorkspaceKeepaliveMetadata::default()
+            },
+        );
+
+        assert_eq!(
+            merged.fuzzer.request_text,
+            "FUZZ /new HTTP/1.1\r\n\r\n".to_string()
+        );
+        assert!(merged.fuzzer.payloads_text.is_empty());
+        assert!(merged.fuzzer.attack_record_id.is_none());
+        assert!(merged.fuzzer.source_transaction_id.is_none());
+        assert!(merged.fuzzer.target.is_none());
+        assert!(merged.fuzzer.target_request_authority.is_none());
+        assert!(merged.fuzzer.notice.is_empty());
+    }
+
+    #[test]
+    fn workspace_keepalive_partial_ws_text_preserves_durable_text() {
+        let ws_tab_id = Uuid::new_v4().to_string();
+        let durable_handshake = "GET /ws HTTP/1.1\r\n".repeat(4096);
+        let durable_editor = "A".repeat(70_000);
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some(ws_tab_id.clone()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: ws_tab_id.clone(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_host: "ws.example".to_string(),
+                    ws_path: "/ws".to_string(),
+                    ws_handshake_text: durable_handshake.clone(),
+                    ws_editor_text: durable_editor.clone(),
+                    ws_message_type: "text".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some(ws_tab_id.clone()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: ws_tab_id,
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_host: "ws.example".to_string(),
+                    ws_path: "/ws-edited".to_string(),
+                    ws_handshake_text: "GET /ws HTTP/1.1\r\n".repeat(32),
+                    ws_editor_text: "A".repeat(2048),
+                    ws_message_type: "binary".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                replay_tabs_complete: false,
+                fuzzer_complete: false,
+                ws_text_complete: Some(false),
+            },
+        );
+
+        let tab = merged.replay.tabs.first().expect("merged websocket tab");
+        assert_eq!(tab.ws_path, "/ws-edited");
+        assert_eq!(tab.ws_message_type, "binary");
+        assert_eq!(tab.ws_handshake_text, durable_handshake);
+        assert_eq!(tab.ws_editor_text, durable_editor);
     }
 
     #[test]

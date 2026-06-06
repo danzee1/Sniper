@@ -103,14 +103,36 @@ async fn https_sniper_records_non_default_connect_port() {
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream
         .write_all(
-            b"CONNECT sniper:8443 HTTP/1.1\r\nHost: sniper:8443\r\nConnection: close\r\n\r\n",
+            b"CONNECT sniper:8443 HTTP/1.1\r\nHost: sniper:8443\r\nConnection: keep-alive\r\n\r\n",
         )
         .await
         .unwrap();
 
     let connect_response = read_connect_response(&mut stream).await;
     assert!(connect_response.starts_with("HTTP/1.1 200"));
-    drop(stream);
+
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(&Certificate(state.certificates.root_der_bytes().to_vec()))
+        .unwrap();
+
+    let client_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("sniper").unwrap();
+    let mut tls_stream = connector.connect(server_name, stream).await.unwrap();
+
+    tls_stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: sniper:8443\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    tls_stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.contains("200 OK"));
 
     tokio::time::sleep(Duration::from_millis(120)).await;
 
@@ -118,6 +140,9 @@ async fn https_sniper_records_non_default_connect_port() {
     let list = session.store.list(&ListFilters::default()).await;
     assert!(list.iter().any(|record| {
         record.method == "CONNECT" && record.host == "sniper:8443" && record.path.is_empty()
+    }));
+    assert!(list.iter().any(|record| {
+        record.method == "GET" && record.host == "sniper:8443" && record.path == "/"
     }));
 
     proxy_handle.abort();

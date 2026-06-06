@@ -3042,6 +3042,44 @@ function workspaceUnloadPayload(primarySnapshot) {
       return { payload: compactPayload, endpoint: "/api/workspace-state/keepalive" };
     }
   }
+  const activeOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, { activeOnly: true });
+  if (activeOnlySnapshot) {
+    const activeOnlyPayload = JSON.stringify(activeOnlySnapshot);
+    if (utf8ByteLength(activeOnlyPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+      return { payload: activeOnlyPayload, endpoint: "/api/workspace-state/keepalive" };
+    }
+  }
+  const activeOnlyReplaySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+    activeOnly: true,
+    dropFuzzer: true,
+  });
+  if (activeOnlyReplaySnapshot) {
+    const activeOnlyReplayPayload = JSON.stringify(activeOnlyReplaySnapshot);
+    if (utf8ByteLength(activeOnlyReplayPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+      return { payload: activeOnlyReplayPayload, endpoint: "/api/workspace-state/keepalive" };
+    }
+  }
+  const boundedActiveOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+    activeOnly: true,
+    wsTextByteLimit: 8 * 1024,
+  });
+  if (boundedActiveOnlySnapshot) {
+    const boundedActiveOnlyPayload = JSON.stringify(boundedActiveOnlySnapshot);
+    if (utf8ByteLength(boundedActiveOnlyPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+      return { payload: boundedActiveOnlyPayload, endpoint: "/api/workspace-state/keepalive" };
+    }
+  }
+  const minimalActiveReplaySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+    activeOnly: true,
+    dropFuzzer: true,
+    wsTextByteLimit: 2 * 1024,
+  });
+  if (minimalActiveReplaySnapshot) {
+    const minimalActiveReplayPayload = JSON.stringify(minimalActiveReplaySnapshot);
+    if (utf8ByteLength(minimalActiveReplayPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
+      return { payload: minimalActiveReplayPayload, endpoint: "/api/workspace-state/keepalive" };
+    }
+  }
   return null;
 }
 
@@ -3064,6 +3102,11 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
       active_tab_id: activeTabId,
       tab_sequence: replay.tab_sequence || state.replayTabSequence || 0,
     },
+    keepalive: {
+      replay_tabs_complete: !options.activeOnly,
+      fuzzer_complete: !options.dropFuzzer,
+      ws_text_complete: !Number.isFinite(options.wsTextByteLimit),
+    },
     fuzzer: options.dropFuzzer ? {} : (compactWorkspaceUnloadFuzzer(snapshot.fuzzer, options) || {}),
   };
 }
@@ -3073,6 +3116,13 @@ function compactWorkspaceUnloadText(value, options = {}) {
   return Number.isFinite(options.textByteLimit)
     ? truncateUtf8(text, options.textByteLimit)
     : text;
+}
+
+function compactWorkspaceUnloadWsText(value, options = {}) {
+  if (Number.isFinite(options.wsTextByteLimit)) {
+    return truncateUtf8(String(value || ""), options.wsTextByteLimit);
+  }
+  return compactWorkspaceUnloadText(value, options);
 }
 
 function compactWorkspaceUnloadEditableRequest(request, options = {}) {
@@ -3104,9 +3154,9 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}) {
       ws_port: tab.ws_port || defaultWsPortForScheme(tab.ws_scheme),
       ws_path: tab.ws_path || "/",
       ws_headers: normalizedHeaders(tab.ws_headers),
-      ws_handshake_text: compactWorkspaceUnloadText(tab.ws_handshake_text, options),
+      ws_handshake_text: compactWorkspaceUnloadWsText(tab.ws_handshake_text, options),
       ws_handshake_edited: !!tab.ws_handshake_edited,
-      ws_editor_text: compactWorkspaceUnloadText(tab.ws_editor_text, options),
+      ws_editor_text: compactWorkspaceUnloadWsText(tab.ws_editor_text, options),
       ws_message_type: normalizeWsMessageType(tab.ws_message_type),
       ws_editor_body_encoded: !!tab.ws_editor_body_encoded,
       ws_setup_notice: tab.ws_setup_notice || "",
