@@ -812,6 +812,7 @@ async fn handle_connect(
 ) -> Response<Body> {
     let started_at = Utc::now();
     let started = Instant::now();
+    let request_http_version = request.version();
     let target = match connect_target(request.uri()) {
         Ok(target) => target,
         Err(error) => {
@@ -825,6 +826,7 @@ async fn handle_connect(
                 started,
                 StatusCode::BAD_REQUEST,
                 error.to_string(),
+                request_http_version,
             )
             .await;
         }
@@ -848,6 +850,7 @@ async fn handle_connect(
                 request_capture,
                 started_at,
                 started,
+                request_http_version,
             )
             .await
             {
@@ -864,8 +867,7 @@ async fn handle_connect(
                     target = %target,
                     "passthrough tunnel upstream connect failed before CONNECT response"
                 );
-                if insert_transaction_quiet(
-                    &session,
+                let record = with_record_http_versions(
                     TransactionRecord::tunnel(
                         started_at,
                         target.clone(),
@@ -876,9 +878,11 @@ async fn handle_connect(
                             "Passthrough tunnel failed to connect to upstream: {error}"
                         )],
                     ),
-                    "passthrough tunnel connect failure",
-                )
-                .await
+                    Some(request_http_version),
+                    Some(Version::HTTP_11),
+                );
+                if insert_transaction_quiet(&session, record, "passthrough tunnel connect failure")
+                    .await
                 {
                     persist_session_quiet(&state, &session).await;
                 }
@@ -901,6 +905,7 @@ async fn handle_connect(
                 request_capture,
                 started_at,
                 started,
+                request_http_version,
             )
             .await
             {
@@ -914,6 +919,7 @@ async fn handle_connect(
         let failure_capture = request_capture.clone();
         let failure_started_at = started_at;
         let failure_started = started;
+        let failure_request_http_version = request_http_version;
 
         spawn_tracked_proxy_task(session.id(), async move {
             if let Err(error) = serve_https_mitm(
@@ -925,12 +931,12 @@ async fn handle_connect(
                 started_at,
                 started,
                 peer_addr,
+                request_http_version,
             )
             .await
             {
                 warn!(%peer_addr, ?error, target = %failure_target, "HTTPS MITM handler failed");
-                if insert_transaction_quiet(
-                    &failure_session,
+                let record = with_record_http_versions(
                     TransactionRecord::tunnel(
                         failure_started_at,
                         failure_target,
@@ -939,10 +945,10 @@ async fn handle_connect(
                         failure_capture,
                         vec![format!("HTTPS MITM failed: {error}")],
                     ),
-                    "https mitm failure",
-                )
-                .await
-                {
+                    Some(failure_request_http_version),
+                    Some(Version::HTTP_11),
+                );
+                if insert_transaction_quiet(&failure_session, record, "https mitm failure").await {
                     persist_session_quiet(&failure_state, &failure_session).await;
                 }
             }
@@ -1604,6 +1610,7 @@ async fn record_connect_rejection(
     started: Instant,
     status: StatusCode,
     message: String,
+    request_http_version: Version,
 ) -> Response<Body> {
     let target = uri
         .authority()
@@ -1613,15 +1620,19 @@ async fn record_connect_rejection(
     let request_capture =
         MessageRecord::from_headers_and_body(request_headers, &[], state.config.body_preview_bytes);
     let (response, response_capture) = synthetic_error_response(status, &message, state);
-    let record = TransactionRecord::tunnel(
-        started_at,
-        target,
-        Some(status.as_u16()),
-        started.elapsed().as_millis() as u64,
-        request_capture,
-        vec![format!("Proxy rejected CONNECT: {message}")],
-    )
-    .with_response(response_capture);
+    let record = with_record_http_versions(
+        TransactionRecord::tunnel(
+            started_at,
+            target,
+            Some(status.as_u16()),
+            started.elapsed().as_millis() as u64,
+            request_capture,
+            vec![format!("Proxy rejected CONNECT: {message}")],
+        )
+        .with_response(response_capture),
+        Some(request_http_version),
+        Some(Version::HTTP_11),
+    );
     if insert_transaction_quiet(session, record, "invalid connect target").await {
         persist_session_quiet(state, session).await;
     }
@@ -1636,9 +1647,9 @@ async fn record_connect_tunnel_failure(
     started_at: chrono::DateTime<Utc>,
     started: Instant,
     note: String,
+    request_http_version: Version,
 ) {
-    if insert_transaction_quiet(
-        session,
+    let record = with_record_http_versions(
         TransactionRecord::tunnel(
             started_at,
             target,
@@ -1647,10 +1658,10 @@ async fn record_connect_tunnel_failure(
             request_capture,
             vec![note],
         ),
-        "connect tunnel failure",
-    )
-    .await
-    {
+        Some(request_http_version),
+        Some(Version::HTTP_11),
+    );
+    if insert_transaction_quiet(session, record, "connect tunnel failure").await {
         persist_session_quiet(state, session).await;
     }
 }
@@ -1692,6 +1703,7 @@ async fn serve_special_host_tls(
     connect_capture: MessageRecord,
     started_at: chrono::DateTime<Utc>,
     started: Instant,
+    request_http_version: Version,
 ) -> Result<()> {
     let upgraded = match upgrade.await {
         Ok(upgraded) => upgraded,
@@ -1705,6 +1717,7 @@ async fn serve_special_host_tls(
                 started_at,
                 started,
                 message.clone(),
+                request_http_version,
             )
             .await;
             return Err(anyhow!(message));
@@ -1723,6 +1736,7 @@ async fn serve_special_host_tls(
                 started_at,
                 started,
                 message.clone(),
+                request_http_version,
             )
             .await;
             return Err(anyhow!(message));
@@ -1740,6 +1754,7 @@ async fn serve_special_host_tls(
                 started_at,
                 started,
                 message.clone(),
+                request_http_version,
             )
             .await;
             return Err(anyhow!(message));
@@ -1747,8 +1762,7 @@ async fn serve_special_host_tls(
     };
 
     let request_authority = special_host_record_authority(&connect_target);
-    if insert_transaction_quiet(
-        &session,
+    let record = with_record_http_versions(
         TransactionRecord::tunnel(
             started_at,
             connect_target,
@@ -1759,10 +1773,10 @@ async fn serve_special_host_tls(
                 "CONNECT tunnel terminated locally for the Sniper certificate portal.".to_string(),
             ],
         ),
-        "special-host tunnel",
-    )
-    .await
-    {
+        Some(request_http_version),
+        Some(Version::HTTP_11),
+    );
+    if insert_transaction_quiet(&session, record, "special-host tunnel").await {
         persist_session_quiet(&state, &session).await;
     }
 
@@ -1806,6 +1820,7 @@ async fn serve_passthrough_tunnel(
     request_capture: MessageRecord,
     started_at: chrono::DateTime<chrono::Utc>,
     started: Instant,
+    request_http_version: Version,
 ) -> Result<()> {
     let upgraded = match upgrade.await {
         Ok(upgraded) => upgraded,
@@ -1819,6 +1834,7 @@ async fn serve_passthrough_tunnel(
                 started_at,
                 started,
                 message.clone(),
+                request_http_version,
             )
             .await;
             return Err(anyhow!(message));
@@ -1844,8 +1860,7 @@ async fn serve_passthrough_tunnel(
         StatusCode::BAD_GATEWAY
     };
 
-    if insert_transaction_quiet(
-        &session,
+    let record = with_record_http_versions(
         TransactionRecord::tunnel(
             started_at,
             target,
@@ -1854,10 +1869,10 @@ async fn serve_passthrough_tunnel(
             request_capture,
             notes,
         ),
-        "passthrough tunnel",
-    )
-    .await
-    {
+        Some(request_http_version),
+        Some(Version::HTTP_11),
+    );
+    if insert_transaction_quiet(&session, record, "passthrough tunnel").await {
         persist_session_quiet(&state, &session).await;
     }
 
@@ -1874,6 +1889,7 @@ async fn serve_https_mitm(
     started_at: chrono::DateTime<Utc>,
     started: Instant,
     peer_addr: SocketAddr,
+    request_http_version: Version,
 ) -> Result<()> {
     let authority: Authority = target
         .parse()
@@ -1891,8 +1907,7 @@ async fn serve_https_mitm(
         .await
         .with_context(|| format!("TLS handshake failed for {}", authority.host()))?;
 
-    if insert_transaction_quiet(
-        &session,
+    let record = with_record_http_versions(
         TransactionRecord::tunnel(
             started_at,
             target,
@@ -1904,10 +1919,10 @@ async fn serve_https_mitm(
                 authority.host()
             )],
         ),
-        "https mitm tunnel",
-    )
-    .await
-    {
+        Some(request_http_version),
+        Some(Version::HTTP_11),
+    );
+    if insert_transaction_quiet(&session, record, "https mitm tunnel").await {
         persist_session_quiet(&state, &session).await;
     }
 

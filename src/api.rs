@@ -2295,10 +2295,16 @@ struct WorkspaceKeepaliveMetadata {
     #[serde(default)]
     fuzzer_complete: bool,
     #[serde(default)]
+    text_complete: Option<bool>,
+    #[serde(default)]
     ws_text_complete: Option<bool>,
 }
 
 impl WorkspaceKeepaliveMetadata {
+    fn text_complete(self) -> bool {
+        self.text_complete.unwrap_or(true)
+    }
+
     fn ws_text_complete(self) -> bool {
         self.ws_text_complete.unwrap_or(true)
     }
@@ -2342,15 +2348,26 @@ fn merge_workspace_keepalive_snapshot(
     }
 
     if keepalive.fuzzer_complete {
-        current.fuzzer = complete_workspace_keepalive_fuzzer(incoming.fuzzer);
+        current.fuzzer =
+            complete_workspace_keepalive_fuzzer(incoming.fuzzer, &current.fuzzer, keepalive);
     } else if fuzzer_keepalive_has_payload(&incoming.fuzzer) {
-        current.fuzzer = merge_workspace_keepalive_fuzzer(current.fuzzer, incoming.fuzzer);
+        current.fuzzer =
+            merge_workspace_keepalive_fuzzer(current.fuzzer, incoming.fuzzer, keepalive);
     }
 
     current
 }
 
-fn complete_workspace_keepalive_fuzzer(mut incoming: FuzzerWorkspaceState) -> FuzzerWorkspaceState {
+fn complete_workspace_keepalive_fuzzer(
+    mut incoming: FuzzerWorkspaceState,
+    current: &FuzzerWorkspaceState,
+    keepalive: WorkspaceKeepaliveMetadata,
+) -> FuzzerWorkspaceState {
+    if !keepalive.text_complete() {
+        incoming.base_request = current.base_request.clone();
+        incoming.request_text.clone_from(&current.request_text);
+        incoming.payloads_text.clone_from(&current.payloads_text);
+    }
     incoming.attack_record = None;
     incoming
 }
@@ -2361,7 +2378,9 @@ fn merge_workspace_keepalive_tab(
     keepalive: WorkspaceKeepaliveMetadata,
 ) {
     let request_text_changed =
-        !incoming.request_text.is_empty() && incoming.request_text != current.request_text;
+        keepalive.text_complete() && incoming.request_text != current.request_text;
+    let current_base_request = current.base_request.clone();
+    let current_request_text = current.request_text.clone();
     let current_history_entries = std::mem::take(&mut current.history_entries);
     let current_history_index = current.history_index;
     let current_response_record = current.response_record.take();
@@ -2383,6 +2402,10 @@ fn merge_workspace_keepalive_tab(
     }
     if current.response_record.is_none() && !request_text_changed {
         current.response_record = current_response_record;
+    }
+    if current.tab_type != "websocket" && !keepalive.text_complete() {
+        current.base_request = current_base_request;
+        current.request_text = current_request_text;
     }
     if current.tab_type == "websocket" && !keepalive.ws_text_complete() {
         current.ws_handshake_text = current_ws_handshake_text;
@@ -2417,8 +2440,9 @@ fn fuzzer_keepalive_has_payload(fuzzer: &FuzzerWorkspaceState) -> bool {
 fn merge_workspace_keepalive_fuzzer(
     mut current: FuzzerWorkspaceState,
     incoming: FuzzerWorkspaceState,
+    keepalive: WorkspaceKeepaliveMetadata,
 ) -> FuzzerWorkspaceState {
-    if incoming.base_request.is_some() {
+    if keepalive.text_complete() && incoming.base_request.is_some() {
         current.base_request = incoming.base_request;
     }
     if incoming.source_transaction_id.is_some() {
@@ -2433,10 +2457,10 @@ fn merge_workspace_keepalive_fuzzer(
     if !incoming.notice.is_empty() {
         current.notice = incoming.notice;
     }
-    if !incoming.request_text.is_empty() {
+    if keepalive.text_complete() && !incoming.request_text.is_empty() {
         current.request_text = incoming.request_text;
     }
-    if !incoming.payloads_text.is_empty() {
+    if keepalive.text_complete() && !incoming.payloads_text.is_empty() {
         current.payloads_text = incoming.payloads_text;
     }
     if incoming.attack_record_id.is_some() {
@@ -6493,6 +6517,73 @@ mod tests {
     }
 
     #[test]
+    fn workspace_keepalive_empty_request_text_does_not_restore_stale_response() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    base_request: Some(test_editable_request("/old")),
+                    request_text: "GET /old HTTP/1.1\r\nHost: example.test\r\n\r\n".to_string(),
+                    response_record: Some(crate::model::TransactionRecord::http(
+                        chrono::Utc::now(),
+                        "GET".to_string(),
+                        "https".to_string(),
+                        "example.test".to_string(),
+                        "/old".to_string(),
+                        Some(200),
+                        1,
+                        crate::model::MessageRecord::from_headers_and_body(
+                            &HeaderMap::new(),
+                            &[],
+                            0,
+                        ),
+                        None,
+                        Vec::new(),
+                        None,
+                        None,
+                    )),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    base_request: Some(test_editable_request("/old")),
+                    request_text: String::new(),
+                    response_record: None,
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        let active = merged.replay.tabs.first().expect("active tab");
+        assert!(active.request_text.is_empty());
+        assert!(active.response_record.is_none());
+    }
+
+    #[test]
     fn workspace_keepalive_partial_ws_text_preserves_durable_text() {
         let ws_tab_id = Uuid::new_v4().to_string();
         let durable_handshake = "GET /ws HTTP/1.1\r\n".repeat(4096);
@@ -6541,6 +6632,7 @@ mod tests {
                 replay_tabs_complete: false,
                 fuzzer_complete: false,
                 ws_text_complete: Some(false),
+                ..super::WorkspaceKeepaliveMetadata::default()
             },
         );
 
@@ -6549,6 +6641,83 @@ mod tests {
         assert_eq!(tab.ws_message_type, "binary");
         assert_eq!(tab.ws_handshake_text, durable_handshake);
         assert_eq!(tab.ws_editor_text, durable_editor);
+    }
+
+    #[test]
+    fn workspace_keepalive_partial_text_preserves_durable_http_and_fuzzer_text() {
+        let current_request = "POST /large HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    base_request: Some(test_editable_request("/large")),
+                    request_text: format!("{current_request}{}", "A".repeat(80_000)),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            fuzzer: FuzzerWorkspaceState {
+                base_request: Some(test_editable_request("/fuzz-large")),
+                request_text: "FUZZ /large HTTP/1.1\r\n\r\n".repeat(2048),
+                payloads_text: "payload\n".repeat(2048),
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let durable_tab_text = current.replay.tabs[0].request_text.clone();
+        let durable_fuzzer_request = current.fuzzer.request_text.clone();
+        let durable_fuzzer_payloads = current.fuzzer.payloads_text.clone();
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    base_request: Some(test_editable_request("/truncated")),
+                    request_text: format!("{current_request}{}", "A".repeat(1024)),
+                    target_scheme: "https".to_string(),
+                    target_host: "edited.example".to_string(),
+                    target_port: "8443".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            fuzzer: FuzzerWorkspaceState {
+                base_request: Some(test_editable_request("/fuzz-truncated")),
+                request_text: "FUZZ /large HTTP/1.1\r\n\r\n".to_string(),
+                payloads_text: "payload\n".to_string(),
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                replay_tabs_complete: false,
+                fuzzer_complete: true,
+                text_complete: Some(false),
+                ..super::WorkspaceKeepaliveMetadata::default()
+            },
+        );
+
+        let tab = merged.replay.tabs.first().expect("merged tab");
+        assert_eq!(tab.target_host, "edited.example");
+        assert_eq!(tab.target_port, "8443");
+        assert_eq!(tab.request_text, durable_tab_text);
+        assert_eq!(tab.base_request.as_ref().unwrap().path, "/large");
+        assert_eq!(merged.fuzzer.request_text, durable_fuzzer_request);
+        assert_eq!(merged.fuzzer.payloads_text, durable_fuzzer_payloads);
+        assert_eq!(
+            merged.fuzzer.base_request.as_ref().unwrap().path,
+            "/fuzz-large"
+        );
     }
 
     #[test]

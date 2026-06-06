@@ -333,6 +333,7 @@ function createWebsocketPagingState() {
     loadedOffset: 0,
     offset: 0,
     hasMore: false,
+    capReached: false,
     loading: false,
   };
 }
@@ -3061,6 +3062,7 @@ function workspaceUnloadPayload(primarySnapshot) {
   }
   const boundedActiveOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
     activeOnly: true,
+    textByteLimit: 8 * 1024,
     wsTextByteLimit: 8 * 1024,
   });
   if (boundedActiveOnlySnapshot) {
@@ -3072,6 +3074,7 @@ function workspaceUnloadPayload(primarySnapshot) {
   const minimalActiveReplaySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
     activeOnly: true,
     dropFuzzer: true,
+    textByteLimit: 2 * 1024,
     wsTextByteLimit: 2 * 1024,
   });
   if (minimalActiveReplaySnapshot) {
@@ -3105,6 +3108,7 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
     keepalive: {
       replay_tabs_complete: !options.activeOnly,
       fuzzer_complete: !options.dropFuzzer,
+      text_complete: !Number.isFinite(options.textByteLimit),
       ws_text_complete: !Number.isFinite(options.wsTextByteLimit),
     },
     fuzzer: options.dropFuzzer ? {} : (compactWorkspaceUnloadFuzzer(snapshot.fuzzer, options) || {}),
@@ -4130,12 +4134,15 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
         : mergeWebsocketPageWithCurrentSummaries(pageItems, state.websocketSessions, summaryMutationGeneration));
     pruneWebsocketSummaryMutationCache();
     const loadedLimit = Math.min(WEBSOCKET_MAX_LOADED_SESSIONS, loadedOffset);
+    const serverHasMore = Boolean(page.has_more);
+    const capReached = serverHasMore && loadedLimit >= WEBSOCKET_MAX_LOADED_SESSIONS;
     state.websocketPaging = {
       total: Math.max(Number(page.total || 0), state.websocketSessions.length),
       limit: loadedLimit,
       loadedOffset: loadedLimit,
       offset: pageOffset,
-      hasMore: Boolean(page.has_more) && loadedLimit < WEBSOCKET_MAX_LOADED_SESSIONS,
+      hasMore: serverHasMore && !capReached,
+      capReached,
       loading: false,
     };
     state.websocketHistoryDirty = false;
@@ -4158,7 +4165,7 @@ async function loadMoreWebsockets() {
   }
   const nextOffset = Math.max(0, Number(paging.loadedOffset ?? paging.limit ?? state.websocketSessions.length) || 0);
   if (nextOffset >= WEBSOCKET_MAX_LOADED_SESSIONS) {
-    state.websocketPaging = { ...paging, hasMore: false };
+    state.websocketPaging = { ...paging, hasMore: false, capReached: true };
     renderWebsocketSessions();
     return;
   }
@@ -4463,6 +4470,7 @@ function applyWebsocketSummaryEvent(event) {
         total: Math.max(Number(paging.total || 0), sessions.length),
         limit: Number(paging.limit ?? paging.loadedOffset ?? 0) || 0,
         loadedOffset: Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
+        capReached: Boolean(paging.capReached),
         loading: false,
       };
       return;
@@ -4473,12 +4481,16 @@ function applyWebsocketSummaryEvent(event) {
     }
     const knownTotal = Number(paging.total || 0);
     const hasMore = Boolean(paging.hasMore);
+    const nextTotal = Math.max(knownTotal + 1, nextSessions.length);
+    const capReached = Boolean(paging.capReached)
+      || (nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS && nextTotal > nextSessions.length);
     state.websocketPaging = {
       ...paging,
-      total: Math.max(knownTotal + 1, nextSessions.length),
+      total: nextTotal,
       limit: Number(paging.limit ?? paging.loadedOffset ?? 0) || 0,
       loadedOffset: Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
-      hasMore: hasMore || nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS,
+      hasMore: hasMore && nextSessions.length < WEBSOCKET_MAX_LOADED_SESSIONS,
+      capReached,
       loading: false,
     };
   }
@@ -8451,6 +8463,7 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
     state.websocketSessions.length,
     state.websocketPaging?.total ?? state.websocketSessions.length,
     Boolean(state.websocketPaging?.hasMore),
+    Boolean(state.websocketPaging?.capReached),
     state.websocketQuery,
   );
 
@@ -8463,7 +8476,9 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
             state.websocketSessions.length
               ? (websocketFilterIsActive() && state.websocketPaging?.hasMore
                 ? "Searching older WebSocket history for matches..."
-                : "No WebSocket sessions match the current filter.")
+                : (websocketFilterIsActive() && state.websocketPaging?.capReached
+                  ? "No loaded WebSocket sessions match the current filter; history cap reached."
+                  : "No WebSocket sessions match the current filter."))
               : "No WebSocket sessions have been captured yet."
           }</td>
         </tr>
@@ -8656,7 +8671,7 @@ function renderWebsocketSessions(options = {}) {
 	  });
 }
 
-function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, totalCount, hasMore, query) {
+function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, totalCount, hasMore, capReached, query) {
   const visibleLabel = renderedCount < visibleCount
     ? `${renderedCount}/${visibleCount} session(s) shown`
     : `${visibleCount} session(s) visible`;
@@ -8667,7 +8682,9 @@ function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, t
   if (query) filters.push(query);
   if (filters.length) parts.push(`filter: ${filters.join(", ")}`);
   if (totalCount) {
-    parts.push(hasMore ? `${loadedCount}/${totalCount} sessions loaded` : `${totalCount} total captured`);
+    parts.push((hasMore || capReached)
+      ? `${loadedCount}/${totalCount} sessions loaded${capReached ? " (cap reached)" : ""}`
+      : `${totalCount} total captured`);
   } else {
     parts.push("No sessions captured yet");
   }
@@ -9204,9 +9221,8 @@ function syncReplayRequestTextFromEditor(newText) {
   } catch (_error) {
     // Keep partially typed drafts as-is until they are parseable again.
   }
-  const httpVersion = parsed?.http_version || replayHttpVersionFromText(nextText);
   activeTab.requestText = nextText;
-  activeTab.httpVersionMode = httpVersion;
+  activeTab.httpVersionMode = replayHttpVersionState(parsed, nextText, activeTab.httpVersionMode);
   activeTab.requestBytes = null;
   activeTab.requestOriginalBytes = null;
   clearReplayResponseForDraftChange(activeTab);
@@ -14150,7 +14166,11 @@ function buildEditableRawRequest(request) {
 function parseEditableRawRequest(text, fallback) {
   const { head, body } = splitRawHttpMessage(text);
   const lines = head.split("\n").filter((line) => line.length > 0);
-  const [startLine = "GET / HTTP/1.1", ...headerLines] = lines;
+  const fallbackPath = fallback?.path && String(fallback.path).trim()
+    ? String(fallback.path)
+    : "/";
+  const requestLineWasSynthesized = lines.length === 0;
+  const [startLine = `${fallback?.method || "GET"} ${fallbackPath}`, ...headerLines] = lines;
   const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)(?:\s+(HTTP\/[0-9.]+))?$/);
 
   if (!match) {
@@ -14158,7 +14178,7 @@ function parseEditableRawRequest(text, fallback) {
   }
 
   let [, method, target, httpVersionToken] = match;
-  const httpVersion = parseReplayHttpVersionToken(httpVersionToken);
+  const httpVersion = requestLineWasSynthesized ? undefined : parseReplayHttpVersionToken(httpVersionToken);
   let scheme = fallback?.scheme || "https";
   let host = fallback?.host || "";
   let path = target;
@@ -18105,8 +18125,14 @@ function sendWsFrameToReplay(frameIdx) {
   const frame = frames.find((candidate) => candidate.index === requestedIndex);
   if (!frame) return;
   const firstLoadedFrameIndex = frames.length ? Number(frames[0]?.index) : 0;
+  const priorClientSetupFrameTruncated = frames.some((candidate) => (
+    candidate.direction === "client_to_server"
+    && Number(candidate.index) < requestedIndex
+    && candidate.preview_truncated
+  ));
   const setupQueueMayBeIncomplete = !!session.frames_truncated
-    || (Number.isFinite(firstLoadedFrameIndex) && firstLoadedFrameIndex > 0);
+    || (Number.isFinite(firstLoadedFrameIndex) && firstLoadedFrameIndex > 0)
+    || priorClientSetupFrameTruncated;
 
   // Determine WS scheme
   let wsScheme;

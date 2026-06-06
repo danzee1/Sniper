@@ -696,7 +696,7 @@ async fn proxy_records_invalid_connect_rejection() {
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream
         .write_all(
-            b"CONNECT example.test HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+            b"CONNECT example.test HTTP/1.0\r\nHost: example.test\r\nConnection: close\r\n\r\n",
         )
         .await
         .unwrap();
@@ -715,6 +715,8 @@ async fn proxy_records_invalid_connect_rejection() {
         .expect("CONNECT rejection should be recorded");
     let record_id = record.id;
     assert_eq!(record.status, Some(400));
+    assert_eq!(record.http_version.as_deref(), Some("HTTP/1.0"));
+    assert_eq!(record.response_http_version.as_deref(), Some("HTTP/1.1"));
     assert!(record.summary().has_response);
     let response_capture = record
         .response
@@ -847,6 +849,8 @@ async fn passthrough_connect_returns_bad_gateway_when_upstream_dial_fails() {
         .find(|record| record.host == closed_addr.to_string())
         .expect("passthrough connect failure should be recorded");
     assert_eq!(record.status, Some(502));
+    assert_eq!(record.http_version.as_deref(), Some("HTTP/1.1"));
+    assert_eq!(record.response_http_version.as_deref(), Some("HTTP/1.1"));
     assert!(record
         .notes
         .iter()

@@ -3371,7 +3371,7 @@ fn parse_editable_raw_request_parts(
     let mut lines = head.lines();
     let fallback_start_line = fallback.map(|request| {
         format!(
-            "{} {} HTTP/1.1",
+            "{} {}",
             request.method,
             if request.path.trim().is_empty() {
                 "/"
@@ -4421,6 +4421,36 @@ mod tests {
         assert_eq!(
             replay_send_http_version(&tab, &parsed).as_deref(),
             Some("HTTP/1.1")
+        );
+    }
+
+    #[test]
+    fn replay_send_uses_tab_http_version_when_request_line_is_synthesized() {
+        let fallback = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/fallback".to_string(),
+            headers: vec![HeaderRecord {
+                name: "host".to_string(),
+                value: "example.com".to_string(),
+            }],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let parsed = parse_editable_raw_request_with_version("", Some(&fallback)).unwrap();
+        let tab = ReplayTabState {
+            http_version_mode: "HTTP/2".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(parsed.request.method, "POST");
+        assert_eq!(parsed.request.path, "/fallback");
+        assert_eq!(parsed.http_version, None);
+        assert_eq!(
+            replay_send_http_version(&tab, &parsed).as_deref(),
+            Some("HTTP/2")
         );
     }
 
