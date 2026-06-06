@@ -336,6 +336,7 @@ function createWebsocketPagingState() {
     limit: WEBSOCKET_PAGE_SIZE,
     loadedOffset: 0,
     offset: 0,
+    afterId: null,
     hasMore: false,
     capReached: false,
     loading: false,
@@ -4267,10 +4268,24 @@ function websocketQuerySignature(queryState = createWebsocketQueryState()) {
   return JSON.stringify(queryState);
 }
 
-function buildWebsocketsPageUrl({ limit, offset, queryState }) {
+function websocketCursorPagingEnabled(queryState = createWebsocketQueryState()) {
+  return !queryState.q
+    && !queryState.inScopeOnly
+    && !queryState.liveOnly
+    && queryState.sortDirection === "desc"
+    && (queryState.sortKey === "started_at" || queryState.sortKey === "index");
+}
+
+function websocketAppendAfterId() {
+  const sessions = Array.isArray(state.websocketSessions) ? state.websocketSessions : [];
+  return sessions.length ? (sessions[sessions.length - 1]?.id || null) : null;
+}
+
+function buildWebsocketsPageUrl({ limit, offset, afterId, queryState }) {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
   params.set("offset", String(offset));
+  if (afterId) params.set("after_id", afterId);
   if (queryState.q) params.set("q", queryState.q);
   if (queryState.sortKey) params.set("sort_key", queryState.sortKey);
   if (queryState.sortDirection) params.set("sort_direction", queryState.sortDirection);
@@ -4296,6 +4311,9 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
   const requestedLimit = append
     ? WEBSOCKET_PAGE_SIZE
     : normalizeWebsocketLoadLimit(options.limit ?? (queryChanged ? WEBSOCKET_PAGE_SIZE : state.websocketPaging?.limit));
+  const requestedAfterId = append && websocketCursorPagingEnabled(queryState)
+    ? (options.afterId || websocketAppendAfterId())
+    : null;
   if (queryChanged) {
     resetWebsocketHistoryScroll();
   }
@@ -4304,11 +4322,17 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     ...(state.websocketPaging || {}),
     querySignature,
     offset: requestedOffset,
+    afterId: requestedAfterId,
     loading: true,
   };
   try {
     const response = await fetch(sessionQueryPath(
-      buildWebsocketsPageUrl({ limit: requestedLimit, offset: requestedOffset, queryState }),
+      buildWebsocketsPageUrl({
+        limit: requestedLimit,
+        offset: requestedOffset,
+        afterId: requestedAfterId,
+        queryState,
+      }),
       sessionId,
     ));
     await requireOkResponse(response, "Failed to load WebSocket history.");
@@ -4355,6 +4379,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
       limit: loadedLimit,
       loadedOffset: loadedLimit,
       offset: pageOffset,
+      afterId: websocketAppendAfterId(),
       hasMore: serverHasMore && !capReached,
       capReached,
       loading: false,
@@ -4398,13 +4423,15 @@ async function loadMoreWebsockets() {
   }
   const previousCount = (state.websocketSessions || []).length;
   const nextOffset = Math.max(0, Number(paging.loadedOffset ?? paging.limit ?? state.websocketSessions.length) || 0);
+  const queryState = createWebsocketQueryState();
+  const nextAfterId = websocketCursorPagingEnabled(queryState) ? websocketAppendAfterId() : null;
   if (nextOffset >= WEBSOCKET_MAX_LOADED_SESSIONS) {
     state.websocketPaging = { ...paging, hasMore: false, capReached: true };
     renderWebsocketSessions();
     return 0;
   }
-  state.websocketPaging = { ...paging, offset: nextOffset };
-  await loadWebsockets(true, { append: true, offset: nextOffset });
+  state.websocketPaging = { ...paging, offset: nextOffset, afterId: nextAfterId };
+  await loadWebsockets(true, { append: true, offset: nextOffset, afterId: nextAfterId });
   return Math.max(0, (state.websocketSessions || []).length - previousCount);
 }
 

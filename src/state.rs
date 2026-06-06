@@ -1587,8 +1587,57 @@ case "$expected_version" in
 esac
 expected_team="$6"
 backup="${bundle}.previous.$$"
+bundle_parent="$(/usr/bin/dirname "$bundle")"
+backup_name="$(/usr/bin/basename "$backup")"
 log_installer() {
   echo "sniper-installer: $1"
+}
+sniper_app_path_shape_ok() {
+  candidate="$1"
+  candidate_name="$(/usr/bin/basename "$candidate")"
+  candidate_parent="$(/usr/bin/dirname "$candidate")"
+  [ -d "$candidate" ] && \
+    [ ! -L "$candidate" ] && \
+    [ "$candidate_name" = "Sniper.app" ] && \
+    [ "$candidate_parent" = "$bundle_parent" ]
+}
+sniper_app_identity_ok_if_present() {
+  candidate="$1"
+  info_plist="$candidate/Contents/Info.plist"
+  if [ ! -f "$info_plist" ]; then
+    return 0
+  fi
+  candidate_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist" 2>/dev/null || true)"
+  candidate_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist" 2>/dev/null || true)"
+  [ "$candidate_bundle_id" = "com.sm1ee.sniper" ] && [ "$candidate_executable" = "Sniper" ]
+}
+sniper_backup_path_ok() {
+  candidate="$1"
+  candidate_name="$(/usr/bin/basename "$candidate")"
+  candidate_parent="$(/usr/bin/dirname "$candidate")"
+  [ -d "$candidate" ] && \
+    [ ! -L "$candidate" ] && \
+    [ "$candidate_name" = "$backup_name" ] && \
+    [ "$candidate_parent" = "$bundle_parent" ] && \
+    sniper_app_identity_ok_if_present "$candidate"
+}
+remove_sniper_app_dir() {
+  candidate="$1"
+  if sniper_app_path_shape_ok "$candidate" && sniper_app_identity_ok_if_present "$candidate"; then
+    rm -rf "$candidate"
+    return $?
+  fi
+  log_installer "refusing to remove unexpected app path $candidate"
+  return 1
+}
+remove_sniper_backup_dir() {
+  candidate="$1"
+  if sniper_backup_path_ok "$candidate"; then
+    rm -rf "$candidate"
+    return $?
+  fi
+  log_installer "refusing to remove unexpected backup path $candidate"
+  return 1
 }
 matching_sniper_pids() {
   sniper_executable="$bundle/Contents/MacOS/Sniper"
@@ -1639,7 +1688,12 @@ while kill -0 "$pid" 2>/dev/null; do
   sleep 0.2
 done
 sleep 0.5
-rm -rf "$backup"
+if [ -e "$backup" ]; then
+  if ! remove_sniper_backup_dir "$backup"; then
+    rm -rf "$tmp"
+    exit 1
+  fi
+fi
 if [ -e "$bundle" ]; then
   if ! mv "$bundle" "$backup"; then
     log_installer "failed to move existing app bundle to backup"
@@ -1666,7 +1720,8 @@ if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --str
     { [ -z "$expected_team" ] || /usr/sbin/spctl --assess --type execute "$bundle"; }; then
     if launch_health_check; then
       log_installer "update installed and launched successfully"
-      rm -rf "$backup" "$tmp"
+      remove_sniper_backup_dir "$backup" || log_installer "leaving previous app backup at $backup"
+      rm -rf "$tmp"
       exit 0
     fi
     log_installer "launch health check failed"
@@ -1676,7 +1731,12 @@ if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --str
 else
   log_installer "failed to copy or verify staged app"
 fi
-rm -rf "$bundle"
+if [ -e "$bundle" ]; then
+  if ! remove_sniper_app_dir "$bundle"; then
+    rm -rf "$tmp"
+    exit 1
+  fi
+fi
 if [ -e "$backup" ]; then
   if mv "$backup" "$bundle"; then
     log_installer "restored previous app bundle after update failure"
@@ -2864,6 +2924,17 @@ mod tests {
         assert!(script.contains("mv \"$bundle\" \"$backup\""));
         assert!(script.contains("if ! mv \"$bundle\" \"$backup\""));
         assert!(script.contains("if mv \"$backup\" \"$bundle\"; then"));
+        assert!(script.contains("sniper_app_path_shape_ok()"));
+        assert!(script.contains("sniper_app_identity_ok_if_present()"));
+        assert!(script.contains("remove_sniper_app_dir()"));
+        assert!(script.contains("remove_sniper_backup_dir()"));
+        assert!(script.contains("[ ! -L \"$candidate\" ]"));
+        assert!(script.contains("[ \"$candidate_name\" = \"Sniper.app\" ]"));
+        assert!(script.contains("[ \"$candidate_parent\" = \"$bundle_parent\" ]"));
+        assert!(script.contains("remove_sniper_backup_dir \"$backup\""));
+        assert!(script.contains("remove_sniper_app_dir \"$bundle\""));
+        assert!(!script.contains("rm -rf \"$bundle\""));
+        assert!(!script.contains("rm -rf \"$backup\""));
         assert!(script.contains("log_installer()"));
         assert!(script.contains("sniper-installer: $1"));
         assert!(script.contains("log_installer \"waiting for old process $pid to exit\""));
@@ -2899,7 +2970,7 @@ mod tests {
             .find("if launch_health_check; then")
             .expect("installer should require the launch health check before cleanup");
         let cleanup_pos = script
-            .find("rm -rf \"$backup\" \"$tmp\"")
+            .rfind("remove_sniper_backup_dir \"$backup\"")
             .expect("installer should clean up after a successful launch");
         assert!(health_check_pos < ditto_pos);
         assert!(before_pids_pos < open_pos);

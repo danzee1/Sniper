@@ -3171,15 +3171,7 @@ async fn discover_api_base_url(
     if let Ok(api) = env::var("SNIPER_API_ADDR") {
         if !api.trim().is_empty() {
             let url = normalize_api_base_url(&api)?;
-            let data_dir = cli_data_dir();
-            let runtime_state = load_runtime_state(&data_dir).ok().flatten();
-            let expected = runtime_state
-                .as_ref()
-                .map(|runtime_state| SniperApiProbeExpectation {
-                    runtime_state,
-                    data_dir: &data_dir,
-                });
-            if let Err(error) = probe_sniper_api_base_url(&url, client, expected).await {
+            if let Err(error) = probe_sniper_api_base_url(&url, client, None).await {
                 bail!("SNIPER_API_ADDR={url} did not point to a reachable Sniper API ({error})");
             }
             return Ok(url);
@@ -6721,36 +6713,31 @@ mod tests {
 
         let wrong_root = root.join("wrong");
         let wrong_server = tokio::spawn(async move {
-            for _ in 0..=SNIPER_API_PROBE_RETRY_DELAYS.len() {
-                let (mut stream, _) = wrong_listener.accept().await.unwrap();
-                let mut buffer = [0_u8; 1024];
-                let _ = stream.read(&mut buffer).await.unwrap();
-                let body = serde_json::json!({
-                    "runtime_instance_id": Uuid::new_v4().to_string(),
-                    "proxy_addr": "127.0.0.1:18080",
-                    "ui_addr": wrong_ui_addr.to_string(),
-                    "data_dir": wrong_root.display().to_string(),
-                    "max_entries": 5000,
-                    "features": ["http_capture", "session_storage", "replay"]
-                })
-                .to_string();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
+            let (mut stream, _) = wrong_listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let body = serde_json::json!({
+                "runtime_instance_id": Uuid::new_v4().to_string(),
+                "proxy_addr": "127.0.0.1:18080",
+                "ui_addr": wrong_ui_addr.to_string(),
+                "data_dir": wrong_root.display().to_string(),
+                "max_entries": 5000,
+                "features": ["http_capture", "session_storage", "replay"]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
         });
 
         let _api_guard = EnvVarGuard::set("SNIPER_API_ADDR", format!("http://{wrong_ui_addr}"));
         let _data_dir_guard = EnvVarGuard::set("SNIPER_DATA_DIR", root.clone().into_os_string());
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let error = discover_api_base_url(None, &client).await.unwrap_err();
-        let message = error.to_string();
+        let discovered = discover_api_base_url(None, &client).await.unwrap();
 
-        assert!(message.contains("SNIPER_API_ADDR="));
-        assert!(message.contains("did not point to a reachable Sniper API"));
-        assert!(message.contains("did not match runtime-state"));
+        assert_eq!(discovered, format!("http://{wrong_ui_addr}"));
         wrong_server.await.unwrap();
         let _ = fs::remove_dir_all(root);
     }

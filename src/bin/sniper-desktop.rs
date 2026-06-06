@@ -33,6 +33,7 @@ enum DesktopUserEvent {
 
 const APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
 const OPEN_PATH: &str = "/usr/bin/open";
+const INSTALL_CLI_PATH_ENV: &str = "SNIPER_INSTALL_CLI_PATH";
 
 fn desktop_data_dir_from_env() -> PathBuf {
     env::var_os("SNIPER_DATA_DIR")
@@ -108,8 +109,16 @@ fn main() -> Result<()> {
         info!(agent = skill.agent, path = %skill.path, "installed sniper-operator skill");
     }
 
-    // Ensure sniper-cli is reachable from the user's shell.
-    install_cli_path();
+    // Keep shell rc mutation opt-in; normal desktop launch should not edit user dotfiles.
+    let install_cli_path_env = env::var(INSTALL_CLI_PATH_ENV).ok();
+    if should_install_cli_path_on_launch(install_cli_path_env.as_deref()) {
+        install_cli_path();
+    } else {
+        info!(
+            env = INSTALL_CLI_PATH_ENV,
+            "skipping sniper-cli PATH install unless explicitly requested"
+        );
+    }
 
     let state = Arc::new(AppState::new(config.clone())?);
 
@@ -673,6 +682,12 @@ fn install_cli_path() {
     }
 }
 
+fn should_install_cli_path_on_launch(env_value: Option<&str>) -> bool {
+    env_value
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 fn should_install_cli_path(macos_dir: &std::path::Path) -> bool {
     let path = macos_dir.to_string_lossy();
     if macos_dir.starts_with("/Volumes") || path.contains("/AppTranslocation/") {
@@ -876,8 +891,8 @@ mod tests {
         complete_desktop_shutdown, finish_desktop_teardown, handle_navigation_request,
         handle_new_window_request, is_blocked_desktop_navigation_scheme, is_same_origin,
         load_shell_rc_contents, persist_desktop_session_state, shell_single_quote,
-        should_install_cli_path, upsert_managed_path_line, write_shell_rc_atomically, AppConfig,
-        AppState,
+        should_install_cli_path, should_install_cli_path_on_launch, upsert_managed_path_line,
+        write_shell_rc_atomically, AppConfig, AppState,
     };
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -1174,6 +1189,16 @@ mod tests {
             .join("Contents")
             .join("MacOS");
         assert!(should_install_cli_path(&user_app));
+    }
+
+    #[test]
+    fn cli_path_install_requires_explicit_launch_opt_in() {
+        assert!(!should_install_cli_path_on_launch(None));
+        assert!(!should_install_cli_path_on_launch(Some("")));
+        assert!(!should_install_cli_path_on_launch(Some("0")));
+        assert!(should_install_cli_path_on_launch(Some("1")));
+        assert!(should_install_cli_path_on_launch(Some("true")));
+        assert!(should_install_cli_path_on_launch(Some("YES")));
     }
 
     #[test]
