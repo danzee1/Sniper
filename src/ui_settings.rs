@@ -110,6 +110,8 @@ pub struct AppUiSettingsSnapshot {
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
     pub websocket_pane_width: Option<u16>,
+    pub ws_replay_left_width: Option<u16>,
+    pub ws_replay_frame_detail_height: Option<u16>,
 }
 
 impl Default for AppUiSettingsSnapshot {
@@ -122,6 +124,8 @@ impl Default for AppUiSettingsSnapshot {
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
+            ws_replay_left_width: None,
+            ws_replay_frame_detail_height: None,
         }
     }
 }
@@ -140,6 +144,14 @@ impl AppUiSettingsSnapshot {
             .websocket_pane_width
             .filter(|width| *width > 0)
             .map(|width| width.clamp(300, 4_096));
+        sanitized.ws_replay_left_width = self
+            .ws_replay_left_width
+            .filter(|width| *width > 0)
+            .map(|width| width.clamp(280, 4_096));
+        sanitized.ws_replay_frame_detail_height = self
+            .ws_replay_frame_detail_height
+            .filter(|height| *height > 0)
+            .map(|height| height.clamp(120, 4_096));
 
         for (key, value) in self.history_column_widths {
             if !key.trim().is_empty() {
@@ -350,6 +362,8 @@ mod tests {
         snapshot.workbench_pane_widths.response_percent = Some(41);
         snapshot.workbench_pane_widths.inspector_width = Some(390);
         snapshot.websocket_pane_width = Some(444);
+        snapshot.ws_replay_left_width = Some(555);
+        snapshot.ws_replay_frame_detail_height = Some(222);
 
         store
             .replace_snapshot(snapshot.clone())
@@ -368,6 +382,8 @@ mod tests {
         assert_eq!(persisted.workbench_pane_widths.response_percent, Some(41));
         assert_eq!(persisted.workbench_pane_widths.inspector_width, Some(390));
         assert_eq!(persisted.websocket_pane_width, Some(444));
+        assert_eq!(persisted.ws_replay_left_width, Some(555));
+        assert_eq!(persisted.ws_replay_frame_detail_height, Some(222));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

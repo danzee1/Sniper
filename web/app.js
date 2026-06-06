@@ -449,6 +449,8 @@ const state = {
   workbenchHeight: null,
   workbenchPaneWidths: null,
   websocketPaneWidth: null,
+  wsReplayLeftWidth: null,
+  wsReplayFrameDetailHeight: null,
 };
 
 let _historyPagingGeneration = 0;
@@ -2762,6 +2764,9 @@ async function flushQueuedWorkspaceStateSave() {
   if (!state.activeSession) {
     return;
   }
+  if (workspaceSaveConflictPending) {
+    return;
+  }
   if (workspaceSaveLoopPromise) {
     return workspaceSaveLoopPromise;
   }
@@ -2793,7 +2798,9 @@ async function runQueuedWorkspaceStateSaves() {
         throw error;
       }
       workspaceSaveConflictPending = true;
-      workspaceSaveDirty = false;
+      workspaceSaveDirty = true;
+      window.clearTimeout(workspaceSaveTimer);
+      workspaceSaveTimer = null;
       showToast(
         "Workspace changed elsewhere; local workspace edits were not saved. Reload the workspace to reconcile.",
         "error",
@@ -2866,13 +2873,17 @@ function handleWorkspaceActionError(error) {
 async function flushWorkspaceState() {
   const hasQueuedChanges = !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer);
   const hasInFlightSave = !!(workspaceSaveInFlight || workspaceSaveLoopPromise);
+  const hasPendingConflict = !!workspaceSaveConflictPending;
   window.clearTimeout(wsTranscriptSaveTimer);
   wsTranscriptSaveTimer = null;
   wsTranscriptFirstDirtyAt = 0;
   window.clearTimeout(workspaceSaveTimer);
   workspaceSaveTimer = null;
-  if (!state.activeSession || (!hasQueuedChanges && !hasInFlightSave)) {
+  if (!state.activeSession || (!hasQueuedChanges && !hasInFlightSave && !hasPendingConflict)) {
     return;
+  }
+  if (hasPendingConflict) {
+    throw new WorkspaceStateConflictError(null);
   }
   if (hasQueuedChanges) {
     workspaceSaveDirty = true;
@@ -2900,7 +2911,7 @@ function flushWorkspaceStateOnUnload() {
     : (workspaceSaveInFlight && workspaceSaveLastSnapshot
       ? workspaceSaveLastSnapshot
       : snapshotWorkspaceState());
-  const payload = workspaceUnloadPayload(snapshot);
+  const payload = workspaceUnloadPayload(snapshot, { allowLossyFallback: !workspaceSaveInFlight });
   if (!payload) {
     workspaceSaveDirty = true;
     console.warn("Skipping unload workspace keepalive save because even the bounded snapshot is too large.");
@@ -2918,15 +2929,17 @@ function flushWorkspaceStateOnUnload() {
   }).catch(() => {});
 }
 
-function workspaceUnloadPayload(primarySnapshot) {
-  const candidates = [
-    primarySnapshot,
-    snapshotWorkspaceState({
-      wsFrameLimit: WORKSPACE_UNLOAD_WS_FRAME_BUDGET,
-      wsBodyByteLimit: WORKSPACE_UNLOAD_WS_BODY_BUDGET,
-    }),
-    snapshotWorkspaceState({ wsFrameLimit: 0, wsBodyByteLimit: 0 }),
-  ];
+function workspaceUnloadPayload(primarySnapshot, options = {}) {
+  const candidates = [primarySnapshot];
+  if (options.allowLossyFallback !== false) {
+    candidates.push(
+      snapshotWorkspaceState({
+        wsFrameLimit: WORKSPACE_UNLOAD_WS_FRAME_BUDGET,
+        wsBodyByteLimit: WORKSPACE_UNLOAD_WS_BODY_BUDGET,
+      }),
+      snapshotWorkspaceState({ wsFrameLimit: 0, wsBodyByteLimit: 0 }),
+    );
+  }
   for (const candidate of candidates) {
     const payload = JSON.stringify(candidate);
     if (utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
@@ -12781,12 +12794,15 @@ function applyUiSettingsSnapshot(snapshot) {
   state.workbenchHeight = sanitizeWorkbenchHeight(snapshot?.workbench_height);
   state.workbenchPaneWidths = sanitizeWorkbenchPaneWidths(snapshot?.workbench_pane_widths);
   state.websocketPaneWidth = sanitizeWebsocketPaneWidth(snapshot?.websocket_pane_width);
+  state.wsReplayLeftWidth = sanitizeWsReplayLeftWidth(snapshot?.ws_replay_left_width);
+  state.wsReplayFrameDetailHeight = sanitizeWsReplayFrameDetailHeight(snapshot?.ws_replay_frame_detail_height);
   applyDisplaySettingsState();
   renderHistoryHeader();
   applyHistoryColumnWidths();
   applyWsColumnWidths();
   applySavedWorkbenchPaneWidths();
   applySavedWebsocketPaneWidth();
+  applySavedWsReplayLayout();
 
   if (state.workbenchHeight) {
     applyWorkbenchStackHeight(state.workbenchHeight, false);
@@ -12809,6 +12825,8 @@ function snapshotUiSettings() {
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,
+    ws_replay_left_width: state.wsReplayLeftWidth > 0 ? state.wsReplayLeftWidth : null,
+    ws_replay_frame_detail_height: state.wsReplayFrameDetailHeight > 0 ? state.wsReplayFrameDetailHeight : null,
   };
 }
 
@@ -14300,6 +14318,73 @@ function resetWebsocketPaneWidth(clearState = true) {
   els.websocketWorkbench?.style.removeProperty("--websocket-left-pane-width");
   if (clearState) {
     state.websocketPaneWidth = null;
+  }
+}
+
+function sanitizeWsReplayLeftWidth(width) {
+  const value = Number(width);
+  return Number.isFinite(value) && value > 0
+    ? Math.round(clamp(value, 280, 4096))
+    : null;
+}
+
+function sanitizeWsReplayFrameDetailHeight(height) {
+  const value = Number(height);
+  return Number.isFinite(value) && value > 0
+    ? Math.round(clamp(value, 120, 4096))
+    : null;
+}
+
+function applyWsReplayLeftWidth(width, options = {}) {
+  const sanitized = sanitizeWsReplayLeftWidth(width);
+  if (!sanitized || !els.wsReplayPanel) {
+    return;
+  }
+  els.wsReplayPanel.style.setProperty("--ws-replay-left-width", `${sanitized}px`);
+  if (options.updateState !== false) {
+    state.wsReplayLeftWidth = sanitized;
+  }
+}
+
+function resetWsReplayLeftWidth(clearState = true) {
+  els.wsReplayPanel?.style.removeProperty("--ws-replay-left-width");
+  if (clearState) {
+    state.wsReplayLeftWidth = null;
+  }
+}
+
+function applyWsReplayFrameDetailHeight(height, options = {}) {
+  const sanitized = sanitizeWsReplayFrameDetailHeight(height);
+  const detail = els.wsReplayPanel?.querySelector(".ws-frame-detail");
+  if (!sanitized || !detail) {
+    return;
+  }
+  detail.style.flex = `0 0 ${sanitized}px`;
+  if (options.updateState !== false) {
+    state.wsReplayFrameDetailHeight = sanitized;
+  }
+}
+
+function resetWsReplayFrameDetailHeight(clearState = true) {
+  const detail = els.wsReplayPanel?.querySelector(".ws-frame-detail");
+  if (detail) {
+    detail.style.removeProperty("flex");
+  }
+  if (clearState) {
+    state.wsReplayFrameDetailHeight = null;
+  }
+}
+
+function applySavedWsReplayLayout() {
+  if (state.wsReplayLeftWidth) {
+    applyWsReplayLeftWidth(state.wsReplayLeftWidth, { updateState: false });
+  } else {
+    resetWsReplayLeftWidth(false);
+  }
+  if (state.wsReplayFrameDetailHeight) {
+    applyWsReplayFrameDetailHeight(state.wsReplayFrameDetailHeight, { updateState: false });
+  } else {
+    resetWsReplayFrameDetailHeight(false);
   }
 }
 
@@ -16428,29 +16513,36 @@ function bindWsReplayEvents() {
   if (els.wsReplayPaneResizer) {
     let startX = 0;
     let startW = 0;
+    let nextW = 0;
     const onMove = (e) => {
       const delta = e.clientX - startX;
       const panel = els.wsReplayPanel;
       const total = panel.getBoundingClientRect().width - 10;
-      const newW = Math.max(280, Math.min(total - 280, startW + delta));
-      panel.style.setProperty("--ws-replay-left-width", `${newW}px`);
+      nextW = Math.max(280, Math.min(total - 280, startW + delta));
+      applyWsReplayLeftWidth(nextW, { updateState: false });
     };
     const onUp = () => {
       document.body.classList.remove("pane-resizing-x");
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      if (nextW > 0) {
+        applyWsReplayLeftWidth(nextW);
+        scheduleUiSettingsSave();
+      }
     };
     els.wsReplayPaneResizer.addEventListener("mousedown", (e) => {
       e.preventDefault();
       startX = e.clientX;
       const left = els.wsReplayPanel.querySelector(".ws-replay-left");
       startW = left ? left.getBoundingClientRect().width : 400;
+      nextW = startW;
       document.body.classList.add("pane-resizing-x");
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
     });
     els.wsReplayPaneResizer.addEventListener("dblclick", () => {
-      els.wsReplayPanel.style.removeProperty("--ws-replay-left-width");
+      resetWsReplayLeftWidth();
+      scheduleUiSettingsSave();
     });
   }
 
@@ -16458,27 +16550,36 @@ function bindWsReplayEvents() {
   if (els.wsReplayFrameResizer) {
     let startY = 0;
     let startH = 0;
+    let nextH = 0;
     const onMove = (e) => {
       const delta = startY - e.clientY;
       const right = els.wsReplayPanel.querySelector(".ws-replay-right");
       const total = right ? right.getBoundingClientRect().height : 600;
-      const newH = Math.max(120, Math.min(total * 0.8, startH + delta));
-      const detail = right.querySelector(".ws-frame-detail");
-      if (detail) detail.style.flex = `0 0 ${newH}px`;
+      nextH = Math.max(120, Math.min(total * 0.8, startH + delta));
+      applyWsReplayFrameDetailHeight(nextH, { updateState: false });
     };
     const onUp = () => {
       document.body.classList.remove("pane-resizing-y");
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      if (nextH > 0) {
+        applyWsReplayFrameDetailHeight(nextH);
+        scheduleUiSettingsSave();
+      }
     };
     els.wsReplayFrameResizer.addEventListener("mousedown", (e) => {
       e.preventDefault();
       startY = e.clientY;
       const detail = els.wsReplayPanel.querySelector(".ws-frame-detail");
       startH = detail ? detail.getBoundingClientRect().height : 200;
+      nextH = startH;
       document.body.classList.add("pane-resizing-y");
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
+    });
+    els.wsReplayFrameResizer.addEventListener("dblclick", () => {
+      resetWsReplayFrameDetailHeight();
+      scheduleUiSettingsSave();
     });
   }
 

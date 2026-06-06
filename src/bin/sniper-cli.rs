@@ -1097,12 +1097,8 @@ impl ApiClient {
             .with_context(|| format!("failed to decode JSON response from {}", path))
     }
 
-    fn url(&self, path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
+    fn url(&self, path: &str) -> Url {
+        api_url(&self.base_url, path).expect("API base URL should be normalized")
     }
 }
 
@@ -1319,15 +1315,17 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
 
 async fn active_session_id(api: &ApiClient) -> Result<Option<Uuid>> {
     let sessions: Vec<SessionSummary> = api.get_json("/api/sessions").await?;
-    Ok(active_session_id_from_summaries(&sessions))
+    active_session_id_from_summaries(&sessions)
 }
 
-fn active_session_id_from_summaries(sessions: &[SessionSummary]) -> Option<Uuid> {
-    sessions
-        .iter()
-        .find(|session| session.active)
-        .or_else(|| sessions.first())
-        .map(|session| session.id)
+fn active_session_id_from_summaries(sessions: &[SessionSummary]) -> Result<Option<Uuid>> {
+    let active_sessions: Vec<_> = sessions.iter().filter(|session| session.active).collect();
+    match active_sessions.as_slice() {
+        [session] => Ok(Some(session.id)),
+        [] if sessions.is_empty() => Ok(None),
+        [] => bail!("no active session; pass --session-id to choose a session explicitly"),
+        _ => bail!("multiple active sessions; pass --session-id to choose a session explicitly"),
+    }
 }
 
 async fn resolve_session_id_arg(
@@ -2918,12 +2916,16 @@ async fn discover_api_base_url(
     client: &reqwest::Client,
 ) -> Result<String> {
     if let Some(api) = cli_api {
-        return Ok(normalize_api_base_url(&api));
+        let url = normalize_api_base_url(&api)?;
+        probe_sniper_api_base_url(&url, client).await?;
+        return Ok(url);
     }
 
     if let Ok(api) = env::var("SNIPER_API_ADDR") {
         if !api.trim().is_empty() {
-            return Ok(normalize_api_base_url(&api));
+            let url = normalize_api_base_url(&api)?;
+            probe_sniper_api_base_url(&url, client).await?;
+            return Ok(url);
         }
     }
 
@@ -2953,7 +2955,7 @@ async fn discover_api_base_url(
 
 async fn probe_sniper_api_base_url(url: &str, client: &reqwest::Client) -> Result<()> {
     let response = client
-        .get(format!("{url}/api/settings"))
+        .get(api_url(url, "/api/settings")?)
         .timeout(std::time::Duration::from_secs(2))
         .send()
         .await
@@ -3001,13 +3003,44 @@ fn sniper_settings_probe_matches(payload: &serde_json::Value) -> bool {
         && features.contains(&"replay")
 }
 
-fn normalize_api_base_url(raw: &str) -> String {
+fn normalize_api_base_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if trimmed.is_empty() {
+        bail!("Sniper API address is empty");
+    }
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
     } else {
         format!("http://{trimmed}")
+    };
+    let mut url =
+        Url::parse(&with_scheme).with_context(|| format!("invalid Sniper API address: {raw}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        bail!("Sniper API address must use http or https");
     }
+    if url.host_str().is_none() {
+        bail!("Sniper API address must include a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("Sniper API address must not include credentials");
+    }
+    if url.path() != "/" && !url.path().is_empty() {
+        bail!("Sniper API address must not include a path");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("Sniper API address must not include a query string or fragment");
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn api_url(base_url: &str, path: &str) -> Result<Url> {
+    let base = Url::parse(&format!("{}/", base_url.trim_end_matches('/')))
+        .with_context(|| format!("invalid normalized Sniper API address: {base_url}"))?;
+    base.join(path.trim_start_matches('/'))
+        .with_context(|| format!("failed to build Sniper API URL for {path}"))
 }
 
 fn build_editable_raw_request(request: &EditableRequest) -> String {
@@ -3790,9 +3823,9 @@ fn parse_response_status_line(status_line: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_session_id_from_summaries, build_annotations_payload, build_editable_raw_request,
-        build_editable_raw_request_with_version, default_editable_request,
-        ensure_json_status_not_failed, explicit_or_active_session_id,
+        active_session_id_from_summaries, api_url, build_annotations_payload,
+        build_editable_raw_request, build_editable_raw_request_with_version,
+        default_editable_request, ensure_json_status_not_failed, explicit_or_active_session_id,
         fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
         install_skills, normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
         oast_fields_for_output, parse_editable_raw_request,
@@ -3904,7 +3937,10 @@ mod tests {
             test_session_summary(active, true),
         ];
 
-        assert_eq!(active_session_id_from_summaries(&sessions), Some(active));
+        assert_eq!(
+            active_session_id_from_summaries(&sessions).unwrap(),
+            Some(active)
+        );
     }
 
     #[test]
@@ -3943,12 +3979,30 @@ mod tests {
     }
 
     #[test]
-    fn active_session_id_falls_back_to_first_session() {
+    fn active_session_id_requires_exactly_one_active_session() {
         let first = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let sessions = vec![test_session_summary(first, false)];
 
-        assert_eq!(active_session_id_from_summaries(&sessions), Some(first));
-        assert_eq!(active_session_id_from_summaries(&[]), None);
+        let error = active_session_id_from_summaries(&sessions).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no active session; pass --session-id"));
+        assert_eq!(active_session_id_from_summaries(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn active_session_id_rejects_multiple_active_sessions() {
+        let first = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let second = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let sessions = vec![
+            test_session_summary(first, true),
+            test_session_summary(second, true),
+        ];
+
+        let error = active_session_id_from_summaries(&sessions).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("multiple active sessions; pass --session-id"));
     }
 
     #[test]
@@ -5467,9 +5521,22 @@ mod tests {
     #[test]
     fn normalize_api_base_accepts_host_port() {
         assert_eq!(
-            normalize_api_base_url("127.0.0.1:19081"),
+            normalize_api_base_url("127.0.0.1:19081").unwrap(),
             "http://127.0.0.1:19081"
         );
+    }
+
+    #[test]
+    fn normalize_api_base_rejects_path_query_and_credentials() {
+        assert!(normalize_api_base_url("http://127.0.0.1:19081/foo").is_err());
+        assert!(normalize_api_base_url("http://127.0.0.1:19081?x=1").is_err());
+        assert!(normalize_api_base_url("http://user@127.0.0.1:19081").is_err());
+    }
+
+    #[test]
+    fn api_url_joins_paths_under_normalized_base() {
+        let url = api_url("http://127.0.0.1:19081", "/api/settings").unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:19081/api/settings");
     }
 
     #[test]

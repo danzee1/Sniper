@@ -214,20 +214,7 @@ pub fn can_replace_snapshot(
     snapshot: &WorkspaceStateSnapshot,
     current: &WorkspaceStateSnapshot,
 ) -> bool {
-    snapshot.revision == current.revision || is_newer_same_client_snapshot(snapshot, current)
-}
-
-fn is_newer_same_client_snapshot(
-    snapshot: &WorkspaceStateSnapshot,
-    current: &WorkspaceStateSnapshot,
-) -> bool {
-    let Some(snapshot_client_id) = snapshot.client_id.as_deref() else {
-        return false;
-    };
-    let Some(current_client_id) = current.client_id.as_deref() else {
-        return false;
-    };
-    snapshot_client_id == current_client_id && snapshot.client_version > current.client_version
+    snapshot.revision == current.revision
 }
 
 impl Default for WorkspaceStateStore {
@@ -297,7 +284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_replace_accepts_newer_snapshot_from_same_client() {
+    async fn workspace_replace_rejects_stale_revision_even_with_newer_same_client_version() {
         let store = WorkspaceStateStore::new();
         let first = store
             .replace_snapshot_checked(WorkspaceStateSnapshot {
@@ -309,7 +296,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.revision, 1);
 
-        let accepted = store
+        let stale = store
             .replace_snapshot_checked(WorkspaceStateSnapshot {
                 revision: 0,
                 client_id: Some("client-a".to_string()),
@@ -321,15 +308,12 @@ mod tests {
                 ..WorkspaceStateSnapshot::default()
             })
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(accepted.revision, 2);
-        assert_eq!(accepted.client_id.as_deref(), Some("client-a"));
-        assert_eq!(accepted.client_version, 2);
-        assert_eq!(
-            accepted.replay.active_tab_id.as_deref(),
-            Some("latest-client-edit")
-        );
+        assert_eq!(stale.revision, 1);
+        assert_eq!(stale.client_id.as_deref(), Some("client-a"));
+        assert_eq!(stale.client_version, 1);
+        assert!(stale.replay.active_tab_id.is_none());
     }
 
     #[tokio::test]
@@ -424,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_replace_persisting_accepts_newer_same_client_snapshot() {
+    async fn workspace_replace_persisting_rejects_stale_newer_same_client_snapshot() {
         let store = WorkspaceStateStore::new();
         store
             .replace_snapshot_checked(WorkspaceStateSnapshot {
@@ -435,7 +419,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (accepted, persisted_revision) = store
+        let result = store
             .replace_snapshot_checked_persisting(
                 WorkspaceStateSnapshot {
                     revision: 0,
@@ -449,15 +433,16 @@ mod tests {
                 },
                 |candidate| async move { Ok::<_, ()>(candidate.revision) },
             )
-            .await
-            .unwrap();
+            .await;
 
-        assert_eq!(accepted.revision, 2);
-        assert_eq!(persisted_revision, 2);
-        assert_eq!(
-            accepted.replay.active_tab_id.as_deref(),
-            Some("beacon-edit")
-        );
+        let stale = match result {
+            Err(super::WorkspaceReplaceError::Conflict(stale)) => stale,
+            _ => panic!("expected stale newer same-client snapshot to conflict"),
+        };
+        assert_eq!(stale.revision, 1);
+        assert_eq!(stale.client_id.as_deref(), Some("client-a"));
+        assert_eq!(stale.client_version, 1);
+        assert!(stale.replay.active_tab_id.is_none());
     }
 
     #[test]
