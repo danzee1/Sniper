@@ -130,6 +130,7 @@ struct WsReplayConnection {
     status: WsReplayStatus,
     frames: Vec<WsReplayFrame>,
     frame_counter: usize,
+    retention_gap_floor: usize,
     sender: Option<WsSender>,
     task_abort: Option<AbortHandle>,
     writer_abort: Option<AbortHandle>,
@@ -234,6 +235,9 @@ impl WsReplayConnection {
         if self.frames.len() > MAX_WS_REPLAY_FRAMES_PER_CONNECTION {
             let overflow = self.frames.len() - MAX_WS_REPLAY_FRAMES_PER_CONNECTION;
             self.frames.drain(..overflow);
+            if let Some(frame) = self.frames.first() {
+                self.retention_gap_floor = self.retention_gap_floor.max(frame.index);
+            }
         }
         Some(index)
     }
@@ -241,9 +245,6 @@ impl WsReplayConnection {
     fn remove_frame(&mut self, index: usize) {
         if let Some(position) = self.frames.iter().position(|frame| frame.index == index) {
             self.frames.remove(position);
-            if index.checked_add(1) == Some(self.frame_counter) {
-                self.frame_counter = index;
-            }
         }
     }
 
@@ -294,6 +295,7 @@ impl WsReplayStore {
             status: WsReplayStatus::Disconnected,
             frames: Vec::new(),
             frame_counter: 0,
+            retention_gap_floor: 0,
             sender: None,
             task_abort: None,
             writer_abort: None,
@@ -335,6 +337,7 @@ impl WsReplayStore {
             status: WsReplayStatus::Connecting,
             frames: Vec::new(),
             frame_counter: 0,
+            retention_gap_floor: 0,
             sender: None,
             task_abort: Some(task_abort),
             writer_abort: None,
@@ -733,7 +736,7 @@ impl WsReplayStore {
         let conn = self.connection(id).await?;
         let c = conn.read().await;
         let first_retained_index = c.frames.first().map(|frame| frame.index);
-        let gap = first_retained_index.is_some_and(|index| since_index < index);
+        let gap = since_index < c.retention_gap_floor;
         let first_new = c.frames.partition_point(|frame| frame.index < since_index);
         let end = (first_new + MAX_WS_REPLAY_FRAMES_PER_RESPONSE).min(c.frames.len());
         let frames = c.frames[first_new..end].to_vec();
@@ -899,6 +902,7 @@ mod tests {
             status,
             frames: Vec::new(),
             frame_counter: 0,
+            retention_gap_floor: 0,
             sender,
             task_abort: None,
             writer_abort: None,
@@ -984,6 +988,7 @@ mod tests {
         let id = Uuid::new_v4();
         let mut connection = test_connection(WsReplayStatus::Connected, None);
         connection.frames = (50..55).map(test_frame).collect();
+        connection.retention_gap_floor = 50;
         store
             .connections
             .write()
@@ -1102,6 +1107,7 @@ mod tests {
 
         assert_eq!(conn.frames.len(), MAX_WS_REPLAY_FRAMES_PER_CONNECTION);
         assert_eq!(conn.frame_counter, MAX_WS_REPLAY_FRAMES_PER_CONNECTION + 3);
+        assert_eq!(conn.retention_gap_floor, 3);
         assert_eq!(conn.frames.first().map(|frame| frame.index), Some(3));
         assert_eq!(
             conn.frames.last().map(|frame| frame.index),
@@ -1134,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_connection_reuses_latest_unsent_index_after_rollback() {
+    fn replay_connection_keeps_indexes_monotonic_after_rollback() {
         let mut conn = test_connection(WsReplayStatus::Connected, None);
         let recorded = conn
             .push_frame(
@@ -1152,10 +1158,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(recorded, 0);
-        assert_eq!(next, 0);
-        assert_eq!(conn.frame_counter, 1);
+        assert_eq!(next, 1);
+        assert_eq!(conn.frame_counter, 2);
         assert_eq!(conn.frames.len(), 1);
-        assert_eq!(conn.frames[0].index, 0);
+        assert_eq!(conn.frames[0].index, 1);
+    }
+
+    #[tokio::test]
+    async fn frames_since_does_not_report_gap_for_rolled_back_index_hole() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let mut connection = test_connection(WsReplayStatus::Connected, None);
+        let rolled_back = connection
+            .push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Text("pending".into()),
+            )
+            .unwrap();
+
+        connection.remove_frame(rolled_back);
+        connection.push_frame(
+            WebSocketFrameDirection::ServerToClient,
+            &WsMessage::Text("reply".into()),
+        );
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(connection)));
+
+        let response = store.frames_since(id, rolled_back).await.unwrap();
+
+        assert_eq!(response.first_retained_index, Some(1));
+        assert_eq!(response.next_index, 2);
+        assert_eq!(response.frames.len(), 1);
+        assert_eq!(response.frames[0].index, 1);
+        assert!(!response.gap);
+        assert!(!response.truncated);
     }
 
     #[test]

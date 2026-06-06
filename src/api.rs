@@ -4274,16 +4274,10 @@ async fn ws_replay_connect(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let operation_lock = state.session_operation_lock(session.id()).await;
-    let _operation_guard = operation_lock.lock().await;
-    if !state.sessions.contains_session(session.id()) {
-        return action_session_conflict_response(&session);
-    }
-    if state.sessions.active_session_id() != session.id()
-        && proxy::session_has_active_proxy_work(session.id())
-    {
-        return session_proxy_work_conflict_response(session.id());
-    }
+    let _operation_guard = match guard_session_write_operation(&state, &session, false).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     if let Some(owner_session_id) = state.ws_replay.owner_session_id(payload.id).await {
         if owner_session_id != session.id() {
             return ws_replay_connection_owner_conflict_response(owner_session_id);
@@ -10196,6 +10190,61 @@ mod tests {
         assert!(
             !response_task.is_finished(),
             "ws replay remove should wait before rechecking active proxy work"
+        );
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        drop(operation_guard);
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(connection_id).await.is_some());
+
+        drop(active_proxy_owner);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_send_rechecks_proxy_work_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-send-proxy-work-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let connection_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(connection_id, original_id)
+            .await;
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock_owned().await;
+
+        let response_task = tokio::spawn(super::ws_replay_send(
+            State(state.clone()),
+            Json(super::WsReplaySendPayload {
+                session_id: Some(original_id),
+                id: connection_id,
+                body: "hello".to_string(),
+                binary: false,
+                kind: None,
+            }),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !response_task.is_finished(),
+            "ws replay send should wait before rechecking active proxy work"
         );
         let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(original_id);
         drop(operation_guard);

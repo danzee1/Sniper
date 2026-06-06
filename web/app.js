@@ -1223,7 +1223,7 @@ function bindEvents() {
     if (!websocketFrameScrollRaf) {
       websocketFrameScrollRaf = requestAnimationFrame(() => {
         websocketFrameScrollRaf = 0;
-        renderWebsocketSessions();
+        renderWebsocketFrameTable();
       });
     }
   });
@@ -9082,6 +9082,13 @@ function renderWebsocketSessions(options = {}) {
   if (els.wsHandshakeLines) {
     els.wsHandshakeLines.textContent = buildLineNumbers(hsLineCount);
   }
+  renderWebsocketFrameTable();
+}
+
+function renderWebsocketFrameTable() {
+  const session = state.selectedWebsocketRecord;
+  if (!session) return;
+
   const frames = getWebsocketFrames(session);
   if (
     state.selectedFrameIdx != null
@@ -9143,7 +9150,7 @@ function renderWebsocketSessions(options = {}) {
   const measured = measuredRow?.getBoundingClientRect().height || 0;
   if (measured > 0 && Math.abs(measured - measuredWebsocketFrameRowHeight) >= 1) {
     measuredWebsocketFrameRowHeight = measured;
-    renderWebsocketSessions();
+    renderWebsocketFrameTable();
   }
 }
 

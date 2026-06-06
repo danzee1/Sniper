@@ -33,6 +33,7 @@ enum DesktopUserEvent {
 
 const APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
 const OPEN_PATH: &str = "/usr/bin/open";
+const INSTALL_SKILLS_ENV: &str = "SNIPER_INSTALL_AGENT_SKILLS";
 const INSTALL_CLI_PATH_ENV: &str = "SNIPER_INSTALL_CLI_PATH";
 
 fn desktop_data_dir_from_env() -> PathBuf {
@@ -102,11 +103,18 @@ fn main() -> Result<()> {
         .context("failed to read bound UI address")?;
     config.ui_addr = runtime_state::advertise_local_api_addr(bound_ui_addr);
 
-    // Auto-install Claude & Codex skills on every launch so they stay in sync
-    // with the current Sniper version. Errors are silently logged.
-    let skill_results = skills::auto_install_all();
-    for skill in &skill_results {
-        info!(agent = skill.agent, path = %skill.path, "installed sniper-operator skill");
+    // Keep agent skill installation opt-in; normal desktop launch should not edit user dotfiles.
+    let install_skills_env = env::var(INSTALL_SKILLS_ENV).ok();
+    if should_install_skills_on_launch(install_skills_env.as_deref()) {
+        let skill_results = skills::auto_install_all();
+        for skill in &skill_results {
+            info!(agent = skill.agent, path = %skill.path, "installed sniper-operator skill");
+        }
+    } else {
+        info!(
+            env = INSTALL_SKILLS_ENV,
+            "skipping agent skill install unless explicitly requested"
+        );
     }
 
     // Keep shell rc mutation opt-in; normal desktop launch should not edit user dotfiles.
@@ -683,6 +691,14 @@ fn install_cli_path() {
 }
 
 fn should_install_cli_path_on_launch(env_value: Option<&str>) -> bool {
+    truthy_env_value(env_value)
+}
+
+fn should_install_skills_on_launch(env_value: Option<&str>) -> bool {
+    truthy_env_value(env_value)
+}
+
+fn truthy_env_value(env_value: Option<&str>) -> bool {
     env_value
         .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
@@ -891,8 +907,9 @@ mod tests {
         complete_desktop_shutdown, finish_desktop_teardown, handle_navigation_request,
         handle_new_window_request, is_blocked_desktop_navigation_scheme, is_same_origin,
         load_shell_rc_contents, persist_desktop_session_state, shell_single_quote,
-        should_install_cli_path, should_install_cli_path_on_launch, upsert_managed_path_line,
-        write_shell_rc_atomically, AppConfig, AppState,
+        should_install_cli_path, should_install_cli_path_on_launch,
+        should_install_skills_on_launch, upsert_managed_path_line, write_shell_rc_atomically,
+        AppConfig, AppState,
     };
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -1199,6 +1216,16 @@ mod tests {
         assert!(should_install_cli_path_on_launch(Some("1")));
         assert!(should_install_cli_path_on_launch(Some("true")));
         assert!(should_install_cli_path_on_launch(Some("YES")));
+    }
+
+    #[test]
+    fn agent_skill_install_requires_explicit_launch_opt_in() {
+        assert!(!should_install_skills_on_launch(None));
+        assert!(!should_install_skills_on_launch(Some("")));
+        assert!(!should_install_skills_on_launch(Some("0")));
+        assert!(should_install_skills_on_launch(Some("1")));
+        assert!(should_install_skills_on_launch(Some("true")));
+        assert!(should_install_skills_on_launch(Some("YES")));
     }
 
     #[test]
