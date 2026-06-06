@@ -34,7 +34,7 @@ use crate::{
     workspace::{WorkspaceStateSnapshot, WorkspaceStateStore},
 };
 
-const SESSIONS_DIR: &str = "sessions";
+pub(crate) const SESSIONS_DIR: &str = "sessions";
 const REGISTRY_FILE: &str = "registry.json";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const TRANSACTION_JOURNAL_FILE: &str = "transactions.journal";

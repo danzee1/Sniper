@@ -64,6 +64,39 @@ impl DisplaySettingsSnapshot {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkbenchPaneWidthsSnapshot {
+    pub request_percent: Option<u16>,
+    pub response_percent: Option<u16>,
+    pub inspector_width: Option<u16>,
+}
+
+impl WorkbenchPaneWidthsSnapshot {
+    fn sanitized(self) -> Self {
+        Self {
+            request_percent: self
+                .request_percent
+                .filter(|width| *width > 0)
+                .map(|width| width.clamp(18, 72)),
+            response_percent: self
+                .response_percent
+                .filter(|width| *width > 0)
+                .map(|width| width.clamp(18, 72)),
+            inspector_width: self
+                .inspector_width
+                .filter(|width| *width > 0)
+                .map(|width| width.clamp(300, 4_096)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.request_percent.is_none()
+            && self.response_percent.is_none()
+            && self.inspector_width.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppUiSettingsSnapshot {
@@ -74,6 +107,9 @@ pub struct AppUiSettingsSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history_column_order: Vec<String>,
     pub workbench_height: Option<u16>,
+    #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
+    pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
+    pub websocket_pane_width: Option<u16>,
 }
 
 impl Default for AppUiSettingsSnapshot {
@@ -84,6 +120,8 @@ impl Default for AppUiSettingsSnapshot {
             ws_column_widths: default_ws_column_widths(),
             history_column_order: Vec::new(),
             workbench_height: None,
+            workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
+            websocket_pane_width: None,
         }
     }
 }
@@ -97,6 +135,11 @@ impl AppUiSettingsSnapshot {
             .workbench_height
             .filter(|height| *height > 0)
             .map(|height| height.min(4_096));
+        sanitized.workbench_pane_widths = self.workbench_pane_widths.sanitized();
+        sanitized.websocket_pane_width = self
+            .websocket_pane_width
+            .filter(|width| *width > 0)
+            .map(|width| width.clamp(300, 4_096));
 
         for (key, value) in self.history_column_widths {
             if !key.trim().is_empty() {
@@ -303,6 +346,10 @@ mod tests {
             .ws_column_widths
             .insert("frame_count".to_string(), 123);
         snapshot.workbench_height = Some(333);
+        snapshot.workbench_pane_widths.request_percent = Some(34);
+        snapshot.workbench_pane_widths.response_percent = Some(41);
+        snapshot.workbench_pane_widths.inspector_width = Some(390);
+        snapshot.websocket_pane_width = Some(444);
 
         store
             .replace_snapshot(snapshot.clone())
@@ -317,6 +364,10 @@ mod tests {
         assert_eq!(persisted.history_column_widths.get("host"), Some(&444));
         assert_eq!(persisted.ws_column_widths.get("frame_count"), Some(&123));
         assert_eq!(persisted.workbench_height, Some(333));
+        assert_eq!(persisted.workbench_pane_widths.request_percent, Some(34));
+        assert_eq!(persisted.workbench_pane_widths.response_percent, Some(41));
+        assert_eq!(persisted.workbench_pane_widths.inspector_width, Some(390));
+        assert_eq!(persisted.websocket_pane_width, Some(444));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

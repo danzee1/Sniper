@@ -4005,13 +4005,6 @@ pub fn session_has_pending_persist(session_id: Uuid) -> bool {
     trailing.contains_key(&session_id)
 }
 
-fn pending_persist_session_count() -> usize {
-    let pending = PERSIST_PENDING_CONTEXTS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    pending.len()
-}
-
 pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
     let mut failures = Vec::new();
 
@@ -4026,6 +4019,11 @@ pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
             pending
                 .iter()
                 .filter_map(|(session_id, session)| {
+                    if !state.sessions.contains_session(*session_id)
+                        && !pending_session_belongs_to_state(state, session.as_ref())
+                    {
+                        return None;
+                    }
                     generations
                         .get(session_id)
                         .copied()
@@ -4040,7 +4038,9 @@ pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
         for (session, generation) in sessions {
             let session_id = session.id();
             if !state.sessions.contains_session(session_id) {
-                forget_persist_state_if_generation(session_id, generation);
+                if pending_session_belongs_to_state(state, session.as_ref()) {
+                    forget_persist_state_if_generation(session_id, generation);
+                }
                 continue;
             }
             wait_for_session_proxy_work_to_finish(session_id, PENDING_PERSIST_FLUSH_PROXY_WAIT)
@@ -4089,11 +4089,11 @@ pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
                 }
             }
         }
-        if !failures.is_empty() || pending_persist_session_count() == 0 {
+        if !failures.is_empty() || pending_persist_session_count_for_state(state) == 0 {
             break;
         }
     }
-    let remaining = pending_persist_session_count();
+    let remaining = pending_persist_session_count_for_state(state);
     if failures.is_empty() && remaining == 0 {
         Ok(())
     } else {
@@ -4112,6 +4112,26 @@ pub async fn flush_pending_session_persists(state: &AppState) -> Result<()> {
                 .join("; ")
         ))
     }
+}
+
+fn pending_session_belongs_to_state(state: &AppState, session: &SessionContext) -> bool {
+    session
+        .storage_dir()
+        .parent()
+        .is_some_and(|parent| parent == state.config.data_dir.join(crate::session::SESSIONS_DIR))
+}
+
+fn pending_persist_session_count_for_state(state: &AppState) -> usize {
+    let pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending
+        .iter()
+        .filter(|(session_id, session)| {
+            state.sessions.contains_session(**session_id)
+                || pending_session_belongs_to_state(state, session.as_ref())
+        })
+        .count()
 }
 
 async fn wait_for_session_proxy_work_to_finish(session_id: Uuid, timeout: Duration) {

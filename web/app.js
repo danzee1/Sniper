@@ -443,6 +443,8 @@ const state = {
   _itemsVersion: 0,
   toolsReady: false,
   workbenchHeight: null,
+  workbenchPaneWidths: null,
+  websocketPaneWidth: null,
 };
 
 let _historyPagingGeneration = 0;
@@ -824,6 +826,9 @@ const WEBSOCKET_WORKBENCH_MIN_WIDTHS = {
 };
 const WEBSOCKET_MAX_RENDERED_SESSION_ROWS = 500;
 const WEBSOCKET_MAX_RENDERED_FRAME_ROWS = 1000;
+const WEBSOCKET_SESSION_ROW_HEIGHT = 28;
+let measuredWebsocketSessionRowHeight = WEBSOCKET_SESSION_ROW_HEIGHT;
+const WEBSOCKET_SESSION_BUFFER_ROWS = 30;
 
 const WEBSOCKET_STACK_MIN_HEIGHTS = {
   sessions: 160,
@@ -1113,13 +1118,14 @@ function bindEvents() {
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
     clearWebsocketQueryBackfill();
-    syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
+    syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
   });
   document.querySelector("#websocketTable")?.closest(".history-table-shell")?.addEventListener("scroll", (event) => {
     const scroller = event.currentTarget;
     if (!scroller || state.activeProxyTab !== "websockets-history") {
       return;
     }
+    renderWebsocketSessionTable();
     if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - WEBSOCKET_SCROLL_PREFETCH_PX) {
       loadMoreWebsockets().catch((error) => console.error(error));
     }
@@ -1127,12 +1133,12 @@ function bindEvents() {
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
+    syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
   });
   document.getElementById("wsHideClosed")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
+    syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
   });
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
@@ -1665,7 +1671,7 @@ function bindEvents() {
   // OAST
   const oastProviderSelect = document.getElementById("proxySettingOastProvider");
   if (oastProviderSelect) {
-    oastProviderSelect.addEventListener("change", () => renderProxySettings());
+    oastProviderSelect.addEventListener("change", () => renderOastSettingsControls());
   }
   if (els.proxySettingOastClearToken) {
     els.proxySettingOastClearToken.addEventListener("click", () => {
@@ -1674,7 +1680,7 @@ function bindEvents() {
       if (oastToken) {
         oastToken.value = "";
       }
-      renderProxySettings();
+      renderOastSettingsControls();
     });
   }
   const oastTokenInput = document.getElementById("proxySettingOastToken");
@@ -1682,7 +1688,7 @@ function bindEvents() {
     oastTokenInput.addEventListener("input", () => {
       if (oastTokenInput.value.trim()) {
         state.oastTokenClearPending = false;
-        renderProxySettings();
+        renderOastSettingsControls();
       }
     });
   }
@@ -7193,7 +7199,50 @@ async function moveWebsocketSelection(offset) {
 
 function scrollSelectedWebsocketRowIntoView() {
   const selectedRow = els.websocketTableBody.querySelector(".history-row.selected");
-  selectedRow?.scrollIntoView({ block: "nearest" });
+  if (selectedRow) {
+    selectedRow.scrollIntoView({ block: "nearest" });
+    return;
+  }
+  scrollWebsocketSessionToId(state.selectedWebsocketId);
+}
+
+function scrollWebsocketSessionToId(targetId) {
+  if (!targetId) return;
+  const sortedEntries = getSortedWebsocketEntries();
+  if (!ensureWebsocketSessionInView(targetId, sortedEntries, { center: true })) {
+    return;
+  }
+  renderWebsocketSessionTable(sortedEntries);
+}
+
+function ensureWebsocketSessionInView(targetId, sortedEntries = getSortedWebsocketEntries(), options = {}) {
+  if (!targetId) return false;
+  const idx = sortedEntries.findIndex(({ session }) => session.id === targetId);
+  if (idx === -1) return false;
+  const shell = document.querySelector("#websocketTable")?.closest(".history-table-shell");
+  if (!shell) return false;
+  if (sortedEntries.length <= WEBSOCKET_MAX_RENDERED_SESSION_ROWS) {
+    shell.scrollTop = 0;
+    return true;
+  }
+  const rowHeight = measuredWebsocketSessionRowHeight || WEBSOCKET_SESSION_ROW_HEIGHT;
+  const rowTop = idx * rowHeight;
+  const rowBottom = rowTop + rowHeight;
+  const viewTop = shell.scrollTop;
+  const viewBottom = viewTop + shell.clientHeight;
+  if (options.center) {
+    shell.scrollTop = Math.max(0, rowTop - shell.clientHeight / 2);
+    return true;
+  }
+  if (rowTop < viewTop) {
+    shell.scrollTop = rowTop;
+    return true;
+  }
+  if (rowBottom > viewBottom) {
+    shell.scrollTop = Math.max(0, rowBottom - shell.clientHeight);
+    return true;
+  }
+  return true;
 }
 
 function moveFrameSelection(offset) {
@@ -7769,16 +7818,15 @@ function renderIntercepts() {
   els.dropInterceptButton.disabled = false;
 }
 
-function renderWebsocketSessions() {
-  const sortedEntries = getSortedWebsocketEntries();
-  const renderedEntries = websocketRenderedSessionWindow(sortedEntries, state.selectedWebsocketId);
+function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()) {
+  const windowed = websocketRenderedSessionWindow(sortedEntries);
   scheduleWebsocketQueryBackfill(sortedEntries.length);
   if (els.websocketSearchInput.value !== state.websocketQuery) {
     els.websocketSearchInput.value = state.websocketQuery;
   }
   els.websocketMeta.textContent = buildWebsocketFilterSummary(
     sortedEntries.length,
-    renderedEntries.length,
+    windowed.renderedEntries.length,
     state.websocketSessions.length,
     state.websocketPaging?.total ?? state.websocketSessions.length,
     Boolean(state.websocketPaging?.hasMore),
@@ -7787,24 +7835,8 @@ function renderWebsocketSessions() {
 
   updateWebsocketSortIndicators();
 
-  els.websocketTableBody.innerHTML = sortedEntries.length
-    ? renderedEntries
-        .map(({ session, index }) => {
-          const selected = session.id === state.selectedWebsocketId ? "selected" : "";
-          return `
-            <tr class="history-row ${selected}" data-id="${session.id}">
-              <td>${index + 1}</td>
-              <td>${escapeHtml(session.host)}</td>
-              <td>${escapeHtml(session.path)}</td>
-              <td>${escapeHtml(formatStatus(session.status))}</td>
-              <td>${session.frame_count}</td>
-              <td>${session.duration_ms == null ? "live" : `${session.duration_ms} ms`}</td>
-              <td>${escapeHtml(formatTimestamp(session.started_at))}</td>
-            </tr>
-          `;
-        })
-        .join("")
-    : `
+  if (!sortedEntries.length) {
+    els.websocketTableBody.innerHTML = `
         <tr class="empty-row">
           <td colspan="7">${
             state.websocketSessions.length
@@ -7815,21 +7847,60 @@ function renderWebsocketSessions() {
           }</td>
         </tr>
       `;
+    return;
+  }
 
-	  Array.from(els.websocketTableBody.querySelectorAll(".history-row")).forEach((row) => {
-	    row.addEventListener("click", () => {
-	      state.wsKeyboardFocus = "sessions";
-	      if (state.selectedWebsocketId !== row.dataset.id) {
-	        state.selectedFrameIdx = null;
-	        state.selectedWebsocketRecord = null;
-	        state.selectedWebsocketDetailError = "";
-	        hideFrameDetail();
-	      }
-	      state.selectedWebsocketId = row.dataset.id;
-	      renderWebsocketSessions();
-	      loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
-	    });
-	  });
+  const rows = windowed.renderedEntries
+    .map(({ session, index }) => {
+      const selected = session.id === state.selectedWebsocketId ? "selected" : "";
+      return `
+            <tr class="history-row ${selected}" data-id="${session.id}">
+              <td>${index + 1}</td>
+              <td>${escapeHtml(session.host)}</td>
+              <td>${escapeHtml(session.path)}</td>
+              <td>${escapeHtml(formatStatus(session.status))}</td>
+              <td>${session.frame_count}</td>
+              <td>${session.duration_ms == null ? "live" : `${session.duration_ms} ms`}</td>
+              <td>${escapeHtml(formatTimestamp(session.started_at))}</td>
+            </tr>
+          `;
+    })
+    .join("");
+  els.websocketTableBody.innerHTML =
+    (windowed.topPadding > 0 ? `<tr class="virtual-spacer"><td colspan="7" style="height:${windowed.topPadding}px;padding:0;border:none"></td></tr>` : "") +
+    rows +
+    (windowed.bottomPadding > 0 ? `<tr class="virtual-spacer"><td colspan="7" style="height:${windowed.bottomPadding}px;padding:0;border:none"></td></tr>` : "");
+
+  Array.from(els.websocketTableBody.querySelectorAll(".history-row")).forEach((row) => {
+    row.addEventListener("click", () => {
+      state.wsKeyboardFocus = "sessions";
+      if (state.selectedWebsocketId !== row.dataset.id) {
+        state.selectedFrameIdx = null;
+        state.selectedWebsocketRecord = null;
+        state.selectedWebsocketDetailError = "";
+        hideFrameDetail();
+      }
+      state.selectedWebsocketId = row.dataset.id;
+      renderWebsocketSessions();
+      loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
+    });
+  });
+
+  const measuredRow = els.websocketTableBody.querySelector(".history-row");
+  const measured = measuredRow?.getBoundingClientRect().height || 0;
+  if (measured > 0 && Math.abs(measured - measuredWebsocketSessionRowHeight) >= 1) {
+    measuredWebsocketSessionRowHeight = measured;
+    renderWebsocketSessionTable(sortedEntries);
+    return;
+  }
+}
+
+function renderWebsocketSessions(options = {}) {
+  const sortedEntries = getSortedWebsocketEntries();
+  if (options.ensureSelectedVisible) {
+    ensureWebsocketSessionInView(state.selectedWebsocketId, sortedEntries);
+  }
+  renderWebsocketSessionTable(sortedEntries);
 
   if (!state.selectedWebsocketRecord) {
     const detailLoading = Boolean(state.selectedWebsocketId);
@@ -8003,11 +8074,48 @@ function centeredWindow(items, selectedPosition, maxItems) {
   return items.slice(start, start + maxItems);
 }
 
-function websocketRenderedSessionWindow(entries, selectedId) {
-  const selectedPosition = selectedId
-    ? entries.findIndex(({ session }) => session.id === selectedId)
-    : -1;
-  return centeredWindow(entries, selectedPosition, WEBSOCKET_MAX_RENDERED_SESSION_ROWS);
+function websocketRenderedSessionWindow(entries) {
+  if (!Array.isArray(entries) || !entries.length) {
+    return {
+      renderedEntries: [],
+      startIdx: 0,
+      endIdx: 0,
+      topPadding: 0,
+      bottomPadding: 0,
+    };
+  }
+  const shell = document.querySelector("#websocketTable")?.closest(".history-table-shell");
+  const rowHeight = measuredWebsocketSessionRowHeight || WEBSOCKET_SESSION_ROW_HEIGHT;
+  if (!shell || entries.length <= WEBSOCKET_MAX_RENDERED_SESSION_ROWS) {
+    return {
+      renderedEntries: entries,
+      startIdx: 0,
+      endIdx: entries.length,
+      topPadding: 0,
+      bottomPadding: 0,
+    };
+  }
+  const viewportHeight = shell.clientHeight || rowHeight * WEBSOCKET_MAX_RENDERED_SESSION_ROWS;
+  const maxScrollTop = Math.max(0, entries.length * rowHeight - viewportHeight);
+  const scrollTop = Math.min(shell.scrollTop, maxScrollTop);
+  if (shell.scrollTop !== scrollTop) {
+    shell.scrollTop = scrollTop;
+  }
+  const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - WEBSOCKET_SESSION_BUFFER_ROWS);
+  let endIdx = Math.min(
+    entries.length,
+    Math.ceil((scrollTop + viewportHeight) / rowHeight) + WEBSOCKET_SESSION_BUFFER_ROWS,
+  );
+  if (endIdx - startIdx > WEBSOCKET_MAX_RENDERED_SESSION_ROWS) {
+    endIdx = startIdx + WEBSOCKET_MAX_RENDERED_SESSION_ROWS;
+  }
+  return {
+    renderedEntries: entries.slice(startIdx, endIdx),
+    startIdx,
+    endIdx,
+    topPadding: startIdx * rowHeight,
+    bottomPadding: Math.max(0, (entries.length - endIdx) * rowHeight),
+  };
 }
 
 function websocketRenderedFrameWindow(frames, selectedFrameIndex) {
@@ -8080,7 +8188,7 @@ function toggleWebsocketSort(key) {
     state.websocketSortKey = key;
     state.websocketSortDirection = key === "index" ? "asc" : "desc";
   }
-  renderWebsocketSessions();
+  renderWebsocketSessions({ ensureSelectedVisible: true });
 }
 
 function updateWebsocketSortIndicators() {
@@ -8095,7 +8203,8 @@ function updateWebsocketSortIndicators() {
   });
 }
 
-async function syncVisibleWebsocketSelection(preserveSelection = true) {
+async function syncVisibleWebsocketSelection(preserveSelection = true, options = {}) {
+  const renderOptions = { ensureSelectedVisible: options.ensureSelectedVisible === true };
   const previousSelectedId = state.selectedWebsocketId;
   const visibleSessions = getVisibleWebsocketSessions();
   if (!preserveSelection || !visibleSessions.some((item) => item.id === state.selectedWebsocketId)) {
@@ -8110,7 +8219,7 @@ async function syncVisibleWebsocketSelection(preserveSelection = true) {
   if (!state.selectedWebsocketId) {
     state.selectedWebsocketRecord = null;
     state.selectedWebsocketDetailError = "";
-    renderWebsocketSessions();
+    renderWebsocketSessions(renderOptions);
     return;
   }
 
@@ -8130,7 +8239,7 @@ async function syncVisibleWebsocketSelection(preserveSelection = true) {
       || (state.selectedWebsocketRecord.duration_ms ?? null) !== (selectedSummary.duration_ms ?? null)
     )
   );
-  renderWebsocketSessions();
+  renderWebsocketSessions(renderOptions);
   if (!state.selectedWebsocketRecord || selectedDetailIsStale) {
     await loadWebsocketDetail(state.selectedWebsocketId);
   }
@@ -8169,6 +8278,25 @@ function renderProxySettings() {
   const aclEl = document.getElementById("proxySettingAutoContentLength");
   if (aclEl) aclEl.checked = localStorage.getItem("sniper_auto_content_length") !== "false";
 
+  renderOastSettingsControls({ hydrateValues: true });
+
+  els.proxySettingsDataDir.textContent = state.settings.data_dir;
+  els.proxySettingsStartupPath.textContent = startup?.file_path || state.settings.data_dir;
+  els.proxySettingsCertificateName.textContent = `${state.settings.certificate.common_name} · expires ${formatTimestamp(state.settings.certificate.expires_at)}`;
+  els.proxySettingListenerHelp.textContent = startup
+    ? startup.rebound === true
+      ? `Proxy listener is now running on ${startup.active_proxy_addr}.`
+      : startup.rebind_error
+        ? `${startup.rebind_error} Saved ${startup.proxy_addr} for the next launch.`
+        : startup.restart_required
+          ? `Saved ${startup.proxy_addr} for the next launch. Restart Sniper to replace the active listener ${startup.active_proxy_addr}.`
+          : `Proxy listener is running on ${startup.active_proxy_addr}.`
+    : "Changes are saved for the next app start.";
+}
+
+function renderOastSettingsControls(options = {}) {
+  if (!state.runtime) return;
+  const hydrateValues = Boolean(options.hydrateValues);
   const oastEnabled = document.getElementById("proxySettingOastEnabled");
   const oastProvider = document.getElementById("proxySettingOastProvider");
   const oastUrl = document.getElementById("proxySettingOastServerUrl");
@@ -8177,11 +8305,17 @@ function renderProxySettings() {
   const oastUrlHint = document.getElementById("oastServerUrlHint");
   const oastTokenField = document.getElementById("oastTokenField");
   const tokenConfigured = state.runtime.oast_token === OAST_TOKEN_REDACTION;
-  if (oastEnabled) oastEnabled.checked = Boolean(state.runtime.oast_enabled);
-  if (oastProvider && document.activeElement !== oastProvider) oastProvider.value = state.runtime.oast_provider || "custom";
-  if (oastUrl && document.activeElement !== oastUrl) oastUrl.value = state.runtime.oast_server_url || "";
-  if (oastToken && document.activeElement !== oastToken) {
+  if (hydrateValues && oastEnabled) oastEnabled.checked = Boolean(state.runtime.oast_enabled);
+  if (hydrateValues && oastProvider && document.activeElement !== oastProvider) {
+    oastProvider.value = state.runtime.oast_provider || "custom";
+  }
+  if (hydrateValues && oastUrl && document.activeElement !== oastUrl) oastUrl.value = state.runtime.oast_server_url || "";
+  if (hydrateValues && oastToken && document.activeElement !== oastToken) {
     oastToken.value = "";
+    oastToken.placeholder = tokenConfigured
+      ? "Token configured; leave blank to keep it"
+      : "Optional token";
+  } else if (oastToken) {
     oastToken.placeholder = tokenConfigured
       ? "Token configured; leave blank to keep it"
       : "Optional token";
@@ -8197,9 +8331,11 @@ function renderProxySettings() {
         ? "Leave blank to keep the saved token, or clear it explicitly."
         : "Enter a token only if your OAST server requires one.";
   }
-  if (oastInterval && document.activeElement !== oastInterval) oastInterval.value = state.runtime.oast_polling_interval_secs || 5;
+  if (hydrateValues && oastInterval && document.activeElement !== oastInterval) {
+    oastInterval.value = state.runtime.oast_polling_interval_secs || 5;
+  }
   // Update UI based on provider
-  const prov = oastProvider?.value || "custom";
+  const prov = oastProvider?.value || state.runtime.oast_provider || "custom";
   if (oastUrl) {
     const placeholders = { interactsh: "https://oast.fun", boast: "https://your-boast:1337", custom: "https://your-server" };
     oastUrl.placeholder = placeholders[prov] || placeholders.custom;
@@ -8215,19 +8351,6 @@ function renderProxySettings() {
   if (oastTokenField) {
     oastTokenField.style.display = prov === "boast" ? "none" : "";
   }
-
-  els.proxySettingsDataDir.textContent = state.settings.data_dir;
-  els.proxySettingsStartupPath.textContent = startup?.file_path || state.settings.data_dir;
-  els.proxySettingsCertificateName.textContent = `${state.settings.certificate.common_name} · expires ${formatTimestamp(state.settings.certificate.expires_at)}`;
-  els.proxySettingListenerHelp.textContent = startup
-    ? startup.rebound === true
-      ? `Proxy listener is now running on ${startup.active_proxy_addr}.`
-      : startup.rebind_error
-        ? `${startup.rebind_error} Saved ${startup.proxy_addr} for the next launch.`
-        : startup.restart_required
-          ? `Saved ${startup.proxy_addr} for the next launch. Restart Sniper to replace the active listener ${startup.active_proxy_addr}.`
-          : `Proxy listener is running on ${startup.active_proxy_addr}.`
-    : "Changes are saved for the next app start.";
 }
 
 function renderReplay() {
@@ -10321,6 +10444,7 @@ async function saveProxySettings() {
   if (oastInterval === null) {
     throw new Error("OAST polling interval must be an integer between 1 and 300 seconds.");
   }
+  const oastProvider = document.getElementById("proxySettingOastProvider")?.value || "custom";
   const runtimeUpdate = {
     session_id: sessionId,
     intercept_enabled: els.proxySettingIntercept.checked,
@@ -10329,13 +10453,13 @@ async function saveProxySettings() {
     scope_patterns: scopePatterns,
     passthrough_hosts: passthroughHosts,
     oast_enabled: document.getElementById("proxySettingOastEnabled")?.checked ?? false,
-    oast_provider: document.getElementById("proxySettingOastProvider")?.value || "custom",
+    oast_provider: oastProvider,
     oast_server_url: document.getElementById("proxySettingOastServerUrl")?.value?.trim() || "",
     oast_polling_interval_secs: oastInterval,
   };
   if (state.oastTokenClearPending) {
     runtimeUpdate.oast_token = "";
-  } else if (oastTokenValue && oastTokenValue !== OAST_TOKEN_REDACTION) {
+  } else if (oastProvider !== "boast" && oastTokenValue && oastTokenValue !== OAST_TOKEN_REDACTION) {
     runtimeUpdate.oast_token = oastTokenValue;
   }
 
@@ -12564,10 +12688,14 @@ function applyUiSettingsSnapshot(snapshot) {
     });
   }
   state.workbenchHeight = sanitizeWorkbenchHeight(snapshot?.workbench_height);
+  state.workbenchPaneWidths = sanitizeWorkbenchPaneWidths(snapshot?.workbench_pane_widths);
+  state.websocketPaneWidth = sanitizeWebsocketPaneWidth(snapshot?.websocket_pane_width);
   applyDisplaySettingsState();
   renderHistoryHeader();
   applyHistoryColumnWidths();
   applyWsColumnWidths();
+  applySavedWorkbenchPaneWidths();
+  applySavedWebsocketPaneWidth();
 
   if (state.workbenchHeight) {
     applyWorkbenchStackHeight(state.workbenchHeight, false);
@@ -12588,6 +12716,8 @@ function snapshotUiSettings() {
     history_column_order: [...state.historyColumnOrder],
     ws_column_widths: { ...state.wsColumnWidths },
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
+    workbench_pane_widths: serializeWorkbenchPaneWidths(),
+    websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,
   };
 }
 
@@ -12616,6 +12746,44 @@ async function persistUiSettings() {
 function sanitizeWorkbenchHeight(candidate) {
   const parsed = Number(candidate);
   return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
+}
+
+function sanitizeWorkbenchPaneWidths(candidate) {
+  if (!candidate || typeof candidate !== "object") {
+    return null;
+  }
+  const requestPercent = Number(candidate.request_percent);
+  const responsePercent = Number(candidate.response_percent);
+  const inspectorWidth = Number(candidate.inspector_width);
+  const next = {};
+  if (Number.isFinite(requestPercent) && requestPercent > 0) {
+    next.requestPercent = clamp(Math.round(requestPercent), 18, 72);
+  }
+  if (Number.isFinite(responsePercent) && responsePercent > 0) {
+    next.responsePercent = clamp(Math.round(responsePercent), 18, 72);
+  }
+  if (Number.isFinite(inspectorWidth) && inspectorWidth > 0) {
+    next.inspectorWidth = clamp(Math.round(inspectorWidth), WORKBENCH_MIN_WIDTHS.inspector, 4096);
+  }
+  return Object.keys(next).length ? next : null;
+}
+
+function sanitizeWebsocketPaneWidth(candidate) {
+  const parsed = Number(candidate);
+  return Number.isFinite(parsed) && parsed > 0
+    ? clamp(Math.round(parsed), WEBSOCKET_WORKBENCH_MIN_WIDTHS.handshake, 4096)
+    : null;
+}
+
+function serializeWorkbenchPaneWidths() {
+  if (!state.workbenchPaneWidths) {
+    return {};
+  }
+  return {
+    request_percent: state.workbenchPaneWidths.requestPercent ?? null,
+    response_percent: state.workbenchPaneWidths.responsePercent ?? null,
+    inspector_width: state.workbenchPaneWidths.inspectorWidth ?? null,
+  };
 }
 
 function syncHttpInScopePill() {
@@ -13725,6 +13893,7 @@ function bindPaneResizer(handle, mode) {
 
   handle.addEventListener("dblclick", () => {
     resetWorkbenchPaneWidths();
+    scheduleUiSettingsSave();
   });
 
   handle.addEventListener("mousedown", (event) => {
@@ -13775,8 +13944,9 @@ function bindPaneResizer(handle, mode) {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       if (mode === "request-response") {
-        normalizeWorkbenchPaneWidths();
+        normalizeWorkbenchPaneWidths({ updateState: true });
       }
+      scheduleUiSettingsSave();
     };
 
     document.addEventListener("mousemove", onMove);
@@ -13797,11 +13967,38 @@ function getWorkbenchWidths() {
   };
 }
 
+function applySavedWorkbenchPaneWidths() {
+  if (!state.workbenchPaneWidths || !els.lowerWorkbench) {
+    resetWorkbenchPaneWidths(false);
+    return;
+  }
+  const totalWidth = els.lowerWorkbench.getBoundingClientRect().width;
+  if (!totalWidth || window.matchMedia(WORKBENCH_STACK_BREAKPOINT).matches) {
+    return;
+  }
+  const currentRequestWidth = els.requestColumn?.getBoundingClientRect().width || totalWidth / 3;
+  const currentResponseWidth = els.responseColumn?.getBoundingClientRect().width || totalWidth / 3;
+  const requestWidth = state.workbenchPaneWidths.requestPercent
+    ? (state.workbenchPaneWidths.requestPercent / 100) * totalWidth
+    : currentRequestWidth;
+  const responseWidth = state.workbenchPaneWidths.responsePercent
+    ? (state.workbenchPaneWidths.responsePercent / 100) * totalWidth
+    : currentResponseWidth;
+  applyWorkbenchPaneWidths(
+    requestWidth,
+    responseWidth,
+    totalWidth,
+    state.workbenchPaneWidths.inspectorWidth ?? null,
+    { updateState: false },
+  );
+}
+
 function applyWorkbenchPaneWidths(
   requestWidth,
   responseWidth,
   totalWidth = els.lowerWorkbench.getBoundingClientRect().width,
   inspectorWidth = null,
+  options = {},
 ) {
   if (!totalWidth) {
     return;
@@ -13811,6 +14008,14 @@ function applyWorkbenchPaneWidths(
   const responsePercent = clamp((responseWidth / totalWidth) * 100, 18, 72);
   els.lowerWorkbench.style.setProperty("--request-pane-width", `${requestPercent}%`);
   els.lowerWorkbench.style.setProperty("--response-pane-width", `${responsePercent}%`);
+  const updateState = options.updateState !== false;
+  if (updateState) {
+    state.workbenchPaneWidths = {
+      ...(state.workbenchPaneWidths || {}),
+      requestPercent: Math.round(requestPercent),
+      responsePercent: Math.round(responsePercent),
+    };
+  }
   if (Number.isFinite(inspectorWidth)) {
     const maxInspectorWidth = Math.max(
       WORKBENCH_MIN_WIDTHS.inspector,
@@ -13822,10 +14027,13 @@ function applyWorkbenchPaneWidths(
       maxInspectorWidth,
     );
     els.lowerWorkbench.style.setProperty("--inspector-pane-width", `${Math.round(clampedInspectorWidth)}px`);
+    if (updateState) {
+      state.workbenchPaneWidths.inspectorWidth = Math.round(clampedInspectorWidth);
+    }
   }
 }
 
-function normalizeWorkbenchPaneWidths() {
+function normalizeWorkbenchPaneWidths(options = {}) {
   if (!els.lowerWorkbench || window.matchMedia(WORKBENCH_STACK_BREAKPOINT).matches) {
     return;
   }
@@ -13855,13 +14063,19 @@ function normalizeWorkbenchPaneWidths() {
     combinedWidth - WORKBENCH_MIN_WIDTHS.response,
   );
   const responseWidth = combinedWidth - requestWidth;
-  applyWorkbenchPaneWidths(requestWidth, responseWidth, bounds.total);
+  applyWorkbenchPaneWidths(requestWidth, responseWidth, bounds.total, null, {
+    ...options,
+    updateState: options.updateState === true,
+  });
 }
 
-function resetWorkbenchPaneWidths() {
+function resetWorkbenchPaneWidths(clearState = true) {
   els.lowerWorkbench.style.removeProperty("--request-pane-width");
   els.lowerWorkbench.style.removeProperty("--response-pane-width");
   els.lowerWorkbench.style.removeProperty("--inspector-pane-width");
+  if (clearState) {
+    state.workbenchPaneWidths = null;
+  }
 }
 
 function bindWebsocketPaneResizer(handle) {
@@ -13871,6 +14085,7 @@ function bindWebsocketPaneResizer(handle) {
 
   handle.addEventListener("dblclick", () => {
     resetWebsocketPaneWidth();
+    scheduleUiSettingsSave();
   });
 
   handle.addEventListener("mousedown", (event) => {
@@ -13903,7 +14118,8 @@ function bindWebsocketPaneResizer(handle) {
       handle.classList.remove("active");
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-      normalizeWebsocketPaneWidth();
+      normalizeWebsocketPaneWidth({ updateState: true });
+      scheduleUiSettingsSave();
     };
 
     document.addEventListener("mousemove", onMove);
@@ -13924,16 +14140,42 @@ function getWebsocketWorkbenchWidths() {
   };
 }
 
-function applyWebsocketPaneWidth(handshakeWidth) {
+function applyWebsocketPaneWidth(handshakeWidth, options = {}) {
   if (!els.websocketWorkbench) {
     return;
   }
-  els.websocketWorkbench.style.setProperty("--websocket-left-pane-width", `${Math.round(handshakeWidth)}px`);
+  const bounds = getWebsocketWorkbenchWidths();
+  const maxWidth = bounds
+    ? bounds.total - WEBSOCKET_WORKBENCH_MIN_WIDTHS.frames
+    : 4096;
+  const roundedWidth = Math.round(clamp(
+    handshakeWidth,
+    WEBSOCKET_WORKBENCH_MIN_WIDTHS.handshake,
+    Math.max(WEBSOCKET_WORKBENCH_MIN_WIDTHS.handshake, maxWidth),
+  ));
+  els.websocketWorkbench.style.setProperty("--websocket-left-pane-width", `${roundedWidth}px`);
+  if (options.updateState !== false) {
+    state.websocketPaneWidth = roundedWidth;
+  }
 }
 
-function normalizeWebsocketPaneWidth() {
-  if (!els.websocketWorkbench || window.matchMedia(WEBSOCKET_WORKBENCH_BREAKPOINT).matches) {
-    resetWebsocketPaneWidth();
+function applySavedWebsocketPaneWidth() {
+  if (!state.websocketPaneWidth || !els.websocketWorkbench) {
+    resetWebsocketPaneWidth(false);
+    return;
+  }
+  if (window.matchMedia(WEBSOCKET_WORKBENCH_BREAKPOINT).matches) {
+    return;
+  }
+  applyWebsocketPaneWidth(state.websocketPaneWidth, { updateState: false });
+}
+
+function normalizeWebsocketPaneWidth(options = {}) {
+  if (!els.websocketWorkbench) {
+    return;
+  }
+  if (window.matchMedia(WEBSOCKET_WORKBENCH_BREAKPOINT).matches) {
+    resetWebsocketPaneWidth(false);
     return;
   }
 
@@ -13943,7 +14185,7 @@ function normalizeWebsocketPaneWidth() {
   }
 
   const bounds = getWebsocketWorkbenchWidths();
-  if (!bounds) {
+  if (!bounds || bounds.total <= 0) {
     return;
   }
 
@@ -13952,11 +14194,17 @@ function normalizeWebsocketPaneWidth() {
     WEBSOCKET_WORKBENCH_MIN_WIDTHS.handshake,
     bounds.total - WEBSOCKET_WORKBENCH_MIN_WIDTHS.frames,
   );
-  applyWebsocketPaneWidth(nextHandshake);
+  applyWebsocketPaneWidth(nextHandshake, {
+    ...options,
+    updateState: options.updateState === true,
+  });
 }
 
-function resetWebsocketPaneWidth() {
+function resetWebsocketPaneWidth(clearState = true) {
   els.websocketWorkbench?.style.removeProperty("--websocket-left-pane-width");
+  if (clearState) {
+    state.websocketPaneWidth = null;
+  }
 }
 
 function bindWebsocketStackResizer(handle) {
