@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::certificate::default_data_dir;
 
@@ -240,9 +241,22 @@ fn load_startup_settings_snapshot(
     })?;
     let path = startup_settings_path(data_dir);
     match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<StoredStartupSettingsSnapshot>(&bytes)
-            .with_context(|| format!("failed to parse startup settings {}", path.display()))?
-            .into_snapshot(default_proxy_addr),
+        Ok(bytes) => {
+            let snapshot = serde_json::from_slice::<StoredStartupSettingsSnapshot>(&bytes)
+                .with_context(|| format!("failed to parse startup settings {}", path.display()))
+                .and_then(|snapshot| snapshot.into_snapshot(default_proxy_addr));
+            match snapshot {
+                Ok(snapshot) => Ok(snapshot),
+                Err(error) => {
+                    warn!(
+                        %error,
+                        path = %path.display(),
+                        "recovering corrupt startup settings"
+                    );
+                    recover_startup_settings_snapshot(&path, default_proxy_addr)
+                }
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let snapshot = StartupSettingsSnapshot::from_proxy_addr(default_proxy_addr);
             persist_startup_settings(&path, &snapshot)?;
@@ -251,6 +265,28 @@ fn load_startup_settings_snapshot(
         Err(error) => Err(error)
             .with_context(|| format!("failed to read startup settings {}", path.display())),
     }
+}
+
+fn recover_startup_settings_snapshot(
+    path: &Path,
+    default_proxy_addr: SocketAddr,
+) -> Result<StartupSettingsSnapshot> {
+    if path.exists() {
+        let corrupt_path = path.with_file_name(format!(
+            ".startup-settings.corrupt-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::rename(path, &corrupt_path).with_context(|| {
+            format!(
+                "failed to move corrupt startup settings {} to {}",
+                path.display(),
+                corrupt_path.display()
+            )
+        })?;
+    }
+    let snapshot = StartupSettingsSnapshot::from_proxy_addr(default_proxy_addr);
+    persist_startup_settings(path, &snapshot)?;
+    Ok(snapshot)
 }
 
 fn persist_startup_settings(path: &Path, snapshot: &StartupSettingsSnapshot) -> Result<()> {
@@ -419,6 +455,58 @@ mod tests {
 
         assert_eq!(saved.proxy_bind_host, "::1");
         assert_eq!(saved.proxy_port, 19090);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_store_recovers_corrupt_json() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-startup-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("temp data dir should be created");
+        std::fs::write(data_dir.join(super::STARTUP_SETTINGS_FILE), b"{not-json")
+            .expect("corrupt startup settings should be written");
+
+        let store =
+            StartupSettingsStore::load_or_create(&data_dir, "127.0.0.1:18080".parse().unwrap())
+                .expect("corrupt startup settings should recover");
+        let saved = store.snapshot().await;
+
+        assert_eq!(saved.proxy_bind_host, "127.0.0.1");
+        assert_eq!(saved.proxy_port, 18080);
+        let corrupt_files = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".startup-settings.corrupt-")
+            })
+            .count();
+        assert_eq!(corrupt_files, 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_store_recovers_invalid_split_fields() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-startup-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("temp data dir should be created");
+        std::fs::write(
+            data_dir.join(super::STARTUP_SETTINGS_FILE),
+            br#"{"proxy_bind_host":"not an ip","proxy_port":0}"#,
+        )
+        .expect("invalid startup settings should be written");
+
+        let store =
+            StartupSettingsStore::load_or_create(&data_dir, "127.0.0.1:18080".parse().unwrap())
+                .expect("invalid startup settings should recover");
+        let saved = store.snapshot().await;
+
+        assert_eq!(saved.proxy_bind_host, "127.0.0.1");
+        assert_eq!(saved.proxy_port, 18080);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

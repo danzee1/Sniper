@@ -939,6 +939,8 @@ function bindEvents() {
   window.addEventListener("resize", resetLayoutTextareas);
   window.addEventListener("pagehide", flushWorkspaceStateOnUnload);
   window.addEventListener("beforeunload", flushWorkspaceStateOnUnload);
+  window.addEventListener("pagehide", flushUiSettingsOnUnload);
+  window.addEventListener("beforeunload", flushUiSettingsOnUnload);
 
   mainTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -1372,11 +1374,14 @@ function bindEvents() {
           showToast(`Proxy listener moved to ${result.active_proxy_addr}`);
         } else if (result?.rebound === false && result?.rebind_error) {
           showToast(result.rebind_error, "error");
-        } else {
-          showToast("Proxy settings saved");
-        }
-      })
-      .catch((error) => { console.error(error); showToast("Failed to save proxy settings", "error"); });
+      } else {
+        showToast("Proxy settings saved");
+      }
+    })
+      .catch((error) => {
+        console.error(error);
+        showToast(error?.message || "Failed to save proxy settings", "error");
+      });
   });
   els.reloadProxySettingsButton.addEventListener("click", () => {
     loadSettings()
@@ -10695,15 +10700,21 @@ async function saveProxySettings() {
   const bindHost = els.proxySettingBindHost.value.trim();
   const proxyPortText = els.proxySettingPort.value.trim();
   const proxyPort = strictIntegerInRange(proxyPortText, 1, 65535);
-  if (proxyPortText && proxyPort === null) {
+  if (!bindHost) {
+    throw new Error("Proxy bind host is required.");
+  }
+  if (!proxyPortText) {
+    throw new Error("Proxy port is required.");
+  }
+  if (proxyPort === null) {
     throw new Error("Proxy port must be an integer between 1 and 65535.");
   }
-  if (bindHost && !isValidIpLiteral(bindHost)) {
+  if (!isValidIpLiteral(bindHost)) {
     throw new Error("Proxy bind host must be an IPv4 or IPv6 address.");
   }
   const startupUpdate = {
-    proxy_bind_host: bindHost || undefined,
-    proxy_port: proxyPortText ? proxyPort : undefined,
+    proxy_bind_host: bindHost,
+    proxy_port: proxyPort,
   };
   const oastTokenValue = document.getElementById("proxySettingOastToken")?.value?.trim() || "";
   const oastIntervalText = document.getElementById("proxySettingOastInterval")?.value?.trim() || "";
@@ -10712,6 +10723,8 @@ async function saveProxySettings() {
     throw new Error("OAST polling interval must be an integer between 1 and 300 seconds.");
   }
   const oastProvider = document.getElementById("proxySettingOastProvider")?.value || "custom";
+  const previousOastProvider = state.runtime?.oast_provider || "custom";
+  const oastProviderChanged = oastProvider !== previousOastProvider;
   const runtimeUpdate = {
     session_id: sessionId,
     intercept_enabled: els.proxySettingIntercept.checked,
@@ -10724,26 +10737,17 @@ async function saveProxySettings() {
     oast_server_url: document.getElementById("proxySettingOastServerUrl")?.value?.trim() || "",
     oast_polling_interval_secs: oastInterval,
   };
-  if (state.oastTokenClearPending || oastProvider === "boast") {
+  if (
+    state.oastTokenClearPending ||
+    oastProvider === "boast" ||
+    (oastProviderChanged && (!oastTokenValue || oastTokenValue === OAST_TOKEN_REDACTION))
+  ) {
     runtimeUpdate.oast_token = "";
   } else if (oastProvider !== "boast" && oastTokenValue && oastTokenValue !== OAST_TOKEN_REDACTION) {
     runtimeUpdate.oast_token = oastTokenValue;
   }
 
   const tokenWillBeUpdated = Object.prototype.hasOwnProperty.call(runtimeUpdate, "oast_token");
-  const startupResponse = await fetch("/api/startup-settings", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(startupUpdate),
-  });
-
-  if (!startupResponse.ok) {
-    throw new Error(await startupResponse.text());
-  }
-  const startupResult = await startupResponse.json();
-
   const runtimeResponse = await fetch("/api/runtime", {
     method: "POST",
     headers: {
@@ -10756,6 +10760,19 @@ async function saveProxySettings() {
     throw new Error(await runtimeResponse.text());
   }
   const runtimeResult = await runtimeResponse.json();
+
+  const startupResponse = await fetch("/api/startup-settings", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(startupUpdate),
+  });
+
+  if (!startupResponse.ok) {
+    throw new Error(await startupResponse.text());
+  }
+  const startupResult = await startupResponse.json();
   if (sessionId !== currentSessionId()) {
     return startupResult;
   }
@@ -13019,6 +13036,25 @@ async function persistUiSettings() {
   if (!response.ok) {
     throw new Error(await response.text());
   }
+}
+
+function flushUiSettingsOnUnload() {
+  if (!uiSettingsSaveTimer) {
+    return;
+  }
+  window.clearTimeout(uiSettingsSaveTimer);
+  uiSettingsSaveTimer = null;
+  const payload = JSON.stringify(snapshotUiSettings());
+  const blob = new Blob([payload], { type: "application/json" });
+  if (navigator.sendBeacon && navigator.sendBeacon("/api/ui-settings", blob)) {
+    return;
+  }
+  fetch("/api/ui-settings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: payload,
+    keepalive: true,
+  }).catch(() => {});
 }
 
 function sanitizeWorkbenchHeight(candidate) {
@@ -16948,6 +16984,7 @@ let contextMenuTargetId = null;
 let contextMenuSessionId = null;
 let contextMenuRecordTarget = null;
 let contextMenuNoteTimer = null;
+let contextMenuPendingNote = null;
 
 function openContextMenu(x, y, transactionId) {
   contextMenuTargetId = transactionId;
@@ -16977,8 +17014,7 @@ function openContextMenu(x, y, transactionId) {
 }
 
 function closeContextMenu() {
-  window.clearTimeout(contextMenuNoteTimer);
-  contextMenuNoteTimer = null;
+  flushContextMenuPendingNote();
   els.contextMenu.classList.add("hidden");
   contextMenuTargetId = null;
   contextMenuSessionId = null;
@@ -17015,6 +17051,17 @@ async function updateAnnotations(transactionId, payload, sessionId = currentSess
   if (!state._annotationInFlight.has(transactionId)) {
     flushPendingAnnotations(transactionId);
   }
+}
+
+function flushContextMenuPendingNote() {
+  window.clearTimeout(contextMenuNoteTimer);
+  contextMenuNoteTimer = null;
+  const pending = contextMenuPendingNote;
+  contextMenuPendingNote = null;
+  if (!pending?.id || pending.sessionId !== currentSessionId()) {
+    return;
+  }
+  updateAnnotations(pending.id, { user_note: pending.value || null }, pending.sessionId);
 }
 
 async function flushPendingAnnotations(transactionId) {
@@ -17183,8 +17230,9 @@ els.contextMenuNote.addEventListener("input", () => {
   const id = contextMenuTargetId;
   const sessionId = contextMenuSessionId;
   const value = els.contextMenuNote.value;
+  contextMenuPendingNote = { id, sessionId, value };
   contextMenuNoteTimer = setTimeout(() => {
-    updateAnnotations(id, { user_note: value || null }, sessionId);
+    flushContextMenuPendingNote();
   }, 500);
 });
 
@@ -17196,11 +17244,12 @@ els.contextMenuNote.addEventListener("keydown", (event) => {
       closeContextMenu();
       return;
     }
-    const id = contextMenuTargetId;
-    const sessionId = contextMenuSessionId;
-    const value = els.contextMenuNote.value;
-    clearTimeout(contextMenuNoteTimer);
-    updateAnnotations(id, { user_note: value || null }, sessionId);
+    contextMenuPendingNote = {
+      id: contextMenuTargetId,
+      sessionId: contextMenuSessionId,
+      value: els.contextMenuNote.value,
+    };
+    flushContextMenuPendingNote();
     closeContextMenu();
   }
   event.stopPropagation();

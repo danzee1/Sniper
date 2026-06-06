@@ -791,12 +791,12 @@
                   <div class="settings-divider"></div>
                   <label class="settings-field">
                     <span>Proxy bind host</span>
-                    <input id="proxySettingBindHost" type="text" list="proxyBindHostPresets" placeholder="127.0.0.1 or 0.0.0.0" />
+                    <input id="proxySettingBindHost" type="text" list="proxyBindHostPresets" placeholder="127.0.0.1 or 0.0.0.0" required />
                     <small>Common values: <code>127.0.0.1</code> for local-only, <code>0.0.0.0</code> to accept traffic from other devices.</small>
                   </label>
                   <label class="settings-field">
                     <span>Proxy port</span>
-                    <input id="proxySettingPort" type="number" min="1" max="65535" placeholder="18080" />
+                    <input id="proxySettingPort" type="number" min="1" max="65535" placeholder="18080" required />
                     <small id="proxySettingListenerHelp">Changes are saved for the next app start.</small>
                   </label>
                   <datalist id="proxyBindHostPresets">

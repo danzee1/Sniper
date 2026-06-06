@@ -68,6 +68,7 @@ use crate::{
 
 const REPLAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REPLAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_CAPTURE_PREVIEW_BYTES: usize = 64 * 1024;
 
 type ProxyClient = Client;
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -4231,7 +4232,10 @@ async fn relay_websocket_session(
     let (mut client_sink, mut client_stream) = client_ws.split();
     let (mut upstream_sink, mut upstream_stream) = upstream_ws.split();
     let mut frame_index = 0_usize;
-    let max_preview = state.config.body_preview_bytes;
+    let max_preview = state
+        .config
+        .body_preview_bytes
+        .min(WEBSOCKET_CAPTURE_PREVIEW_BYTES);
     let close_note = loop {
         tokio::select! {
             message = client_stream.next() => {
@@ -4385,6 +4389,7 @@ fn capture_websocket_frame(
     max_preview: usize,
 ) -> Option<WebSocketFrameRecord> {
     let captured_at = Utc::now();
+    let max_preview = max_preview.min(WEBSOCKET_CAPTURE_PREVIEW_BYTES);
 
     match message {
         WebSocketMessage::Text(text) => {
@@ -5394,6 +5399,22 @@ mod tests {
         .expect("text frame should capture");
 
         assert_eq!(frame.body_preview, "é");
+        assert!(frame.preview_truncated);
+    }
+
+    #[test]
+    fn websocket_text_preview_is_capped_below_http_preview_limit() {
+        let text = "x".repeat(WEBSOCKET_CAPTURE_PREVIEW_BYTES + 1);
+        let frame = capture_websocket_frame(
+            0,
+            WebSocketFrameDirection::ClientToServer,
+            &WebSocketMessage::Text(text.into()),
+            usize::MAX,
+        )
+        .expect("text frame should capture");
+
+        assert_eq!(frame.body_preview.len(), WEBSOCKET_CAPTURE_PREVIEW_BYTES);
+        assert_eq!(frame.body_size, WEBSOCKET_CAPTURE_PREVIEW_BYTES + 1);
         assert!(frame.preview_truncated);
     }
 

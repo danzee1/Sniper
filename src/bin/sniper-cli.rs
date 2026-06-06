@@ -37,6 +37,7 @@ use url::Url;
 use uuid::Uuid;
 
 const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
+const DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const MAX_CLI_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -157,6 +158,8 @@ enum SessionCommand {
     List,
     Create(CreateSessionArgs),
     Switch(SessionSwitchArgs),
+    Delete(SessionDeleteArgs),
+    Reveal(SessionRevealArgs),
 }
 
 #[derive(Args, Debug)]
@@ -167,6 +170,18 @@ struct CreateSessionArgs {
 
 #[derive(Args, Debug)]
 struct SessionSwitchArgs {
+    #[arg(long)]
+    id: Uuid,
+}
+
+#[derive(Args, Debug)]
+struct SessionDeleteArgs {
+    #[arg(long)]
+    id: Uuid,
+}
+
+#[derive(Args, Debug)]
+struct SessionRevealArgs {
     #[arg(long)]
     id: Uuid,
 }
@@ -1345,6 +1360,20 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
                 .await?;
             print_json(&session)
         }
+        SessionCommand::Delete(args) => {
+            api.delete_status(&format!("/api/sessions/{}", args.id))
+                .await?;
+            print_json(&json!({
+                "ok": true,
+                "id": args.id,
+            }))
+        }
+        SessionCommand::Reveal(args) => {
+            let result: serde_json::Value = api
+                .post_json(&format!("/api/sessions/{}/reveal", args.id), &json!({}))
+                .await?;
+            print_json(&result)
+        }
     }
 }
 
@@ -2278,31 +2307,7 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
         }
         OastCommand::Configure(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let mut update = serde_json::Map::new();
-            if let Some(session_id) = session_id {
-                update.insert("session_id".into(), serde_json::json!(session_id));
-            }
-            if let Some(provider) = args.provider {
-                update.insert("oast_provider".into(), serde_json::Value::String(provider));
-            }
-            if let Some(url) = args.url {
-                update.insert("oast_server_url".into(), serde_json::Value::String(url));
-            }
-            if let Some(token) = args.token {
-                update.insert("oast_token".into(), serde_json::Value::String(token));
-            }
-            if let Some(interval) = args.interval {
-                update.insert(
-                    "oast_polling_interval_secs".into(),
-                    serde_json::json!(interval),
-                );
-            }
-            if args.enable {
-                update.insert("oast_enabled".into(), serde_json::Value::Bool(true));
-            }
-            if args.disable {
-                update.insert("oast_enabled".into(), serde_json::Value::Bool(false));
-            }
+            let update = build_oast_configure_update(&args, session_id);
             if update.len() == usize::from(session_id.is_some()) {
                 // Just show current settings
                 let path = session_query_path("/api/runtime", session_id);
@@ -2320,6 +2325,52 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             }
         }
     }
+}
+
+fn build_oast_configure_update(
+    args: &OastConfigureArgs,
+    session_id: Option<Uuid>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut update = serde_json::Map::new();
+    if let Some(session_id) = session_id {
+        update.insert("session_id".into(), serde_json::json!(session_id));
+    }
+    if let Some(provider) = args.provider.as_deref() {
+        update.insert(
+            "oast_provider".into(),
+            serde_json::Value::String(provider.to_string()),
+        );
+    }
+    if let Some(url) = args.url.as_deref() {
+        update.insert(
+            "oast_server_url".into(),
+            serde_json::Value::String(url.to_string()),
+        );
+    }
+    if let Some(token) = args.token.as_deref() {
+        update.insert(
+            "oast_token".into(),
+            serde_json::Value::String(token.to_string()),
+        );
+    } else if args.provider.is_some() {
+        update.insert(
+            "oast_token".into(),
+            serde_json::Value::String(String::new()),
+        );
+    }
+    if let Some(interval) = args.interval {
+        update.insert(
+            "oast_polling_interval_secs".into(),
+            serde_json::json!(interval),
+        );
+    }
+    if args.enable {
+        update.insert("oast_enabled".into(), serde_json::Value::Bool(true));
+    }
+    if args.disable {
+        update.insert("oast_enabled".into(), serde_json::Value::Bool(false));
+    }
+    update
 }
 
 struct ReplayOpenInput {
@@ -2504,9 +2555,12 @@ fn websocket_detail_path(
     if let Some(session_id) = session_id {
         params.push(("session_id".to_string(), session_id.to_string()));
     }
-    if let Some(frame_limit) = frame_limit {
-        params.push(("frame_limit".to_string(), frame_limit.to_string()));
-    }
+    params.push((
+        "frame_limit".to_string(),
+        frame_limit
+            .unwrap_or(DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT)
+            .to_string(),
+    ));
     let query = encode_query(params);
     if query.is_empty() {
         format!("/api/websockets/{websocket_id}")
@@ -3960,21 +4014,23 @@ mod tests {
     use super::{
         active_session_id_from_summaries, api_url, attach_workspace_save_error,
         build_annotations_payload, build_editable_raw_request,
-        build_editable_raw_request_with_version, default_editable_request,
-        explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
-        fuzzer_target_request_authority_for_request, install_skills, normalize_api_base_url,
-        normalize_replay_port, normalize_target_inputs, oast_fields_for_output,
-        parse_editable_raw_request, parse_editable_raw_request_bytes_with_version,
-        parse_editable_raw_request_with_version, parse_editable_raw_response,
-        parse_editable_raw_response_bytes, prepare_cli_workspace_save, push_replay_history_entry,
-        read_limited_to_end, read_payloads_input, read_raw_request_input, read_raw_response_input,
-        read_text_input, replay_send_http_version, replay_tab_target_as_request,
-        replay_tab_target_matches_request, replay_update_should_preserve_current_port,
-        session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
-        strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
-        websocket_detail_path, websocket_list_path, workspace_conflict_message, Cli, Command,
-        HistoryCommand, HistoryListResponse, SequenceCommand, SequenceCreateInput,
-        SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        build_editable_raw_request_with_version, build_oast_configure_update,
+        default_editable_request, explicit_or_active_session_id, failed_record_output,
+        fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
+        install_skills, normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
+        oast_fields_for_output, parse_editable_raw_request,
+        parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
+        parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
+        push_replay_history_entry, read_limited_to_end, read_payloads_input,
+        read_raw_request_input, read_raw_response_input, read_text_input, replay_send_http_version,
+        replay_tab_target_as_request, replay_tab_target_matches_request,
+        replay_update_should_preserve_current_port, session_query_path,
+        sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
+        sync_replay_tab_target_to_request, transaction_detail_path, websocket_detail_path,
+        websocket_list_path, workspace_conflict_message, Cli, Command, HistoryCommand,
+        HistoryListResponse, OastConfigureArgs, SequenceCommand, SequenceCreateInput,
+        SessionCommand, SkillsInstallArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT,
+        MAX_CLI_INPUT_BYTES,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -4043,6 +4099,10 @@ mod tests {
         assert_eq!(
             websocket_detail_path(websocket_id, None, Some(2)),
             "/api/websockets/11111111-1111-1111-1111-111111111111?frame_limit=2"
+        );
+        assert_eq!(
+            websocket_detail_path(websocket_id, Some(session_id), None),
+            "/api/websockets/11111111-1111-1111-1111-111111111111?session_id=22222222-2222-2222-2222-222222222222&frame_limit=1000"
         );
     }
 
@@ -4238,6 +4298,40 @@ mod tests {
         assert_eq!(
             fields.get("oast_provider"),
             Some(&serde_json::json!("custom"))
+        );
+    }
+
+    #[test]
+    fn oast_configure_provider_change_clears_omitted_token() {
+        let update = build_oast_configure_update(
+            &OastConfigureArgs {
+                provider: Some("interactsh".to_string()),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert_eq!(
+            update.get("oast_provider"),
+            Some(&serde_json::json!("interactsh"))
+        );
+        assert_eq!(update.get("oast_token"), Some(&serde_json::json!("")));
+    }
+
+    #[test]
+    fn oast_configure_explicit_token_wins_for_boast() {
+        let update = build_oast_configure_update(
+            &OastConfigureArgs {
+                provider: Some("boast".to_string()),
+                token: Some("manual-token".to_string()),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert_eq!(
+            update.get("oast_token"),
+            Some(&serde_json::json!("manual-token"))
         );
     }
 
@@ -5169,6 +5263,45 @@ mod tests {
         assert!(message.contains(&session_id.to_string()));
         assert!(message.contains("client_id browser-client"));
         assert!(message.contains("client_version 77"));
+    }
+
+    #[test]
+    fn session_delete_and_reveal_parse_ids() {
+        let delete_id = Uuid::new_v4();
+        let delete_id_arg = delete_id.to_string();
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "session",
+            "delete",
+            "--id",
+            delete_id_arg.as_str(),
+        ])
+        .unwrap();
+        let Command::Session {
+            command: SessionCommand::Delete(args),
+        } = parsed.command
+        else {
+            panic!("expected session delete");
+        };
+        assert_eq!(args.id, delete_id);
+
+        let reveal_id = Uuid::new_v4();
+        let reveal_id_arg = reveal_id.to_string();
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "session",
+            "reveal",
+            "--id",
+            reveal_id_arg.as_str(),
+        ])
+        .unwrap();
+        let Command::Session {
+            command: SessionCommand::Reveal(args),
+        } = parsed.command
+        else {
+            panic!("expected session reveal");
+        };
+        assert_eq!(args.id, reveal_id);
     }
 
     #[test]

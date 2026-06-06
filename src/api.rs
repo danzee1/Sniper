@@ -84,6 +84,7 @@ const MAX_SCANNER_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MATCH_REPLACE_RULES: usize = 500;
 const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
 const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const OPEN_PATH: &str = "/usr/bin/open";
 
 #[derive(RustEmbed)]
@@ -3613,7 +3614,10 @@ async fn get_websocket(
         Ok(session) => session,
         Err(response) => return response,
     };
-    match session.websockets.get_windowed(id, query.frame_limit).await {
+    let frame_limit = query
+        .frame_limit
+        .or(Some(DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT));
+    match session.websockets.get_windowed(id, frame_limit).await {
         Some(record) => Json(record).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -7785,7 +7789,7 @@ mod tests {
             status: Some(101),
             request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
             response: None,
-            frames: (1..=5)
+            frames: (1..=1002)
                 .map(|index| WebSocketFrameRecord {
                     index,
                     captured_at: Utc::now(),
@@ -7821,7 +7825,7 @@ mod tests {
                 .iter()
                 .map(|frame| frame.index)
                 .collect::<Vec<_>>(),
-            vec![4, 5]
+            vec![1001, 1002]
         );
 
         let empty_detail_response = super::get_websocket(
@@ -7839,6 +7843,23 @@ mod tests {
         let empty_detail: WebSocketSessionRecord = response_json(empty_detail_response).await;
         assert!(empty_detail.frames.is_empty());
 
+        let default_detail_response = super::get_websocket(
+            State(state.clone()),
+            Path(websocket_id.to_string()),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                limit: None,
+                offset: None,
+                frame_limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(default_detail_response.status(), super::StatusCode::OK);
+        let default_detail: WebSocketSessionRecord = response_json(default_detail_response).await;
+        assert_eq!(default_detail.frames.len(), 1000);
+        assert_eq!(default_detail.frames[0].index, 3);
+        assert_eq!(default_detail.frames[999].index, 1002);
+
         let legacy_list_response = super::list_websockets(
             State(state.clone()),
             Query(super::WebSocketQuery {
@@ -7850,8 +7871,8 @@ mod tests {
         )
         .await;
         let legacy_list: Vec<WebSocketSessionSummary> = response_json(legacy_list_response).await;
-        assert_eq!(legacy_list[0].frame_count, 5);
-        assert_eq!(legacy_list[0].last_frame_index, Some(5));
+        assert_eq!(legacy_list[0].frame_count, 1002);
+        assert_eq!(legacy_list[0].last_frame_index, Some(1002));
 
         let list_response = super::list_websockets_page(
             State(state),
@@ -7864,8 +7885,8 @@ mod tests {
         )
         .await;
         let page: super::WebSocketPageResponse = response_json(list_response).await;
-        assert_eq!(page.items[0].frame_count, 5);
-        assert_eq!(page.items[0].last_frame_index, Some(5));
+        assert_eq!(page.items[0].frame_count, 1002);
+        assert_eq!(page.items[0].last_frame_index, Some(1002));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
