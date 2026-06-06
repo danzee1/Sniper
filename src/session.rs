@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -38,6 +38,7 @@ pub(crate) const SESSIONS_DIR: &str = "sessions";
 const REGISTRY_FILE: &str = "registry.json";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const TRANSACTION_JOURNAL_FILE: &str = "transactions.journal";
+const MAX_SESSION_NAME_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -611,7 +612,7 @@ impl SessionRegistry {
         let now = Utc::now();
         let metadata = SessionMetadata {
             id: Uuid::new_v4(),
-            name: normalize_session_name(name.as_deref(), now),
+            name: normalize_session_name(name.as_deref(), now)?,
             created_at: now,
             updated_at: now,
             last_opened_at: now,
@@ -1100,11 +1101,16 @@ fn default_session_metadata(name: &str) -> SessionMetadata {
     }
 }
 
-fn normalize_session_name(name: Option<&str>, now: DateTime<Utc>) -> String {
-    name.map(str::trim)
+fn normalize_session_name(name: Option<&str>, now: DateTime<Utc>) -> Result<String> {
+    let normalized = name
+        .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("Session {}", now.format("%Y-%m-%d %H:%M")))
+        .unwrap_or_else(|| format!("Session {}", now.format("%Y-%m-%d %H:%M")));
+    if normalized.len() > MAX_SESSION_NAME_BYTES {
+        bail!("session name cannot exceed {MAX_SESSION_NAME_BYTES} bytes");
+    }
+    Ok(normalized)
 }
 
 fn session_summary(metadata: &SessionMetadata, storage_dir: &Path, active: bool) -> SessionSummary {
@@ -1720,6 +1726,20 @@ mod tests {
             .summaries()
             .iter()
             .any(|session| session.id == created.id));
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_oversized_session_names() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-session-name-cap-{}", uuid::Uuid::new_v4()));
+        let (registry, _active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let error = registry
+            .create_session(Some("x".repeat(super::MAX_SESSION_NAME_BYTES + 1)))
+            .unwrap_err();
+        assert!(error.to_string().contains("session name"));
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

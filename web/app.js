@@ -1398,10 +1398,10 @@ function bindEvents() {
       view.addEventListener("contextmenu", (e) => {
         if (!state.selectedId) return;
         e.preventDefault();
-        paneContextMenuTarget = {
-          id: state.selectedId,
-          sessionId: currentSessionId(),
-        };
+        paneContextMenuTarget = createTransactionRecordMenuTarget(
+          state.selectedId,
+          currentSessionId(),
+        );
         paneCtx.classList.remove("hidden");
         const mw = paneCtx.offsetWidth, mh = paneCtx.offsetHeight;
         paneCtx.style.left = `${Math.min(e.clientX, window.innerWidth - mw - 8)}px`;
@@ -1423,9 +1423,9 @@ function bindEvents() {
         showToast("The selected session changed. Open the menu again.", "error");
         return;
       }
-      if (action === "copy-url") copyTransactionUrl(target.id);
+      if (action === "copy-url") copyMenuTargetUrl(target);
       else if (action === "send-to-replay") {
-        loadTransactionRecordById(target.id, target.sessionId)
+        loadMenuTargetRecord(target)
           .then((record) => {
             if (!record) throw new Error("Selected transaction could not be loaded.");
             if (record.kind === "tunnel") throw new Error("Tunnel records cannot be sent to Replay.");
@@ -1433,41 +1433,33 @@ function bindEvents() {
           })
           .catch(handleSendActionError);
       } else if (action === "send-to-fuzzer") {
-        loadTransactionRecordById(target.id, target.sessionId)
+        loadMenuTargetRecord(target)
           .then((record) => {
             if (!record) throw new Error("Selected transaction could not be loaded.");
             openFuzzerFromRecord(record);
           })
           .catch(handleSendActionError);
       } else if (action === "send-to-sequence") {
-        loadTransactionRecordById(target.id, target.sessionId)
+        loadMenuTargetRecord(target)
           .then((record) => {
             if (!record) throw new Error("Selected transaction could not be loaded.");
             return sendRecordToSequence(record);
           })
           .catch(handleSendActionError);
       } else if (action.startsWith("copy-response-")) {
-        loadTransactionRecordById(target.id, target.sessionId)
-          .then((record) => copyResponseContentForRecord(record, action.replace("copy-", "")))
-          .catch(handleSendActionError);
+        const record = getMenuTargetRecordForClipboard(target);
+        if (!record) return;
+        copyResponseContentForRecord(record, action.replace("copy-", ""));
       }
       else if (action.startsWith("copy-as-")) {
         const fmt = action.replace("copy-as-", "");
-        const text = state.selectedRecord?.id === target.id
-          ? recordToFormat(state.selectedRecord, fmt)
-          : "";
+        const record = getMenuTargetRecordForClipboard(target);
+        if (!record) return;
+        const text = recordToFormat(record, fmt);
         if (text) {
           copyTextToClipboard(text)
             .then(() => showToast(`Copied as ${fmt}`))
             .catch(() => showToast("Failed to copy", "error"));
-        } else {
-          historyRequestToFormat(target.id, fmt).then((asyncText) => {
-            if (asyncText) {
-              copyTextToClipboard(asyncText)
-                .then(() => showToast(`Copied as ${fmt}`))
-                .catch(() => showToast("Failed to copy", "error"));
-            }
-          });
         }
       }
     });
@@ -3578,6 +3570,81 @@ async function loadTransactionRecordById(id, sessionId = currentSessionId()) {
     return null;
   }
   return record;
+}
+
+function createTransactionRecordMenuTarget(id, sessionId = currentSessionId()) {
+  const target = {
+    id,
+    sessionId,
+    record: state.selectedRecord?.id === id ? state.selectedRecord : null,
+    loadPromise: null,
+    loadError: null,
+  };
+  if (!target.record) {
+    target.loadPromise = loadTransactionRecordById(id, sessionId)
+      .then((record) => {
+        if (record?.id === id && sessionId === currentSessionId()) {
+          target.record = record;
+        }
+        return target.record;
+      })
+      .catch((error) => {
+        target.loadError = error;
+        return null;
+      });
+  }
+  return target;
+}
+
+function loadMenuTargetRecord(target) {
+  if (!target?.id || target.sessionId !== currentSessionId()) {
+    return null;
+  }
+  if (target.record?.id === target.id) {
+    return Promise.resolve(target.record);
+  }
+  return target.loadPromise || loadTransactionRecordById(target.id, target.sessionId);
+}
+
+function getMenuTargetRecordForClipboard(target) {
+  if (!target?.id || target.sessionId !== currentSessionId()) {
+    showToast("The selected session changed. Open the menu again.", "error");
+    return null;
+  }
+  if (target.record?.id === target.id) {
+    return target.record;
+  }
+  showToast(
+    target.loadError
+      ? "Selected transaction could not be loaded."
+      : "Transaction is still loading. Open the menu again.",
+    "error",
+  );
+  return null;
+}
+
+function transactionUrlFromSource(source) {
+  if (!source) return "";
+  const scheme = source.scheme || "https";
+  const host = source.host || "";
+  const path = source.path || "/";
+  return buildUrlFromTarget(scheme, host, "", path);
+}
+
+function copyMenuTargetUrl(target) {
+  if (!target?.id || target.sessionId !== currentSessionId()) {
+    showToast("The selected session changed. Open the menu again.", "error");
+    return;
+  }
+  const source = target.record || getHistoryItem(target.id);
+  const url = transactionUrlFromSource(source);
+  if (!url) {
+    showToast("Selected transaction could not be loaded.", "error");
+    return;
+  }
+  copyTextToClipboard(url)
+    .then(() => showToast("Copied URL"))
+    .catch(() => showToast("Failed to copy", "error"));
 }
 
 async function loadIntercepts(preserveSelection = true) {
@@ -16752,11 +16819,13 @@ function clearCompareState() {
 /* ─── Context menu (color tags & notes) ─── */
 let contextMenuTargetId = null;
 let contextMenuSessionId = null;
+let contextMenuRecordTarget = null;
 let contextMenuNoteTimer = null;
 
 function openContextMenu(x, y, transactionId) {
   contextMenuTargetId = transactionId;
   contextMenuSessionId = currentSessionId();
+  contextMenuRecordTarget = createTransactionRecordMenuTarget(transactionId, contextMenuSessionId);
   const menu = els.contextMenu;
   menu.classList.remove("hidden");
 
@@ -16786,6 +16855,7 @@ function closeContextMenu() {
   els.contextMenu.classList.add("hidden");
   contextMenuTargetId = null;
   contextMenuSessionId = null;
+  contextMenuRecordTarget = null;
 }
 
 function contextMenuSessionIsCurrent() {
@@ -16922,8 +16992,9 @@ els.contextMenu.querySelectorAll(".color-dot").forEach((dot) => {
 els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
   item.addEventListener("click", () => {
     const action = item.dataset.action;
-    const targetId = contextMenuTargetId;
-    const targetSessionId = contextMenuSessionId;
+    const target = contextMenuRecordTarget;
+    const targetId = target?.id || contextMenuTargetId;
+    const targetSessionId = target?.sessionId || contextMenuSessionId;
     if (!targetId) return;
     if (!contextMenuSessionIsCurrent()) {
       closeContextMenu();
@@ -16931,7 +17002,8 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
     }
     state.selectedId = targetId;
     closeContextMenu();
-    const loadTargetRecord = () => loadTransactionRecordById(targetId, targetSessionId);
+    const loadTargetRecord = () => loadMenuTargetRecord(target)
+      || loadTransactionRecordById(targetId, targetSessionId);
     if (action === "send-to-replay") {
       loadTargetRecord()
         .then((record) => {
@@ -16955,25 +17027,16 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
         })
         .catch(handleSendActionError);
     } else if (action === "copy-url") {
-      copyTransactionUrl(targetId);
+      copyMenuTargetUrl(target);
     } else if (action?.startsWith("copy-as-")) {
       const format = action.replace("copy-as-", "");
-      // Use selectedRecord if available (sync, preserves user gesture for clipboard)
-      if (state.selectedRecord && state.selectedRecord.id === targetId) {
-        const text = selectedRecordToFormat(format);
-        if (text) {
-          copyTextToClipboard(text)
-            .then(() => showToast(`Copied as ${format}`))
-            .catch(() => showToast("Failed to copy", "error"));
-        }
-      } else {
-        historyRequestToFormat(targetId, format).then((text) => {
-          if (text) {
-            copyTextToClipboard(text)
-              .then(() => showToast(`Copied as ${format}`))
-              .catch(() => showToast("Failed to copy", "error"));
-          }
-        });
+      const record = getMenuTargetRecordForClipboard(target);
+      if (!record) return;
+      const text = recordToFormat(record, format);
+      if (text) {
+        copyTextToClipboard(text)
+          .then(() => showToast(`Copied as ${format}`))
+          .catch(() => showToast("Failed to copy", "error"));
       }
     } else if (action === "compare-set-base") {
       setCompareBase(targetId);
@@ -17461,12 +17524,10 @@ function replayRequestToFormat(format, tab = getActiveReplayTab()) {
 function copySelectedTransactionUrl() {
   const record = getCurrentSelectedRecord();
   if (!record) return;
-  const scheme = record.scheme || "https";
-  const host = record.host || "";
-  const path = record.path || "/";
-  const url = buildUrlFromTarget(scheme, host, "", path);
-  copyTextToClipboard(url);
-  showToast("Copied URL");
+  const url = transactionUrlFromSource(record);
+  copyTextToClipboard(url)
+    .then(() => showToast("Copied URL"))
+    .catch(() => showToast("Failed to copy", "error"));
 }
 
 function copyResponseContent(format) {
@@ -17488,8 +17549,9 @@ function copyResponseContentForRecord(record, format) {
     text = buildRawResponse(record);
   }
   const label = format === "response-headers" ? "Copied headers" : format === "response-body" ? "Copied body" : "Copied raw response";
-  copyTextToClipboard(text);
-  showToast(label);
+  return copyTextToClipboard(text)
+    .then(() => showToast(label))
+    .catch(() => showToast("Failed to copy", "error"));
 }
 
 // Synchronous version using already-loaded selectedRecord (preserves user gesture for clipboard)
@@ -17562,10 +17624,7 @@ async function historyRequestToFormat(transactionId, format) {
 function copyTransactionUrl(transactionId) {
   const item = getHistoryItem(transactionId);
   if (!item) return;
-  const scheme = item.scheme || "https";
-  const host = item.host || "";
-  const path = item.path || "/";
-  const url = buildUrlFromTarget(scheme, host, "", path);
+  const url = transactionUrlFromSource(item);
   copyTextToClipboard(url).then(() => showToast("Copied URL")).catch(() => {});
 }
 

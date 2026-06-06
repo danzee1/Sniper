@@ -5,6 +5,9 @@ use tokio::sync::RwLock;
 pub const OAST_TOKEN_REDACTION: &str = "********";
 pub const MIN_OAST_POLLING_INTERVAL_SECS: u64 = 1;
 pub const MAX_OAST_POLLING_INTERVAL_SECS: u64 = 300;
+const MAX_RUNTIME_PATTERN_ENTRIES: usize = 500;
+const MAX_RUNTIME_PATTERN_BYTES: usize = 512;
+const MAX_RUNTIME_TEXT_FIELD_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSettingsSnapshot {
@@ -129,11 +132,13 @@ impl RuntimeSettings {
         }
 
         if let Some(scope_patterns) = update.scope_patterns {
-            current.scope_patterns = normalize_scope_patterns(scope_patterns);
+            current.scope_patterns =
+                normalize_bounded_scope_patterns("scope pattern", scope_patterns)?;
         }
 
         if let Some(passthrough_hosts) = update.passthrough_hosts {
-            current.passthrough_hosts = normalize_scope_patterns(passthrough_hosts);
+            current.passthrough_hosts =
+                normalize_bounded_scope_patterns("passthrough host", passthrough_hosts)?;
         }
 
         if let Some(upstream_insecure) = update.upstream_insecure {
@@ -148,10 +153,12 @@ impl RuntimeSettings {
             current.oast_enabled = oast_enabled;
         }
         if let Some(oast_server_url) = update.oast_server_url {
+            validate_runtime_text_field("OAST server URL", &oast_server_url)?;
             current.oast_server_url = oast_server_url;
         }
         if let Some(oast_token) = update.oast_token {
             if oast_token != OAST_TOKEN_REDACTION {
+                validate_runtime_text_field("OAST token", &oast_token)?;
                 current.oast_token = oast_token;
             }
         }
@@ -213,6 +220,26 @@ fn normalize_scope_patterns(patterns: Vec<String>) -> Vec<String> {
         .map(|pattern| pattern.trim().to_ascii_lowercase())
         .filter(|pattern| !pattern.is_empty())
         .collect()
+}
+
+fn normalize_bounded_scope_patterns(label: &str, patterns: Vec<String>) -> Result<Vec<String>> {
+    let normalized = normalize_scope_patterns(patterns);
+    if normalized.len() > MAX_RUNTIME_PATTERN_ENTRIES {
+        bail!("{label} list cannot exceed {MAX_RUNTIME_PATTERN_ENTRIES} entries");
+    }
+    for pattern in &normalized {
+        if pattern.len() > MAX_RUNTIME_PATTERN_BYTES {
+            bail!("{label} cannot exceed {MAX_RUNTIME_PATTERN_BYTES} bytes");
+        }
+    }
+    Ok(normalized)
+}
+
+fn validate_runtime_text_field(label: &str, value: &str) -> Result<()> {
+    if value.len() > MAX_RUNTIME_TEXT_FIELD_BYTES {
+        bail!("{label} cannot exceed {MAX_RUNTIME_TEXT_FIELD_BYTES} bytes");
+    }
+    Ok(())
 }
 
 fn matches_scope(host: &str, patterns: &[String]) -> bool {
@@ -320,6 +347,40 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("OAST polling interval"));
         assert_eq!(settings.snapshot().await.oast_polling_interval_secs, 5);
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_rejects_oversized_durable_fields() {
+        let settings = RuntimeSettings::new();
+        let error = settings
+            .update(RuntimeSettingsUpdate {
+                scope_patterns: Some(vec!["x".repeat(super::MAX_RUNTIME_PATTERN_BYTES + 1)]),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("scope pattern"));
+
+        let error = settings
+            .update(RuntimeSettingsUpdate {
+                passthrough_hosts: Some(vec![
+                    "example.test".to_string();
+                    super::MAX_RUNTIME_PATTERN_ENTRIES + 1
+                ]),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("passthrough host list"));
+
+        let error = settings
+            .update(RuntimeSettingsUpdate {
+                oast_server_url: Some("x".repeat(super::MAX_RUNTIME_TEXT_FIELD_BYTES + 1)),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("OAST server URL"));
     }
 
     #[tokio::test]

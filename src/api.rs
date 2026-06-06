@@ -3146,7 +3146,12 @@ async fn forward_all_response_intercepts(
         )
         .await;
     }
-    StatusCode::NO_CONTENT.into_response()
+    Json(serde_json::json!({
+        "ok": true,
+        "action": "forward-all",
+        "forwarded": count,
+    }))
+    .into_response()
 }
 
 // ── Sequences ──

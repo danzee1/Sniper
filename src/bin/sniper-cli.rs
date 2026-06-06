@@ -2050,8 +2050,9 @@ async fn handle_response_intercept(
         ResponseInterceptCommand::ForwardAll(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/response-intercepts/forward-all", session_id);
-            api.post_status(&path, &json!({})).await?;
-            print_json(&json!({ "ok": true, "action": "forward-all", "session_id": session_id }))
+            let mut result: serde_json::Value = api.post_json(&path, &json!({})).await?;
+            attach_session_id(&mut result, session_id);
+            print_json(&result)
         }
     }
 }
