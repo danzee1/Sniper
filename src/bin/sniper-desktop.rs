@@ -13,7 +13,7 @@ use sniper::{api, config::AppConfig, proxy, runtime_state, skills, state::AppSta
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     window::WindowBuilder,
 };
 use tokio::net::TcpListener;
@@ -21,6 +21,11 @@ use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
 use wry::WebViewBuilder;
+
+#[derive(Clone, Copy, Debug)]
+enum DesktopUserEvent {
+    ShutdownSignal,
+}
 
 fn main() -> Result<()> {
     sniper::init_tracing();
@@ -123,7 +128,9 @@ fn main() -> Result<()> {
     };
     let oast_task = runtime.spawn(sniper::oast::run_oast_poller_for_state(state.clone()));
 
-    let event_loop = EventLoop::new();
+    let event_loop = EventLoopBuilder::<DesktopUserEvent>::with_user_event().build();
+    let event_proxy = event_loop.create_proxy();
+    let signal_task = runtime.spawn(wait_for_desktop_shutdown_signal(event_proxy));
     install_platform_app_menu();
     let window = WindowBuilder::new()
         .with_title("Sniper")
@@ -171,6 +178,15 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            signal_task.abort();
+            if let Err(join_error) = runtime.block_on(signal_task) {
+                if !join_error.is_cancelled() {
+                    warn!(
+                        ?join_error,
+                        "shutdown signal task stopped with an error after webview build failure"
+                    );
+                }
+            }
             runtime.block_on(state.abort_proxy_task());
             remove_runtime_state_file(&state.config.data_dir, state.runtime_instance_id);
             return Err(anyhow::anyhow!("failed to build desktop webview: {error}"));
@@ -184,6 +200,7 @@ fn main() -> Result<()> {
     let shutdown_done = Arc::new(AtomicBool::new(false));
     let mut ui_task = Some(ui_task);
     let mut oast_task = Some(oast_task);
+    let mut signal_task = Some(signal_task);
     event_loop.run(move |event, _, control_flow| {
         let _keep_runtime = &runtime;
         let _keep_window = &window;
@@ -217,6 +234,17 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            if let Some(signal_task) = signal_task.take() {
+                signal_task.abort();
+                if let Err(error) = runtime.block_on(signal_task) {
+                    if !error.is_cancelled() {
+                        warn!(
+                            ?error,
+                            "shutdown signal task stopped with an error during desktop shutdown"
+                        );
+                    }
+                }
+            }
             runtime.block_on(close_state.ws_replay.disconnect_all());
             runtime.block_on(close_state.abort_proxy_task());
             if let Err(error) = runtime.block_on(proxy::close_live_websocket_relays(
@@ -244,6 +272,21 @@ fn main() -> Result<()> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                if shutdown_done.load(Ordering::Acquire) {
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                match persist_desktop_session_state(&runtime, close_state.as_ref()) {
+                    Ok(()) => {
+                        teardown_once(true);
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    Err(error) => {
+                        *control_flow = block_desktop_shutdown(error);
+                    }
+                }
+            }
+            Event::UserEvent(DesktopUserEvent::ShutdownSignal) => {
                 if shutdown_done.load(Ordering::Acquire) {
                     *control_flow = ControlFlow::Exit;
                     return;
@@ -304,6 +347,51 @@ fn remove_runtime_state_file(data_dir: &Path, runtime_instance_id: Uuid) {
                 "failed to remove runtime state before desktop shutdown"
             );
         }
+    }
+}
+
+async fn wait_for_desktop_shutdown_signal(proxy: EventLoopProxy<DesktopUserEvent>) {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => Some(signal),
+                Err(error) => {
+                    warn!(?error, "failed to listen for desktop SIGTERM");
+                    None
+                }
+            };
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    warn!(?error, "failed to listen for desktop shutdown signal");
+                } else {
+                    info!("desktop shutdown signal received");
+                }
+            }
+            _ = async {
+                if let Some(signal) = &mut terminate {
+                    signal.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!("desktop termination signal received");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("desktop shutdown signal received"),
+            Err(error) => warn!(?error, "failed to listen for desktop shutdown signal"),
+        }
+    }
+    if let Err(error) = proxy.send_event(DesktopUserEvent::ShutdownSignal) {
+        warn!(
+            ?error,
+            "failed to forward desktop shutdown signal to event loop"
+        );
     }
 }
 

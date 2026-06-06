@@ -743,6 +743,8 @@ impl AppState {
             &expected_team,
         ) {
             cleanup_update_artifacts(None, &tmp_dir).await;
+            self.mark_proxy_offline_after_self_update_prepare_failure()
+                .await;
             return Err(error);
         }
 
@@ -786,6 +788,26 @@ impl AppState {
         self.abort_proxy_task().await;
         crate::proxy::drain_proxy_connections(Duration::from_secs(1)).await;
         Ok(())
+    }
+
+    async fn mark_proxy_offline_after_self_update_prepare_failure(&self) {
+        self.set_proxy_online(false);
+        let proxy_addr = self.get_active_proxy_addr().await;
+        let ui_addr = self.get_active_ui_addr().await;
+        if let Err(error) = crate::runtime_state::persist_runtime_state(
+            &self.config.data_dir,
+            &crate::runtime_state::RuntimeStateSnapshot::with_proxy_status_and_instance(
+                proxy_addr,
+                ui_addr,
+                false,
+                self.runtime_instance_id,
+            ),
+        ) {
+            tracing::warn!(
+                ?error,
+                "failed to persist offline runtime state after self-update installer spawn failure"
+            );
+        }
     }
 
     fn remove_runtime_state_for_self_update_restart(&self) {

@@ -983,6 +983,9 @@ function bindEvents() {
       if (state.activeTool === "proxy" && state.activeProxyTab === "http-history") {
         if (state.historyDirty) loadTransactions(true, consumeHistoryLoadOptions()).catch((error) => console.error(error));
       }
+      if (state.activeTool === "proxy" && state.activeProxyTab === "websockets-history") {
+        if (state.websocketHistoryDirty) loadWebsockets(true).catch((error) => console.error(error));
+      }
     });
   });
 
@@ -3716,6 +3719,19 @@ function isKnownCount(value) {
   return Number.isFinite(value);
 }
 
+function adjustHistoryPagingAfterLocalRemoval(removedCount = 1) {
+  const count = Math.max(0, Number(removedCount) || 0);
+  if (!count || !state.historyPaging) return;
+  const paging = state.historyPaging;
+  if (isKnownCount(paging.total)) {
+    paging.total = Math.max(state.items.length, Number(paging.total) - count);
+  }
+  if (isKnownCount(paging.filteredTotal)) {
+    paging.filteredTotal = Math.max(0, Number(paging.filteredTotal) - count);
+  }
+  paging.offset = state.items.length;
+}
+
 async function loadTransactions(preserveSelection = true, options = {}) {
   _historyFullLoadInFlight += 1;
   try {
@@ -3789,18 +3805,19 @@ async function loadTransactionDetail(id) {
   if (!response.ok) {
     if (response.status === 404) {
       const index = state.items.findIndex((item) => item.id === id);
+      let nextSelectedId = null;
       if (index >= 0) {
         state.items.splice(index, 1);
+        nextSelectedId = state.items[Math.min(index, state.items.length - 1)]?.id ?? null;
         state._itemsVersion += 1;
+        adjustHistoryPagingAfterLocalRemoval(1);
         precomputeItemIndexes();
         invalidateVisibleEntriesCache();
         refreshHistoryPagingCursorFromItems();
         renderHistory();
       }
       if (state.selectedId === id) {
-        state.selectedRecord = null;
-        state.loadingDetailId = null;
-        moveHistorySelectionIfMissing(index <= 0 ? "first" : "last");
+        await selectHistoryTransaction(nextSelectedId, { scroll: true });
       }
     } else if (state.selectedId === id) {
       renderEmptyDetail();
@@ -4566,15 +4583,18 @@ async function loadWebsocketDetail(id, options = {}) {
         return;
       }
       if (response.status === 404) {
+        const removedIndex = (state.websocketSessions || []).findIndex((item) => item.id === id);
         const previousLength = (state.websocketSessions || []).length;
         state.websocketSessions = (state.websocketSessions || []).filter((item) => item.id !== id);
         adjustWebsocketPagingAfterLocalRemoval(previousLength - state.websocketSessions.length);
-        state.selectedWebsocketId = null;
+        state.selectedWebsocketId = removedIndex >= 0
+          ? (state.websocketSessions[Math.min(removedIndex, state.websocketSessions.length - 1)]?.id ?? null)
+          : null;
         state.selectedFrameIdx = null;
         state.selectedWebsocketRecord = null;
         state.selectedWebsocketDetailError = "";
         hideFrameDetail();
-        await syncVisibleWebsocketSelection(false, { ensureSelectedVisible: true });
+        await syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true });
         return;
       }
       state.selectedWebsocketRecord = null;
@@ -19626,6 +19646,7 @@ const sniperCMTheme = CM.EditorView.theme({
     padding: "12px 14px",
     caretColor: "var(--accent, #e0a050)",
     lineHeight: "1.48",
+    tabSize: "2",
     fontFamily: "var(--mono, monospace)",
     color: "var(--text, #f1f1f1)",
   },
@@ -20008,6 +20029,7 @@ function buildSearchDecorations(doc, query, activeIndex = -1) {
 function createBaseExtensions(options = {}) {
   const exts = [
     sniperCMTheme,
+    CM.EditorState.tabSize.of(2),
     CM.lineNumbers(),
     CM.highlightSpecialChars(),
     CM.drawSelection(),

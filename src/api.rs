@@ -4108,18 +4108,14 @@ async fn list_websockets_page(
     State(state): State<Arc<AppState>>,
     Query(mut query): Query<WebSocketQuery>,
 ) -> Response {
-    const DEFAULT_PAGE_LIMIT: usize = 500;
     const MAX_PAGE_LIMIT: usize = 10_000;
 
     if let Err(error) = validate_optional_limit(query.limit) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    query.limit = Some(
-        query
-            .limit
-            .unwrap_or(DEFAULT_PAGE_LIMIT)
-            .clamp(1, MAX_PAGE_LIMIT),
-    );
+    if let Some(limit) = query.limit {
+        query.limit = Some(limit.clamp(1, MAX_PAGE_LIMIT));
+    }
     let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
@@ -4497,15 +4493,10 @@ async fn ws_replay_disconnect(
         return active_session_conflict_response(&state);
     };
     let result = if payload.remove {
-        if !state.sessions.contains_session(session_id) {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        if let Some(false) = state
-            .ws_replay
-            .belongs_to_session(payload.id, session_id)
-            .await
+        if let Err(response) =
+            ensure_ws_replay_connection_owner(&state, payload.id, session_id).await
         {
-            return active_session_conflict_response(&state);
+            return response;
         }
         state.ws_replay.remove(payload.id).await;
         Ok(())
@@ -9286,7 +9277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_replay_remove_is_idempotent_for_unknown_connection() {
+    async fn ws_replay_remove_returns_not_found_for_unknown_connection() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-ws-replay-remove-missing-{}",
             uuid::Uuid::new_v4()
@@ -9311,7 +9302,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::OK);
+        assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -9810,6 +9801,62 @@ mod tests {
         assert_eq!(page.items[0].frame_count, 1002);
         assert_eq!(page.items[0].last_frame_index, Some(1002));
 
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_page_without_explicit_limit_uses_store_default_limit() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-websocket-page-default-limit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 600,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let message = MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024);
+        for index in 0..501 {
+            session
+                .websockets
+                .open(WebSocketSessionRecord {
+                    id: Uuid::new_v4(),
+                    started_at: Utc::now(),
+                    closed_at: Some(Utc::now()),
+                    duration_ms: Some(1),
+                    scheme: "wss".to_string(),
+                    host: format!("ws-{index}.example.test"),
+                    path: "/socket".to_string(),
+                    status: Some(101),
+                    request: message.clone(),
+                    response: Some(message.clone()),
+                    frames: Vec::new(),
+                    notes: Vec::new(),
+                })
+                .await;
+        }
+
+        let response = super::list_websockets_page(
+            State(state),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                limit: None,
+                offset: None,
+                frame_limit: None,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let page: super::WebSocketPageResponse = response_json(response).await;
+
+        assert_eq!(page.items.len(), 501);
+        assert_eq!(page.limit, 600);
+        assert_eq!(page.filtered_total, Some(501));
+        assert!(!page.has_more);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

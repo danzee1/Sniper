@@ -172,6 +172,13 @@ pub async fn rebind_proxy(
         return Ok(());
     }
 
+    close_live_websocket_relays(
+        state.as_ref(),
+        "Proxy listener rebind closed the live WebSocket relay.",
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
     // Always stop the old listener first.  When the host changes on the same
     // port (e.g. 127.0.0.1:8080 → 0.0.0.0:8080) the old socket would block
     // the new bind because 0.0.0.0 encompasses 127.0.0.1.
@@ -255,12 +262,6 @@ pub async fn rebind_proxy(
         }
     };
 
-    close_live_websocket_relays(
-        state.as_ref(),
-        "Proxy listener rebind closed the live WebSocket relay.",
-    )
-    .await
-    .map_err(|error| error.to_string())?;
     drain_proxy_connections(Duration::from_millis(200)).await;
 
     let bound_addr = listener
@@ -2636,7 +2637,7 @@ async fn forward_websocket_request(
                 persist_session_quiet(&state, &session).await;
             }
         }
-        forget_live_websocket_relay(relay_id);
+        forget_live_websocket_relay_unless_close_pending(relay_id);
     });
 
     build_local_response(
@@ -4122,6 +4123,7 @@ struct LiveWebSocketRelay {
     captured_websocket_id: Option<Uuid>,
     started: Instant,
     abort: AbortHandle,
+    close_persist_pending: Arc<AtomicBool>,
 }
 
 struct StreamedResponsePump {
@@ -4364,6 +4366,7 @@ fn remember_live_websocket_relay(
             captured_websocket_id,
             started,
             abort,
+            close_persist_pending: Arc::new(AtomicBool::new(false)),
         },
     );
 }
@@ -4372,6 +4375,20 @@ fn forget_live_websocket_relay(relay_id: Uuid) {
     let mut relays = LIVE_WEBSOCKET_RELAYS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    relays.remove(&relay_id);
+}
+
+fn forget_live_websocket_relay_unless_close_pending(relay_id: Uuid) {
+    let mut relays = LIVE_WEBSOCKET_RELAYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if relays
+        .get(&relay_id)
+        .map(|relay| relay.close_persist_pending.load(Ordering::Acquire))
+        .unwrap_or(false)
+    {
+        return;
+    }
     relays.remove(&relay_id);
 }
 
@@ -4539,6 +4556,7 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) -
     for (relay_id, relay) in relays {
         relay.abort.abort();
         if let Some(websocket_id) = relay.captured_websocket_id {
+            relay.close_persist_pending.store(true, Ordering::Release);
             relay
                 .session
                 .websockets
@@ -5728,8 +5746,91 @@ mod tests {
             .to_string()
             .contains("failed to persist closed live websocket relays"));
         assert!(session_has_live_websocket_relays(session.id()));
+        forget_live_websocket_relay_unless_close_pending(websocket_id);
+        assert!(session_has_live_websocket_relays(session.id()));
 
         forget_live_websocket_relay(websocket_id);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_proxy_keeps_existing_proxy_online_when_relay_close_persist_fails() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-rebind-live-ws-persist-failure-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:18080".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let current_addr = "127.0.0.1:18080".parse().unwrap();
+        state.set_active_proxy_addr(current_addr).await;
+        state.set_proxy_online(true);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        state.set_proxy_task(handle).await;
+
+        let session = state.session().await;
+        let websocket_id = Uuid::new_v4();
+        session
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now(),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                path: "/ws".to_string(),
+                status: Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(
+            websocket_id,
+            Some(websocket_id),
+            &session,
+            Instant::now(),
+            abort,
+        );
+        let registry_path = data_dir
+            .join(crate::session::SESSIONS_DIR)
+            .join("registry.json");
+        std::fs::remove_file(&registry_path).unwrap();
+        std::fs::create_dir(&registry_path).unwrap();
+
+        let error = rebind_proxy(state.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("failed to persist closed live websocket relays"));
+        assert!(state.is_proxy_online());
+        assert_eq!(state.get_active_proxy_addr().await, current_addr);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(session_has_live_websocket_relays(session.id()));
+
+        forget_live_websocket_relay(websocket_id);
+        state.abort_proxy_task().await;
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
