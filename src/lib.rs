@@ -141,19 +141,24 @@ async fn shutdown_headless_runtime(state: &AppState, oast_task: tokio::task::Joi
     )
     .await;
     proxy::drain_proxy_connections(Duration::from_secs(1)).await;
+    let mut session_persisted = true;
     if let Err(error) = proxy::flush_pending_session_persists(state).await {
+        session_persisted = false;
         warn!(
             ?error,
             "failed to flush pending session snapshots before headless shutdown"
         );
     }
     if let Err(error) = state.persist_active_session().await {
+        session_persisted = false;
         warn!(
             ?error,
             "failed to persist active session before headless shutdown"
         );
     }
-    if let Err(error) = runtime_state::remove_runtime_state(&state.config.data_dir) {
+    if !session_persisted {
+        warn!("leaving runtime state after failed headless session persistence");
+    } else if let Err(error) = runtime_state::remove_runtime_state(&state.config.data_dir) {
         warn!(
             ?error,
             "failed to remove runtime state during headless shutdown"

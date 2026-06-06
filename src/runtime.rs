@@ -347,7 +347,11 @@ fn host_matches_any(host: &str, patterns: &[String]) -> bool {
 }
 
 fn normalize_host_for_matching(host: &str) -> String {
-    host_without_port(host).to_ascii_lowercase()
+    strip_dns_root_dot(host_without_port(host)).to_ascii_lowercase()
+}
+
+fn strip_dns_root_dot(host: &str) -> &str {
+    host.strip_suffix('.').unwrap_or(host)
 }
 
 fn host_without_port(host: &str) -> &str {
@@ -461,8 +465,11 @@ mod tests {
         );
         assert_eq!(snapshot.passthrough_hosts, vec!["passthrough.test"]);
         assert!(settings.is_in_scope("api.example.net").await);
+        assert!(settings.is_in_scope("api.example.net.").await);
         assert!(settings.is_in_scope("example.org:9443").await);
+        assert!(settings.is_in_scope("example.org.:9443").await);
         assert!(settings.is_passthrough("passthrough.test:443").await);
+        assert!(settings.is_passthrough("passthrough.test.:443").await);
     }
 
     #[tokio::test]

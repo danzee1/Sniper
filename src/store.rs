@@ -791,12 +791,14 @@ impl Default for TransactionStore {
 }
 
 fn normalize_storage_sequences(entries: &mut [TransactionRecord]) {
-    let needs_repair = entries
-        .iter()
-        .try_fold(0u64, |previous, record| {
-            (record.sequence > previous).then_some(record.sequence)
-        })
-        .is_none();
+    let has_unadvanceable_sequence = entries.iter().any(|record| record.sequence == u64::MAX);
+    let needs_repair = has_unadvanceable_sequence
+        || entries
+            .iter()
+            .try_fold(0u64, |previous, record| {
+                (record.sequence > previous).then_some(record.sequence)
+            })
+            .is_none();
     if !needs_repair {
         return;
     }
@@ -2408,6 +2410,33 @@ mod tests {
             vec!["4.legacy", "3.legacy", "2.legacy"]
         );
         assert!(first_page.items.iter().all(|item| item.sequence > 0));
+    }
+
+    #[tokio::test]
+    async fn storage_sequence_repair_handles_unadvanceable_max_sequence() {
+        let mut max_record = test_record("max-sequence.legacy");
+        max_record.sequence = u64::MAX;
+        let store = TransactionStore::from_records(vec![max_record]);
+
+        store.insert(test_record("after-max.example")).await;
+
+        let page = store
+            .list_page(&ListFilters {
+                limit: Some(10),
+                sort_key: Some("index".into()),
+                sort_direction: Some("desc".into()),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| (item.host.as_str(), item.sequence))
+                .collect::<Vec<_>>(),
+            vec![("after-max.example", 2), ("max-sequence.legacy", 1)]
+        );
+        assert_eq!(store.latest_sequence(), 2);
     }
 
     #[tokio::test]

@@ -4579,6 +4579,25 @@ function connectEvents() {
   }
   const eventSessionId = currentSessionId();
   eventSource = new EventSource(sessionQueryPath("/api/events", eventSessionId));
+  let openedOnce = false;
+
+  eventSource.onopen = () => {
+    els.liveStatus.textContent = "Proxy live";
+    els.liveStatus.classList.add("online");
+    if (!openedOnce) {
+      openedOnce = true;
+      return;
+    }
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
+    _lastWebsocketFallbackPoll = Date.now();
+    if (isWebsocketHistoryVisible()) {
+      loadWebsockets(true).catch((error) => console.error(error));
+    } else {
+      state.websocketHistoryDirty = true;
+    }
+  };
 
   eventSource.addEventListener("transaction", (event) => {
     if (eventSessionId !== currentSessionId()) {

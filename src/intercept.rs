@@ -40,8 +40,8 @@ impl InterceptRule {
         }
 
         if !self.host_pattern.is_empty() {
-            let host = host_without_port(&request.host).to_ascii_lowercase();
-            let pattern = host_without_port(&self.host_pattern).to_ascii_lowercase();
+            let host = normalize_host_for_matching(&request.host);
+            let pattern = normalize_host_for_matching(&self.host_pattern);
             if let Some(suffix) = pattern.strip_prefix("*.") {
                 if host != suffix && !host.ends_with(&format!(".{suffix}")) {
                     return false;
@@ -460,6 +460,11 @@ fn host_without_port(host: &str) -> &str {
     trimmed
 }
 
+fn normalize_host_for_matching(host: &str) -> String {
+    let host = host_without_port(host);
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -488,6 +493,41 @@ mod tests {
             body: String::new(),
             body_encoding: BodyEncoding::Utf8,
         }
+    }
+
+    #[test]
+    fn intercept_rule_matches_trailing_dot_exact_hosts() {
+        let mut request = request();
+        request.host = "Example.COM.:443".to_string();
+        let rule = InterceptRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            scope: InterceptScope::Request,
+            host_pattern: "example.com".to_string(),
+            path_pattern: String::new(),
+            method_filter: Vec::new(),
+        };
+
+        assert!(rule.matches(&request));
+    }
+
+    #[test]
+    fn intercept_rule_matches_trailing_dot_wildcard_hosts() {
+        let mut request = request();
+        request.host = "api.Example.COM.".to_string();
+        let rule = InterceptRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            scope: InterceptScope::Request,
+            host_pattern: "*.example.com".to_string(),
+            path_pattern: String::new(),
+            method_filter: Vec::new(),
+        };
+
+        assert!(rule.matches(&request));
+
+        request.host = "example.com.".to_string();
+        assert!(rule.matches(&request));
     }
 
     #[tokio::test]

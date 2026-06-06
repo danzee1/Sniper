@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use cfb_mode::Decryptor as CfbDecryptor;
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use rand::Rng;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use rsa::sha2::Sha256;
@@ -24,6 +25,9 @@ use uuid::Uuid;
 use crate::{session::SessionContext, state::AppState};
 
 const MAX_OAST_BROADCAST_CAPACITY: usize = 4096;
+const MAX_OAST_POLL_BODY_BYTES: usize = 1_048_576;
+const MAX_OAST_POLL_CALLBACKS: usize = 4096;
+const MAX_OAST_CALLBACK_FIELD_BYTES: usize = 64 * 1024;
 
 // ── Provider enum ──
 
@@ -592,6 +596,59 @@ fn oast_endpoint_url(base_url: &str, path: &str, query: &[(&str, &str)]) -> Stri
     format!("{endpoint}?{}", encoded.finish())
 }
 
+async fn read_limited_oast_poll_body(
+    response: reqwest::Response,
+    provider: &'static str,
+) -> Option<String> {
+    if let Some(length) = response.content_length() {
+        if length > MAX_OAST_POLL_BODY_BYTES as u64 {
+            debug!(
+                provider,
+                length,
+                max = MAX_OAST_POLL_BODY_BYTES,
+                "OAST poll body rejected by content length"
+            );
+            return None;
+        }
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                debug!(provider, %error, "OAST poll body read failed");
+                return None;
+            }
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_OAST_POLL_BODY_BYTES {
+            debug!(
+                provider,
+                max = MAX_OAST_POLL_BODY_BYTES,
+                "OAST poll body rejected after streaming limit"
+            );
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    match String::from_utf8(body) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            debug!(provider, %error, "OAST poll body was not valid UTF-8");
+            None
+        }
+    }
+}
+
+fn callback_fields_within_oast_limits(callback: &OastCallback) -> bool {
+    callback.protocol.len() <= MAX_OAST_CALLBACK_FIELD_BYTES
+        && callback.remote_addr.len() <= MAX_OAST_CALLBACK_FIELD_BYTES
+        && callback.raw_data.len() <= MAX_OAST_CALLBACK_FIELD_BYTES
+        && callback.correlation_id.len() <= MAX_OAST_CALLBACK_FIELD_BYTES
+}
+
 // ── Generate payload (multi-backend aware) ──
 
 /// Generate an OAST payload. Returns (correlation_id, full_payload).
@@ -775,12 +832,9 @@ async fn poll_interactsh(
         return vec![];
     }
 
-    let text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            debug!(error = %e, "Interactsh poll body read failed");
-            return vec![];
-        }
+    let text = match read_limited_oast_poll_body(resp, "interactsh").await {
+        Some(text) => text,
+        None => return vec![],
     };
 
     #[derive(Deserialize)]
@@ -803,6 +857,13 @@ async fn poll_interactsh(
         Some(d) if !d.is_empty() => d,
         _ => return vec![],
     };
+    if data.len() > MAX_OAST_POLL_CALLBACKS {
+        debug!(
+            received = data.len(),
+            max = MAX_OAST_POLL_CALLBACKS,
+            "Interactsh poll response truncated to callback limit"
+        );
+    }
 
     let aes_key_b64 = match poll_resp.aes_key {
         Some(k) if !k.is_empty() => k,
@@ -831,10 +892,11 @@ async fn poll_interactsh(
     };
 
     // Decrypt each data entry: base64 decode -> AES-CFB decrypt -> parse JSON
-    let mut callbacks = Vec::with_capacity(data.len());
-    for entry in &data {
+    let mut callbacks = Vec::with_capacity(data.len().min(MAX_OAST_POLL_CALLBACKS));
+    for entry in data.iter().take(MAX_OAST_POLL_CALLBACKS) {
         match decrypt_interactsh_entry(entry, &aes_key_bytes) {
-            Some(cb) => callbacks.push(cb),
+            Some(cb) if callback_fields_within_oast_limits(&cb) => callbacks.push(cb),
+            Some(_) => debug!("Interactsh callback rejected by field-size limit"),
             None => continue,
         }
     }
@@ -977,12 +1039,9 @@ async fn poll_boast(base_url: &str, client: &reqwest::Client) -> Vec<OastCallbac
         return vec![];
     }
 
-    let text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            debug!(error = %e, "BOAST poll body read failed");
-            return vec![];
-        }
+    let text = match read_limited_oast_poll_body(resp, "boast").await {
+        Some(text) => text,
+        None => return vec![],
     };
 
     #[derive(Deserialize)]
@@ -1005,8 +1064,17 @@ async fn poll_boast(base_url: &str, client: &reqwest::Client) -> Vec<OastCallbac
         }
     };
 
+    if events.len() > MAX_OAST_POLL_CALLBACKS {
+        debug!(
+            received = events.len(),
+            max = MAX_OAST_POLL_CALLBACKS,
+            "BOAST poll response truncated to callback limit"
+        );
+    }
+
     events
         .into_iter()
+        .take(MAX_OAST_POLL_CALLBACKS)
         .map(|ev| OastCallback {
             id: Uuid::new_v4(),
             received_at: Utc::now(),
@@ -1015,6 +1083,7 @@ async fn poll_boast(base_url: &str, client: &reqwest::Client) -> Vec<OastCallbac
             raw_data: ev.data,
             correlation_id: ev.id,
         })
+        .filter(callback_fields_within_oast_limits)
         .collect()
 }
 
@@ -1080,9 +1149,9 @@ async fn poll_custom(config: &OastConfig, client: &reqwest::Client) -> Vec<OastC
         },
     }
 
-    let text = match response.text().await {
-        Ok(t) => t,
-        Err(_) => return vec![],
+    let text = match read_limited_oast_poll_body(response, "custom").await {
+        Some(text) => text,
+        None => return vec![],
     };
 
     let raw_callbacks: Vec<RawCallback> = match serde_json::from_str::<PollResponse>(&text) {
@@ -1094,8 +1163,17 @@ async fn poll_custom(config: &OastConfig, client: &reqwest::Client) -> Vec<OastC
         }
     };
 
+    if raw_callbacks.len() > MAX_OAST_POLL_CALLBACKS {
+        debug!(
+            received = raw_callbacks.len(),
+            max = MAX_OAST_POLL_CALLBACKS,
+            "custom OAST poll response truncated to callback limit"
+        );
+    }
+
     raw_callbacks
         .into_iter()
+        .take(MAX_OAST_POLL_CALLBACKS)
         .map(|raw| OastCallback {
             id: Uuid::new_v4(),
             received_at: Utc::now(),
@@ -1104,6 +1182,7 @@ async fn poll_custom(config: &OastConfig, client: &reqwest::Client) -> Vec<OastC
             raw_data: raw.raw_data,
             correlation_id: raw.correlation_id,
         })
+        .filter(callback_fields_within_oast_limits)
         .collect()
 }
 
@@ -1573,6 +1652,20 @@ mod tests {
         }
     }
 
+    async fn serve_single_oast_response(response: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0_u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn oast_endpoint_url_encodes_query_values() {
         let url = oast_endpoint_url(
@@ -1616,6 +1709,48 @@ mod tests {
         let payload = build_oast_payload_checked("oast.example.test", "abc123").unwrap();
 
         assert_eq!(payload, "oast.example.test/abc123");
+    }
+
+    #[tokio::test]
+    async fn boast_poll_rejects_oversized_content_length() {
+        let base = serve_single_oast_response(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n[]",
+            MAX_OAST_POLL_BODY_BYTES + 1
+        ))
+        .await;
+
+        let callbacks = poll_boast(&base, &reqwest::Client::new()).await;
+
+        assert!(callbacks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_poll_rejects_oversized_callback_fields() {
+        let raw_data = "x".repeat(MAX_OAST_CALLBACK_FIELD_BYTES + 1);
+        let body = serde_json::json!([{
+            "protocol": "http",
+            "remote_address": "127.0.0.1:53",
+            "raw_request": raw_data,
+            "correlation_id": "oversized"
+        }])
+        .to_string();
+        let base = serve_single_oast_response(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ))
+        .await;
+        let config = OastConfig {
+            enabled: true,
+            server_url: base,
+            token: String::new(),
+            polling_interval_secs: 1,
+            provider: OastProvider::Custom,
+        };
+
+        let callbacks = poll_custom(&config, &reqwest::Client::new()).await;
+
+        assert!(callbacks.is_empty());
     }
 
     #[tokio::test]
