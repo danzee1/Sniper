@@ -102,6 +102,9 @@ pub fn runtime_state_path(data_dir: &Path) -> PathBuf {
 }
 
 pub fn load_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot>> {
+    if !runtime_state_path(data_dir).exists() {
+        return Ok(None);
+    }
     let _lock = lock_runtime_state(data_dir)?;
     load_runtime_state_locked(data_dir)
 }
@@ -362,7 +365,7 @@ mod tests {
     use super::{
         advertise_local_api_addr, load_runtime_state, persist_runtime_state, remove_runtime_state,
         remove_runtime_state_if_owner, remove_runtime_state_if_same_ui_addr, runtime_state_path,
-        RuntimeStateSnapshot,
+        RuntimeStateSnapshot, RUNTIME_STATE_LOCK_FILE,
     };
 
     #[test]
@@ -555,6 +558,33 @@ mod tests {
 
         assert!(loaded.is_none());
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_load_missing_file_does_not_create_paths() {
+        let absent_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-absent-dir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&absent_dir);
+
+        let loaded = load_runtime_state(&absent_dir).unwrap();
+
+        assert!(loaded.is_none());
+        assert!(!absent_dir.exists());
+
+        let empty_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-empty-dir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&empty_dir);
+        fs::create_dir_all(&empty_dir).unwrap();
+
+        let loaded = load_runtime_state(&empty_dir).unwrap();
+
+        assert!(loaded.is_none());
+        assert!(!empty_dir.join(RUNTIME_STATE_LOCK_FILE).exists());
+        let _ = fs::remove_dir_all(&empty_dir);
     }
 
     #[test]

@@ -2669,6 +2669,12 @@ async fn guard_session_write_operation(
     if require_still_active && state.sessions.active_session_id() != session.id() {
         return Err(active_session_conflict_response(state));
     }
+    if !require_still_active
+        && state.sessions.active_session_id() != session.id()
+        && proxy::session_has_active_proxy_work(session.id())
+    {
+        return Err(session_proxy_work_conflict_response(session.id()));
+    }
     Ok(guard)
 }
 
@@ -2705,6 +2711,28 @@ async fn ensure_ws_replay_connection_owner(
     }
     match state.ws_replay.owner_session_id(id).await {
         Some(owner_session_id) if owner_session_id == session_id => Ok(()),
+        Some(owner_session_id) => Err(ws_replay_connection_owner_conflict_response(
+            owner_session_id,
+        )),
+        None => Err(StatusCode::NOT_FOUND.into_response()),
+    }
+}
+
+async fn guard_ws_replay_connection_owner_operation(
+    state: &Arc<AppState>,
+    id: Uuid,
+    session_id: Uuid,
+) -> std::result::Result<OwnedMutexGuard<()>, Response> {
+    if !state.sessions.contains_session(session_id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    let operation_lock = state.session_operation_lock(session_id).await;
+    let guard = operation_lock.lock_owned().await;
+    if !state.sessions.contains_session(session_id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    match state.ws_replay.owner_session_id(id).await {
+        Some(owner_session_id) if owner_session_id == session_id => Ok(guard),
         Some(owner_session_id) => Err(ws_replay_connection_owner_conflict_response(
             owner_session_id,
         )),
@@ -4423,9 +4451,11 @@ async fn ws_replay_send(
     let Some(session_id) = payload.session_id else {
         return active_session_conflict_response(&state);
     };
-    if let Err(response) = ensure_ws_replay_connection_owner(&state, payload.id, session_id).await {
-        return response;
-    }
+    let _operation_guard =
+        match guard_ws_replay_connection_owner_operation(&state, payload.id, session_id).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let kind = payload.kind.unwrap_or(if payload.binary {
         WsReplaySendKind::Binary
     } else {
@@ -4512,20 +4542,15 @@ async fn ws_replay_disconnect(
     let Some(session_id) = payload.session_id else {
         return active_session_conflict_response(&state);
     };
+    let _operation_guard =
+        match guard_ws_replay_connection_owner_operation(&state, payload.id, session_id).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
     let result = if payload.remove {
-        if let Err(response) =
-            ensure_ws_replay_connection_owner(&state, payload.id, session_id).await
-        {
-            return response;
-        }
         state.ws_replay.remove(payload.id).await;
         Ok(())
     } else {
-        if let Err(response) =
-            ensure_ws_replay_connection_owner(&state, payload.id, session_id).await
-        {
-            return response;
-        }
         state.ws_replay.disconnect(payload.id).await
     };
     match result {
@@ -8171,6 +8196,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_inactive_runtime_update_rechecks_proxy_work_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-runtime-proxy-work-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let inactive_id = original.id();
+        let operation_lock = state.session_operation_lock(inactive_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut update_future = Box::pin(super::update_runtime_settings(
+            State(state.clone()),
+            Json(RuntimeSettingsUpdate {
+                session_id: Some(inactive_id),
+                intercept_enabled: Some(true),
+                ..RuntimeSettingsUpdate::default()
+            }),
+        ));
+
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut update_future).await;
+        assert!(blocked.is_err());
+        let active_proxy_owner = crate::proxy::remember_active_proxy_session_owner(inactive_id);
+        drop(operation_guard);
+
+        let response = update_future.await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(!original.runtime.snapshot().await.intercept_enabled);
+
+        drop(active_proxy_owner);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn oast_clear_waits_for_session_operation_lock() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-oast-clear-op-lock-{}",
@@ -9725,6 +9795,52 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_remove_waits_for_session_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-remove-lock-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let connection_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(connection_id, session_id)
+            .await;
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard = operation_lock.lock_owned().await;
+
+        let response_task = tokio::spawn(super::ws_replay_disconnect(
+            State(state.clone()),
+            Json(super::WsReplayDisconnectPayload {
+                session_id: Some(session_id),
+                id: connection_id,
+                remove: true,
+            }),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !response_task.is_finished(),
+            "ws replay remove should wait for the session operation lock"
+        );
+        drop(operation_guard);
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), super::StatusCode::OK);
+        assert!(state.ws_replay.snapshot(connection_id).await.is_none());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

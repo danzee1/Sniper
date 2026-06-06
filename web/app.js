@@ -5249,6 +5249,7 @@ function connectEvents() {
     if (eventSessionId !== currentSessionId()) {
       return;
     }
+    _lastWebsocketFallbackPoll = Date.now();
     applyWebsocketSummaryEvent(event);
   });
 

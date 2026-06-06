@@ -1392,6 +1392,22 @@ case "$expected_version" in
 esac
 expected_team="$6"
 backup="${bundle}.previous.$$"
+launch_health_check() {
+  if ! /usr/bin/open "$bundle"; then
+    return 1
+  fi
+  launch_attempts=0
+  while [ "$launch_attempts" -lt 50 ]; do
+    if /usr/bin/pgrep -f "$bundle/Contents/MacOS/Sniper" >/dev/null 2>&1; then
+      sleep 2
+      /usr/bin/pgrep -f "$bundle/Contents/MacOS/Sniper" >/dev/null 2>&1
+      return $?
+    fi
+    launch_attempts=$((launch_attempts + 1))
+    sleep 0.2
+  done
+  return 1
+}
 wait_attempts=0
 while kill -0 "$pid" 2>/dev/null; do
   wait_attempts=$((wait_attempts + 1))
@@ -1425,7 +1441,7 @@ if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --str
     [ "$installed_version" = "$expected_version" ] && \
     { [ -z "$expected_team" ] || [ "$installed_team" = "$expected_team" ]; } && \
     { [ -z "$expected_team" ] || /usr/sbin/spctl --assess --type execute "$bundle"; }; then
-  if /usr/bin/open "$bundle"; then
+  if launch_health_check; then
     rm -rf "$backup" "$tmp"
     exit 0
   fi
@@ -2522,13 +2538,27 @@ mod tests {
         assert!(script.contains("if mv \"$backup\" \"$bundle\"; then"));
         assert!(script.contains("rm -rf \"$tmp\"\n    exit 1"));
         assert!(script.contains("/usr/bin/codesign --verify --deep --strict \"$bundle\""));
+        let health_check_pos = script
+            .find("launch_health_check()")
+            .expect("installer should define a launch health check");
         let open_pos = script
-            .find("if /usr/bin/open \"$bundle\"; then")
-            .expect("installer should check whether the new app launched");
+            .find("if ! /usr/bin/open \"$bundle\"; then")
+            .expect("installer should launch the new app inside the health check");
+        let pgrep_pos = script
+            .find("/usr/bin/pgrep -f \"$bundle/Contents/MacOS/Sniper\"")
+            .expect("installer should verify the launched Sniper process stays alive");
+        let launch_pos = script
+            .find("if launch_health_check; then")
+            .expect("installer should require the launch health check before cleanup");
         let cleanup_pos = script
             .find("rm -rf \"$backup\" \"$tmp\"")
             .expect("installer should clean up after a successful launch");
-        assert!(open_pos < cleanup_pos);
+        assert!(health_check_pos < ditto_pos);
+        assert!(open_pos < pgrep_pos);
+        assert!(pgrep_pos < launch_pos);
+        assert!(launch_pos < cleanup_pos);
+        assert!(script.contains("[ \"$launch_attempts\" -lt 50 ]"));
+        assert!(script.contains("sleep 2"));
         assert!(script.contains("v*|V*) expected_version="));
         assert!(script.contains("v*|V*) installed_version="));
     }

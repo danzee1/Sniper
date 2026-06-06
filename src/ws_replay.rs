@@ -115,8 +115,13 @@ impl std::error::Error for WsReplayOwnerConflict {}
 
 #[derive(Debug)]
 enum WsReplayOutboundMessage {
-    Message(WsMessage),
-    Close { recorded_index: Option<usize> },
+    Message {
+        msg: WsMessage,
+        recorded_index: Option<usize>,
+    },
+    Close {
+        recorded_index: Option<usize>,
+    },
 }
 
 /// Internal state for a single WS replay connection.
@@ -382,7 +387,10 @@ impl WsReplayStore {
                             async move {
                                 while let Some(outbound) = rx.recv().await {
                                     let (msg, recorded_index) = match outbound {
-                                        WsReplayOutboundMessage::Message(msg) => (msg, None),
+                                        WsReplayOutboundMessage::Message {
+                                            msg,
+                                            recorded_index,
+                                        } => (msg, recorded_index),
                                         WsReplayOutboundMessage::Close { recorded_index } => {
                                             (WsMessage::Close(None), recorded_index)
                                         }
@@ -434,9 +442,10 @@ impl WsReplayStore {
                                         };
                                         if let Some(sender) = sender {
                                             if let Err(error) = sender
-                                                .send(WsReplayOutboundMessage::Message(
-                                                    WsMessage::Pong(payload),
-                                                ))
+                                                .send(WsReplayOutboundMessage::Message {
+                                                    msg: WsMessage::Pong(payload),
+                                                    recorded_index: None,
+                                                })
                                                 .await
                                             {
                                                 let message = format!(
@@ -627,15 +636,25 @@ impl WsReplayStore {
             .connection(id)
             .await
             .context("no such WS replay connection")?;
-        let c = conn.read().await;
-        let sender = c.sender.as_ref().context("connection is not open")?;
+        let mut c = conn.write().await;
+        let sender = c.sender.as_ref().context("connection is not open")?.clone();
+        let recorded_index = c.push_frame(WebSocketFrameDirection::ClientToServer, &msg);
         sender
-            .try_send(WsReplayOutboundMessage::Message(msg))
+            .try_send(WsReplayOutboundMessage::Message {
+                msg,
+                recorded_index,
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
+                    if let Some(index) = recorded_index {
+                        c.remove_frame(index);
+                    }
                     anyhow::Error::new(WsReplaySendError::QueueFull)
                 }
                 mpsc::error::TrySendError::Closed(_) => {
+                    if let Some(index) = recorded_index {
+                        c.remove_frame(index);
+                    }
                     anyhow::Error::new(WsReplaySendError::Closed)
                 }
             })?;
@@ -1363,13 +1382,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_then_disconnect_records_outbound_frame_before_close() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = test_channel();
+        let (abort, _registration) = AbortHandle::new_pair();
+        let mut connection_state = test_connection(WsReplayStatus::Connected, Some(tx));
+        connection_state.task_abort = Some(abort.clone());
+        let connection = Arc::new(RwLock::new(connection_state));
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, connection.clone());
+
+        store.send_text(id, "hello".to_string()).await.unwrap();
+        store.disconnect(id).await.unwrap();
+
+        let frames = connection.read().await.frames.clone();
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(frames[0].kind, WebSocketFrameKind::Text));
+        assert!(matches!(frames[1].kind, WebSocketFrameKind::Close));
+        assert_eq!(frames[0].index, 0);
+        assert_eq!(frames[1].index, 1);
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Message {
+                msg: WsMessage::Text(text),
+                recorded_index: Some(0),
+            }) if text == "hello"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Close {
+                recorded_index: Some(1)
+            })
+        ));
+        assert!(!abort.is_aborted());
+    }
+
+    #[tokio::test]
     async fn disconnect_full_queue_aborts_writer_and_drops_synthetic_close() {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(WsReplayOutboundMessage::Message(WsMessage::Text(
-            "queued".into(),
-        )))
+        tx.try_send(WsReplayOutboundMessage::Message {
+            msg: WsMessage::Text("queued".into()),
+            recorded_index: None,
+        })
         .unwrap();
         let (task_abort, _task_registration) = AbortHandle::new_pair();
         let (writer_abort, _writer_registration) = AbortHandle::new_pair();
@@ -1391,7 +1452,10 @@ mod tests {
         assert!(connection.read().await.frames.is_empty());
         assert!(matches!(
             rx.recv().await,
-            Some(WsReplayOutboundMessage::Message(WsMessage::Text(text))) if text == "queued"
+            Some(WsReplayOutboundMessage::Message {
+                msg: WsMessage::Text(text),
+                recorded_index: None,
+            }) if text == "queued"
         ));
     }
 
@@ -1400,9 +1464,10 @@ mod tests {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(WsReplayOutboundMessage::Message(WsMessage::Text(
-            "queued".into(),
-        )))
+        tx.try_send(WsReplayOutboundMessage::Message {
+            msg: WsMessage::Text("queued".into()),
+            recorded_index: None,
+        })
         .unwrap();
         let (task_abort, _task_registration) = AbortHandle::new_pair();
         let (writer_abort, _writer_registration) = AbortHandle::new_pair();
@@ -1419,7 +1484,10 @@ mod tests {
         assert!(store.snapshot(id).await.is_none());
         assert!(matches!(
             rx.recv().await,
-            Some(WsReplayOutboundMessage::Message(WsMessage::Text(text))) if text == "queued"
+            Some(WsReplayOutboundMessage::Message {
+                msg: WsMessage::Text(text),
+                recorded_index: None,
+            }) if text == "queued"
         ));
     }
 
@@ -1439,7 +1507,10 @@ mod tests {
         store.send_ping(id, b"hi".to_vec()).await.unwrap();
 
         match rx.recv().await {
-            Some(WsReplayOutboundMessage::Message(WsMessage::Ping(payload))) => {
+            Some(WsReplayOutboundMessage::Message {
+                msg: WsMessage::Ping(payload),
+                recorded_index: Some(_),
+            }) => {
                 assert_eq!(payload.as_ref(), b"hi")
             }
             other => panic!("expected ping frame, got {other:?}"),
@@ -1451,9 +1522,10 @@ mod tests {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(WsReplayOutboundMessage::Message(WsMessage::Text(
-            "queued".into(),
-        )))
+        tx.try_send(WsReplayOutboundMessage::Message {
+            msg: WsMessage::Text("queued".into()),
+            recorded_index: None,
+        })
         .unwrap();
         store.connections.write().await.insert(
             id,
@@ -1474,7 +1546,10 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(WsReplayOutboundMessage::Message(WsMessage::Text(text))) if text == "queued"
+            Some(WsReplayOutboundMessage::Message {
+                msg: WsMessage::Text(text),
+                recorded_index: None,
+            }) if text == "queued"
         ));
     }
 

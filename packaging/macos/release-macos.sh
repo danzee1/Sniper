@@ -172,7 +172,7 @@ cleanup_release_marker() {
 }
 trap cleanup_release_marker EXIT
 
-if [[ "$BRIDGE_REQUIRES_UNIVERSAL" == "1" ]]; then
+if [[ "$BRIDGE_REQUIRES_UNIVERSAL" == "1" || "$REQUESTED_DMG_ARCH" == "universal" ]]; then
   UNIVERSAL_APP=1 "$ROOT_DIR/packaging/macos/make-app.sh"
 else
   "$ROOT_DIR/packaging/macos/make-app.sh"
