@@ -17691,12 +17691,10 @@ function startWsPoll(tab) {
 function applyWsReplayFramePollResponse(tab, data, sinceIndex) {
   const incomingFrames = normalizeWebsocketFrames(data?.frames);
   const firstRetainedIndex = Number(data?.first_retained_index);
-  const serverGap = data?.gap === true
-    || (Number.isFinite(firstRetainedIndex) && firstRetainedIndex > sinceIndex);
-  const incomingGap = incomingFrames.length > 0
-    && Number.isFinite(Number(incomingFrames[0].index))
-    && Number(incomingFrames[0].index) > sinceIndex;
-  if (serverGap || incomingGap) {
+  const serverGap = typeof data?.gap === "boolean"
+    ? data.gap === true
+    : (Number.isFinite(firstRetainedIndex) && firstRetainedIndex > sinceIndex);
+  if (serverGap) {
     tab.wsFramesTruncated = true;
     const firstAvailable = Number.isFinite(firstRetainedIndex)
       ? firstRetainedIndex

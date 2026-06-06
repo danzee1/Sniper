@@ -2699,7 +2699,7 @@ async fn guard_session_write_operation(
     let operation_lock = state.session_operation_lock(session.id()).await;
     let guard = operation_lock.lock_owned().await;
     if !state.sessions.contains_session(session.id()) {
-        return Err(action_session_conflict_response(session));
+        return Err(StatusCode::NOT_FOUND.into_response());
     }
     if require_still_active && state.sessions.active_session_id() != session.id() {
         return Err(active_session_conflict_response(state));
@@ -2720,7 +2720,7 @@ async fn begin_session_proxy_operation(
     let operation_lock = state.session_operation_lock(session.id()).await;
     let _operation_guard = operation_lock.lock().await;
     if !state.sessions.contains_session(session.id()) {
-        return Err(action_session_conflict_response(session));
+        return Err(StatusCode::NOT_FOUND.into_response());
     }
     if state.sessions.active_session_id() != session.id()
         && proxy::session_has_active_proxy_work(session.id())
@@ -6490,6 +6490,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    #[tokio::test]
+    async fn session_write_guard_rejects_deleted_session_as_not_found() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-write-guard-deleted-session-{}",
+            Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 32,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let deleted_session = state.session().await;
+        state
+            .create_session(Some("replacement".to_string()))
+            .await
+            .unwrap();
+        state.delete_session(deleted_session.id()).await.unwrap();
+
+        let response = super::guard_session_write_operation(&state, &deleted_session, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     #[test]
     fn scanner_config_rejects_empty_custom_rule_pattern() {
         let mut config = ScannerConfig::default();
@@ -8454,6 +8485,52 @@ mod tests {
         }
 
         drop(active_proxy_owner);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn session_proxy_operation_rejects_deleted_session_as_not_found() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-proxy-operation-deleted-session-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let operation_lock = state.session_operation_lock(original_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut delete_future = Box::pin(state.delete_session(original_id));
+        let blocked_delete =
+            tokio::time::timeout(Duration::from_millis(30), &mut delete_future).await;
+        assert!(blocked_delete.is_err());
+
+        let mut proxy_future = Box::pin(super::begin_session_proxy_operation(&state, &original));
+        let blocked_proxy =
+            tokio::time::timeout(Duration::from_millis(30), &mut proxy_future).await;
+        assert!(blocked_proxy.is_err());
+
+        drop(operation_guard);
+        delete_future.await.unwrap();
+        match proxy_future.await {
+            Ok(owner) => {
+                drop(owner);
+                panic!("proxy operation should reject deleted sessions");
+            }
+            Err(response) => assert_eq!(response.status(), super::StatusCode::NOT_FOUND),
+        }
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

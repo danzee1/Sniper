@@ -748,6 +748,9 @@ impl TransactionStore {
                 }
             }
         }
+        if let Some(error) = journal_error {
+            return Err(error);
+        }
         let mut inner = self.inner.write().await;
         let Some(index) = inner.by_id.get(&id).copied() else {
             return Ok(false);
@@ -759,9 +762,6 @@ impl TransactionStore {
         record.user_note = previous_user_note;
         let summary = record.summary();
         inner.summaries[index] = CachedSummary::new(summary);
-        if let Some(error) = journal_error {
-            return Err(error);
-        }
         Ok(true)
     }
 
@@ -1899,7 +1899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn annotation_restore_rolls_back_memory_when_rollback_journal_append_fails() {
+    async fn annotation_restore_does_not_mutate_when_rollback_journal_append_fails() {
         let mut record = test_record("example.com");
         record.color_tag = Some("old".to_string());
         let id = record.id;
@@ -1925,7 +1925,7 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         let stored = store.get(id).await.unwrap();
-        assert_eq!(stored.color_tag.as_deref(), Some("old"));
+        assert_eq!(stored.color_tag.as_deref(), Some("new"));
         assert_eq!(stored.user_note, None);
     }
 
