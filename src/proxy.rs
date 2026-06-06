@@ -818,12 +818,46 @@ async fn handle_connect(
             }
         });
     } else if session.runtime.is_passthrough(&target).await {
+        let upstream_stream = match tokio::net::TcpStream::connect(&target).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                warn!(
+                    %peer_addr,
+                    ?error,
+                    target = %target,
+                    "passthrough tunnel upstream connect failed before CONNECT response"
+                );
+                if insert_transaction_quiet(
+                    &session,
+                    TransactionRecord::tunnel(
+                        started_at,
+                        target.clone(),
+                        Some(StatusCode::BAD_GATEWAY.as_u16()),
+                        started.elapsed().as_millis() as u64,
+                        request_capture,
+                        vec![format!(
+                            "Passthrough tunnel failed to connect to upstream: {error}"
+                        )],
+                    ),
+                    "passthrough tunnel connect failure",
+                )
+                .await
+                {
+                    persist_session_quiet(&state, &session).await;
+                }
+                return text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "passthrough tunnel upstream connect failed",
+                );
+            }
+        };
         let state = state.clone();
         let session = session.clone();
         let target = target.clone();
         spawn_tracked_proxy_task(session.id(), async move {
             if let Err(error) = serve_passthrough_tunnel(
                 upgrade,
+                upstream_stream,
                 state.clone(),
                 session.clone(),
                 target.clone(),
@@ -1504,6 +1538,7 @@ async fn serve_special_host_tls(
 
 async fn serve_passthrough_tunnel(
     upgrade: hyper::upgrade::OnUpgrade,
+    mut upstream_stream: tokio::net::TcpStream,
     state: Arc<AppState>,
     session: Arc<SessionContext>,
     target: String,
@@ -1515,37 +1550,6 @@ async fn serve_passthrough_tunnel(
         .await
         .context("CONNECT upgrade failed for passthrough tunnel")?;
     let mut client_stream = TokioIo::new(upgraded);
-
-    let upstream_addr = if target.contains(':') {
-        target.clone()
-    } else {
-        format!("{target}:443")
-    };
-
-    let mut upstream_stream = match tokio::net::TcpStream::connect(&upstream_addr).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            if insert_transaction_quiet(
-                &session,
-                TransactionRecord::tunnel(
-                    started_at,
-                    target.clone(),
-                    Some(StatusCode::BAD_GATEWAY.as_u16()),
-                    started.elapsed().as_millis() as u64,
-                    request_capture,
-                    vec![format!(
-                        "Passthrough tunnel failed to connect to upstream: {error}"
-                    )],
-                ),
-                "passthrough tunnel connect failure",
-            )
-            .await
-            {
-                persist_session_quiet(&state, &session).await;
-            }
-            return Err(error).context("passthrough tunnel upstream connect failed");
-        }
-    };
 
     let result = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
 

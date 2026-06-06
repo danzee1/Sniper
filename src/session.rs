@@ -1460,6 +1460,8 @@ fn replay_transaction_journal_file(
     let mut inserted_order = Vec::new();
     let mut line = Vec::new();
     let mut line_number = 0usize;
+    let mut offset = 0u64;
+    let mut valid_prefix_len = 0u64;
     loop {
         line.clear();
         let bytes = reader.read_until(b'\n', &mut line).with_context(|| {
@@ -1471,10 +1473,15 @@ fn replay_transaction_journal_file(
         if bytes == 0 {
             break;
         }
+        let line_start_offset = offset;
+        offset = offset.saturating_add(bytes as u64);
         line_number += 1;
         let line_has_newline = line.ends_with(b"\n");
         let trimmed = trim_ascii_whitespace(&line);
         if trimmed.is_empty() {
+            if line_has_newline {
+                valid_prefix_len = offset;
+            }
             continue;
         }
         if !line_has_newline {
@@ -1483,6 +1490,7 @@ fn replay_transaction_journal_file(
                 line = line_number,
                 "ignoring trailing partial transaction journal line"
             );
+            repair_corrupt_transaction_journal_tail(journal_path, valid_prefix_len);
             break;
         }
         let entry: TransactionJournalEntry = match serde_json::from_slice(trimmed) {
@@ -1494,7 +1502,7 @@ fn replay_transaction_journal_file(
                     line = line_number,
                     "stopping transaction journal replay at corrupt line"
                 );
-                preserve_corrupt_transaction_journal(journal_path);
+                repair_corrupt_transaction_journal_tail(journal_path, line_start_offset);
                 break;
             }
         };
@@ -1531,6 +1539,7 @@ fn replay_transaction_journal_file(
                 }
             }
         }
+        valid_prefix_len = offset;
     }
     if !inserted_order.is_empty() {
         let mut replayed_order = Vec::with_capacity(inserted_order.len() + order.len());
@@ -1566,6 +1575,37 @@ fn preserve_corrupt_transaction_journal(journal_path: &Path) {
             corrupt_path = %corrupt_path.display(),
             "failed to preserve corrupt transaction journal"
         );
+    }
+}
+
+fn repair_corrupt_transaction_journal_tail(journal_path: &Path, valid_prefix_len: u64) {
+    preserve_corrupt_transaction_journal(journal_path);
+    match fs::OpenOptions::new().write(true).open(journal_path) {
+        Ok(file) => {
+            if let Err(error) = file.set_len(valid_prefix_len).and_then(|_| file.sync_all()) {
+                warn!(
+                    ?error,
+                    path = %journal_path.display(),
+                    valid_prefix_len,
+                    "failed to truncate corrupt transaction journal tail"
+                );
+                return;
+            }
+            if let Some(parent) = journal_path.parent() {
+                if let Err(error) = sync_directory(parent, "transaction journal directory") {
+                    warn!(
+                        ?error,
+                        path = %journal_path.display(),
+                        "failed to sync repaired transaction journal directory"
+                    );
+                }
+            }
+        }
+        Err(error) => warn!(
+            ?error,
+            path = %journal_path.display(),
+            "failed to open corrupt transaction journal for repair"
+        ),
     }
 }
 
@@ -2970,6 +3010,9 @@ mod tests {
                 .starts_with(".transactions.journal.corrupt-")
         });
         assert!(has_corrupt_backup);
+        let repaired_journal = std::fs::read_to_string(&journal_path).unwrap();
+        assert!(repaired_journal.contains("valid-journal.example"));
+        assert!(!repaired_journal.contains("{not json}"));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -3921,6 +3964,90 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].host, "partial.example:443");
         assert_eq!(restored[0].path, "/before-partial");
+    }
+
+    #[tokio::test]
+    async fn registry_repairs_partial_transaction_journal_tail_before_future_appends() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-partial-append-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let first = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "partial-before.example:443".to_string(),
+            "/before-partial".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut lines = Vec::new();
+        serde_json::to_writer(
+            &mut lines,
+            &TransactionJournalEntry::Insert { record: first },
+        )
+        .unwrap();
+        lines.push(b'\n');
+        lines.extend_from_slice(br#"{"type":"insert""#);
+        std::fs::write(&journal_path, lines).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        loaded
+            .store
+            .insert(TransactionRecord::http(
+                Utc::now(),
+                "POST".to_string(),
+                "https".to_string(),
+                "partial-after.example:443".to_string(),
+                "/after-partial".to_string(),
+                Some(201),
+                2,
+                MessageRecord {
+                    headers: vec![],
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                None,
+                vec![],
+                None,
+                None,
+            ))
+            .await;
+
+        let reloaded = registry.load_context(active.id()).unwrap();
+        let restored = reloaded.store.snapshot(Some(10)).await;
+        assert!(restored
+            .iter()
+            .any(|record| record.host == "partial-before.example:443"));
+        assert!(restored
+            .iter()
+            .any(|record| record.host == "partial-after.example:443"));
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     convert::Infallible,
-    net::IpAddr,
+    net::{IpAddr, Ipv6Addr},
     path::{Component, PathBuf},
     sync::Arc,
     time::Duration,
@@ -1087,6 +1087,8 @@ fn replay_tab_has_websocket_payload(tab: &crate::workspace::ReplayTabState) -> b
         || !tab.ws_setup_notice.is_empty()
         || !tab.ws_setup_queue.is_empty()
         || !tab.ws_frames.is_empty()
+        || tab.ws_selected_frame_index.is_some()
+        || tab.ws_frame_window_start.is_some()
 }
 
 fn add_workspace_text_bytes(
@@ -3848,6 +3850,9 @@ fn normalize_ws_replay_authority(
         if inner.trim().is_empty() {
             return Err("WebSocket host is required".to_string());
         }
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return Err("invalid bracketed IPv6 host".to_string());
+        }
         let suffix = &host[end + 1..];
         let port = if suffix.is_empty() {
             fallback_port
@@ -5169,6 +5174,7 @@ mod tests {
         assert!(build_ws_replay_url("wss", "example.test#frag", 443, "/").is_err());
         assert!(build_ws_replay_url("wss", "bad host.test", 443, "/").is_err());
         assert!(build_ws_replay_url("wss", "example.test:notaport", 443, "/").is_err());
+        assert!(build_ws_replay_url("wss", "[not-ip]", 443, "/").is_err());
         assert!(build_ws_replay_url("wss", "[2001:db8::1]:70000", 443, "/").is_err());
     }
 
@@ -5843,16 +5849,31 @@ mod tests {
 
     #[test]
     fn workspace_validation_rejects_websocket_state_on_non_websocket_tabs() {
-        let mut snapshot = WorkspaceStateSnapshot::default();
-        snapshot.replay.tabs.push(ReplayTabState {
+        fn assert_rejects(tab: ReplayTabState) {
+            let mut snapshot = WorkspaceStateSnapshot::default();
+            snapshot.replay.tabs.push(tab);
+            let error = super::validate_workspace_state(&snapshot).unwrap_err();
+            assert!(error.contains("must not include websocket state"));
+        }
+
+        assert_rejects(ReplayTabState {
             id: "http-draft".to_string(),
             sequence: 1,
             ws_setup_notice: "websocket only".to_string(),
             ..ReplayTabState::default()
         });
-
-        let error = super::validate_workspace_state(&snapshot).unwrap_err();
-        assert!(error.contains("must not include websocket state"));
+        assert_rejects(ReplayTabState {
+            id: "http-draft".to_string(),
+            sequence: 1,
+            ws_selected_frame_index: Some(0),
+            ..ReplayTabState::default()
+        });
+        assert_rejects(ReplayTabState {
+            id: "http-draft".to_string(),
+            sequence: 1,
+            ws_frame_window_start: Some(0),
+            ..ReplayTabState::default()
+        });
     }
 
     #[test]

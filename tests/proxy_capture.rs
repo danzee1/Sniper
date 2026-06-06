@@ -4,6 +4,7 @@ use axum::{routing::get, Router};
 use sniper::{
     config::AppConfig,
     proxy::{flush_pending_session_persists, serve_proxy},
+    runtime::RuntimeSettingsUpdate,
     state::AppState,
     store::ListFilters,
 };
@@ -355,6 +356,66 @@ async fn proxy_records_invalid_connect_rejection() {
     assert!(visible_with_response_filter
         .iter()
         .any(|summary| summary.id == record_id));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn passthrough_connect_returns_bad_gateway_when_upstream_dial_fails() {
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_addr = closed.local_addr().unwrap();
+    drop(closed);
+
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-passthrough-connect-failure-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+    let session = state.session().await;
+    session
+        .runtime
+        .update(RuntimeSettingsUpdate {
+            passthrough_hosts: Some(vec!["127.0.0.1".to_string()]),
+            ..RuntimeSettingsUpdate::default()
+        })
+        .await
+        .unwrap();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!(
+        "CONNECT {closed_addr} HTTP/1.1\r\nHost: {closed_addr}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.contains("502 Bad Gateway"));
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let records = session.store.snapshot(Some(10)).await;
+    let record = records
+        .iter()
+        .find(|record| record.host == closed_addr.to_string())
+        .expect("passthrough connect failure should be recorded");
+    assert_eq!(record.status, Some(502));
+    assert!(record
+        .notes
+        .iter()
+        .any(|note| note.contains("failed to connect to upstream")));
 
     proxy_handle.abort();
 }
