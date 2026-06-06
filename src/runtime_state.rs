@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     fs,
     io::{ErrorKind, Write},
@@ -12,6 +14,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 const RUNTIME_STATE_FILE: &str = "runtime-state.json";
+const RUNTIME_STATE_LOCK_FILE: &str = ".runtime-state.lock";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshot {
@@ -91,6 +94,11 @@ pub fn runtime_state_path(data_dir: &Path) -> PathBuf {
 }
 
 pub fn load_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot>> {
+    let _lock = lock_runtime_state(data_dir)?;
+    load_runtime_state_locked(data_dir)
+}
+
+fn load_runtime_state_locked(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot>> {
     let path = runtime_state_path(data_dir);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -167,6 +175,11 @@ fn move_invalid_runtime_state_aside(data_dir: &Path, path: &Path) {
 }
 
 pub fn persist_runtime_state(data_dir: &Path, snapshot: &RuntimeStateSnapshot) -> Result<()> {
+    let _lock = lock_runtime_state(data_dir)?;
+    persist_runtime_state_locked(data_dir, snapshot)
+}
+
+fn persist_runtime_state_locked(data_dir: &Path, snapshot: &RuntimeStateSnapshot) -> Result<()> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
     let path = runtime_state_path(data_dir);
@@ -194,6 +207,11 @@ pub fn persist_runtime_state(data_dir: &Path, snapshot: &RuntimeStateSnapshot) -
 }
 
 pub fn remove_runtime_state(data_dir: &Path) -> Result<()> {
+    let _lock = lock_runtime_state(data_dir)?;
+    remove_runtime_state_locked(data_dir)
+}
+
+fn remove_runtime_state_locked(data_dir: &Path) -> Result<()> {
     let path = runtime_state_path(data_dir);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -224,13 +242,14 @@ pub fn remove_runtime_state_if_matches(
     data_dir: &Path,
     expected: &RuntimeStateSnapshot,
 ) -> Result<bool> {
-    let Some(current) = load_runtime_state(data_dir)? else {
+    let _lock = lock_runtime_state(data_dir)?;
+    let Some(current) = load_runtime_state_locked(data_dir)? else {
         return Ok(false);
     };
     if !runtime_state_matches(&current, expected) {
         return Ok(false);
     }
-    remove_runtime_state(data_dir)?;
+    remove_runtime_state_locked(data_dir)?;
     Ok(true)
 }
 
@@ -238,25 +257,27 @@ pub fn remove_runtime_state_if_same_ui_addr(
     data_dir: &Path,
     expected_ui_addr: SocketAddr,
 ) -> Result<bool> {
-    let Some(current) = load_runtime_state(data_dir)? else {
+    let _lock = lock_runtime_state(data_dir)?;
+    let Some(current) = load_runtime_state_locked(data_dir)? else {
         return Ok(false);
     };
     let expected_ui_addr = advertise_local_api_addr(expected_ui_addr).to_string();
     if current.ui_addr != expected_ui_addr {
         return Ok(false);
     }
-    remove_runtime_state(data_dir)?;
+    remove_runtime_state_locked(data_dir)?;
     Ok(true)
 }
 
 pub fn remove_runtime_state_if_owner(data_dir: &Path, expected_instance_id: Uuid) -> Result<bool> {
-    let Some(current) = load_runtime_state(data_dir)? else {
+    let _lock = lock_runtime_state(data_dir)?;
+    let Some(current) = load_runtime_state_locked(data_dir)? else {
         return Ok(false);
     };
     if current.instance_id != expected_instance_id {
         return Ok(false);
     }
-    remove_runtime_state(data_dir)?;
+    remove_runtime_state_locked(data_dir)?;
     Ok(true)
 }
 
@@ -273,6 +294,55 @@ fn sync_directory(path: &Path, label: &str) -> Result<()> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .with_context(|| format!("failed to sync {label} {}", path.display()))
+}
+
+struct RuntimeStateLock {
+    #[allow(dead_code)]
+    file: fs::File,
+}
+
+fn lock_runtime_state(data_dir: &Path) -> Result<RuntimeStateLock> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
+    let lock_path = data_dir.join(RUNTIME_STATE_LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open runtime state lock {}", lock_path.display()))?;
+    lock_runtime_state_file(&file, &lock_path)?;
+    Ok(RuntimeStateLock { file })
+}
+
+#[cfg(unix)]
+fn lock_runtime_state_file(file: &fs::File, lock_path: &Path) -> Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to lock runtime state {}", lock_path.display()))
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_runtime_state_file(_file: &fs::File, _lock_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+impl Drop for RuntimeStateLock {
+    fn drop(&mut self) {
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        if result != 0 {
+            warn!(
+                error = ?std::io::Error::last_os_error(),
+                "failed to unlock runtime state"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

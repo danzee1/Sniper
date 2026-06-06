@@ -5086,7 +5086,7 @@ async fn oast_status(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc, time::Duration};
 
     use axum::{
         extract::{Path, Query, State},
@@ -5096,7 +5096,6 @@ mod tests {
     use chrono::Utc;
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uuid::Uuid;
 
@@ -5212,6 +5211,312 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn test_state(name: &str) -> (Arc<AppState>, PathBuf) {
+        let config = test_app_config(name);
+        let data_dir = config.data_dir.clone();
+        (Arc::new(AppState::new(config).unwrap()), data_dir)
+    }
+
+    async fn api_route_response(
+        state: Arc<AppState>,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (reqwest::StatusCode, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::router(state)).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut request = client.request(method, format!("http://{addr}{path}"));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        server.abort();
+        (status, body)
+    }
+
+    async fn api_route_json(
+        state: Arc<AppState>,
+        method: reqwest::Method,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (reqwest::StatusCode, String) {
+        api_route_response(state, method, path, Some(body)).await
+    }
+
+    fn assert_active_session_conflict_body(body: &str, active_session_id: Uuid) {
+        let payload: serde_json::Value =
+            serde_json::from_str(body).expect("conflict response should be JSON");
+        let expected_session_id = active_session_id.to_string();
+        assert_eq!(
+            payload.get("error").and_then(serde_json::Value::as_str),
+            Some("active session changed")
+        );
+        assert_eq!(
+            payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_session_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_send_route_enforces_session_id_contracts() {
+        let (state, data_dir) = test_state("sniper-route-replay-send-session");
+        let active_id = state.session().await.id();
+        let unknown_id = Uuid::new_v4();
+        let request = serde_json::to_value(test_editable_request("/")).unwrap();
+        let base_payload = serde_json::json!({
+            "request": request,
+            "target": null,
+            "source_transaction_id": null,
+            "http_version": null,
+        });
+
+        let mut unknown_payload = base_payload.clone();
+        unknown_payload["session_id"] = serde_json::json!(unknown_id);
+        let (status, body) = api_route_json(
+            state.clone(),
+            reqwest::Method::POST,
+            "/api/replay/send",
+            unknown_payload,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
+
+        let mut missing_payload = base_payload;
+        missing_payload["session_id"] = serde_json::Value::Null;
+        let (status, body) = api_route_json(
+            state,
+            reqwest::Method::POST,
+            "/api/replay/send",
+            missing_payload,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT);
+        assert_active_session_conflict_body(&body, active_id);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn fuzzer_routes_enforce_session_id_contracts() {
+        let (state, data_dir) = test_state("sniper-route-fuzzer-session");
+        let active_id = state.session().await.id();
+        let unknown_id = Uuid::new_v4();
+        let attack_id = Uuid::new_v4();
+        let template = serde_json::to_value(test_editable_request("/$payload$")).unwrap();
+        let base_payload = serde_json::json!({
+            "template": template,
+            "payloads": ["one"],
+            "source_transaction_id": null,
+            "http_version": null,
+            "target": null,
+        });
+
+        let mut unknown_payload = base_payload.clone();
+        unknown_payload["session_id"] = serde_json::json!(unknown_id);
+        let (status, body) = api_route_json(
+            state.clone(),
+            reqwest::Method::POST,
+            "/api/fuzzer/attacks",
+            unknown_payload,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
+
+        let mut missing_payload = base_payload;
+        missing_payload["session_id"] = serde_json::Value::Null;
+        let (status, body) = api_route_json(
+            state.clone(),
+            reqwest::Method::POST,
+            "/api/fuzzer/attacks",
+            missing_payload,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT);
+        assert_active_session_conflict_body(&body, active_id);
+
+        for path in [
+            format!("/api/fuzzer/attacks?session_id={unknown_id}"),
+            format!("/api/fuzzer/attacks/{attack_id}?session_id={unknown_id}"),
+        ] {
+            let (status, body) =
+                api_route_response(state.clone(), reqwest::Method::GET, &path, None).await;
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+            assert!(body.is_empty());
+        }
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn sequence_routes_enforce_session_id_contracts() {
+        let (state, data_dir) = test_state("sniper-route-sequence-session");
+        let active_id = state.session().await.id();
+        let unknown_id = Uuid::new_v4();
+        let sequence_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let definition = serde_json::json!({
+            "id": sequence_id,
+            "name": "Route contract",
+            "steps": [],
+        });
+
+        let mut missing_payload = definition.clone();
+        missing_payload["session_id"] = serde_json::Value::Null;
+        let (status, body) = api_route_json(
+            state.clone(),
+            reqwest::Method::POST,
+            "/api/sequences",
+            missing_payload,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT);
+        assert_active_session_conflict_body(&body, active_id);
+
+        for (method, path) in [
+            (
+                reqwest::Method::GET,
+                format!("/api/sequences?session_id={unknown_id}"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/api/sequences/{sequence_id}?session_id={unknown_id}"),
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("/api/sequences/{sequence_id}?session_id={unknown_id}"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/api/sequence-runs?session_id={unknown_id}"),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/api/sequence-runs/{run_id}?session_id={unknown_id}"),
+            ),
+        ] {
+            let (status, body) = api_route_response(state.clone(), method, &path, None).await;
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+            assert!(body.is_empty());
+        }
+
+        let (status, body) = api_route_json(
+            state.clone(),
+            reqwest::Method::POST,
+            &format!("/api/sequences/{sequence_id}/run"),
+            serde_json::json!({ "session_id": unknown_id }),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_routes_enforce_session_id_contracts() {
+        let (state, data_dir) = test_state("sniper-route-ws-replay-session");
+        let active_id = state.session().await.id();
+        let unknown_id = Uuid::new_v4();
+        let connection_id = Uuid::new_v4();
+
+        let connect_payload = serde_json::json!({
+            "id": connection_id,
+            "scheme": "ws",
+            "host": "127.0.0.1",
+            "port": 80,
+            "path": "/",
+            "headers": [],
+        });
+        let send_payload = serde_json::json!({
+            "id": connection_id,
+            "body": "hello",
+            "binary": false,
+        });
+        let disconnect_payload = serde_json::json!({
+            "id": connection_id,
+            "remove": true,
+        });
+
+        for (path, mut payload) in [
+            ("/api/replay/ws-connect", connect_payload),
+            ("/api/replay/ws-send", send_payload),
+            ("/api/replay/ws-disconnect", disconnect_payload),
+        ] {
+            payload["session_id"] = serde_json::json!(unknown_id);
+            let (status, body) =
+                api_route_json(state.clone(), reqwest::Method::POST, path, payload).await;
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+            assert!(body.is_empty());
+        }
+
+        for (path, mut payload) in [
+            (
+                "/api/replay/ws-connect",
+                serde_json::json!({
+                    "id": connection_id,
+                    "scheme": "ws",
+                    "host": "127.0.0.1",
+                    "port": 80,
+                    "path": "/",
+                    "headers": [],
+                }),
+            ),
+            (
+                "/api/replay/ws-send",
+                serde_json::json!({
+                    "id": connection_id,
+                    "body": "hello",
+                    "binary": false,
+                }),
+            ),
+            (
+                "/api/replay/ws-disconnect",
+                serde_json::json!({
+                    "id": connection_id,
+                    "remove": true,
+                }),
+            ),
+        ] {
+            payload["session_id"] = serde_json::Value::Null;
+            let (status, body) =
+                api_route_json(state.clone(), reqwest::Method::POST, path, payload).await;
+            assert_eq!(status, reqwest::StatusCode::CONFLICT);
+            assert_active_session_conflict_body(&body, active_id);
+        }
+
+        for path in [
+            format!("/api/replay/ws-snapshot/{connection_id}?session_id={unknown_id}"),
+            format!("/api/replay/ws-frames/{connection_id}?since=0&session_id={unknown_id}"),
+        ] {
+            let (status, body) =
+                api_route_response(state.clone(), reqwest::Method::GET, &path, None).await;
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+            assert!(body.is_empty());
+        }
+
+        for path in [
+            format!("/api/replay/ws-snapshot/{connection_id}"),
+            format!("/api/replay/ws-frames/{connection_id}?since=0"),
+        ] {
+            let (status, body) =
+                api_route_response(state.clone(), reqwest::Method::GET, &path, None).await;
+            assert_eq!(status, reqwest::StatusCode::CONFLICT);
+            assert_active_session_conflict_body(&body, active_id);
+        }
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

@@ -985,7 +985,7 @@ function bindEvents() {
         if (state.historyDirty) loadTransactions(true, consumeHistoryLoadOptions()).catch((error) => console.error(error));
       }
       if (state.activeTool === "proxy" && state.activeProxyTab === "websockets-history") {
-        if (state.websocketHistoryDirty) loadWebsockets(true).catch((error) => console.error(error));
+        if (state.websocketHistoryDirty) loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
       }
     });
   });
@@ -1001,7 +1001,7 @@ function bindEvents() {
         loadInterceptRules().catch((error) => console.error(error));
       }
       if (state.activeProxyTab === "websockets-history") {
-        loadWebsockets(true).catch((error) => console.error(error));
+        loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
       }
       if (state.activeProxyTab === "http-history") {
         if (state.historyDirty) loadTransactions(true, consumeHistoryLoadOptions()).catch((error) => console.error(error));
@@ -1150,7 +1150,7 @@ function bindEvents() {
     }
     _websocketSearchReloadTimer = window.setTimeout(() => {
       _websocketSearchReloadTimer = 0;
-      loadWebsockets(true).catch((error) => console.error(error));
+      loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
     }, 160);
   });
   let websocketScrollRaf = 0;
@@ -1175,6 +1175,13 @@ function bindEvents() {
       return;
     }
     state.wsKeyboardFocus = "sessions";
+    if (
+      state.selectedWebsocketId === row.dataset.id
+      && state.selectedWebsocketRecord?.id === row.dataset.id
+      && !state.selectedWebsocketDetailError
+    ) {
+      return;
+    }
     if (state.selectedWebsocketId !== row.dataset.id) {
       state.selectedFrameIdx = null;
       state.selectedWebsocketRecord = null;
@@ -1185,15 +1192,32 @@ function bindEvents() {
     renderWebsocketSessions();
     loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
   });
+  els.websocketFramesBody?.addEventListener("click", (event) => {
+    const row = event.target.closest(".history-row[data-frame-index]");
+    if (!row || !els.websocketFramesBody.contains(row)) {
+      return;
+    }
+    selectWebsocketFrameRow(row);
+  });
+  els.websocketFramesBody?.addEventListener("contextmenu", (event) => {
+    const row = event.target.closest(".history-row[data-frame-index]");
+    if (!row || !els.websocketFramesBody.contains(row)) {
+      return;
+    }
+    event.preventDefault();
+    if (selectWebsocketFrameRow(row)) {
+      openWsFrameContextMenu(event.clientX, event.clientY);
+    }
+  });
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    loadWebsockets(true).catch((error) => console.error(error));
+    loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
   });
   document.getElementById("wsHideClosed")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    loadWebsockets(true).catch((error) => console.error(error));
+    loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
   });
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
@@ -1390,7 +1414,7 @@ function bindEvents() {
   });
   if (els.refreshWebsocketsButton) {
     els.refreshWebsocketsButton.addEventListener("click", () => {
-      loadWebsockets(true).catch((error) => console.error(error));
+      loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
     });
   }
   els.frameDetailClose.addEventListener("click", hideFrameDetail);
@@ -4315,19 +4339,25 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
   }
 }
 
+async function loadWebsocketsPageRefresh(preserveSelection = true) {
+  return loadWebsockets(preserveSelection, { limit: WEBSOCKET_PAGE_SIZE });
+}
+
 async function loadMoreWebsockets() {
   const paging = state.websocketPaging || createWebsocketPagingState();
   if (paging.loading || !paging.hasMore) {
-    return;
+    return 0;
   }
+  const previousCount = (state.websocketSessions || []).length;
   const nextOffset = Math.max(0, Number(paging.loadedOffset ?? paging.limit ?? state.websocketSessions.length) || 0);
   if (nextOffset >= WEBSOCKET_MAX_LOADED_SESSIONS) {
     state.websocketPaging = { ...paging, hasMore: false, capReached: true };
     renderWebsocketSessions();
-    return;
+    return 0;
   }
   state.websocketPaging = { ...paging, offset: nextOffset };
   await loadWebsockets(true, { append: true, offset: nextOffset });
+  return Math.max(0, (state.websocketSessions || []).length - previousCount);
 }
 
 function adjustWebsocketPagingAfterLocalRemoval(removedCount = 1) {
@@ -4422,16 +4452,19 @@ function resetWebsocketHistoryScroll() {
   }
 }
 
-function scheduleFilteredWebsocketReload() {
+function scheduleWebsocketPageRefresh() {
   state.websocketHistoryDirty = true;
   if (_websocketFilteredReloadTimer) return;
   _websocketFilteredReloadTimer = window.setTimeout(() => {
     _websocketFilteredReloadTimer = 0;
-    if (!websocketFilterIsActive()) return;
     if (isWebsocketHistoryVisible()) {
-      loadWebsockets(true).catch((error) => console.error(error));
+      loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
     }
   }, 250);
+}
+
+function scheduleFilteredWebsocketReload() {
+  scheduleWebsocketPageRefresh();
 }
 
 function clearWebsocketQueryBackfill() {
@@ -4685,8 +4718,7 @@ async function loadWebsocketDetail(id, options = {}) {
       _websocketDetailPendingPromise = null;
     }
     if (_websocketDetailRefreshNeededId === id && id === state.selectedWebsocketId) {
-      _websocketDetailRefreshNeededId = null;
-      await loadWebsocketDetail(id, { force: true });
+      scheduleSelectedWebsocketDetailRefresh(id);
     }
   }
 }
@@ -4707,6 +4739,11 @@ function websocketSummarySignature(summary) {
   ].join("|");
 }
 
+function websocketServerOrderCanAcceptSummaryEvents() {
+  return (state.websocketSortKey || "started_at") === "started_at"
+    && (state.websocketSortDirection || "desc") === "desc";
+}
+
 function applyWebsocketSummaryEvent(event) {
   let summary;
   try {
@@ -4718,6 +4755,10 @@ function applyWebsocketSummaryEvent(event) {
   if (!summary?.id) return;
   if (websocketFilterIsActive()) {
     scheduleFilteredWebsocketReload();
+    return;
+  }
+  if (!websocketServerOrderCanAcceptSummaryEvents()) {
+    scheduleWebsocketPageRefresh();
     return;
   }
 
@@ -5017,7 +5058,7 @@ async function pollAuxiliaryData() {
   if (isWebsocketHistoryVisible()) {
     if (now - _lastWebsocketFallbackPoll >= WEBSOCKET_POLL_FALLBACK_MS) {
       _lastWebsocketFallbackPoll = now;
-      tasks.push(loadWebsockets(true));
+      tasks.push(loadWebsocketsPageRefresh(true));
     }
   }
 
@@ -5073,7 +5114,7 @@ function connectEvents() {
     }
     _lastWebsocketFallbackPoll = Date.now();
     if (isWebsocketHistoryVisible()) {
-      loadWebsockets(true).catch((error) => console.error(error));
+      loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
     } else {
       state.websocketHistoryDirty = true;
     }
@@ -5148,7 +5189,7 @@ function connectEvents() {
     }
     _lastWebsocketFallbackPoll = Date.now();
     if (isWebsocketHistoryVisible()) {
-      loadWebsockets(true).catch((error) => console.error(error));
+      loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
     } else {
       state.websocketHistoryDirty = true;
     }
@@ -8085,17 +8126,41 @@ function scrollSelectedHistoryRowIntoView() {
 }
 
 async function moveWebsocketSelection(offset) {
-  const sortedEntries = getSortedWebsocketEntries();
+  let sortedEntries = getSortedWebsocketEntries();
   if (!sortedEntries.length) return;
 
   const currentIndex = sortedEntries.findIndex(({ session }) => session.id === state.selectedWebsocketId);
   const fallbackIndex = offset > 0 ? 0 : sortedEntries.length - 1;
+  if (
+    offset > 0
+    && currentIndex === sortedEntries.length - 1
+    && state.websocketPaging?.hasMore
+    && !state.websocketPaging.loading
+  ) {
+    const selectedIdBeforeLoad = state.selectedWebsocketId;
+    const added = await loadMoreWebsockets();
+    if (added <= 0) return;
+    sortedEntries = getSortedWebsocketEntries();
+    const loadedIndex = sortedEntries.findIndex(({ session }) => session.id === selectedIdBeforeLoad);
+    const loadedNextId = loadedIndex >= 0 ? sortedEntries[loadedIndex + 1]?.session?.id : null;
+    if (loadedNextId) {
+      await selectWebsocketSession(loadedNextId, { scroll: true });
+    }
+    return;
+  }
   const nextIndex = clamp(
     currentIndex === -1 ? fallbackIndex : currentIndex + offset,
     0,
     sortedEntries.length - 1,
   );
   const nextId = sortedEntries[nextIndex]?.session?.id;
+  if (!nextId) return;
+
+  await selectWebsocketSession(nextId, { scroll: true });
+}
+
+async function selectWebsocketSession(id, options = {}) {
+  const nextId = id ?? null;
   if (!nextId) return;
 
   if (state.selectedWebsocketId !== nextId) {
@@ -8106,7 +8171,9 @@ async function moveWebsocketSelection(offset) {
   }
   state.selectedWebsocketId = nextId;
   renderWebsocketSessions();
-  scrollSelectedWebsocketRowIntoView();
+  if (options.scroll) {
+    scrollSelectedWebsocketRowIntoView();
+  }
   await loadWebsocketDetail(nextId);
 }
 
@@ -8943,35 +9010,25 @@ function renderWebsocketSessions(options = {}) {
         </tr>
       `;
 
-	  // Frame click + context menu handlers
-	  Array.from(els.websocketFramesBody.querySelectorAll(".history-row[data-frame-index]")).forEach((row) => {
-	    const selectFrameRow = () => {
-	      const frameIndex = parseInt(row.dataset.frameIndex, 10);
-	      const frame = frames.find((candidate) => candidate.index === frameIndex);
-	      if (!frame) return false;
+}
 
-	      state.selectedFrameIdx = frame.index;
-	      state.wsKeyboardFocus = "frames";
+function selectWebsocketFrameRow(row) {
+  const frameIndex = parseInt(row?.dataset?.frameIndex ?? "", 10);
+  if (!Number.isFinite(frameIndex)) {
+    return false;
+  }
+  const frames = getWebsocketFrames(state.selectedWebsocketRecord);
+  const frame = frames.find((candidate) => candidate.index === frameIndex);
+  if (!frame) {
+    return false;
+  }
 
-      // Highlight selected row
-      els.websocketFramesBody.querySelectorAll(".frame-selected").forEach((r) => r.classList.remove("frame-selected"));
-      row.classList.add("frame-selected");
-
-	      // Show detail panel
-	      showFrameDetail(frame);
-	      return true;
-	    };
-	    row.addEventListener("click", () => {
-	      selectFrameRow();
-	    });
-
-	    // Right-click on frame → show context menu
-	    row.addEventListener("contextmenu", (e) => {
-	      e.preventDefault();
-	      if (!selectFrameRow()) return;
-	      openWsFrameContextMenu(e.clientX, e.clientY);
-	    });
-	  });
+  state.selectedFrameIdx = frame.index;
+  state.wsKeyboardFocus = "frames";
+  els.websocketFramesBody.querySelectorAll(".frame-selected").forEach((item) => item.classList.remove("frame-selected"));
+  row.classList.add("frame-selected");
+  showFrameDetail(frame);
+  return true;
 }
 
 function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, totalCount, filteredCount, hasMore, capReached, query) {
@@ -9093,7 +9150,7 @@ function toggleWebsocketSort(key) {
     state.websocketSortDirection = key === "index" ? "asc" : "desc";
   }
   clearWebsocketQueryBackfill();
-  loadWebsockets(true).catch((error) => console.error(error));
+  loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
 }
 
 function updateWebsocketSortIndicators() {

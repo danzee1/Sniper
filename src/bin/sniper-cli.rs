@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     net::IpAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,7 +24,7 @@ use sniper::{
         TransactionRecord, TransactionSummary, WebSocketSessionRecord, WebSocketSessionSummary,
     },
     runtime::RuntimeSettingsSnapshot,
-    runtime_state::{load_runtime_state, remove_runtime_state_if_matches},
+    runtime_state::{load_runtime_state, remove_runtime_state_if_matches, RuntimeStateSnapshot},
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     session::SessionSummary,
     skills,
@@ -3163,15 +3163,28 @@ async fn discover_api_base_url(
 ) -> Result<String> {
     if let Some(api) = cli_api {
         let url = normalize_api_base_url(&api)?;
-        probe_sniper_api_base_url(&url, client).await?;
+        probe_sniper_api_base_url(&url, client, None).await?;
         return Ok(url);
     }
 
     if let Ok(api) = env::var("SNIPER_API_ADDR") {
         if !api.trim().is_empty() {
             let url = normalize_api_base_url(&api)?;
-            probe_sniper_api_base_url(&url, client).await?;
-            return Ok(url);
+            match probe_sniper_api_base_url(&url, client, None).await {
+                Ok(()) => return Ok(url),
+                Err(env_probe_error) => {
+                    match discover_api_base_url_from_data_dir(client, cli_data_dir()).await {
+                        Ok(discovered_url) => return Ok(discovered_url),
+                        Err(discovery_error) => {
+                            bail!(
+                                "SNIPER_API_ADDR={url} did not point to a reachable Sniper API \
+                                 ({env_probe_error}); runtime-state discovery also failed: \
+                                 {discovery_error}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3196,7 +3209,14 @@ async fn discover_api_base_url_from_data_dir(
     })?;
     if let Some(runtime_state) = runtime_state {
         let url = runtime_state.api_base_url();
-        if probe_sniper_api_base_url(&url, client).await.is_ok() {
+        let expected = SniperApiProbeExpectation {
+            runtime_state: &runtime_state,
+            data_dir: &data_dir,
+        };
+        if probe_sniper_api_base_url(&url, client, Some(expected))
+            .await
+            .is_ok()
+        {
             return Ok(url);
         }
         let remove_result = remove_runtime_state_if_matches(&data_dir, &runtime_state);
@@ -3233,13 +3253,23 @@ async fn discover_api_base_url_from_data_dir(
     bail!("could not discover Sniper API address; pass --api or start sniper-desktop first")
 }
 
-async fn probe_sniper_api_base_url(url: &str, client: &reqwest::Client) -> Result<()> {
+#[derive(Clone, Copy)]
+struct SniperApiProbeExpectation<'a> {
+    runtime_state: &'a RuntimeStateSnapshot,
+    data_dir: &'a Path,
+}
+
+async fn probe_sniper_api_base_url(
+    url: &str,
+    client: &reqwest::Client,
+    expected: Option<SniperApiProbeExpectation<'_>>,
+) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..=SNIPER_API_PROBE_RETRY_DELAYS.len() {
         if attempt > 0 {
             tokio::time::sleep(SNIPER_API_PROBE_RETRY_DELAYS[attempt - 1]).await;
         }
-        match probe_sniper_api_base_url_once(url, client).await {
+        match probe_sniper_api_base_url_once(url, client, expected).await {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -3247,7 +3277,11 @@ async fn probe_sniper_api_base_url(url: &str, client: &reqwest::Client) -> Resul
     Err(last_error.expect("probe loop always runs at least once"))
 }
 
-async fn probe_sniper_api_base_url_once(url: &str, client: &reqwest::Client) -> Result<()> {
+async fn probe_sniper_api_base_url_once(
+    url: &str,
+    client: &reqwest::Client,
+    expected: Option<SniperApiProbeExpectation<'_>>,
+) -> Result<()> {
     let response = client
         .get(api_url(url, "/api/settings")?)
         .timeout(SNIPER_API_PROBE_TIMEOUT)
@@ -3262,10 +3296,61 @@ async fn probe_sniper_api_base_url_once(url: &str, client: &reqwest::Client) -> 
         .json()
         .await
         .context("Sniper API probe response was not JSON")?;
-    if !sniper_settings_probe_matches(&payload) {
+    validate_sniper_settings_probe(&payload, expected)
+}
+
+fn validate_sniper_settings_probe(
+    payload: &serde_json::Value,
+    expected: Option<SniperApiProbeExpectation<'_>>,
+) -> Result<()> {
+    if !sniper_settings_probe_matches(payload) {
         bail!("Sniper API probe response did not match the expected /api/settings schema");
     }
+    if let Some(expected) = expected {
+        let response_instance_id =
+            probe_string_field(payload, "runtime_instance_id").and_then(|value| {
+                Uuid::parse_str(value).with_context(|| {
+                    "Sniper API probe response had invalid runtime_instance_id".to_string()
+                })
+            })?;
+        if response_instance_id != expected.runtime_state.instance_id {
+            bail!(
+                "Sniper API probe response did not match runtime-state instance \
+                 (expected {}, got {})",
+                expected.runtime_state.instance_id,
+                response_instance_id
+            );
+        }
+
+        let response_ui_addr = probe_string_field(payload, "ui_addr")?;
+        if response_ui_addr != expected.runtime_state.ui_addr {
+            bail!(
+                "Sniper API probe response did not match runtime-state UI address \
+                 (expected {}, got {})",
+                expected.runtime_state.ui_addr,
+                response_ui_addr
+            );
+        }
+
+        let response_data_dir = probe_string_field(payload, "data_dir")?;
+        let expected_data_dir = expected.data_dir.display().to_string();
+        if response_data_dir != expected_data_dir {
+            bail!(
+                "Sniper API probe response did not match runtime-state data directory \
+                 (expected {}, got {})",
+                expected_data_dir,
+                response_data_dir
+            );
+        }
+    }
     Ok(())
+}
+
+fn probe_string_field<'a>(payload: &'a serde_json::Value, field: &str) -> Result<&'a str> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Sniper API probe response missing string field {field}"))
 }
 
 fn sniper_settings_probe_matches(payload: &serde_json::Value) -> bool {
@@ -3281,8 +3366,12 @@ fn sniper_settings_probe_matches(payload: &serde_json::Value) -> bool {
         .unwrap_or_default();
 
     payload
-        .get("proxy_addr")
-        .is_some_and(serde_json::Value::is_string)
+        .get("runtime_instance_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        && payload
+            .get("proxy_addr")
+            .is_some_and(serde_json::Value::is_string)
         && payload
             .get("ui_addr")
             .is_some_and(serde_json::Value::is_string)
@@ -4172,6 +4261,7 @@ mod tests {
         HistoryCommand, HistoryListResponse, OastConfigureArgs, SequenceCommand,
         SequenceCreateInput, SessionCommand, SkillsInstallArgs, WebSocketListArgs,
         WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        SNIPER_API_PROBE_RETRY_DELAYS,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -6116,6 +6206,7 @@ mod tests {
     #[test]
     fn sniper_settings_probe_requires_sniper_markers() {
         let valid = serde_json::json!({
+            "runtime_instance_id": Uuid::new_v4().to_string(),
             "proxy_addr": "127.0.0.1:18080",
             "ui_addr": "127.0.0.1:19090",
             "data_dir": "/tmp/sniper",
@@ -6211,6 +6302,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("sniper-cli-probe-retry-{}", Uuid::new_v4()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ui_addr = listener.local_addr().unwrap();
+        let snapshot = RuntimeStateSnapshot::with_proxy_status(
+            "127.0.0.1:18080".parse().unwrap(),
+            ui_addr,
+            true,
+        );
+        let runtime_instance_id = snapshot.instance_id;
         let attempts = Arc::new(AtomicUsize::new(0));
         let server_attempts = attempts.clone();
         let server_root = root.clone();
@@ -6226,6 +6323,7 @@ mod tests {
                     (
                         "200 OK",
                         serde_json::json!({
+                            "runtime_instance_id": runtime_instance_id.to_string(),
                             "proxy_addr": "127.0.0.1:18080",
                             "ui_addr": ui_addr.to_string(),
                             "data_dir": server_root.display().to_string(),
@@ -6242,11 +6340,6 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let snapshot = RuntimeStateSnapshot::with_proxy_status(
-            "127.0.0.1:18080".parse().unwrap(),
-            ui_addr,
-            true,
-        );
         persist_runtime_state(&root, &snapshot).unwrap();
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -6257,6 +6350,58 @@ mod tests {
         assert_eq!(url, format!("http://{ui_addr}"));
         assert!(runtime_state_path(&root).exists());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.await.unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn discovery_removes_runtime_state_when_probe_instance_mismatches() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-cli-instance-mismatch-{}", Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui_addr = listener.local_addr().unwrap();
+        let snapshot = RuntimeStateSnapshot::with_proxy_status(
+            "127.0.0.1:18080".parse().unwrap(),
+            ui_addr,
+            true,
+        );
+        let mut response_instance_id = Uuid::new_v4();
+        while response_instance_id == snapshot.instance_id {
+            response_instance_id = Uuid::new_v4();
+        }
+        let server_root = root.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..=SNIPER_API_PROBE_RETRY_DELAYS.len() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer).await.unwrap();
+                let body = serde_json::json!({
+                    "runtime_instance_id": response_instance_id.to_string(),
+                    "proxy_addr": "127.0.0.1:18080",
+                    "ui_addr": ui_addr.to_string(),
+                    "data_dir": server_root.display().to_string(),
+                    "max_entries": 5000,
+                    "features": ["http_capture", "session_storage", "replay"]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        persist_runtime_state(&root, &snapshot).unwrap();
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = discover_api_base_url_from_data_dir(&client, root.clone())
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Removed the stale runtime-state"));
+        assert!(!runtime_state_path(&root).exists());
         server.await.unwrap();
         let _ = fs::remove_dir_all(root);
     }

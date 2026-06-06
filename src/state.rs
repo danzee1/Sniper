@@ -493,6 +493,7 @@ impl AppState {
         let active_addr = self.get_active_proxy_addr().await;
         let ui_addr = self.get_active_ui_addr().await;
         RuntimeInfo {
+            runtime_instance_id: self.runtime_instance_id,
             proxy_addr: active_addr.to_string(),
             ui_addr: ui_addr.to_string(),
             max_entries: self.config.max_entries,
@@ -1030,6 +1031,7 @@ impl Drop for UpdateArtifactGuard {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeInfo {
+    pub runtime_instance_id: uuid::Uuid,
     pub proxy_addr: String,
     pub ui_addr: String,
     pub max_entries: usize,
