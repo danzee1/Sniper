@@ -114,6 +114,10 @@ const HTTP_HISTORY_MAX_LOADED_ITEMS = HTTP_HISTORY_PAGE_SIZE;
 const HTTP_HISTORY_BACKFILL_DELAY_MS = 80;
 const HTTP_HISTORY_SCROLL_PREFETCH_ROWS = 120;
 const HTTP_HISTORY_POLL_FALLBACK_MS = 30000;
+const WEBSOCKET_PAGE_SIZE = 500;
+const WEBSOCKET_MAX_LOADED_SESSIONS = 5000;
+const WEBSOCKET_SCROLL_PREFETCH_PX = 240;
+const WEBSOCKET_DETAIL_FRAME_LIMIT = 1000;
 const FINDINGS_BADGE_POLL_INTERVAL_MS = 30000;
 const WS_REPLAY_MAX_LOADED_FRAMES = 10000;
 const WS_REPLAY_MAX_RENDERED_FRAMES = 1000;
@@ -317,8 +321,9 @@ function createHistoryPagingState() {
 function createWebsocketPagingState() {
   return {
     total: 0,
-    limit: 5000,
+    limit: WEBSOCKET_PAGE_SIZE,
     hasMore: false,
+    loading: false,
   };
 }
 
@@ -806,6 +811,8 @@ const WEBSOCKET_WORKBENCH_MIN_WIDTHS = {
   handshake: 360,
   frames: 320,
 };
+const WEBSOCKET_MAX_RENDERED_SESSION_ROWS = 500;
+const WEBSOCKET_MAX_RENDERED_FRAME_ROWS = 1000;
 
 const WEBSOCKET_STACK_MIN_HEIGHTS = {
   sessions: 160,
@@ -1095,6 +1102,15 @@ function bindEvents() {
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
     syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
+  });
+  document.querySelector("#websocketTable")?.closest(".history-table-shell")?.addEventListener("scroll", (event) => {
+    const scroller = event.currentTarget;
+    if (!scroller || state.activeProxyTab !== "websockets-history") {
+      return;
+    }
+    if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - WEBSOCKET_SCROLL_PREFETCH_PX) {
+      loadMoreWebsockets().catch((error) => console.error(error));
+    }
   });
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
@@ -3638,19 +3654,69 @@ async function toggleInterceptRuleEnabled(ruleId, enabled) {
 async function loadWebsockets(preserveSelection = true) {
   const generation = ++_websocketLoadGeneration;
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath("/api/websockets?limit=5000", sessionId));
-  await requireOkResponse(response, "Failed to load WebSocket history.");
-  const page = websocketPagePayload(await response.json());
-  if (generation !== _websocketLoadGeneration || sessionId !== currentSessionId()) {
+  const requestedLimit = normalizeWebsocketLoadLimit(state.websocketPaging?.limit);
+  state.websocketPaging = {
+    ...createWebsocketPagingState(),
+    ...(state.websocketPaging || {}),
+    limit: requestedLimit,
+    loading: true,
+  };
+  try {
+    const response = await fetch(sessionQueryPath(`/api/websockets?limit=${requestedLimit}`, sessionId));
+    await requireOkResponse(response, "Failed to load WebSocket history.");
+    const page = websocketPagePayload(await response.json());
+    if (generation !== _websocketLoadGeneration || sessionId !== currentSessionId()) {
+      return;
+    }
+    const loadedLimit = normalizeWebsocketLoadLimit(page.limit || requestedLimit);
+    state.websocketSessions = page.items;
+    state.websocketPaging = {
+      total: page.total,
+      limit: loadedLimit,
+      hasMore: Boolean(page.has_more) && loadedLimit < WEBSOCKET_MAX_LOADED_SESSIONS,
+      loading: false,
+    };
+    await syncVisibleWebsocketSelection(preserveSelection);
+  } catch (error) {
+    if (generation === _websocketLoadGeneration && sessionId === currentSessionId()) {
+      state.websocketPaging = {
+        ...(state.websocketPaging || createWebsocketPagingState()),
+        loading: false,
+      };
+    }
+    throw error;
+  }
+}
+
+async function loadMoreWebsockets() {
+  const paging = state.websocketPaging || createWebsocketPagingState();
+  if (paging.loading || !paging.hasMore) {
     return;
   }
-  state.websocketSessions = page.items;
-  state.websocketPaging = {
-    total: page.total,
-    limit: page.limit,
-    hasMore: page.has_more,
-  };
-  await syncVisibleWebsocketSelection(preserveSelection);
+  const nextLimit = normalizeWebsocketLoadLimit(
+    Math.min(
+      WEBSOCKET_MAX_LOADED_SESSIONS,
+      Math.max(paging.limit + WEBSOCKET_PAGE_SIZE, state.websocketSessions.length + WEBSOCKET_PAGE_SIZE),
+    ),
+  );
+  if (nextLimit <= paging.limit) {
+    state.websocketPaging = { ...paging, hasMore: false };
+    renderWebsocketSessions();
+    return;
+  }
+  state.websocketPaging = { ...paging, limit: nextLimit };
+  await loadWebsockets(true);
+}
+
+function normalizeWebsocketLoadLimit(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return WEBSOCKET_PAGE_SIZE;
+  }
+  return Math.min(
+    WEBSOCKET_MAX_LOADED_SESSIONS,
+    Math.max(WEBSOCKET_PAGE_SIZE, Math.ceil(numeric)),
+  );
 }
 
 async function loadWebsocketDetail(id) {
@@ -3664,7 +3730,11 @@ async function loadWebsocketDetail(id) {
 
   const pending = (async () => {
     const sessionId = currentSessionId();
-    const response = await fetch(sessionQueryPath(`/api/websockets/${encodeURIComponent(id)}`, sessionId));
+    const detailPath = sessionQueryPath(
+      `/api/websockets/${encodeURIComponent(id)}?frame_limit=${WEBSOCKET_DETAIL_FRAME_LIMIT}`,
+      sessionId,
+    );
+    const response = await fetch(detailPath);
     if (generation !== _websocketDetailGeneration || sessionId !== currentSessionId()) {
       return;
     }
@@ -3681,7 +3751,19 @@ async function loadWebsocketDetail(id) {
     if (generation !== _websocketDetailGeneration || sessionId !== currentSessionId() || state.selectedWebsocketId !== id) {
       return;
     }
-    state.selectedWebsocketRecord = detail;
+    const summary = state.websocketSessions.find((item) => item.id === id);
+    state.selectedWebsocketRecord = {
+      ...detail,
+      frame_count: Number.isFinite(Number(summary?.frame_count))
+        ? Number(summary.frame_count)
+        : (Array.isArray(detail.frames) ? detail.frames.length : 0),
+      note_count: Number.isFinite(Number(summary?.note_count))
+        ? Number(summary.note_count)
+        : (Array.isArray(detail.notes) ? detail.notes.length : 0),
+      frames_truncated: Array.isArray(detail.frames)
+        && Number.isFinite(Number(summary?.frame_count))
+        && detail.frames.length < Number(summary.frame_count),
+    };
     renderWebsocketSessions();
   })();
   _websocketDetailPendingId = id;
@@ -6813,7 +6895,11 @@ function moveFrameSelection(offset) {
 
   // Update selection highlight — find by data attribute, not DOM index
   els.websocketFramesBody.querySelectorAll(".frame-selected").forEach((r) => r.classList.remove("frame-selected"));
-  const target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
+  let target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
+  if (!target && frames.length > WEBSOCKET_MAX_RENDERED_FRAME_ROWS) {
+    renderWebsocketSessions();
+    target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
+  }
   if (target) {
     target.classList.add("frame-selected");
     target.scrollIntoView({ block: "nearest" });
@@ -7362,11 +7448,13 @@ function renderIntercepts() {
 
 function renderWebsocketSessions() {
   const sortedEntries = getSortedWebsocketEntries();
+  const renderedEntries = websocketRenderedSessionWindow(sortedEntries, state.selectedWebsocketId);
   if (els.websocketSearchInput.value !== state.websocketQuery) {
     els.websocketSearchInput.value = state.websocketQuery;
   }
   els.websocketMeta.textContent = buildWebsocketFilterSummary(
     sortedEntries.length,
+    renderedEntries.length,
     state.websocketSessions.length,
     state.websocketPaging?.total ?? state.websocketSessions.length,
     Boolean(state.websocketPaging?.hasMore),
@@ -7376,7 +7464,7 @@ function renderWebsocketSessions() {
   updateWebsocketSortIndicators();
 
   els.websocketTableBody.innerHTML = sortedEntries.length
-    ? sortedEntries
+    ? renderedEntries
         .map(({ session, index }) => {
           const selected = session.id === state.selectedWebsocketId ? "selected" : "";
           return `
@@ -7482,14 +7570,20 @@ function renderWebsocketSessions() {
   ) {
     state.selectedFrameIdx = null;
   }
+  const renderedFrames = websocketRenderedFrameWindow(frames, state.selectedFrameIdx);
+  const fullFrameCount = Number.isFinite(Number(session.frame_count))
+    ? Number(session.frame_count)
+    : frames.length;
+  const frameNumberOffset = Math.max(0, fullFrameCount - frames.length);
+  const framePositions = new Map(frames.map((frame, index) => [frame.index, frameNumberOffset + index + 1]));
   els.websocketFramesBody.innerHTML = frames.length
-    ? frames
-        .map((frame, idx) => {
+    ? renderedFrames
+        .map((frame) => {
           const dir = frame.direction === "client_to_server" ? "\u2192" : "\u2190";
           const dirClass = frame.direction === "client_to_server" ? "dir-client" : "dir-server";
           return `
           <tr class="history-row${frame.index === state.selectedFrameIdx ? ' frame-selected' : ''}" data-frame-index="${frame.index}">
-            <td class="cell-narrow">${idx + 1}</td>
+            <td class="cell-narrow">${framePositions.get(frame.index) || ""}</td>
             <td class="cell-narrow ${dirClass}">${dir}</td>
             <td class="cell-narrow">${frame.kind}</td>
             <td class="cell-narrow">${escapeHtml(formatSize(frame.body_size))}</td>
@@ -7534,8 +7628,11 @@ function renderWebsocketSessions() {
 	  });
 }
 
-function buildWebsocketFilterSummary(visibleCount, loadedCount, totalCount, hasMore, query) {
-  const parts = [`${visibleCount} session(s) visible`];
+function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, totalCount, hasMore, query) {
+  const visibleLabel = renderedCount < visibleCount
+    ? `${renderedCount}/${visibleCount} session(s) shown`
+    : `${visibleCount} session(s) visible`;
+  const parts = [visibleLabel];
   const filters = [];
   if (document.getElementById("wsInScopeOnly")?.classList.contains("active")) filters.push("in scope");
   if (document.getElementById("wsHideClosed")?.classList.contains("active")) filters.push("live only");
@@ -7547,6 +7644,36 @@ function buildWebsocketFilterSummary(visibleCount, loadedCount, totalCount, hasM
     parts.push("No sessions captured yet");
   }
   return parts.join(" · ");
+}
+
+function centeredWindow(items, selectedPosition, maxItems) {
+  if (!Array.isArray(items) || items.length <= maxItems) {
+    return items || [];
+  }
+  const fallbackStart = 0;
+  const halfWindow = Math.floor(maxItems / 2);
+  const position = Number.isFinite(selectedPosition) && selectedPosition >= 0
+    ? selectedPosition
+    : fallbackStart;
+  const start = Math.max(
+    0,
+    Math.min(position - halfWindow, items.length - maxItems),
+  );
+  return items.slice(start, start + maxItems);
+}
+
+function websocketRenderedSessionWindow(entries, selectedId) {
+  const selectedPosition = selectedId
+    ? entries.findIndex(({ session }) => session.id === selectedId)
+    : -1;
+  return centeredWindow(entries, selectedPosition, WEBSOCKET_MAX_RENDERED_SESSION_ROWS);
+}
+
+function websocketRenderedFrameWindow(frames, selectedFrameIndex) {
+  const selectedPosition = selectedFrameIndex == null
+    ? -1
+    : frames.findIndex((frame) => frame.index === selectedFrameIndex);
+  return centeredWindow(frames, selectedPosition, WEBSOCKET_MAX_RENDERED_FRAME_ROWS);
 }
 
 function getVisibleWebsocketSessions() {

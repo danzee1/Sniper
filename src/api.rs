@@ -1625,6 +1625,7 @@ impl From<TransactionListPage> for TransactionPageResponse {
 struct WebSocketQuery {
     session_id: Option<Uuid>,
     limit: Option<usize>,
+    frame_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3502,8 +3503,19 @@ async fn get_websocket(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if let Err(error) = validate_optional_limit(query.frame_limit) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
     match session.websockets.get(id).await {
-        Some(record) => Json(record).into_response(),
+        Some(mut record) => {
+            if let Some(limit) = query.frame_limit {
+                if record.frames.len() > limit {
+                    let start = record.frames.len() - limit;
+                    record.frames = record.frames.split_off(start);
+                }
+            }
+            Json(record).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -4423,7 +4435,7 @@ mod tests {
         model::{
             BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, MessageRecord,
             RequestTargetOverride, TransactionRecord, WebSocketFrameDirection, WebSocketFrameKind,
-            WebSocketSessionRecord,
+            WebSocketFrameRecord, WebSocketSessionRecord,
         },
         oast::{OastCallback, OastProvider},
         runtime::{RuntimeSettingsSnapshot, RuntimeSettingsUpdate},
@@ -7356,6 +7368,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: None,
                 limit: None,
+                frame_limit: None,
             }),
         )
         .await;
@@ -7369,6 +7382,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(original_id),
                 limit: None,
+                frame_limit: None,
             }),
         )
         .await;
@@ -7378,6 +7392,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(original_id),
                 limit: None,
+                frame_limit: None,
             }),
         )
         .await;
@@ -7386,6 +7401,85 @@ mod tests {
         assert_eq!(pinned_websocket_page.items.len(), 1);
         assert_eq!(pinned_websocket_page.items[0].id, websocket_id);
         drop(active_proxy_owner);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_detail_frame_limit_returns_tail_frames_without_changing_summary_count() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-websocket-frame-limit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let websocket = WebSocketSessionRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            closed_at: Some(Utc::now()),
+            duration_ms: Some(1),
+            scheme: "wss".to_string(),
+            host: "example.test".to_string(),
+            path: "/socket".to_string(),
+            status: Some(101),
+            request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+            response: None,
+            frames: (1..=5)
+                .map(|index| WebSocketFrameRecord {
+                    index,
+                    captured_at: Utc::now(),
+                    direction: WebSocketFrameDirection::ServerToClient,
+                    kind: WebSocketFrameKind::Text,
+                    body_preview: format!("frame-{index}"),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    preview_truncated: false,
+                })
+                .collect(),
+            notes: Vec::new(),
+        };
+        let websocket_id = websocket.id;
+        session.websockets.open(websocket).await;
+
+        let detail_response = super::get_websocket(
+            State(state.clone()),
+            Path(websocket_id.to_string()),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                limit: None,
+                frame_limit: Some(2),
+            }),
+        )
+        .await;
+        assert_eq!(detail_response.status(), super::StatusCode::OK);
+        let detail: WebSocketSessionRecord = response_json(detail_response).await;
+        assert_eq!(
+            detail
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+
+        let list_response = super::list_websockets(
+            State(state),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                limit: Some(10),
+                frame_limit: None,
+            }),
+        )
+        .await;
+        let page: super::WebSocketPageResponse = response_json(list_response).await;
+        assert_eq!(page.items[0].frame_count, 5);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
