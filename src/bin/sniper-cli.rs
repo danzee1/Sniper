@@ -3179,21 +3179,10 @@ async fn discover_api_base_url(
                     runtime_state,
                     data_dir: &data_dir,
                 });
-            match probe_sniper_api_base_url(&url, client, expected).await {
-                Ok(()) => return Ok(url),
-                Err(env_probe_error) => {
-                    match discover_api_base_url_from_data_dir(client, data_dir).await {
-                        Ok(discovered_url) => return Ok(discovered_url),
-                        Err(discovery_error) => {
-                            bail!(
-                                "SNIPER_API_ADDR={url} did not point to a reachable Sniper API \
-                                 ({env_probe_error}); runtime-state discovery also failed: \
-                                 {discovery_error}"
-                            );
-                        }
-                    }
-                }
+            if let Err(error) = probe_sniper_api_base_url(&url, client, expected).await {
+                bail!("SNIPER_API_ADDR={url} did not point to a reachable Sniper API ({error})");
             }
+            return Ok(url);
         }
     }
 
@@ -6705,16 +6694,14 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn env_api_addr_falls_back_when_runtime_identity_mismatches() {
+    async fn env_api_addr_is_authoritative_when_runtime_identity_mismatches() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("sniper-cli-env-mismatch-{}", Uuid::new_v4()));
-        let correct_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let correct_ui_addr = correct_listener.local_addr().unwrap();
         let wrong_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let wrong_ui_addr = wrong_listener.local_addr().unwrap();
         let snapshot = RuntimeStateSnapshot::with_proxy_status(
             "127.0.0.1:18080".parse().unwrap(),
-            correct_ui_addr,
+            "127.0.0.1:0".parse().unwrap(),
             true,
         );
         persist_runtime_state(&root, &snapshot).unwrap();
@@ -6741,36 +6728,17 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let expected_instance_id = snapshot.instance_id;
-        let correct_root = root.clone();
-        let correct_server = tokio::spawn(async move {
-            let (mut stream, _) = correct_listener.accept().await.unwrap();
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer).await.unwrap();
-            let body = serde_json::json!({
-                "runtime_instance_id": expected_instance_id.to_string(),
-                "proxy_addr": "127.0.0.1:18080",
-                "ui_addr": correct_ui_addr.to_string(),
-                "data_dir": correct_root.display().to_string(),
-                "max_entries": 5000,
-                "features": ["http_capture", "session_storage", "replay"]
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
 
         let _api_guard = EnvVarGuard::set("SNIPER_API_ADDR", format!("http://{wrong_ui_addr}"));
         let _data_dir_guard = EnvVarGuard::set("SNIPER_DATA_DIR", root.clone().into_os_string());
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let url = discover_api_base_url(None, &client).await.unwrap();
+        let error = discover_api_base_url(None, &client).await.unwrap_err();
+        let message = error.to_string();
 
-        assert_eq!(url, format!("http://{correct_ui_addr}"));
+        assert!(message.contains("SNIPER_API_ADDR="));
+        assert!(message.contains("did not point to a reachable Sniper API"));
+        assert!(message.contains("did not match runtime-state"));
         wrong_server.await.unwrap();
-        correct_server.await.unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

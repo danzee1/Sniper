@@ -241,6 +241,9 @@ impl WsReplayConnection {
     fn remove_frame(&mut self, index: usize) {
         if let Some(position) = self.frames.iter().position(|frame| frame.index == index) {
             self.frames.remove(position);
+            if index.checked_add(1) == Some(self.frame_counter) {
+                self.frame_counter = index;
+            }
         }
     }
 
@@ -1128,6 +1131,31 @@ mod tests {
             WebSocketFrameDirection::ServerToClient
         ));
         assert_eq!(conn.frame_counter, 2);
+    }
+
+    #[test]
+    fn replay_connection_reuses_latest_unsent_index_after_rollback() {
+        let mut conn = test_connection(WsReplayStatus::Connected, None);
+        let recorded = conn
+            .push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Text("pending".into()),
+            )
+            .unwrap();
+
+        conn.remove_frame(recorded);
+        let next = conn
+            .push_frame(
+                WebSocketFrameDirection::ClientToServer,
+                &WsMessage::Text("retry".into()),
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 0);
+        assert_eq!(next, 0);
+        assert_eq!(conn.frame_counter, 1);
+        assert_eq!(conn.frames.len(), 1);
+        assert_eq!(conn.frames[0].index, 0);
     }
 
     #[test]

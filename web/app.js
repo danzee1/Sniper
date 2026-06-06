@@ -855,7 +855,10 @@ const WEBSOCKET_MAX_RENDERED_SESSION_ROWS = 500;
 const WEBSOCKET_MAX_RENDERED_FRAME_ROWS = 1000;
 const WEBSOCKET_SESSION_ROW_HEIGHT = 28;
 let measuredWebsocketSessionRowHeight = WEBSOCKET_SESSION_ROW_HEIGHT;
+const WEBSOCKET_FRAME_ROW_HEIGHT = 28;
+let measuredWebsocketFrameRowHeight = WEBSOCKET_FRAME_ROW_HEIGHT;
 const WEBSOCKET_SESSION_BUFFER_ROWS = 30;
+const WEBSOCKET_FRAME_BUFFER_ROWS = 30;
 
 const WEBSOCKET_STACK_MIN_HEIGHTS = {
   sessions: 160,
@@ -1207,6 +1210,18 @@ function bindEvents() {
     event.preventDefault();
     if (selectWebsocketFrameRow(row)) {
       openWsFrameContextMenu(event.clientX, event.clientY);
+    }
+  });
+  let websocketFrameScrollRaf = 0;
+  els.websocketFramesBody?.closest(".history-table-shell")?.addEventListener("scroll", () => {
+    if (state.activeProxyTab !== "websockets-history" || !state.selectedWebsocketRecord) {
+      return;
+    }
+    if (!websocketFrameScrollRaf) {
+      websocketFrameScrollRaf = requestAnimationFrame(() => {
+        websocketFrameScrollRaf = 0;
+        renderWebsocketSessions();
+      });
     }
   });
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
@@ -5193,6 +5208,7 @@ function connectEvents() {
     if (eventSessionId !== currentSessionId()) {
       return;
     }
+    _lastHttpHistoryFallbackPoll = Date.now();
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");
     if (!applyTransactionDeltaEvent(event, eventSessionId)) {
@@ -8319,6 +8335,7 @@ function moveFrameSelection(offset) {
   els.websocketFramesBody.querySelectorAll(".frame-selected").forEach((r) => r.classList.remove("frame-selected"));
   let target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
   if (!target && frames.length > WEBSOCKET_MAX_RENDERED_FRAME_ROWS) {
+    ensureWebsocketFramePositionInView(nextPosition, { center: true });
     renderWebsocketSessions();
     target = els.websocketFramesBody.querySelector(`.history-row[data-frame-index="${frame.index}"]`);
   }
@@ -9038,7 +9055,8 @@ function renderWebsocketSessions(options = {}) {
     state.selectedFrameIdx = null;
     hideFrameDetail();
   }
-  const renderedFrames = websocketRenderedFrameWindow(frames, state.selectedFrameIdx);
+  const frameWindow = websocketRenderedFrameWindow(frames);
+  const renderedFrames = frameWindow.renderedFrames;
   const fullFrameCount = Number.isFinite(Number(session.frame_count))
     ? Number(session.frame_count)
     : frames.length;
@@ -9059,8 +9077,14 @@ function renderWebsocketSessions(options = {}) {
             <td colspan="5">Showing latest ${frames.length} frames (${olderFrameCount} older not loaded).</td>
           </tr>`
     : "";
+  const frameTopSpacer = frameWindow.topPadding > 0
+    ? `<tr class="virtual-spacer"><td colspan="5" style="height:${frameWindow.topPadding}px;padding:0;border:none"></td></tr>`
+    : "";
+  const frameBottomSpacer = frameWindow.bottomPadding > 0
+    ? `<tr class="virtual-spacer"><td colspan="5" style="height:${frameWindow.bottomPadding}px;padding:0;border:none"></td></tr>`
+    : "";
   els.websocketFramesBody.innerHTML = frames.length
-    ? frameWindowNotice + renderedFrames
+    ? frameWindowNotice + frameTopSpacer + renderedFrames
         .map((frame) => {
           const dir = frame.direction === "client_to_server" ? "\u2192" : "\u2190";
           const dirClass = frame.direction === "client_to_server" ? "dir-client" : "dir-server";
@@ -9073,13 +9097,19 @@ function renderWebsocketSessions(options = {}) {
             <td class="cell-url">${escapeHtml(renderFramePreview(frame))}</td>
           </tr>`;
         })
-        .join("")
+        .join("") + frameBottomSpacer
     : `
         <tr class="empty-row">
           <td colspan="5">No frames recorded yet.</td>
         </tr>
       `;
 
+  const measuredRow = els.websocketFramesBody.querySelector(".history-row");
+  const measured = measuredRow?.getBoundingClientRect().height || 0;
+  if (measured > 0 && Math.abs(measured - measuredWebsocketFrameRowHeight) >= 1) {
+    measuredWebsocketFrameRowHeight = measured;
+    renderWebsocketSessions();
+  }
 }
 
 function selectWebsocketFrameRow(row) {
@@ -9185,11 +9215,77 @@ function websocketRenderedSessionWindow(entries) {
   };
 }
 
-function websocketRenderedFrameWindow(frames, selectedFrameIndex) {
-  const selectedPosition = selectedFrameIndex == null
-    ? -1
-    : frames.findIndex((frame) => frame.index === selectedFrameIndex);
-  return centeredWindow(frames, selectedPosition, WEBSOCKET_MAX_RENDERED_FRAME_ROWS);
+function websocketFramesShell() {
+  return els.websocketFramesBody?.closest(".history-table-shell") || null;
+}
+
+function ensureWebsocketFramePositionInView(position, options = {}) {
+  const shell = websocketFramesShell();
+  if (!shell || !Number.isFinite(position) || position < 0) {
+    return false;
+  }
+  const rowHeight = measuredWebsocketFrameRowHeight || WEBSOCKET_FRAME_ROW_HEIGHT;
+  const rowTop = position * rowHeight;
+  const rowBottom = rowTop + rowHeight;
+  const viewTop = shell.scrollTop;
+  const viewBottom = viewTop + shell.clientHeight;
+  if (options.center) {
+    shell.scrollTop = Math.max(0, rowTop - shell.clientHeight / 2);
+    return true;
+  }
+  if (rowTop < viewTop) {
+    shell.scrollTop = rowTop;
+    return true;
+  }
+  if (rowBottom > viewBottom) {
+    shell.scrollTop = Math.max(0, rowBottom - shell.clientHeight);
+    return true;
+  }
+  return true;
+}
+
+function websocketRenderedFrameWindow(frames) {
+  if (!Array.isArray(frames) || !frames.length) {
+    return {
+      renderedFrames: [],
+      startIdx: 0,
+      endIdx: 0,
+      topPadding: 0,
+      bottomPadding: 0,
+    };
+  }
+  const shell = websocketFramesShell();
+  const rowHeight = measuredWebsocketFrameRowHeight || WEBSOCKET_FRAME_ROW_HEIGHT;
+  if (!shell || frames.length <= WEBSOCKET_MAX_RENDERED_FRAME_ROWS) {
+    return {
+      renderedFrames: frames,
+      startIdx: 0,
+      endIdx: frames.length,
+      topPadding: 0,
+      bottomPadding: 0,
+    };
+  }
+  const viewportHeight = shell.clientHeight || rowHeight * WEBSOCKET_MAX_RENDERED_FRAME_ROWS;
+  const maxScrollTop = Math.max(0, frames.length * rowHeight - viewportHeight);
+  const scrollTop = Math.min(shell.scrollTop, maxScrollTop);
+  if (shell.scrollTop !== scrollTop) {
+    shell.scrollTop = scrollTop;
+  }
+  const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - WEBSOCKET_FRAME_BUFFER_ROWS);
+  let endIdx = Math.min(
+    frames.length,
+    Math.ceil((scrollTop + viewportHeight) / rowHeight) + WEBSOCKET_FRAME_BUFFER_ROWS,
+  );
+  if (endIdx - startIdx > WEBSOCKET_MAX_RENDERED_FRAME_ROWS) {
+    endIdx = startIdx + WEBSOCKET_MAX_RENDERED_FRAME_ROWS;
+  }
+  return {
+    renderedFrames: frames.slice(startIdx, endIdx),
+    startIdx,
+    endIdx,
+    topPadding: startIdx * rowHeight,
+    bottomPadding: Math.max(0, (frames.length - endIdx) * rowHeight),
+  };
 }
 
 function getVisibleWebsocketSessions() {
@@ -9957,15 +10053,26 @@ function replayHttpVersionFromText(text) {
 
 function replayHttpVersionState(request, requestText, mode) {
   return replayHttpVersionFromText(requestText || "")
-    || normalizeReplayHttpVersion(request?.http_version || "")
     || normalizeReplayHttpVersionMode(mode);
+}
+
+function replayLegacyHttpVersionState(request, requestText, mode) {
+  return replayHttpVersionState(request, requestText, mode)
+    || normalizeReplayHttpVersion(request?.http_version || "");
+}
+
+function replayEffectiveHttpVersion(request, requestText, mode) {
+  return normalizeReplayHttpVersion(request?.http_version || "")
+    || replayHttpVersionFromText(requestText || "")
+    || normalizeReplayHttpVersionMode(mode)
+    || undefined;
 }
 
 function replayStoredHttpVersionMode(request, requestText, mode, hasStoredMode) {
   if (hasStoredMode) {
     return normalizeReplayHttpVersionMode(mode);
   }
-  return replayHttpVersionState(request, requestText, mode);
+  return replayLegacyHttpVersionState(request, requestText, mode);
 }
 
 function parseReplayHttpVersionToken(token) {
@@ -12322,10 +12429,7 @@ async function sendReplay() {
   const sendingTabId = tab.id;
   const sendingSessionId = state.activeSession?.id || null;
 
-  const httpVersion = normalizeReplayHttpVersion(request.http_version || "")
-    || replayHttpVersionFromText(requestText)
-    || normalizeReplayHttpVersion(tab.httpVersionMode || "")
-    || undefined;
+  const httpVersion = replayEffectiveHttpVersion(request, requestText, tab.httpVersionMode);
 
   const replayController = new AbortController();
   _replaySendControllers.set(sendingTabId, replayController);
@@ -12514,10 +12618,7 @@ async function followRedirect() {
   let httpVersion;
   try {
     currentRequest = parseEditableRawRequest(replayReqText, fallback);
-    httpVersion = normalizeReplayHttpVersion(currentRequest.http_version || "")
-      || replayHttpVersionFromText(replayReqText)
-      || normalizeReplayHttpVersion(tab.httpVersionMode || "")
-      || undefined;
+    httpVersion = replayEffectiveHttpVersion(currentRequest, replayReqText, tab.httpVersionMode);
   } catch (e) {
     const message = e?.message || "Failed to parse request.";
     els.replayResponseMeta.textContent = "Error";

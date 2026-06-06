@@ -1392,17 +1392,31 @@ case "$expected_version" in
 esac
 expected_team="$6"
 backup="${bundle}.previous.$$"
+matching_sniper_pids() {
+  /usr/bin/pgrep -f "$bundle/Contents/MacOS/Sniper" 2>/dev/null || true
+}
 launch_health_check() {
-  if ! /usr/bin/open "$bundle"; then
+  before_pids="$(matching_sniper_pids)"
+  if ! /usr/bin/open -n "$bundle"; then
     return 1
   fi
   launch_attempts=0
   while [ "$launch_attempts" -lt 50 ]; do
-    if /usr/bin/pgrep -f "$bundle/Contents/MacOS/Sniper" >/dev/null 2>&1; then
-      sleep 2
-      /usr/bin/pgrep -f "$bundle/Contents/MacOS/Sniper" >/dev/null 2>&1
-      return $?
-    fi
+    after_pids="$(matching_sniper_pids)"
+    for candidate_pid in $after_pids; do
+      found_before=0
+      for before_pid in $before_pids; do
+        if [ "$candidate_pid" = "$before_pid" ]; then
+          found_before=1
+          break
+        fi
+      done
+      if [ "$found_before" -eq 0 ]; then
+        sleep 2
+        matching_sniper_pids | /usr/bin/grep -qx "$candidate_pid"
+        return $?
+      fi
+    done
     launch_attempts=$((launch_attempts + 1))
     sleep 0.2
   done
@@ -2541,12 +2555,15 @@ mod tests {
         let health_check_pos = script
             .find("launch_health_check()")
             .expect("installer should define a launch health check");
+        let before_pids_pos = script
+            .find("before_pids=\"$(matching_sniper_pids)\"")
+            .expect("installer should capture already-running app processes");
         let open_pos = script
-            .find("if ! /usr/bin/open \"$bundle\"; then")
-            .expect("installer should launch the new app inside the health check");
+            .find("if ! /usr/bin/open -n \"$bundle\"; then")
+            .expect("installer should launch a new app instance inside the health check");
         let pgrep_pos = script
-            .find("/usr/bin/pgrep -f \"$bundle/Contents/MacOS/Sniper\"")
-            .expect("installer should verify the launched Sniper process stays alive");
+            .find("matching_sniper_pids | /usr/bin/grep -qx \"$candidate_pid\"")
+            .expect("installer should verify the launched Sniper pid stays alive");
         let launch_pos = script
             .find("if launch_health_check; then")
             .expect("installer should require the launch health check before cleanup");
@@ -2554,6 +2571,7 @@ mod tests {
             .find("rm -rf \"$backup\" \"$tmp\"")
             .expect("installer should clean up after a successful launch");
         assert!(health_check_pos < ditto_pos);
+        assert!(before_pids_pos < open_pos);
         assert!(open_pos < pgrep_pos);
         assert!(pgrep_pos < launch_pos);
         assert!(launch_pos < cleanup_pos);
