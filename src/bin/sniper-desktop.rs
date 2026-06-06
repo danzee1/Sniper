@@ -178,6 +178,7 @@ fn main() -> Result<()> {
 
     let close_state = state.clone();
     let close_data_dir = close_state.config.data_dir.clone();
+    let teardown_started = Arc::new(AtomicBool::new(false));
     let shutdown_done = Arc::new(AtomicBool::new(false));
     let mut ui_task = Some(ui_task);
     let mut oast_task = Some(oast_task);
@@ -188,8 +189,8 @@ fn main() -> Result<()> {
         let _keep_proxy_task = &proxy_task;
         *control_flow = ControlFlow::Wait;
 
-        let mut teardown_once = || {
-            if shutdown_done.swap(true, Ordering::AcqRel) {
+        let mut teardown_once = |session_persisted: bool| {
+            if !begin_desktop_teardown(teardown_started.as_ref()) {
                 return;
             }
             if let Some(ui_task) = ui_task.take() {
@@ -223,7 +224,11 @@ fn main() -> Result<()> {
             runtime.block_on(proxy::drain_proxy_connections(
                 std::time::Duration::from_secs(1),
             ));
-            complete_desktop_shutdown(shutdown_done.as_ref(), &close_data_dir);
+            finish_desktop_teardown(
+                shutdown_done.as_ref(),
+                &close_data_dir,
+                session_persisted,
+            );
         };
 
         match event {
@@ -237,7 +242,7 @@ fn main() -> Result<()> {
                 }
                 match persist_desktop_session_state(&runtime, close_state.as_ref()) {
                     Ok(()) => {
-                        teardown_once();
+                        teardown_once(true);
                         *control_flow = ControlFlow::Exit;
                     }
                     Err(error) => {
@@ -246,16 +251,26 @@ fn main() -> Result<()> {
                 }
             }
             Event::LoopDestroyed => {
-                if !shutdown_done.load(Ordering::Acquire) {
-                    if let Err(error) = persist_desktop_session_state(&runtime, close_state.as_ref())
-                    {
-                        error!(
-                            ?error,
-                            "desktop shutdown finished without durable session persistence during forced teardown"
-                        );
+                let session_persisted = if shutdown_done.load(Ordering::Acquire) {
+                    true
+                } else {
+                    match persist_desktop_session_state(&runtime, close_state.as_ref()) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            error!(
+                                ?error,
+                                "desktop shutdown finished without durable session persistence during forced teardown"
+                            );
+                            false
+                        }
                     }
+                };
+                if !session_persisted && !teardown_started.load(Ordering::Acquire) {
+                    error!(
+                        "forced desktop teardown will preserve runtime state after failed persistence"
+                    );
                 }
-                teardown_once();
+                teardown_once(session_persisted);
             }
             _ => {}
         }
@@ -311,6 +326,20 @@ fn block_desktop_shutdown(error: anyhow::Error) -> ControlFlow {
         "blocked desktop close because session state was not durably persisted"
     );
     ControlFlow::Wait
+}
+
+fn begin_desktop_teardown(teardown_started: &AtomicBool) -> bool {
+    !teardown_started.swap(true, Ordering::AcqRel)
+}
+
+fn finish_desktop_teardown(shutdown_done: &AtomicBool, data_dir: &Path, session_persisted: bool) {
+    if session_persisted {
+        complete_desktop_shutdown(shutdown_done, data_dir);
+    } else {
+        warn!(
+            "leaving runtime state after failed desktop session persistence during forced teardown"
+        );
+    }
 }
 
 fn complete_desktop_shutdown(shutdown_done: &AtomicBool, data_dir: &Path) {
@@ -673,9 +702,10 @@ fn is_same_origin(url: &str, expected_origin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_desktop_shutdown, combine_desktop_persist_results, complete_desktop_shutdown,
-        handle_navigation_request, handle_new_window_request, is_blocked_desktop_navigation_scheme,
-        is_same_origin, load_shell_rc_contents, shell_single_quote, should_install_cli_path,
+        begin_desktop_teardown, block_desktop_shutdown, combine_desktop_persist_results,
+        complete_desktop_shutdown, finish_desktop_teardown, handle_navigation_request,
+        handle_new_window_request, is_blocked_desktop_navigation_scheme, is_same_origin,
+        load_shell_rc_contents, shell_single_quote, should_install_cli_path,
         upsert_managed_path_line, write_shell_rc_atomically,
     };
 
@@ -760,6 +790,49 @@ mod tests {
         let shutdown_done = std::sync::atomic::AtomicBool::new(false);
 
         complete_desktop_shutdown(&shutdown_done, &root);
+
+        assert!(shutdown_done.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!runtime_state_path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forced_desktop_teardown_preserves_runtime_state_when_persist_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "sniper-desktop-shutdown-failed-persist-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime_state_path = super::runtime_state::runtime_state_path(&root);
+        std::fs::write(&runtime_state_path, "{}").unwrap();
+        let teardown_started = std::sync::atomic::AtomicBool::new(false);
+        let shutdown_done = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(begin_desktop_teardown(&teardown_started));
+        finish_desktop_teardown(&shutdown_done, &root, false);
+
+        assert!(teardown_started.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!shutdown_done.load(std::sync::atomic::Ordering::Acquire));
+        assert!(runtime_state_path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forced_desktop_teardown_removes_runtime_state_after_persist_success() {
+        let root = std::env::temp_dir().join(format!(
+            "sniper-desktop-shutdown-forced-ok-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime_state_path = super::runtime_state::runtime_state_path(&root);
+        std::fs::write(&runtime_state_path, "{}").unwrap();
+        let teardown_started = std::sync::atomic::AtomicBool::new(false);
+        let shutdown_done = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(begin_desktop_teardown(&teardown_started));
+        finish_desktop_teardown(&shutdown_done, &root, true);
 
         assert!(shutdown_done.load(std::sync::atomic::Ordering::Acquire));
         assert!(!runtime_state_path.exists());

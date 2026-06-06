@@ -3874,6 +3874,7 @@ async fn events(
     let mut transaction_receiver = session.store.subscribe();
     let mut log_receiver = session.event_log.subscribe();
     let mut finding_receiver = session.scanner.subscribe();
+    let mut websocket_receiver = session.websockets.subscribe();
     let latest_sequence = session.store.latest_sequence();
 
     let stream = stream! {
@@ -3931,6 +3932,22 @@ async fn events(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             yield Ok(Event::default()
                                 .event("findings_gap")
+                                .data("lagged"));
+                            continue;
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                result = websocket_receiver.recv() => {
+                    match result {
+                        Ok(summary) => {
+                            if let Ok(payload) = serde_json::to_string(&summary) {
+                                yield Ok(Event::default().event("websocket").data(payload));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok(Event::default()
+                                .event("websockets_gap")
                                 .data("lagged"));
                             continue;
                         },
@@ -7428,6 +7445,76 @@ mod tests {
         let page: super::WebSocketPageResponse = response_json(list_response).await;
         assert_eq!(page.items[0].frame_count, 5);
         assert_eq!(page.items[0].last_frame_index, Some(5));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_events_stream_emits_summary_update() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-websocket-events-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let events_response = super::events(
+            State(state),
+            Query(super::EventsQuery {
+                session_id: Some(session.id()),
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(events_response.status(), super::StatusCode::OK);
+        let mut events_body = events_response.into_body();
+
+        let websocket = WebSocketSessionRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            closed_at: None,
+            duration_ms: None,
+            scheme: "wss".to_string(),
+            host: "events.example".to_string(),
+            path: "/socket".to_string(),
+            status: Some(101),
+            request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+            response: None,
+            frames: Vec::new(),
+            notes: Vec::new(),
+        };
+        let websocket_id = websocket.id;
+        session.websockets.open(websocket).await;
+
+        let mut text = String::new();
+        for _ in 0..8 {
+            let frame = tokio::time::timeout(Duration::from_secs(1), events_body.frame())
+                .await
+                .expect("websocket event stream should yield a frame")
+                .expect("websocket event stream should remain open")
+                .expect("websocket event frame should be ok");
+            if let Ok(bytes) = frame.into_data() {
+                text.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            if text.contains("event: websocket") && text.contains(&websocket_id.to_string()) {
+                break;
+            }
+        }
+
+        assert!(
+            text.contains("event: websocket"),
+            "event stream should include websocket summary event: {text}"
+        );
+        assert!(
+            text.contains(&websocket_id.to_string()),
+            "websocket event should include summary id {websocket_id}: {text}"
+        );
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

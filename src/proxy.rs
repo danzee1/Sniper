@@ -3633,6 +3633,11 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>, genera
     });
 }
 
+fn mark_session_persist_pending(session: &Arc<SessionContext>) {
+    remember_persist_context_once(session);
+    mark_persist_dirty(session);
+}
+
 fn remember_persist_context(session: &Arc<SessionContext>) -> u64 {
     let generation = NEXT_PERSIST_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     let mut pending = PERSIST_PENDING_CONTEXTS
@@ -3643,6 +3648,25 @@ fn remember_persist_context(session: &Arc<SessionContext>) -> u64 {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     generations.insert(session.id(), generation);
+    generation
+}
+
+fn remember_persist_context_once(session: &Arc<SessionContext>) -> u64 {
+    let session_id = session.id();
+    let mut pending = PERSIST_PENDING_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut generations = PERSIST_CONTEXT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if pending.contains_key(&session_id) {
+        if let Some(generation) = generations.get(&session_id).copied() {
+            return generation;
+        }
+    }
+    let generation = NEXT_PERSIST_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    pending.insert(session_id, Arc::clone(session));
+    generations.insert(session_id, generation);
     generation
 }
 
@@ -4087,9 +4111,10 @@ async fn relay_websocket_session(
                                     &message,
                                     max_preview,
                                 ) {
-                                    session.websockets.append_frame(id, frame).await;
+                                    if session.websockets.append_frame(id, frame).await {
+                                        mark_session_persist_pending(&session);
+                                    }
                                     frame_index += 1;
-                                    persist_session_quiet(&state, &session).await;
                                 }
                             }
                             continue;
@@ -4107,9 +4132,10 @@ async fn relay_websocket_session(
                                 &captured_message,
                                 max_preview,
                             ) {
-                                session.websockets.append_frame(id, frame).await;
+                                if session.websockets.append_frame(id, frame).await {
+                                    mark_session_persist_pending(&session);
+                                }
                                 frame_index += 1;
-                                persist_session_quiet(&state, &session).await;
                             }
                         }
                         if should_close {
@@ -4141,9 +4167,10 @@ async fn relay_websocket_session(
                                     &message,
                                     max_preview,
                                 ) {
-                                    session.websockets.append_frame(id, frame).await;
+                                    if session.websockets.append_frame(id, frame).await {
+                                        mark_session_persist_pending(&session);
+                                    }
                                     frame_index += 1;
-                                    persist_session_quiet(&state, &session).await;
                                 }
                             }
                             continue;
@@ -4161,9 +4188,10 @@ async fn relay_websocket_session(
                                 &captured_message,
                                 max_preview,
                             ) {
-                                session.websockets.append_frame(id, frame).await;
+                                if session.websockets.append_frame(id, frame).await {
+                                    mark_session_persist_pending(&session);
+                                }
                                 frame_index += 1;
-                                persist_session_quiet(&state, &session).await;
                             }
                         }
                         if should_close {
@@ -4476,6 +4504,35 @@ mod tests {
             session_id,
             new_generation
         ));
+        assert!(pending_session_context(session_id).is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_frame_pending_persist_reuses_existing_generation() {
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: std::env::temp_dir().join(format!(
+                "sniper-proxy-ws-frame-persist-generation-{}",
+                Uuid::new_v4()
+            )),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+
+        let generation = remember_persist_context(&session);
+        mark_session_persist_pending(&session);
+
+        assert_eq!(current_persist_generation(session_id), Some(generation));
+        assert!(pending_session_context(session_id).is_some());
+        assert!(take_persist_dirty(session_id));
+        assert!(forget_persist_context_if_generation(session_id, generation));
         assert!(pending_session_context(session_id).is_none());
 
         let _ = std::fs::remove_dir_all(data_dir);

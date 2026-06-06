@@ -114,6 +114,7 @@ const HTTP_HISTORY_MAX_LOADED_ITEMS = HTTP_HISTORY_PAGE_SIZE;
 const HTTP_HISTORY_BACKFILL_DELAY_MS = 80;
 const HTTP_HISTORY_SCROLL_PREFETCH_ROWS = 120;
 const HTTP_HISTORY_POLL_FALLBACK_MS = 30000;
+const WEBSOCKET_POLL_FALLBACK_MS = 30000;
 const WEBSOCKET_PAGE_SIZE = 500;
 const WEBSOCKET_MAX_LOADED_SESSIONS = 5000;
 const WEBSOCKET_SCROLL_PREFETCH_PX = 240;
@@ -447,7 +448,9 @@ let _websocketLoadGeneration = 0;
 let _websocketDetailGeneration = 0;
 let _websocketDetailPendingId = null;
 let _websocketDetailPendingPromise = null;
+let _websocketDetailRefreshTimer = null;
 let _lastHttpHistoryFallbackPoll = Date.now();
+let _lastWebsocketFallbackPoll = Date.now();
 let _interceptToggleRequestSeq = 0;
 
 const els = {
@@ -2984,6 +2987,11 @@ function resetSessionScopedUiState() {
   state.selectedWebsocketRecord = null;
   _websocketLoadGeneration += 1;
   _websocketDetailGeneration += 1;
+  if (_websocketDetailRefreshTimer) {
+    window.clearTimeout(_websocketDetailRefreshTimer);
+    _websocketDetailRefreshTimer = null;
+  }
+  _lastWebsocketFallbackPoll = Date.now();
   state.eventLog = [];
   state.matchReplaceRules = [];
   state.selectedMatchReplaceRuleId = null;
@@ -3796,6 +3804,102 @@ async function loadWebsocketDetail(id) {
   }
 }
 
+function websocketSummarySignature(summary) {
+  if (!summary) return "";
+  return [
+    summary.id,
+    summary.status ?? "",
+    summary.frame_count ?? 0,
+    summary.last_frame_index ?? "",
+    summary.closed_at ?? "",
+    summary.duration_ms ?? "",
+    summary.note_count ?? 0,
+    summary.started_at ?? "",
+    summary.host ?? "",
+    summary.path ?? "",
+  ].join("|");
+}
+
+function applyWebsocketSummaryEvent(event) {
+  let summary;
+  try {
+    summary = JSON.parse(event.data);
+  } catch (error) {
+    console.error("invalid websocket event", error);
+    return;
+  }
+  if (!summary?.id) return;
+
+  const sessions = Array.isArray(state.websocketSessions) ? state.websocketSessions : [];
+  const existingIndex = sessions.findIndex((item) => item.id === summary.id);
+  const previous = existingIndex >= 0 ? sessions[existingIndex] : null;
+  if (websocketSummarySignature(previous) === websocketSummarySignature(summary)) {
+    return;
+  }
+
+  const nextSessions = sessions.slice();
+  if (existingIndex >= 0) {
+    nextSessions[existingIndex] = summary;
+  } else {
+    nextSessions.unshift(summary);
+    if (nextSessions.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
+      nextSessions.length = WEBSOCKET_MAX_LOADED_SESSIONS;
+    }
+    const paging = state.websocketPaging || createWebsocketPagingState();
+    state.websocketPaging = {
+      ...paging,
+      total: Math.max(Number(paging.total || 0) + 1, nextSessions.length),
+      hasMore: Boolean(paging.hasMore) || nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS,
+      loading: false,
+    };
+  }
+  state.websocketSessions = nextSessions;
+
+  const selectedChanged = state.selectedWebsocketId === summary.id;
+  if (selectedChanged && state.selectedWebsocketRecord) {
+    const loadedLastFrameIndex = state.selectedWebsocketRecord.loaded_last_frame_index ?? null;
+    state.selectedWebsocketRecord = {
+      ...state.selectedWebsocketRecord,
+      status: summary.status,
+      closed_at: summary.closed_at,
+      duration_ms: summary.duration_ms,
+      frame_count: summary.frame_count,
+      last_frame_index: summary.last_frame_index,
+      note_count: summary.note_count,
+      frames_truncated: Number.isFinite(Number(summary.frame_count))
+        && Array.isArray(state.selectedWebsocketRecord.frames)
+        && state.selectedWebsocketRecord.frames.length < Number(summary.frame_count),
+    };
+    if (Number(loadedLastFrameIndex ?? -1) !== Number(summary.last_frame_index ?? -1)) {
+      scheduleSelectedWebsocketDetailRefresh(summary.id);
+    }
+  }
+
+  if (state.activeTool === "proxy" && state.activeProxyTab === "websockets-history") {
+    if (!state.selectedWebsocketId) {
+      syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
+    } else {
+      renderWebsocketSessions();
+    }
+  }
+}
+
+function scheduleSelectedWebsocketDetailRefresh(id) {
+  if (id !== state.selectedWebsocketId || _websocketDetailRefreshTimer) {
+    return;
+  }
+  _websocketDetailRefreshTimer = window.setTimeout(() => {
+    _websocketDetailRefreshTimer = null;
+    if (
+      id === state.selectedWebsocketId
+      && state.activeTool === "proxy"
+      && state.activeProxyTab === "websockets-history"
+    ) {
+      loadWebsocketDetail(id).catch((error) => console.error(error));
+    }
+  }, 750);
+}
+
 async function loadEventLog() {
   const sessionId = currentSessionId();
   const response = await fetch(sessionQueryPath("/api/event-log?limit=200", sessionId));
@@ -3901,7 +4005,10 @@ async function pollAuxiliaryData() {
   }
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "websockets-history") {
-    tasks.push(loadWebsockets(true));
+    if (now - _lastWebsocketFallbackPoll >= WEBSOCKET_POLL_FALLBACK_MS) {
+      _lastWebsocketFallbackPoll = now;
+      tasks.push(loadWebsockets(true));
+    }
   }
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "http-history") {
@@ -3995,6 +4102,21 @@ function connectEvents() {
     } else {
       scheduleFindingsBadgeRefresh();
     }
+  });
+
+  eventSource.addEventListener("websocket", (event) => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
+    applyWebsocketSummaryEvent(event);
+  });
+
+  eventSource.addEventListener("websockets_gap", () => {
+    if (eventSessionId !== currentSessionId()) {
+      return;
+    }
+    _lastWebsocketFallbackPoll = Date.now();
+    loadWebsockets(true).catch((error) => console.error(error));
   });
 
   eventSource.addEventListener("session_changed", () => {

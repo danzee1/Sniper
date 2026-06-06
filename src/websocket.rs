@@ -49,7 +49,8 @@ impl WebSocketStore {
         }
     }
 
-    pub async fn open(&self, session: WebSocketSessionRecord) {
+    pub async fn open(&self, mut session: WebSocketSessionRecord) {
+        trim_frame_overflow(&mut session.frames, self.max_frames_per_session);
         let summary = session.summary();
         let mut sessions = self.sessions.write().await;
         sessions.push_front(session);
@@ -61,10 +62,7 @@ impl WebSocketStore {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
             session.frames.push(frame);
-            if session.frames.len() > self.max_frames_per_session {
-                let overflow = session.frames.len() - self.max_frames_per_session;
-                session.frames.drain(..overflow);
-            }
+            trim_frame_overflow(&mut session.frames, self.max_frames_per_session);
             let _ = self.events.send(session.summary());
             true
         } else {
@@ -225,10 +223,7 @@ fn sessions_with_live_preserved(
     records
         .into_iter()
         .filter_map(|mut session| {
-            if session.frames.len() > max_frames_per_session {
-                let overflow = session.frames.len() - max_frames_per_session;
-                session.frames.drain(..overflow);
-            }
+            trim_frame_overflow(&mut session.frames, max_frames_per_session);
             if session.closed_at.is_none() {
                 if live_remaining == 0 {
                     return None;
@@ -243,6 +238,13 @@ fn sessions_with_live_preserved(
             Some(session)
         })
         .collect()
+}
+
+fn trim_frame_overflow(frames: &mut Vec<WebSocketFrameRecord>, max_frames_per_session: usize) {
+    if frames.len() > max_frames_per_session {
+        let overflow = frames.len() - max_frames_per_session;
+        frames.drain(..overflow);
+    }
 }
 
 fn trim_closed_overflow(sessions: &mut VecDeque<WebSocketSessionRecord>, max_entries: usize) {
@@ -316,6 +318,28 @@ mod tests {
         assert_eq!(restored[0].frames.len(), 2);
         assert_eq!(restored[0].frames[0].index, 2);
         assert_eq!(restored[0].frames[1].index, 3);
+    }
+
+    #[tokio::test]
+    async fn open_trims_initial_frames_to_cap() {
+        let store = WebSocketStore::new(10, 2);
+
+        store
+            .open(session(vec![frame(1), frame(2), frame(3)]))
+            .await;
+
+        let restored = store.snapshot(None).await;
+        assert_eq!(
+            restored[0]
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let page = store.list_page(Some(10)).await;
+        assert_eq!(page.items[0].frame_count, 2);
+        assert_eq!(page.items[0].last_frame_index, Some(3));
     }
 
     #[tokio::test]
