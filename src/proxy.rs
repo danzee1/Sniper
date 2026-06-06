@@ -2499,6 +2499,7 @@ async fn forward_websocket_request(
         state.config.body_preview_bytes,
     );
     let request_path = normalize_request_path(&forwarded_request.path);
+    let capture_enabled = session.runtime.websocket_capture_enabled().await;
     let http_record = with_record_http_versions(
         TransactionRecord::http(
             started_at,
@@ -2512,7 +2513,7 @@ async fn forward_websocket_request(
             Some(response_capture.clone()),
             merge_notes(
                 merge_notes(request_notes, applied_response.notes),
-                vec!["WebSocket upgrade proxied and mirrored into WebSockets history.".to_string()],
+                vec![websocket_upgrade_transaction_note(capture_enabled).to_string()],
             ),
             original_request_capture,
             original_response_capture,
@@ -2531,7 +2532,6 @@ async fn forward_websocket_request(
         )
         .await;
 
-    let capture_enabled = session.runtime.websocket_capture_enabled().await;
     let captured_websocket_id = capture_enabled.then(Uuid::new_v4);
 
     if let Some(id) = captured_websocket_id {
@@ -3843,6 +3843,14 @@ fn header_values_contain_token(headers: &HeaderMap, name: HeaderName, token: &st
 fn is_websocket_upgrade_editable(request: &EditableRequest) -> bool {
     let headers = header_map_from_records(&request.headers);
     is_websocket_upgrade_headers(&headers)
+}
+
+fn websocket_upgrade_transaction_note(capture_enabled: bool) -> &'static str {
+    if capture_enabled {
+        "WebSocket upgrade proxied and mirrored into WebSockets history."
+    } else {
+        "WebSocket upgrade proxied; WebSocket capture is disabled."
+    }
 }
 
 struct ConnectedWebSocket {
@@ -5804,6 +5812,18 @@ mod tests {
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
 
         assert!(is_websocket_upgrade_headers(&headers));
+    }
+
+    #[test]
+    fn websocket_upgrade_note_reflects_capture_setting() {
+        assert_eq!(
+            websocket_upgrade_transaction_note(true),
+            "WebSocket upgrade proxied and mirrored into WebSockets history."
+        );
+        assert_eq!(
+            websocket_upgrade_transaction_note(false),
+            "WebSocket upgrade proxied; WebSocket capture is disabled."
+        );
     }
 
     #[test]

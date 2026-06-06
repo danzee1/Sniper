@@ -472,6 +472,9 @@ let _websocketDetailRefreshTimer = null;
 let _websocketDetailRefreshNeededId = null;
 let _websocketSummaryMutationGeneration = 0;
 let _websocketSummaryMutationById = new Map();
+let _websocketVisibleSyncTimer = null;
+let _websocketVisibleSyncEnsureSelected = false;
+let _websocketVisibleSyncDeferStaleDetail = false;
 let _websocketQueryBackfillTimer = 0;
 let _websocketQueryBackfillGeneration = 0;
 let _lastHttpHistoryFallbackPoll = Date.now();
@@ -4576,12 +4579,12 @@ function applyWebsocketSummaryEvent(event) {
 
   if (isWebsocketHistoryVisible()) {
     if (!state.selectedWebsocketId) {
-      syncVisibleWebsocketSelection(true).catch((error) => console.error(error));
+      scheduleVisibleWebsocketSelectionSync();
     } else {
-      syncVisibleWebsocketSelection(true, {
+      scheduleVisibleWebsocketSelectionSync({
         ensureSelectedVisible: true,
         deferStaleDetail: true,
-      }).catch((error) => console.error(error));
+      });
     }
   }
 }
@@ -4618,6 +4621,34 @@ function scheduleSelectedWebsocketDetailRefresh(id) {
       loadWebsocketDetail(refreshId, { force: true }).catch((error) => console.error(error));
     }
   }, 750);
+}
+
+function scheduleVisibleWebsocketSelectionSync(options = {}) {
+  if (!isWebsocketHistoryVisible()) {
+    return;
+  }
+  _websocketVisibleSyncEnsureSelected =
+    _websocketVisibleSyncEnsureSelected || options.ensureSelectedVisible === true;
+  _websocketVisibleSyncDeferStaleDetail =
+    _websocketVisibleSyncDeferStaleDetail || options.deferStaleDetail === true;
+  if (_websocketVisibleSyncTimer) {
+    return;
+  }
+  _websocketVisibleSyncTimer = window.setTimeout(() => {
+    _websocketVisibleSyncTimer = null;
+    const ensureSelectedVisible =
+      _websocketVisibleSyncEnsureSelected || Boolean(state.selectedWebsocketId);
+    const deferStaleDetail = _websocketVisibleSyncDeferStaleDetail;
+    _websocketVisibleSyncEnsureSelected = false;
+    _websocketVisibleSyncDeferStaleDetail = false;
+    if (!isWebsocketHistoryVisible()) {
+      return;
+    }
+    syncVisibleWebsocketSelection(true, {
+      ensureSelectedVisible,
+      deferStaleDetail,
+    }).catch((error) => console.error(error));
+  }, 100);
 }
 
 async function loadEventLog() {
@@ -16379,17 +16410,20 @@ function escapeHtml(value) {
 function normalizeWebsocketFrames(frames) {
   return (Array.isArray(frames) ? frames : [])
     .filter((frame) => frame && typeof frame === "object")
-    .map((frame, fallbackIndex) => {
-      const index = Number(frame.index);
-      return {
-        ...frame,
-        index: Number.isFinite(index) ? index : fallbackIndex,
-        direction: frame.direction === "client_to_server" ? "client_to_server" : "server_to_client",
-        kind: String(frame.kind || "text"),
-        body: String(frame.body ?? frame.body_preview ?? ""),
-        body_preview: String(frame.body_preview ?? frame.body ?? ""),
-      };
-    });
+    .map((frame, fallbackIndex) => normalizeWebsocketFrame(frame, fallbackIndex));
+}
+
+function normalizeWebsocketFrame(frame, fallbackIndex = 0) {
+  if (!frame || typeof frame !== "object") return null;
+  const index = Number(frame.index);
+  return {
+    ...frame,
+    index: Number.isFinite(index) ? index : fallbackIndex,
+    direction: frame.direction === "client_to_server" ? "client_to_server" : "server_to_client",
+    kind: String(frame.kind || "text"),
+    body: String(frame.body ?? frame.body_preview ?? ""),
+    body_preview: String(frame.body_preview ?? frame.body ?? ""),
+  };
 }
 
 function getWebsocketFrames(session) {
@@ -16410,6 +16444,24 @@ function websocketFramesAreTruncated(frames, summary) {
 
 function getWsReplayFrames(tab) {
   return normalizeWebsocketFrames(tab?.wsFrames);
+}
+
+function getRawWsReplayFrames(tab) {
+  return Array.isArray(tab?.wsFrames) ? tab.wsFrames : [];
+}
+
+function wsFrameIndexValue(frame, fallbackIndex = 0) {
+  const index = Number(frame?.index);
+  return Number.isFinite(index) ? index : fallbackIndex;
+}
+
+function wsReplayFrameIndexSet(tab) {
+  const indexes = new Set();
+  const frames = getRawWsReplayFrames(tab);
+  for (let index = 0; index < frames.length; index += 1) {
+    indexes.add(wsFrameIndexValue(frames[index], index));
+  }
+  return indexes;
 }
 
 function utf8ByteLength(value) {
@@ -16460,7 +16512,16 @@ function snapshotWsReplayFrames(tab, budget = null) {
   const frameLimit = budget
     ? Math.min(WS_REPLAY_MAX_PERSISTED_FRAMES, Math.max(0, budget.frames))
     : WS_REPLAY_MAX_PERSISTED_FRAMES;
-  const frames = getWsReplayFrames(tab).slice(-frameLimit);
+  const rawFrames = getRawWsReplayFrames(tab);
+  const frames = [];
+  for (
+    let rawIndex = rawFrames.length - 1;
+    rawIndex >= 0 && frames.length < frameLimit;
+    rawIndex -= 1
+  ) {
+    const frame = normalizeWebsocketFrame(rawFrames[rawIndex], rawIndex);
+    if (frame) frames.unshift(frame);
+  }
   const selected = [];
   for (let reverseIndex = frames.length - 1; reverseIndex >= 0; reverseIndex -= 1) {
     const frame = frames[reverseIndex];
@@ -17031,7 +17092,7 @@ function applyWsReplayFramePollResponse(tab, data, sinceIndex) {
 
   let addedFrames = false;
   if (incomingFrames.length > 0) {
-    const existing = new Set(getWsReplayFrames(tab).map((frame) => frame.index));
+    const existing = wsReplayFrameIndexSet(tab);
     const fresh = incomingFrames.filter((frame) => !existing.has(frame.index));
     if (fresh.length) {
       if (!Array.isArray(tab.wsFrames)) tab.wsFrames = [];
@@ -17071,11 +17132,12 @@ function stopWsPoll(tab) {
 }
 
 function nextWsFrameIndex(tab) {
-  const frames = getWsReplayFrames(tab);
-  return frames.reduce((next, frame) => {
-    const index = Number(frame?.index);
-    return Number.isFinite(index) ? Math.max(next, index + 1) : next;
-  }, frames.length);
+  const frames = getRawWsReplayFrames(tab);
+  let next = frames.length;
+  for (let fallbackIndex = 0; fallbackIndex < frames.length; fallbackIndex += 1) {
+    next = Math.max(next, wsFrameIndexValue(frames[fallbackIndex], fallbackIndex) + 1);
+  }
+  return next;
 }
 
 function trimWsReplayFrames(tab) {

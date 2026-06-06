@@ -210,6 +210,28 @@ pub fn remove_runtime_state(data_dir: &Path) -> Result<()> {
     }
 }
 
+pub fn remove_runtime_state_if_matches(
+    data_dir: &Path,
+    expected: &RuntimeStateSnapshot,
+) -> Result<bool> {
+    let Some(current) = load_runtime_state(data_dir)? else {
+        return Ok(false);
+    };
+    if !runtime_state_matches(&current, expected) {
+        return Ok(false);
+    }
+    remove_runtime_state(data_dir)?;
+    Ok(true)
+}
+
+fn runtime_state_matches(left: &RuntimeStateSnapshot, right: &RuntimeStateSnapshot) -> bool {
+    left.proxy_addr == right.proxy_addr
+        && left.ui_addr == right.ui_addr
+        && left.proxy_online == right.proxy_online
+        && left.updated_at == right.updated_at
+        && left.app_version == right.app_version
+}
+
 fn sync_directory(path: &Path, label: &str) -> Result<()> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -282,6 +304,34 @@ mod tests {
         remove_runtime_state(&temp_dir).unwrap();
         assert!(!runtime_state_path(&temp_dir).exists());
         remove_runtime_state(&temp_dir).unwrap();
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_state_remove_if_matches_preserves_replaced_snapshot() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sniper-runtime-state-remove-match-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let expected = RuntimeStateSnapshot::new(
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+        );
+        let replacement = RuntimeStateSnapshot::new(
+            "127.0.0.1:8081".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
+        );
+        persist_runtime_state(&temp_dir, &expected).unwrap();
+        persist_runtime_state(&temp_dir, &replacement).unwrap();
+
+        assert!(!super::remove_runtime_state_if_matches(&temp_dir, &expected).unwrap());
+        assert!(runtime_state_path(&temp_dir).exists());
+        let loaded = load_runtime_state(&temp_dir).unwrap().unwrap();
+        assert_eq!(loaded.ui_addr, replacement.ui_addr);
+
+        assert!(super::remove_runtime_state_if_matches(&temp_dir, &replacement).unwrap());
+        assert!(!runtime_state_path(&temp_dir).exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

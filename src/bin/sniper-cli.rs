@@ -24,7 +24,7 @@ use sniper::{
         TransactionRecord, TransactionSummary, WebSocketSessionRecord, WebSocketSessionSummary,
     },
     runtime::RuntimeSettingsSnapshot,
-    runtime_state::load_runtime_state,
+    runtime_state::{load_runtime_state, remove_runtime_state_if_matches},
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     session::SessionSummary,
     skills,
@@ -3130,7 +3130,13 @@ async fn discover_api_base_url(
         }
     }
 
-    let data_dir = default_data_dir();
+    discover_api_base_url_from_data_dir(client, default_data_dir()).await
+}
+
+async fn discover_api_base_url_from_data_dir(
+    client: &reqwest::Client,
+    data_dir: PathBuf,
+) -> Result<String> {
     let runtime_state = load_runtime_state(&data_dir).with_context(|| {
         format!(
             "failed to read Sniper runtime-state; it may be mid-update or stale at {}",
@@ -3142,10 +3148,32 @@ async fn discover_api_base_url(
         if probe_sniper_api_base_url(&url, client).await.is_ok() {
             return Ok(url);
         }
+        let remove_result = remove_runtime_state_if_matches(&data_dir, &runtime_state);
         // Probe failed — stale runtime-state
+        let removed_stale = match remove_result {
+            Ok(removed) => removed,
+            Err(error) => {
+                bail!(
+                    "Sniper API at {} is not responding (stale runtime-state from {}), \
+                     and failed to remove stale runtime-state: {error}. \
+                     Either start Sniper Desktop or pass --api http://HOST:PORT explicitly.",
+                    runtime_state.ui_addr,
+                    runtime_state.updated_at.format("%Y-%m-%d %H:%M:%S")
+                );
+            }
+        };
+        if !removed_stale {
+            bail!(
+                "Sniper API at {} is not responding (stale runtime-state from {}), \
+                 but runtime-state changed before cleanup. \
+                 Either start Sniper Desktop or pass --api http://HOST:PORT explicitly.",
+                runtime_state.ui_addr,
+                runtime_state.updated_at.format("%Y-%m-%d %H:%M:%S")
+            );
+        }
         bail!(
             "Sniper API at {} is not responding (stale runtime-state from {}). \
-             Either start Sniper Desktop or pass --api http://HOST:PORT explicitly.",
+             Removed the stale runtime-state; start Sniper Desktop or pass --api http://HOST:PORT explicitly.",
             runtime_state.ui_addr,
             runtime_state.updated_at.format("%Y-%m-%d %H:%M:%S")
         )
@@ -4062,10 +4090,11 @@ mod tests {
         active_session_id_from_summaries, api_url, attach_workspace_save_error,
         build_annotations_payload, build_editable_raw_request,
         build_editable_raw_request_with_version, build_oast_configure_update,
-        default_editable_request, explicit_or_active_session_id, failed_record_output,
-        fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
-        install_skills, next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
-        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
+        default_editable_request, discover_api_base_url_from_data_dir,
+        explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
+        fuzzer_target_request_authority_for_request, install_skills, next_replay_tab_sequence,
+        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
+        oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
         push_replay_history_entry, read_limited_to_end, read_payloads_input,
@@ -4084,6 +4113,7 @@ mod tests {
     use sniper::model::{
         BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, RequestTargetOverride,
     };
+    use sniper::runtime_state::{persist_runtime_state, runtime_state_path, RuntimeStateSnapshot};
     use sniper::session::SessionSummary;
     use sniper::skills;
     use sniper::workspace::{
@@ -6002,6 +6032,36 @@ mod tests {
             "features": ["health"]
         });
         assert!(!sniper_settings_probe_matches(&wrong_service));
+    }
+
+    #[tokio::test]
+    async fn discovery_removes_stale_runtime_state_after_probe_failure() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-cli-stale-runtime-{}", Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_ui_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let snapshot = RuntimeStateSnapshot::with_proxy_status(
+            "127.0.0.1:18080".parse().unwrap(),
+            closed_ui_addr,
+            true,
+        );
+        persist_runtime_state(&root, &snapshot).unwrap();
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let error = discover_api_base_url_from_data_dir(&client, root.clone())
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Removed the stale runtime-state"));
+        assert!(!runtime_state_path(&root).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
