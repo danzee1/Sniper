@@ -1218,6 +1218,8 @@ fn rebuild_streaming_response(
         if let Some(value) = upstream_content_length {
             sanitized.insert(CONTENT_LENGTH, value);
         }
+    } else {
+        sanitized.remove(CONTENT_LENGTH);
     }
 
     let mut response = Response::new(body);

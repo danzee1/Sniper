@@ -79,7 +79,9 @@ async fn proxy_streams_open_upstream_response_before_eof() {
         let mut request = [0_u8; 1024];
         let _ = socket.read(&mut request).await.unwrap();
         socket
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello")
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\n\r\nhello",
+            )
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -198,6 +200,10 @@ async fn flush_pending_persists_waits_for_streaming_body_pump_store() {
     })
     .await
     .expect("proxy should stream response bytes before upstream EOF");
+    let response_text = String::from_utf8_lossy(&buffer);
+    assert!(!response_text
+        .to_ascii_lowercase()
+        .contains("content-length"));
 
     let session = state.session().await;
     flush_pending_session_persists(state.as_ref())

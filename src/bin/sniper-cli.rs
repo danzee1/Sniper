@@ -1738,6 +1738,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.notice.clear();
             let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
 
+            ensure_cli_record_not_failed("fuzzer attack", &record)?;
             if args.r#async {
                 print_json(&json!({
                     "async_requested": true,
@@ -1750,7 +1751,6 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             if let Some(save_error) = workspace_save_error {
                 bail!("fuzzer attack completed, but workspace state was not saved: {save_error}");
             }
-            ensure_cli_record_not_failed("fuzzer attack", &record)?;
             Ok(())
         }
         FuzzerCommand::Status(args) => {
@@ -2064,8 +2064,8 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
                     &SessionIdPayload { session_id },
                 )
                 .await?;
-            print_json(&result)?;
             ensure_json_status_not_failed("sequence run", &result)?;
+            print_json(&result)?;
             Ok(())
         }
         SequenceCommand::RunGet(args) => {

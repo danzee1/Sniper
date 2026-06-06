@@ -111,6 +111,7 @@ impl WebSocketSessionEntry {
 pub struct WebSocketListPage {
     pub items: Vec<WebSocketSessionSummary>,
     pub total: usize,
+    pub offset: usize,
     pub limit: usize,
     pub has_more: bool,
 }
@@ -187,24 +188,31 @@ impl WebSocketStore {
     }
 
     pub async fn list(&self, limit: Option<usize>) -> Vec<WebSocketSessionSummary> {
-        self.list_page(limit).await.items
+        self.list_page(limit, None).await.items
     }
 
-    pub async fn list_page(&self, limit: Option<usize>) -> WebSocketListPage {
+    pub async fn list_page(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> WebSocketListPage {
         let inner = self.inner.read().await;
         let total = inner.order.len();
         let limit = limit.unwrap_or(self.max_entries).min(self.max_entries);
+        let offset = offset.unwrap_or(0).min(total);
         let items = inner
             .order
             .iter()
+            .skip(offset)
             .take(limit)
             .filter_map(|id| inner.sessions.get(id).map(WebSocketSessionEntry::summary))
             .collect();
         WebSocketListPage {
             items,
             total,
+            offset,
             limit,
-            has_more: limit < total,
+            has_more: offset.saturating_add(limit) < total,
         }
     }
 
@@ -456,7 +464,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
-        let page = store.list_page(Some(10)).await;
+        let page = store.list_page(Some(10), None).await;
         assert_eq!(page.items[0].frame_count, 2);
         assert_eq!(page.items[0].last_frame_index, Some(3));
     }
@@ -487,7 +495,7 @@ mod tests {
 
         assert!(store.append_frame(record_id, frame(3)).await);
 
-        let page = store.list_page(Some(10)).await;
+        let page = store.list_page(Some(10), None).await;
         let summary = &page.items[0];
         assert_eq!(summary.frame_count, 2);
         assert_eq!(summary.last_frame_index, Some(3));
@@ -512,7 +520,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![8, 9, 10]
         );
-        let summary = &store.list_page(Some(10)).await.items[0];
+        let summary = &store.list_page(Some(10), None).await.items[0];
         assert_eq!(summary.frame_count, 3);
         assert_eq!(summary.last_frame_index, Some(10));
     }
@@ -556,11 +564,33 @@ mod tests {
         store.open(first).await;
         store.open(replacement).await;
 
-        let page = store.list_page(Some(10)).await;
+        let page = store.list_page(Some(10), None).await;
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].host, "replacement.example");
         let stored = store.get(first_id).await.unwrap();
         assert_eq!(stored.frames[0].index, 2);
+    }
+
+    #[tokio::test]
+    async fn list_page_returns_offset_window_without_resending_prefix() {
+        let store = WebSocketStore::new(10, 10);
+        let first = session(Vec::new());
+        let second = session(Vec::new());
+        let second_id = second.id;
+        let third = session(Vec::new());
+
+        store.open(first).await;
+        store.open(second).await;
+        store.open(third).await;
+
+        let page = store.list_page(Some(1), Some(1)).await;
+
+        assert_eq!(page.total, 3);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.limit, 1);
+        assert!(page.has_more);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, second_id);
     }
 
     #[tokio::test]
@@ -584,7 +614,7 @@ mod tests {
         let snapshot = store.snapshot(Some(10)).await;
         assert_eq!(snapshot.len(), 1);
         assert_ne!(snapshot[0].id, first_id);
-        assert_eq!(store.list_page(Some(10)).await.total, 1);
+        assert_eq!(store.list_page(Some(10), None).await.total, 1);
     }
 
     #[tokio::test]

@@ -1611,6 +1611,7 @@ impl From<TransactionListPage> for TransactionPageResponse {
 struct WebSocketQuery {
     session_id: Option<Uuid>,
     limit: Option<usize>,
+    offset: Option<usize>,
     frame_limit: Option<usize>,
 }
 
@@ -1618,6 +1619,7 @@ struct WebSocketQuery {
 struct WebSocketPageResponse {
     items: Vec<crate::model::WebSocketSessionSummary>,
     total: usize,
+    offset: usize,
     limit: usize,
     has_more: bool,
 }
@@ -3445,7 +3447,10 @@ async fn list_websockets(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let page = session.websockets.list_page(query.limit).await;
+    let page = session
+        .websockets
+        .list_page(query.limit, query.offset)
+        .await;
     Json(page.items).into_response()
 }
 
@@ -3460,10 +3465,14 @@ async fn list_websockets_page(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let page = session.websockets.list_page(query.limit).await;
+    let page = session
+        .websockets
+        .list_page(query.limit, query.offset)
+        .await;
     Json(WebSocketPageResponse {
         items: page.items,
         total: page.total,
+        offset: page.offset,
         limit: page.limit,
         has_more: page.has_more,
     })
@@ -7345,6 +7354,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: None,
                 limit: None,
+                offset: None,
                 frame_limit: None,
             }),
         )
@@ -7359,6 +7369,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(original_id),
                 limit: None,
+                offset: None,
                 frame_limit: None,
             }),
         )
@@ -7369,6 +7380,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(original_id),
                 limit: None,
+                offset: None,
                 frame_limit: None,
             }),
         )
@@ -7431,6 +7443,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(session.id()),
                 limit: None,
+                offset: None,
                 frame_limit: Some(2),
             }),
         )
@@ -7452,6 +7465,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(session.id()),
                 limit: None,
+                offset: None,
                 frame_limit: Some(0),
             }),
         )
@@ -7465,6 +7479,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(session.id()),
                 limit: Some(10),
+                offset: None,
                 frame_limit: None,
             }),
         )
@@ -7478,6 +7493,7 @@ mod tests {
             Query(super::WebSocketQuery {
                 session_id: Some(session.id()),
                 limit: Some(10),
+                offset: None,
                 frame_limit: None,
             }),
         )

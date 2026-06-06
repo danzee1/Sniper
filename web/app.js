@@ -296,6 +296,7 @@ function websocketPagePayload(value) {
   return {
     items,
     total: Number.isFinite(Number(payload.total)) ? Number(payload.total) : items.length,
+    offset: Number.isFinite(Number(payload.offset)) ? Number(payload.offset) : 0,
     limit: Number.isFinite(Number(payload.limit)) ? Number(payload.limit) : items.length,
     has_more: Boolean(payload.has_more),
   };
@@ -324,6 +325,7 @@ function createWebsocketPagingState() {
   return {
     total: 0,
     limit: WEBSOCKET_PAGE_SIZE,
+    offset: 0,
     hasMore: false,
     loading: false,
   };
@@ -333,6 +335,7 @@ const state = {
   items: [],
   selectedId: null,
   selectedRecord: null,
+  loadingDetailId: null,
   historyPaging: createHistoryPagingState(),
   historyDirty: false,
   historyResetScrollOnNextLoad: false,
@@ -1034,7 +1037,7 @@ function bindEvents() {
     state.selectedId = row.dataset.id;
     state.selectedRecord = null;
     updateHistorySelection(state.selectedId);
-    renderEmptyDetail();
+    renderLoadingDetail("Loading selected transaction...");
     scrollSelectedHistoryRowIntoView();
     loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
     // Keep focus on the table so arrow keys navigate rows, not code-view lines
@@ -1047,7 +1050,7 @@ function bindEvents() {
     state.selectedId = row.dataset.id;
     state.selectedRecord = null;
     updateHistorySelection(state.selectedId);
-    renderEmptyDetail();
+    renderLoadingDetail("Loading selected transaction...");
     loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
     openContextMenu(event.clientX, event.clientY, row.dataset.id);
   });
@@ -2271,6 +2274,7 @@ async function _applySettings(response) {
   state.settings = await response.json();
   state.runtime = state.settings.runtime;
   state.activeSession = state.settings.active_session;
+  state.oastTokenClearPending = false;
   // Sync intercept scope pill with server state
   const interceptScopePill = document.getElementById("interceptInScopeToggle");
   if (interceptScopePill) {
@@ -3454,6 +3458,7 @@ async function loadTransactionDetail(id) {
   if (state.selectedId !== id || sessionId !== currentSessionId()) {
     return null;
   }
+  state.loadingDetailId = null;
   state.selectedRecord = record;
   renderDetail(state.selectedRecord);
   return record;
@@ -3691,31 +3696,41 @@ async function toggleInterceptRuleEnabled(ruleId, enabled) {
   await loadInterceptRules();
 }
 
-async function loadWebsockets(preserveSelection = true) {
+async function loadWebsockets(preserveSelection = true, options = {}) {
   const generation = ++_websocketLoadGeneration;
   const summaryMutationGeneration = _websocketSummaryMutationGeneration;
   const sessionId = currentSessionId();
-  const requestedLimit = normalizeWebsocketLoadLimit(state.websocketPaging?.limit);
+  const append = Boolean(options.append);
+  const requestedOffset = append ? Math.max(0, Number(options.offset ?? state.websocketSessions.length) || 0) : 0;
+  const requestedLimit = append
+    ? WEBSOCKET_PAGE_SIZE
+    : normalizeWebsocketLoadLimit(options.limit ?? state.websocketPaging?.limit);
   state.websocketPaging = {
     ...createWebsocketPagingState(),
     ...(state.websocketPaging || {}),
-    limit: requestedLimit,
+    offset: requestedOffset,
     loading: true,
   };
   try {
-    const response = await fetch(sessionQueryPath(`/api/websockets-page?limit=${requestedLimit}`, sessionId));
+    const response = await fetch(sessionQueryPath(`/api/websockets-page?limit=${requestedLimit}&offset=${requestedOffset}`, sessionId));
     await requireOkResponse(response, "Failed to load WebSocket history.");
     const page = websocketPagePayload(await response.json());
     if (generation !== _websocketLoadGeneration || sessionId !== currentSessionId()) {
       return;
     }
-    const loadedLimit = normalizeWebsocketLoadLimit(page.limit || requestedLimit);
-    state.websocketSessions = summaryMutationGeneration === _websocketSummaryMutationGeneration
-      ? page.items
-      : mergeWebsocketPageWithCurrentSummaries(page.items, state.websocketSessions, summaryMutationGeneration);
+    state.websocketSessions = append
+      ? mergeWebsocketAppendPage(page.items, state.websocketSessions, summaryMutationGeneration)
+      : (summaryMutationGeneration === _websocketSummaryMutationGeneration
+        ? page.items
+        : mergeWebsocketPageWithCurrentSummaries(page.items, state.websocketSessions, summaryMutationGeneration));
+    const loadedLimit = Math.max(
+      state.websocketSessions.length,
+      Number(page.offset || requestedOffset) + jsonArray(page.items).length,
+    );
     state.websocketPaging = {
       total: Math.max(Number(page.total || 0), state.websocketSessions.length),
       limit: loadedLimit,
+      offset: Math.max(0, Number(page.offset || requestedOffset) || 0),
       hasMore: Boolean(page.has_more) && loadedLimit < WEBSOCKET_MAX_LOADED_SESSIONS,
       loading: false,
     };
@@ -3736,19 +3751,14 @@ async function loadMoreWebsockets() {
   if (paging.loading || !paging.hasMore) {
     return;
   }
-  const nextLimit = normalizeWebsocketLoadLimit(
-    Math.min(
-      WEBSOCKET_MAX_LOADED_SESSIONS,
-      Math.max(paging.limit + WEBSOCKET_PAGE_SIZE, state.websocketSessions.length + WEBSOCKET_PAGE_SIZE),
-    ),
-  );
-  if (nextLimit <= paging.limit) {
+  const nextOffset = Math.max(0, state.websocketSessions.length);
+  if (nextOffset >= WEBSOCKET_MAX_LOADED_SESSIONS) {
     state.websocketPaging = { ...paging, hasMore: false };
     renderWebsocketSessions();
     return;
   }
-  state.websocketPaging = { ...paging, limit: nextLimit };
-  await loadWebsockets(true);
+  state.websocketPaging = { ...paging, offset: nextOffset };
+  await loadWebsockets(true, { append: true, offset: nextOffset });
 }
 
 function websocketQueryBackfillShouldRun(visibleCount) {
@@ -3880,6 +3890,35 @@ function mergeWebsocketPageWithCurrentSummaries(pageItems, currentItems, mutatio
     seen.add(item.id);
   }
   merged.unshift(...preserved);
+  if (merged.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
+    merged.length = WEBSOCKET_MAX_LOADED_SESSIONS;
+  }
+  return merged;
+}
+
+function mergeWebsocketAppendPage(pageItems, currentItems, mutationGenerationAtRequest) {
+  const currentById = new Map((currentItems || []).map((item) => [item.id, item]));
+  const merged = [];
+  const seen = new Set();
+  for (const item of currentItems || []) {
+    if (!item?.id || seen.has(item.id)) continue;
+    merged.push(item);
+    seen.add(item.id);
+  }
+  for (const item of pageItems || []) {
+    if (!item?.id) continue;
+    const current = currentById.get(item.id);
+    const currentMutatedDuringRequest = (_websocketSummaryMutationById.get(item.id) || 0) > mutationGenerationAtRequest;
+    if (current) {
+      if (currentMutatedDuringRequest && isWebsocketSummaryFresher(current, item)) continue;
+      const index = merged.findIndex((candidate) => candidate.id === item.id);
+      if (index >= 0) merged[index] = item;
+      continue;
+    }
+    if (seen.has(item.id)) continue;
+    merged.push(item);
+    seen.add(item.id);
+  }
   if (merged.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
     merged.length = WEBSOCKET_MAX_LOADED_SESSIONS;
   }
@@ -4404,11 +4443,7 @@ function replaceHistoryItemsForGap(items) {
   rebuildHistoryItemIndex();
   state._itemsVersion += 1;
   invalidateVisibleEntriesCache();
-  if (state.selectedId && !getHistoryItem(state.selectedId)) {
-    state.selectedId = null;
-    state.selectedRecord = null;
-    renderEmptyDetail();
-  }
+  moveHistorySelectionIfMissing("first");
   refreshHistoryPagingCursorFromItems();
   return freshItems.length;
 }
@@ -4434,16 +4469,36 @@ function trimHistoryCache(prefer = "recent") {
   }
 
   state._connectCount = state.items.reduce((count, item) => count + (item.method === "CONNECT" ? 1 : 0), 0);
-  reconcileHistorySelectionAfterTrim(removed);
+  reconcileHistorySelectionAfterTrim(removed, prefer === "older" ? "first" : "last");
   refreshHistoryPagingCursorFromItems();
   return removed.length;
 }
 
-function reconcileHistorySelectionAfterTrim(removedItems = []) {
+function reconcileHistorySelectionAfterTrim(removedItems = [], fallback = "first") {
   if (!state.selectedId || !removedItems.some((item) => item?.id === state.selectedId)) {
     return;
   }
+  moveHistorySelectionIfMissing(fallback);
+}
+
+function moveHistorySelectionIfMissing(fallback = "first") {
+  if (!state.selectedId || getHistoryItem(state.selectedId)) {
+    return false;
+  }
+  const nextItem = fallback === "last"
+    ? state.items[state.items.length - 1]
+    : state.items[0];
+  state.selectedId = nextItem?.id ?? null;
+  state.selectedRecord = null;
+  state.loadingDetailId = null;
   updateHistorySelection(state.selectedId);
+  if (state.selectedId) {
+    renderLoadingDetail("Loading selected transaction...");
+    loadTransactionDetail(state.selectedId).catch((error) => console.error(error));
+  } else {
+    renderEmptyDetail();
+  }
+  return true;
 }
 
 function adjustHistoryScrollAfterHeadTrim(removedCount) {
@@ -7532,6 +7587,7 @@ function selectCodePaneContents(targetPane) {
 
 function renderDetail(record, options = {}) {
   if (!els.detailTitle) return;
+  state.loadingDetailId = null;
   if (!options.preserveOriginalToggles) {
     state.showOriginal.request = false;
     state.showOriginal.response = false;
@@ -7588,6 +7644,7 @@ function renderDetail(record, options = {}) {
 
 function renderEmptyDetail() {
   state.selectedRecord = null;
+  state.loadingDetailId = null;
   els.detailTitle.textContent = "Inspector";
   els.detailTags.innerHTML = "";
   els.protocolStrip.innerHTML = renderProtocolStrip({ current: "HTTP/1", supportsHttp2: false });
@@ -7604,8 +7661,28 @@ function renderEmptyDetail() {
   renderMessagePanes();
 }
 
+function renderLoadingDetail(message = "Loading selected transaction...") {
+  state.selectedRecord = null;
+  state.loadingDetailId = state.selectedId;
+  els.detailTitle.textContent = "Inspector";
+  els.detailTags.innerHTML = "";
+  els.protocolStrip.innerHTML = renderProtocolStrip({ current: "HTTP/1", supportsHttp2: false });
+  els.attributesCount.textContent = "1";
+  els.requestHeaderCount.textContent = "0";
+  els.responseHeaderCount.textContent = "0";
+  els.summaryList.innerHTML = renderSummaryRows([
+    { label: "Status", value: message },
+  ]);
+  els.requestHeadersBody.innerHTML = `<p class="empty-copy">${escapeHtml(message)}</p>`;
+  els.responseHeadersBody.innerHTML = "<p class=\"empty-copy\">Loading response details.</p>";
+  els.notesCard.innerHTML = "<p>No anomalies were recorded for this transaction.</p>";
+  renderViewTabs();
+  renderMessagePanes();
+}
+
 function renderMessagePanes() {
   const record = state.selectedRecord;
+  const detailLoading = Boolean(state.selectedId && state.loadingDetailId === state.selectedId);
   const requestRecord = record && state.showOriginal.request && record.original_request
     ? { ...record, request: record.original_request }
     : record;
@@ -7614,10 +7691,10 @@ function renderMessagePanes() {
     : record;
   const requestText = requestRecord
     ? buildMessagePresentation("request", requestRecord)
-    : "Select a transaction from HTTP.";
+    : (detailLoading ? "Loading selected transaction..." : "Select a transaction from HTTP.");
   const responseText = responseRecord
     ? buildMessagePresentation("response", responseRecord)
-    : "No response selected.";
+    : (detailLoading ? "Loading response details." : "No response selected.");
 
   const reqMode = state.messageViews.request;
   const resMode = state.messageViews.response;

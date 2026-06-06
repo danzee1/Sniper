@@ -431,9 +431,15 @@ impl TransactionRecord {
             || self
                 .request
                 .header_value("upgrade")
-                .map(|value| value.eq_ignore_ascii_case("websocket"))
+                .map(|value| header_value_contains_token(value, "websocket"))
                 .unwrap_or(false)
     }
+}
+
+fn header_value_contains_token(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -779,7 +785,7 @@ mod tests {
         write::{GzEncoder, ZlibEncoder},
         Compression,
     };
-    use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
+    use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, UPGRADE};
     use std::io::Write;
 
     fn gzip(body: &[u8]) -> Vec<u8> {
@@ -949,6 +955,30 @@ mod tests {
         assert!(record.notes.is_empty());
         assert_eq!(record.summary().note_count, 0);
         assert_eq!(record.request.header_value("host"), Some(""));
+    }
+
+    #[test]
+    fn transaction_record_detects_websocket_upgrade_token_lists() {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, "h2c, websocket".parse().unwrap());
+        let request = MessageRecord::from_headers_and_body(&headers, &[], 1024);
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "socket.example.com".to_string(),
+            "/ws".to_string(),
+            Some(400),
+            1,
+            request,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(record.is_websocket());
+        assert!(record.summary().is_websocket);
     }
 
     #[test]
