@@ -170,7 +170,7 @@ impl SequenceStore {
         run_deque.extend(runs.into_iter().take(max_entries));
         Self {
             max_entries,
-            definitions: RwLock::new(definitions),
+            definitions: RwLock::new(bound_sequence_definitions(definitions, max_entries)),
             runs: RwLock::new(run_deque),
         }
     }
@@ -194,11 +194,14 @@ impl SequenceStore {
             *existing = def;
         } else {
             defs.push(def);
+            while defs.len() > self.max_entries {
+                defs.remove(0);
+            }
         }
     }
 
     pub async fn replace_definitions(&self, definitions: Vec<SequenceDefinition>) {
-        *self.definitions.write().await = definitions;
+        *self.definitions.write().await = bound_sequence_definitions(definitions, self.max_entries);
     }
 
     pub async fn delete_definition(&self, id: Uuid) -> bool {
@@ -269,6 +272,17 @@ impl SequenceStore {
             .cloned()
             .collect()
     }
+}
+
+fn bound_sequence_definitions(
+    mut definitions: Vec<SequenceDefinition>,
+    max_entries: usize,
+) -> Vec<SequenceDefinition> {
+    if definitions.len() > max_entries {
+        let remove = definitions.len() - max_entries;
+        definitions.drain(0..remove);
+    }
+    definitions
 }
 
 fn substitute_variables(text: &str, variables: &HashMap<String, String>) -> String {
@@ -406,7 +420,7 @@ pub async fn run_sequence(
 
     for step in &definition.steps {
         let request = apply_variables_to_request(&step.request, &variables);
-        if let Err(error) = crate::api::validate_editable_request(&request) {
+        if let Err(error) = crate::api::validate_runnable_editable_request(&request) {
             let message = format!(
                 "Sequence step {} produced an invalid request after variable substitution: {error}",
                 step.label
@@ -606,6 +620,12 @@ fn ensure_sequence_requests_are_runnable(definition: &SequenceDefinition) -> Res
                 step.label
             ));
         }
+        if let Err(error) = crate::api::validate_runnable_editable_request(&step.request) {
+            return Err(anyhow!(
+                "Sequence step {} has an unsafe request draft: {error}",
+                step.label
+            ));
+        }
     }
     Ok(())
 }
@@ -631,6 +651,26 @@ mod tests {
         .expect("legacy sequence definition should deserialize");
 
         assert!(definition.steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sequence_store_limits_definition_count() {
+        let store = SequenceStore::new(2);
+        for name in ["first", "second", "third"] {
+            store
+                .upsert_definition(SequenceDefinition {
+                    id: Uuid::new_v4(),
+                    name: name.to_string(),
+                    steps: Vec::new(),
+                })
+                .await;
+        }
+
+        let definitions = store.list_definitions().await;
+
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].name, "second");
+        assert_eq!(definitions[1].name, "third");
     }
 
     #[test]
@@ -700,6 +740,38 @@ mod tests {
 
         let error = ensure_sequence_requests_are_runnable(&definition).unwrap_err();
         assert!(error.to_string().contains("invalid request draft"));
+    }
+
+    #[test]
+    fn runnable_sequence_rejects_preview_truncated_request() {
+        let definition = SequenceDefinition {
+            id: Uuid::new_v4(),
+            name: "Truncated sequence".to_string(),
+            steps: vec![SequenceStep {
+                id: Uuid::new_v4(),
+                label: "partial".to_string(),
+                request: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "POST".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: "partial".to_string(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: true,
+                },
+                request_text: None,
+                request_parse_error: None,
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+                extractions: Vec::new(),
+            }],
+        };
+
+        let error = ensure_sequence_requests_are_runnable(&definition).unwrap_err();
+
+        assert!(error.to_string().contains("preview is truncated"));
     }
 
     #[test]

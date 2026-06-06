@@ -611,6 +611,16 @@ pub(crate) fn validate_editable_request(
     validate_editable_body_framing(&request.headers, body.len())
 }
 
+pub(crate) fn validate_runnable_editable_request(
+    request: &EditableRequest,
+) -> std::result::Result<(), String> {
+    validate_editable_request(request)?;
+    if request.preview_truncated {
+        return Err("request body preview is truncated and cannot be replayed safely".to_string());
+    }
+    Ok(())
+}
+
 fn validate_http_scheme_field(scheme: &str, label: &str) -> std::result::Result<(), String> {
     let trimmed = scheme.trim();
     if trimmed != scheme {
@@ -2535,12 +2545,16 @@ async fn clear_findings(
         .scanner
         .snapshot(Some(state.config.max_entries))
         .await;
+    let previous_generation = session.scanner.clear_generation();
     session.scanner.clear().await;
     if persist_session_mutation_locked_or_status(&state, &session)
         .await
         .is_err()
     {
         session.scanner.replace_all(previous).await;
+        session
+            .scanner
+            .restore_clear_generation(previous_generation);
         persist_rolled_back_session_snapshot(&state, &session, "scanner findings clear").await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -3486,7 +3500,7 @@ async fn send_replay(
             return replay_send_error_response(error);
         }
     }
-    if let Err(error) = validate_editable_request(&payload.request) {
+    if let Err(error) = validate_runnable_editable_request(&payload.request) {
         return replay_send_error_response(error);
     }
     let _session_owner = match begin_session_proxy_operation(&state, &session).await {
@@ -3588,7 +3602,7 @@ async fn run_fuzzer_attack(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(error) = validate_editable_request(&payload.template) {
+    if let Err(error) = validate_runnable_editable_request(&payload.template) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
@@ -3603,7 +3617,7 @@ async fn run_fuzzer_attack(
     if let Err(error) = fuzzer::validate_expanded_requests(
         &payload.template,
         &payload.payloads,
-        validate_editable_request,
+        validate_runnable_editable_request,
     ) {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
@@ -4502,6 +4516,7 @@ async fn clear_oast_callbacks(
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.oast.snapshot().await;
     let previous_cleared_keys = session.oast.snapshot_cleared_keys().await;
+    let previous_generation = session.oast.clear_generation();
     session.oast.clear().await;
     if persist_session_mutation_locked_or_status(&state, &session)
         .await
@@ -4512,6 +4527,7 @@ async fn clear_oast_callbacks(
             .oast
             .restore_cleared_keys(previous_cleared_keys)
             .await;
+        session.oast.restore_clear_generation(previous_generation);
         persist_rolled_back_session_snapshot(&state, &session, "OAST callbacks clear").await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4986,6 +5002,25 @@ mod tests {
         assert!(validate_editable_request(&request)
             .unwrap_err()
             .contains("does not match body length"));
+    }
+
+    #[test]
+    fn runnable_request_validation_rejects_preview_truncated_body() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: "partial body".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: true,
+        };
+
+        assert!(validate_editable_request(&request).is_ok());
+        assert!(super::validate_runnable_editable_request(&request)
+            .unwrap_err()
+            .contains("preview is truncated"));
     }
 
     #[test]
@@ -7298,6 +7333,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_send_rejects_preview_truncated_request_before_sending() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-replay-send-truncated-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+
+        let response = super::send_replay(
+            State(state.clone()),
+            Json(super::ReplaySendPayload {
+                session_id: Some(session.id()),
+                request: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "POST".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: "partial".to_string(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: true,
+                },
+                target: None,
+                source_transaction_id: None,
+                http_version: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
+        let body = response_body_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("preview is truncated"));
+        assert!(session.store.snapshot(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn replay_send_releases_session_operation_lock_while_upstream_is_pending() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-replay-send-lock-release-{}",
@@ -7574,6 +7658,50 @@ mod tests {
                     preview_truncated: false,
                 },
                 payloads: vec!["bad path".to_string()],
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
+        assert!(session.fuzzer.list(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn fuzzer_run_rejects_preview_truncated_template_before_attack() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-fuzzer-truncated-template-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+
+        let response = super::run_fuzzer_attack(
+            State(state.clone()),
+            Json(crate::fuzzer::FuzzerAttackPayload {
+                session_id: Some(session.id()),
+                template: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "POST".to_string(),
+                    path: "/$payload$".to_string(),
+                    headers: Vec::new(),
+                    body: "partial".to_string(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: true,
+                },
+                payloads: vec!["one".to_string()],
                 source_transaction_id: None,
                 http_version: None,
                 target: None,

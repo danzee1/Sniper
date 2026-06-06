@@ -172,6 +172,10 @@ impl ScannerStore {
         self.clear_generation.load(Ordering::Acquire)
     }
 
+    pub fn restore_clear_generation(&self, generation: u64) {
+        self.clear_generation.store(generation, Ordering::Release);
+    }
+
     pub async fn push_if_generation(&self, finding: ScannerFinding, generation: u64) -> bool {
         self.push_inner(finding, Some(generation)).await
     }
@@ -2216,6 +2220,22 @@ mod tests {
 
         assert!(!store.push_if_generation(finding, generation).await);
         assert_eq!(store.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn scanner_store_can_restore_clear_generation_after_failed_clear() {
+        let store = ScannerStore::new(10);
+        let generation = store.clear_generation();
+
+        store.clear().await;
+        store.restore_clear_generation(generation);
+
+        assert!(
+            store
+                .push_if_generation(finding("Missing CSP"), generation)
+                .await
+        );
+        assert_eq!(store.count().await, 1);
     }
 
     #[test]

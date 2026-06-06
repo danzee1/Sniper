@@ -1,5 +1,8 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use aes::cipher::{AsyncStreamCipher, KeyIvInit};
@@ -160,6 +163,7 @@ pub struct OastStore {
     config: RwLock<OastConfig>,
     registration: RwLock<RegistrationState>,
     cleared_keys: RwLock<VecDeque<OastCallbackDedupKey>>,
+    clear_generation: AtomicU64,
 }
 
 impl OastStore {
@@ -176,10 +180,22 @@ impl OastStore {
             config: RwLock::new(config),
             registration: RwLock::new(RegistrationState::None),
             cleared_keys: RwLock::new(VecDeque::new()),
+            clear_generation: AtomicU64::new(0),
         }
     }
 
     pub async fn push(&self, callback: OastCallback) -> bool {
+        self.push_inner(callback, None).await
+    }
+
+    pub async fn push_if_generation(&self, callback: OastCallback, generation: u64) -> bool {
+        self.push_inner(callback, Some(generation)).await
+    }
+
+    async fn push_inner(&self, callback: OastCallback, generation: Option<u64>) -> bool {
+        if generation.is_some_and(|expected| self.clear_generation() != expected) {
+            return false;
+        }
         let dedup_key = callback_dedup_key(&callback);
         let summary = callback.summary();
         let cleared_keys = self.cleared_keys.read().await;
@@ -201,6 +217,14 @@ impl OastStore {
         true
     }
 
+    pub fn clear_generation(&self) -> u64 {
+        self.clear_generation.load(Ordering::Acquire)
+    }
+
+    pub fn restore_clear_generation(&self, generation: u64) {
+        self.clear_generation.store(generation, Ordering::Release);
+    }
+
     pub async fn list(&self, limit: Option<usize>) -> Vec<OastCallbackSummary> {
         let entries = self.entries.read().await;
         entries
@@ -216,6 +240,7 @@ impl OastStore {
     }
 
     pub async fn clear(&self) {
+        self.clear_generation.fetch_add(1, Ordering::AcqRel);
         let mut cleared_keys = self.cleared_keys.write().await;
         let mut entries = self.entries.write().await;
         for callback in entries.iter() {
@@ -1282,6 +1307,7 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
         }
 
         drop(operation_guard);
+        let clear_generation = session.oast.clear_generation();
         let callbacks = match config.provider {
             OastProvider::Interactsh => {
                 poll_interactsh_from_store(&session.oast, &config, &client).await
@@ -1325,7 +1351,11 @@ pub async fn run_oast_poller_for_state(state: Arc<AppState>) {
             let mutation_guard = session.mutation_guard().await;
             let mut inserted = 0usize;
             for callback in callbacks {
-                if session.oast.push(callback).await {
+                if session
+                    .oast
+                    .push_if_generation(callback, clear_generation)
+                    .await
+                {
                     inserted += 1;
                 }
             }
@@ -1540,6 +1570,29 @@ mod tests {
 
         assert!(!store.push(duplicate).await);
         assert_eq!(store.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_generation_rejects_callbacks_from_stale_poll() {
+        let store = OastStore::new(16);
+        let generation = store.clear_generation();
+
+        store.clear().await;
+
+        assert!(!store.push_if_generation(callback("dns"), generation).await);
+        assert_eq!(store.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_generation_can_be_restored_after_failed_clear() {
+        let store = OastStore::new(16);
+        let generation = store.clear_generation();
+
+        store.clear().await;
+        store.restore_clear_generation(generation);
+
+        assert!(store.push_if_generation(callback("dns"), generation).await);
+        assert_eq!(store.count().await, 1);
     }
 
     #[tokio::test]

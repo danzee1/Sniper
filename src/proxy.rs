@@ -1463,6 +1463,33 @@ async fn record_connect_rejection(
     response
 }
 
+async fn record_connect_tunnel_failure(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    target: String,
+    request_capture: MessageRecord,
+    started_at: chrono::DateTime<Utc>,
+    started: Instant,
+    note: String,
+) {
+    if insert_transaction_quiet(
+        session,
+        TransactionRecord::tunnel(
+            started_at,
+            target,
+            Some(StatusCode::BAD_GATEWAY.as_u16()),
+            started.elapsed().as_millis() as u64,
+            request_capture,
+            vec![note],
+        ),
+        "connect tunnel failure",
+    )
+    .await
+    {
+        persist_session_quiet(state, session).await;
+    }
+}
+
 trait EmptyStringExt {
     fn if_empty_then(self, fallback: &str) -> String;
 }
@@ -1500,18 +1527,58 @@ async fn serve_special_host_tls(
     started_at: chrono::DateTime<Utc>,
     started: Instant,
 ) -> Result<()> {
-    let upgraded = upgrade
-        .await
-        .context("CONNECT upgrade failed for special host")?;
+    let upgraded = match upgrade.await {
+        Ok(upgraded) => upgraded,
+        Err(error) => {
+            let message = format!("CONNECT upgrade failed for special host: {error}");
+            record_connect_tunnel_failure(
+                &state,
+                &session,
+                "sniper:443".to_string(),
+                connect_capture,
+                started_at,
+                started,
+                message.clone(),
+            )
+            .await;
+            return Err(anyhow!(message));
+        }
+    };
     let upgraded = TokioIo::new(upgraded);
-    let acceptor: TlsAcceptor = state
-        .certificates
-        .tls_acceptor()
-        .context("failed to build special host TLS certificate")?;
-    let tls_stream = acceptor
-        .accept(upgraded)
-        .await
-        .context("TLS handshake failed for special host")?;
+    let acceptor: TlsAcceptor = match state.certificates.tls_acceptor() {
+        Ok(acceptor) => acceptor,
+        Err(error) => {
+            let message = format!("failed to build special host TLS certificate: {error}");
+            record_connect_tunnel_failure(
+                &state,
+                &session,
+                "sniper:443".to_string(),
+                connect_capture,
+                started_at,
+                started,
+                message.clone(),
+            )
+            .await;
+            return Err(anyhow!(message));
+        }
+    };
+    let tls_stream = match acceptor.accept(upgraded).await {
+        Ok(tls_stream) => tls_stream,
+        Err(error) => {
+            let message = format!("TLS handshake failed for special host: {error}");
+            record_connect_tunnel_failure(
+                &state,
+                &session,
+                "sniper:443".to_string(),
+                connect_capture,
+                started_at,
+                started,
+                message.clone(),
+            )
+            .await;
+            return Err(anyhow!(message));
+        }
+    };
 
     if insert_transaction_quiet(
         &session,
@@ -1541,10 +1608,13 @@ async fn serve_special_host_tls(
         .http1()
         .preserve_header_case(true)
         .title_case_headers(true);
-    builder
-        .serve_connection(io, service)
-        .await
-        .map_err(|error| anyhow!("special host HTTP serving failed: {error}"))
+    if let Err(error) = builder.serve_connection(io, service).await {
+        warn!(
+            ?error,
+            "special host HTTP serving failed after CONNECT was recorded"
+        );
+    }
+    Ok(())
 }
 
 async fn serve_passthrough_tunnel(
@@ -1557,9 +1627,23 @@ async fn serve_passthrough_tunnel(
     started_at: chrono::DateTime<chrono::Utc>,
     started: Instant,
 ) -> Result<()> {
-    let upgraded = upgrade
-        .await
-        .context("CONNECT upgrade failed for passthrough tunnel")?;
+    let upgraded = match upgrade.await {
+        Ok(upgraded) => upgraded,
+        Err(error) => {
+            let message = format!("CONNECT upgrade failed for passthrough tunnel: {error}");
+            record_connect_tunnel_failure(
+                &state,
+                &session,
+                target,
+                request_capture,
+                started_at,
+                started,
+                message.clone(),
+            )
+            .await;
+            return Err(anyhow!(message));
+        }
+    };
     let mut client_stream = TokioIo::new(upgraded);
 
     let result = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
@@ -2019,7 +2103,7 @@ async fn forward_websocket_request(
                 request_notes,
                 vec![format!("Invalid WebSocket handshake: {message}")],
             ),
-            None,
+            original_request_capture,
             None,
         );
         if insert_transaction_quiet(&session, record, "invalid edited websocket upgrade").await {
@@ -2086,8 +2170,8 @@ async fn forward_websocket_request(
                 started.elapsed().as_millis() as u64,
                 request_capture,
                 Some(response_capture),
-                vec![message],
-                None,
+                merge_notes(request_notes, vec![message]),
+                original_request_capture,
                 None,
             );
             if insert_transaction_quiet(&session, record, "websocket connect failure").await {
@@ -2116,8 +2200,8 @@ async fn forward_websocket_request(
                 started.elapsed().as_millis() as u64,
                 request_capture,
                 Some(response_capture),
-                vec![message],
-                None,
+                merge_notes(request_notes, vec![message]),
+                original_request_capture,
                 None,
             );
             if insert_transaction_quiet(&session, record, "invalid websocket handshake").await {
@@ -2126,10 +2210,17 @@ async fn forward_websocket_request(
             return client_response;
         }
     };
+    let original_response_capture = MessageRecord::from_headers_and_body(
+        &response_headers,
+        &[],
+        state.config.body_preview_bytes,
+    );
     let applied_response = session
         .match_replace
         .apply_response(response_headers, Bytes::new())
         .await;
+    let original_response_capture =
+        (!applied_response.notes.is_empty()).then_some(original_response_capture);
     if !applied_response.notes.is_empty() {
         session
             .event_log
@@ -2159,9 +2250,12 @@ async fn forward_websocket_request(
             started.elapsed().as_millis() as u64,
             request_capture,
             Some(response_capture),
-            merge_notes(request_notes, vec![message]),
-            None,
-            None,
+            merge_notes(
+                merge_notes(request_notes, applied_response.notes),
+                vec![message],
+            ),
+            original_request_capture,
+            original_response_capture,
         );
         if insert_transaction_quiet(&session, record, "invalid websocket response").await {
             persist_session_quiet(&state, &session).await;
@@ -2186,11 +2280,11 @@ async fn forward_websocket_request(
         request_capture.clone(),
         Some(response_capture.clone()),
         merge_notes(
-            request_notes,
+            merge_notes(request_notes, applied_response.notes),
             vec!["WebSocket upgrade proxied and mirrored into WebSockets history.".to_string()],
         ),
-        None,
-        None,
+        original_request_capture,
+        original_response_capture,
     );
     insert_transaction_quiet(&session, http_record, "websocket upgrade transaction").await;
     session

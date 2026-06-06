@@ -1135,15 +1135,37 @@ function bindEvents() {
     clearWebsocketQueryBackfill();
     syncVisibleWebsocketSelection(true, { ensureSelectedVisible: true }).catch((error) => console.error(error));
   });
+  let websocketScrollRaf = 0;
   document.querySelector("#websocketTable")?.closest(".history-table-shell")?.addEventListener("scroll", (event) => {
     const scroller = event.currentTarget;
     if (!scroller || state.activeProxyTab !== "websockets-history") {
       return;
     }
-    renderWebsocketSessionTable();
+    if (!websocketScrollRaf) {
+      websocketScrollRaf = requestAnimationFrame(() => {
+        websocketScrollRaf = 0;
+        renderWebsocketSessionTable();
+      });
+    }
     if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - WEBSOCKET_SCROLL_PREFETCH_PX) {
       loadMoreWebsockets().catch((error) => console.error(error));
     }
+  });
+  els.websocketTableBody?.addEventListener("click", (event) => {
+    const row = event.target.closest(".history-row");
+    if (!row || !els.websocketTableBody.contains(row)) {
+      return;
+    }
+    state.wsKeyboardFocus = "sessions";
+    if (state.selectedWebsocketId !== row.dataset.id) {
+      state.selectedFrameIdx = null;
+      state.selectedWebsocketRecord = null;
+      state.selectedWebsocketDetailError = "";
+      hideFrameDetail();
+    }
+    state.selectedWebsocketId = row.dataset.id;
+    renderWebsocketSessions();
+    loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
   });
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
@@ -1652,17 +1674,13 @@ function bindEvents() {
     }
     state._replayLastSnapshot = text;
     els.replayRequestEditor.value = text;
-    tab.requestText = text;
-    clearReplayResponseForDraftChange(tab);
+    syncReplayRequestTextFromEditor(text);
+    const renderedText = tab.requestText || text;
     // Debounce re-render so syntax highlighting refreshes without losing cursor
     clearTimeout(els.replayRequestHighlight._renderTimer);
     els.replayRequestHighlight._renderTimer = setTimeout(() => {
-      replayHighlightRerender(text);
+      replayHighlightRerender(renderedText);
     }, 400);
-    updateReplaySearchPane("request", text);
-    syncReplayToolbar(tab);
-    renderReplayTabs();
-    scheduleWorkspaceStateSave();
   });
   els.replayRequestHighlight?.addEventListener("keydown", (e) => {
     if (els.replayRequestCM) return; // CM handles editing
@@ -8276,21 +8294,6 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
     rows +
     (windowed.bottomPadding > 0 ? `<tr class="virtual-spacer"><td colspan="7" style="height:${windowed.bottomPadding}px;padding:0;border:none"></td></tr>` : "");
 
-  Array.from(els.websocketTableBody.querySelectorAll(".history-row")).forEach((row) => {
-    row.addEventListener("click", () => {
-      state.wsKeyboardFocus = "sessions";
-      if (state.selectedWebsocketId !== row.dataset.id) {
-        state.selectedFrameIdx = null;
-        state.selectedWebsocketRecord = null;
-        state.selectedWebsocketDetailError = "";
-        hideFrameDetail();
-      }
-      state.selectedWebsocketId = row.dataset.id;
-      renderWebsocketSessions();
-      loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
-    });
-  });
-
   const measuredRow = els.websocketTableBody.querySelector(".history-row");
   const measured = measuredRow?.getBoundingClientRect().height || 0;
   if (measured > 0 && Math.abs(measured - measuredWebsocketSessionRowHeight) >= 1) {
@@ -8952,20 +8955,57 @@ function restoreContentEditableCaret(el, pos) {
   }
 }
 
+function setReplayRequestEditorText(text, { preserveSelection = true } = {}) {
+  const nextText = text || "";
+  const cv = getCMView("replayReq");
+  if (cv) {
+    if (preserveSelection && typeof cv.setContentPreservingSelection === "function") {
+      cv.setContentPreservingSelection(nextText);
+    } else {
+      cv.setContent(nextText);
+    }
+    return;
+  }
+  if (els.replayRequestEditor) {
+    els.replayRequestEditor.value = nextText;
+  }
+  if (els.replayRequestHighlight && state.replayMessageViews.request !== "hex") {
+    if (preserveSelection) {
+      replayHighlightRerender(nextText);
+    } else {
+      els.replayRequestHighlight.innerHTML = renderCodeHtml(nextText, state.replayMessageViews.request, "request");
+    }
+  }
+}
+
 function syncReplayRequestTextFromEditor(newText) {
   const activeTab = getActiveReplayTab();
   if (!activeTab || activeTab.type === "websocket") {
     return;
   }
-  const httpVersion = replayHttpVersionFromText(newText);
-  activeTab.requestText = newText;
+  let nextText = newText;
+  let parsed = null;
+  try {
+    parsed = parseEditableRawRequest(
+      newText,
+      activeTab.baseRequest || createDefaultEditableRequest(),
+    );
+    if (parsed._normalizedRawText && parsed._normalizedRawText !== newText) {
+      nextText = parsed._normalizedRawText;
+      setReplayRequestEditorText(nextText, { preserveSelection: true });
+    }
+  } catch (_error) {
+    // Keep partially typed drafts as-is until they are parseable again.
+  }
+  const httpVersion = parsed?.http_version || replayHttpVersionFromText(nextText);
+  activeTab.requestText = nextText;
   activeTab.httpVersionMode = httpVersion;
   activeTab.requestBytes = null;
   activeTab.requestOriginalBytes = null;
   clearReplayResponseForDraftChange(activeTab);
   syncReplayToolbar(activeTab);
   refreshReplayTabLabel(activeTab.id);
-  updateReplaySearchPane("request", newText, { scrollToFirst: false });
+  updateReplaySearchPane("request", nextText, { scrollToFirst: false });
   scheduleWorkspaceStateSave();
 }
 
@@ -11602,7 +11642,12 @@ async function sendReplay() {
     const fallback = tab.baseRequest || createDefaultEditableRequest();
     const replayReqText = tab.requestText || "";
     request = parseEditableRawRequest(replayReqText, fallback);
-    requestText = replayReqText;
+    requestText = request._normalizedRawText || replayReqText;
+    if (requestText !== replayReqText) {
+      tab.requestText = requestText;
+      setReplayRequestEditorText(requestText, { preserveSelection: true });
+      scheduleWorkspaceStateSave();
+    }
     target = getRepeaterTargetConfig(tab, request);
   } catch (e) {
     els.replayResponseMeta.textContent = "Error";
@@ -13955,18 +14000,23 @@ function parseEditableRawRequest(text, fallback) {
   const bodyEncoding = fallback?.body_encoding === "base64" ? "base64" : "utf8";
   const bodyLength = editableRequestBodyLength(body, bodyEncoding);
   const acceptedBodyLengths = [bodyLength];
+  let contentLengthChanged = false;
 
   // Auto-update Content-Length if enabled
   if (document.getElementById("proxySettingAutoContentLength")?.checked) {
     for (const header of headers) {
       if (headerNameEquals(header, "content-length")) {
-        header.value = String(bodyLength);
+        const nextValue = String(bodyLength);
+        if (header.value !== nextValue) {
+          header.value = nextValue;
+          contentLengthChanged = true;
+        }
       }
     }
   }
   validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths);
 
-  return {
+  const request = {
     scheme,
     host,
     method,
@@ -13977,6 +14027,13 @@ function parseEditableRawRequest(text, fallback) {
     body_encoding: bodyEncoding,
     preview_truncated: false,
   };
+  if (contentLengthChanged) {
+    Object.defineProperty(request, "_normalizedRawText", {
+      value: buildEditableRawRequest(request),
+      enumerable: false,
+    });
+  }
+  return request;
 }
 
 function validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths = [bodyLength]) {
@@ -19491,6 +19548,26 @@ class SniperCodeView {
     try {
       view.dispatch({
         changes: { from: 0, to: view.state.doc.length, insert: nextText },
+      });
+    } finally {
+      cmProgrammaticViews.delete(view);
+    }
+  }
+
+  setContentPreservingSelection(text) {
+    const { view } = this;
+    const nextText = text || "";
+    if (view.state.doc.toString() === nextText) {
+      return;
+    }
+    const selection = view.state.selection.main;
+    const anchor = Math.min(selection.anchor, nextText.length);
+    const head = Math.min(selection.head, nextText.length);
+    cmProgrammaticViews.add(view);
+    try {
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: nextText },
+        selection: { anchor, head },
       });
     } finally {
       cmProgrammaticViews.delete(view);
