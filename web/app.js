@@ -2793,7 +2793,8 @@ function snapshotWorkspaceState(options = {}) {
     replay: {
       tabs: state.replayTabs.map((tab) => {
         if (tab.type === "websocket") {
-          const wsFrames = snapshotWsReplayFrames(tab, wsFrameBudget);
+          const wsFramesSnapshot = snapshotWsReplayFrames(tab, wsFrameBudget);
+          const wsFrames = wsFramesSnapshot.frames;
           return {
             id: tab.id,
             type: "websocket",
@@ -2819,7 +2820,7 @@ function snapshotWorkspaceState(options = {}) {
               autoSend: !!item.autoSend,
             })),
             ws_frames: wsFrames,
-            ws_frames_truncated: !!tab.wsFramesTruncated || websocketFramesAreTruncated(wsFrames, null),
+            ws_frames_truncated: !!tab.wsFramesTruncated || wsFramesSnapshot.truncated,
             ws_selected_frame_index: snapshotWsReplaySelectedFrameIndex(tab, wsFrames),
             ws_frame_window_start: snapshotWsReplayFrameWindowStart(tab, wsFrames),
           };
@@ -16994,10 +16995,12 @@ function snapshotWsReplayFrames(tab, budget = null) {
     if (frame) frames.unshift(frame);
   }
   const selected = [];
+  let truncated = rawFrames.length > frames.length;
   for (let reverseIndex = frames.length - 1; reverseIndex >= 0; reverseIndex -= 1) {
     const frame = frames[reverseIndex];
     const fallbackIndex = reverseIndex;
     if (budget && (budget.frames <= 0 || budget.bytes <= 0)) {
+      truncated = true;
       break;
     }
     const encoding = frame.body_encoding === "base64" ? "base64" : "utf8";
@@ -17031,7 +17034,14 @@ function snapshotWsReplayFrames(tab, budget = null) {
       preview_truncated: Boolean(frame.preview_truncated || preview.truncated || bodySize > preview.storedBytes),
     });
   }
-  return selected.reverse();
+  if (selected.length < frames.length) {
+    truncated = true;
+  }
+  const persistedFrames = selected.reverse();
+  return {
+    frames: persistedFrames,
+    truncated: truncated || websocketFramesAreTruncated(persistedFrames, null),
+  };
 }
 
 function snapshotWsReplaySelectedFrameIndex(tab, frames) {

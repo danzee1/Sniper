@@ -1485,7 +1485,7 @@ expected_team="$6"
 backup="${bundle}.previous.$$"
 matching_sniper_pids() {
   sniper_executable="$bundle/Contents/MacOS/Sniper"
-  /bin/ps -axo pid=,command= | /usr/bin/awk -v exe="$sniper_executable" '
+  /bin/ps -axww -o pid= -o command= | /usr/bin/awk -v exe="$sniper_executable" '
     index($0, exe) {
       pid=$1
       if (pid ~ /^[0-9]+$/) print pid
@@ -2745,7 +2745,7 @@ mod tests {
         assert!(script.contains("rm -rf \"$tmp\"\n    exit 1"));
         assert!(script.contains("/usr/bin/codesign --verify --deep --strict \"$bundle\""));
         assert!(script.contains("sniper_executable=\"$bundle/Contents/MacOS/Sniper\""));
-        assert!(script.contains("/bin/ps -axo pid=,command="));
+        assert!(script.contains("/bin/ps -axww -o pid= -o command="));
         assert!(script.contains("index($0, exe)"));
         assert!(!script.contains("pgrep -f \"$bundle/Contents/MacOS/Sniper\""));
         let health_check_pos = script

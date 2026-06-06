@@ -816,29 +816,7 @@ impl SessionRegistry {
             .ok_or_else(|| anyhow!("session {id} was not found"))?;
         let storage_dir = session_dir(&self.root_dir, id);
         let snapshot = load_session_snapshot(&storage_dir, self.max_entries)?;
-        if update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries) {
-            let mut registry = self.inner.write().expect("session registry lock poisoned");
-            let mut next = registry.clone();
-            if let Some(existing) = next.sessions.iter_mut().find(|session| session.id == id) {
-                existing.request_count = metadata.request_count;
-                existing.websocket_count = metadata.websocket_count;
-                existing.event_count = metadata.event_count;
-                existing.fuzzer_count = metadata.fuzzer_count;
-                existing.rule_count = metadata.rule_count;
-                match write_json(&self.registry_path, &next) {
-                    Ok(()) => {
-                        *registry = next;
-                    }
-                    Err(error) => {
-                        warn!(
-                            %error,
-                            session_id = %id,
-                            "failed to repair session metadata counts after snapshot load"
-                        );
-                    }
-                }
-            }
-        }
+        update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries);
         Ok(Arc::new(SessionContext::from_snapshot(
             metadata,
             storage_dir,
@@ -4142,6 +4120,10 @@ mod tests {
         .unwrap();
         lines.push(b'\n');
         std::fs::write(journal_path, lines).unwrap();
+        let registry_path = data_dir
+            .join(super::SESSIONS_DIR)
+            .join(super::REGISTRY_FILE);
+        let registry_before = std::fs::read(&registry_path).unwrap();
 
         let loaded = registry.load_context(active.id()).unwrap();
         let restored = loaded.store.snapshot(Some(10)).await;
@@ -4153,12 +4135,14 @@ mod tests {
         assert_eq!(restored[0].notes, vec!["journaled".to_string()]);
         assert_eq!(restored[0].color_tag.as_deref(), Some("red"));
         assert_eq!(restored[0].user_note.as_deref(), Some("remember me"));
+        assert_eq!(loaded.summary(true).request_count, 1);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry_before);
         let summary = registry
             .summaries()
             .into_iter()
             .find(|summary| summary.id == active.id())
             .unwrap();
-        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.request_count, 0);
     }
 
     #[tokio::test]
