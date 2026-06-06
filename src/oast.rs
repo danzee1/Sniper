@@ -460,6 +460,9 @@ fn callback_dedup_key(callback: &OastCallback) -> OastCallbackDedupKey {
 // ── Helper: extract domain from URL ──
 
 fn extract_domain(url: &str) -> String {
+    if let Ok(domain) = oast_payload_domain(url) {
+        return domain;
+    }
     let base = url.trim_end_matches('/');
     base.strip_prefix("https://")
         .or_else(|| base.strip_prefix("http://"))
@@ -487,6 +490,9 @@ pub fn generate_correlation_id() -> String {
 
 /// Build an OAST payload URL from server URL and correlation ID.
 pub fn build_oast_payload(server_url: &str, correlation_id: &str) -> String {
+    if let Ok(payload) = build_oast_payload_checked(server_url, correlation_id) {
+        return payload;
+    }
     let base = server_url.trim_end_matches('/');
     if let Some(domain) = base
         .strip_prefix("https://")
@@ -496,6 +502,66 @@ pub fn build_oast_payload(server_url: &str, correlation_id: &str) -> String {
     } else {
         format!("{base}/{correlation_id}")
     }
+}
+
+/// Build an OAST payload, rejecting server URLs that cannot produce a valid DNS payload.
+pub fn build_oast_payload_checked(
+    server_url: &str,
+    correlation_id: &str,
+) -> Result<String, String> {
+    let trimmed = server_url.trim();
+    if trimmed.is_empty() {
+        return Err("OAST server URL is required before generating a payload.".to_string());
+    }
+
+    match Url::parse(trimmed) {
+        Ok(url) => {
+            let scheme = url.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Err("OAST server URL must use http or https.".to_string());
+            }
+            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                return Err(
+                    "OAST server URL cannot include a path, query, or fragment.".to_string()
+                );
+            }
+            let domain = oast_payload_domain(trimmed)?;
+            Ok(format!("{correlation_id}.{domain}"))
+        }
+        Err(_) => {
+            let base = trimmed.trim_end_matches('/');
+            if base.is_empty() {
+                return Err("OAST server URL is required before generating a payload.".to_string());
+            }
+            if base.contains('/')
+                || base.contains('?')
+                || base.contains('#')
+                || base.chars().any(char::is_whitespace)
+            {
+                return Err(
+                    "OAST server URL must be a host or http/https URL without path, query, or fragment."
+                        .to_string(),
+                );
+            }
+            Ok(format!("{base}/{correlation_id}"))
+        }
+    }
+}
+
+fn oast_payload_domain(server_url: &str) -> Result<String, String> {
+    let url =
+        Url::parse(server_url.trim()).map_err(|_| "OAST server URL is invalid.".to_string())?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("OAST server URL must use http or https.".to_string());
+    }
+    let domain = url
+        .host_str()
+        .map(str::trim)
+        .map(|host| host.trim_end_matches('.'))
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "OAST server URL must include a host.".to_string())?;
+    Ok(domain.to_string())
 }
 
 fn oast_endpoint_url(base_url: &str, path: &str, query: &[(&str, &str)]) -> String {
@@ -560,8 +626,13 @@ pub async fn generate_payload(store: &OastStore) -> Option<(String, String)> {
         }
         OastProvider::Boast | OastProvider::Custom => {
             let cid = generate_correlation_id();
-            let payload = build_oast_payload(&config.server_url, &cid);
-            Some((cid, payload))
+            match build_oast_payload_checked(&config.server_url, &cid) {
+                Ok(payload) => Some((cid, payload)),
+                Err(error) => {
+                    warn!("Refusing to generate OAST payload: {error}");
+                    None
+                }
+            }
         }
     }
 }
@@ -1511,6 +1582,28 @@ mod tests {
             !oast_endpoint_url("https://interact.example.test", "deregister", &[])
                 .contains("token=")
         );
+    }
+
+    #[test]
+    fn oast_payload_builder_uses_url_host_for_dns_payloads() {
+        let payload =
+            build_oast_payload_checked("https://oast.example.test:8443/", "abc123").unwrap();
+
+        assert_eq!(payload, "abc123.oast.example.test");
+    }
+
+    #[test]
+    fn oast_payload_builder_rejects_url_paths_queries_and_fragments() {
+        assert!(build_oast_payload_checked("https://oast.example.test/api", "abc123").is_err());
+        assert!(build_oast_payload_checked("https://oast.example.test?x=1", "abc123").is_err());
+        assert!(build_oast_payload_checked("https://oast.example.test/#frag", "abc123").is_err());
+    }
+
+    #[test]
+    fn oast_payload_builder_preserves_legacy_bare_host_payloads() {
+        let payload = build_oast_payload_checked("oast.example.test", "abc123").unwrap();
+
+        assert_eq!(payload, "oast.example.test/abc123");
     }
 
     #[tokio::test]

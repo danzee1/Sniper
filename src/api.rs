@@ -4580,7 +4580,11 @@ async fn generate_oast_payload(
     }
     // Fallback: generic generation for BOAST/custom-compatible providers.
     let correlation_id = crate::oast::generate_correlation_id();
-    let payload = crate::oast::build_oast_payload(&config.oast_server_url, &correlation_id);
+    let payload =
+        match crate::oast::build_oast_payload_checked(&config.oast_server_url, &correlation_id) {
+            Ok(payload) => payload,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
     Json(OastPayloadResponse {
         correlation_id,
         payload,
@@ -6597,6 +6601,45 @@ mod tests {
         .await;
         assert!(inactive_events_after_clear.is_empty());
         assert_eq!(active.event_log.list(Some(10)).await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn generate_oast_payload_rejects_server_url_with_path() {
+        let config = test_app_config("sniper-oast-payload-url-path");
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+
+        let runtime: RuntimeSettingsSnapshot = response_json(
+            super::update_runtime_settings(
+                State(state.clone()),
+                Json(RuntimeSettingsUpdate {
+                    oast_enabled: Some(true),
+                    oast_server_url: Some("https://oast.example.test/api".to_string()),
+                    oast_provider: Some(OastProvider::Boast),
+                    ..RuntimeSettingsUpdate::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(runtime.oast_enabled);
+
+        let response = super::generate_oast_payload(
+            State(state),
+            Query(super::OastQuery {
+                session_id: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("path"));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
