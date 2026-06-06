@@ -393,10 +393,30 @@ impl WsReplayStore {
                         while let Some(msg_result) = read.next().await {
                             match msg_result {
                                 Ok(msg) => {
-                                    if matches!(msg, WsMessage::Ping(_)) {
-                                        let mut c = conn.write().await;
-                                        c.push_frame(WebSocketFrameDirection::ServerToClient, &msg);
-                                        c.push_auto_reply_frame(&msg);
+                                    if let WsMessage::Ping(payload) = msg {
+                                        let sender = {
+                                            let mut c = conn.write().await;
+                                            c.push_frame(
+                                                WebSocketFrameDirection::ServerToClient,
+                                                &WsMessage::Ping(payload.clone()),
+                                            );
+                                            c.sender.clone()
+                                        };
+                                        if let Some(sender) = sender {
+                                            if let Err(error) = sender
+                                                .send(WsReplayOutboundMessage::Message(
+                                                    WsMessage::Pong(payload),
+                                                ))
+                                                .await
+                                            {
+                                                let message = format!(
+                                                    "ws replay pong auto-reply failed: {error}"
+                                                );
+                                                warn!("{}", message);
+                                                read_error = Some(message);
+                                                break;
+                                            }
+                                        }
                                         continue;
                                     }
 

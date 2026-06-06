@@ -102,6 +102,7 @@ struct StreamedRecordContext {
     response_headers: HeaderMap,
     notes: Vec<String>,
     original_request_capture: Option<MessageRecord>,
+    request_version: Option<Version>,
     response_version: Version,
     max_preview: usize,
 }
@@ -109,6 +110,20 @@ struct StreamedRecordContext {
 struct UpstreamError {
     status: StatusCode,
     message: String,
+}
+
+fn with_record_http_versions(
+    mut record: TransactionRecord,
+    request_version: Option<Version>,
+    response_version: Option<Version>,
+) -> TransactionRecord {
+    if let Some(version) = request_version {
+        record = record.with_request_http_version(version);
+    }
+    if let Some(version) = response_version {
+        record = record.with_response_http_version(version);
+    }
+    record
 }
 
 pub async fn run_proxy_listener(state: Arc<AppState>) -> Result<TcpListener> {
@@ -460,6 +475,7 @@ pub async fn try_send_replay_request_for_session(
         notes,
         true,
         original_request_capture,
+        requested_http_version.or(Some(Version::HTTP_11)),
         requested_http_version,
         outbound_uri_authority.as_deref(),
     )
@@ -467,11 +483,11 @@ pub async fn try_send_replay_request_for_session(
 
     let mut record = exchange.record.clone();
     if requested_http_version == Some(Version::HTTP_2)
-        && record.http_version.as_deref() != Some("HTTP/2")
+        && record.response_http_version() != Some("HTTP/2")
     {
         let message = format!(
             "requested HTTP/2 but upstream negotiated {}",
-            record.http_version.as_deref().unwrap_or("unknown")
+            record.response_http_version().unwrap_or("unknown")
         );
         record.notes.push(message.clone());
         store_record_and_scan(&state, &session, record.clone()).await;
@@ -2011,6 +2027,7 @@ async fn forward_http_request(
     started: Instant,
     secure_special_host: bool,
 ) -> Response<Body> {
+    let request_http_version = parts.version;
     let editable_request = editable_request_from_parts(&parts, &request_bytes, &absolute_uri);
     let intercepted_request = match maybe_intercept_request(
         state.clone(),
@@ -2055,6 +2072,7 @@ async fn forward_http_request(
             notes,
             secure_special_host,
             original_request_capture,
+            Some(request_http_version),
             None,
             None,
         )
@@ -2072,6 +2090,7 @@ async fn forward_http_request(
         notes,
         secure_special_host,
         original_request_capture,
+        Some(request_http_version),
         None,
         None,
     )
@@ -2142,6 +2161,7 @@ async fn forward_websocket_request(
     started: Instant,
     secure_special_host: bool,
 ) -> Response<Body> {
+    let request_http_version = parts.version;
     let client_request_headers = parts.headers.clone();
     let editable_request = editable_request_from_parts(&parts, &request_bytes, &absolute_uri);
     let forwarded_request = match maybe_intercept_request(
@@ -2192,6 +2212,7 @@ async fn forward_websocket_request(
             ),
             secure_special_host,
             original_request_capture,
+            Some(request_http_version),
             None,
             None,
         )
@@ -2261,6 +2282,7 @@ async fn forward_websocket_request(
             ),
             secure_special_host,
             original_request_capture,
+            Some(request_http_version),
             None,
             None,
         )
@@ -2698,6 +2720,7 @@ async fn execute_streaming_http_exchange(
     mut notes: Vec<String>,
     _secure_special_host: bool,
     original_request_capture: Option<MessageRecord>,
+    request_http_version: Option<Version>,
     requested_http_version: Option<Version>,
     outbound_uri_authority: Option<&str>,
 ) -> Response<Body> {
@@ -2799,21 +2822,24 @@ async fn execute_streaming_http_exchange(
                     .await;
                 let (response, response_capture) =
                     synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
-                let record = TransactionRecord::http(
-                    started_at,
-                    method.to_string(),
-                    request.scheme,
-                    request.host,
-                    path,
-                    Some(StatusCode::BAD_GATEWAY.as_u16()),
-                    started.elapsed().as_millis() as u64,
-                    request_capture,
-                    Some(response_capture),
-                    notes,
-                    original_request_capture,
-                    None,
-                )
-                .with_http_version(response_version);
+                let record = with_record_http_versions(
+                    TransactionRecord::http(
+                        started_at,
+                        method.to_string(),
+                        request.scheme,
+                        request.host,
+                        path,
+                        Some(StatusCode::BAD_GATEWAY.as_u16()),
+                        started.elapsed().as_millis() as u64,
+                        request_capture,
+                        Some(response_capture),
+                        notes,
+                        original_request_capture,
+                        None,
+                    ),
+                    request_http_version,
+                    Some(response_version),
+                );
                 store_record_and_scan(&state, &session, record).await;
                 return response;
             }
@@ -2834,6 +2860,7 @@ async fn execute_streaming_http_exchange(
                 response_headers: response_headers.clone(),
                 notes,
                 original_request_capture,
+                request_version: request_http_version,
                 response_version,
                 max_preview: state.config.body_preview_bytes,
             };
@@ -2998,21 +3025,24 @@ impl StreamedRecordContext {
             }
         }
         self.notes = notes;
-        let record = TransactionRecord::http(
-            self.started_at,
-            self.method,
-            self.scheme,
-            self.host,
-            self.path,
-            Some(self.status.as_u16()),
-            self.started.elapsed().as_millis() as u64,
-            self.request_capture,
-            Some(response_capture),
-            self.notes,
-            self.original_request_capture,
-            None,
-        )
-        .with_http_version(self.response_version);
+        let record = with_record_http_versions(
+            TransactionRecord::http(
+                self.started_at,
+                self.method,
+                self.scheme,
+                self.host,
+                self.path,
+                Some(self.status.as_u16()),
+                self.started.elapsed().as_millis() as u64,
+                self.request_capture,
+                Some(response_capture),
+                self.notes,
+                self.original_request_capture,
+                None,
+            ),
+            self.request_version,
+            Some(self.response_version),
+        );
         store_record_and_scan(&self.state, &self.session, record).await;
         forget_persist_context_if_clean(self.session.id(), self.persist_generation);
     }
@@ -3028,6 +3058,7 @@ async fn execute_http_exchange(
     mut notes: Vec<String>,
     secure_special_host: bool,
     original_request_capture: Option<MessageRecord>,
+    request_http_version: Option<Version>,
     requested_http_version: Option<Version>,
     outbound_uri_authority: Option<&str>,
 ) -> ExecutedExchange {
@@ -3175,21 +3206,24 @@ async fn execute_http_exchange(
                 let (_response, response_capture) =
                     synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
                 return ExecutedExchange {
-                    record: TransactionRecord::http(
-                        started_at,
-                        method.to_string(),
-                        request.scheme,
-                        request.host,
-                        path,
-                        Some(StatusCode::BAD_GATEWAY.as_u16()),
-                        started.elapsed().as_millis() as u64,
-                        request_capture,
-                        Some(response_capture),
-                        notes,
-                        original_request_capture,
-                        None,
-                    )
-                    .with_http_version(resp_version),
+                    record: with_record_http_versions(
+                        TransactionRecord::http(
+                            started_at,
+                            method.to_string(),
+                            request.scheme,
+                            request.host,
+                            path,
+                            Some(StatusCode::BAD_GATEWAY.as_u16()),
+                            started.elapsed().as_millis() as u64,
+                            request_capture,
+                            Some(response_capture),
+                            notes,
+                            original_request_capture,
+                            None,
+                        ),
+                        request_http_version,
+                        Some(resp_version),
+                    ),
                     response: Err(UpstreamError {
                         status: StatusCode::BAD_GATEWAY,
                         message,
@@ -3234,21 +3268,24 @@ async fn execute_http_exchange(
                         state.config.body_preview_bytes,
                     );
                     ExecutedExchange {
-                        record: TransactionRecord::http(
-                            started_at,
-                            method.to_string(),
-                            request.scheme,
-                            request.host,
-                            path,
-                            Some(status.as_u16()),
-                            started.elapsed().as_millis() as u64,
-                            request_capture,
-                            Some(response_capture),
-                            notes,
-                            original_request_capture,
-                            original_response_capture,
-                        )
-                        .with_http_version(resp_version),
+                        record: with_record_http_versions(
+                            TransactionRecord::http(
+                                started_at,
+                                method.to_string(),
+                                request.scheme,
+                                request.host,
+                                path,
+                                Some(status.as_u16()),
+                                started.elapsed().as_millis() as u64,
+                                request_capture,
+                                Some(response_capture),
+                                notes,
+                                original_request_capture,
+                                original_response_capture,
+                            ),
+                            request_http_version,
+                            Some(resp_version),
+                        ),
                         response: Ok(UpstreamResponse {
                             status,
                             headers: applied_response.headers,
@@ -4619,6 +4656,26 @@ async fn relay_websocket_session(
                                     frame_index += 1;
                                 }
                             }
+                            if let WebSocketMessage::Ping(payload) = &message {
+                                let reply = WebSocketMessage::Pong(payload.clone());
+                                client_sink
+                                    .send(reply.clone())
+                                    .await
+                                    .context("failed to send websocket pong to client")?;
+                                if let Some(id) = session_id {
+                                    if let Some(frame) = capture_websocket_frame(
+                                        frame_index,
+                                        WebSocketFrameDirection::ServerToClient,
+                                        &reply,
+                                        max_preview,
+                                    ) {
+                                        if session.websockets.append_frame(id, frame).await {
+                                            mark_session_persist_pending(&state, &session);
+                                        }
+                                        frame_index += 1;
+                                    }
+                                }
+                            }
                             continue;
                         }
                         let should_close = message.is_close();
@@ -4673,6 +4730,26 @@ async fn relay_websocket_session(
                                         mark_session_persist_pending(&state, &session);
                                     }
                                     frame_index += 1;
+                                }
+                            }
+                            if let WebSocketMessage::Ping(payload) = &message {
+                                let reply = WebSocketMessage::Pong(payload.clone());
+                                upstream_sink
+                                    .send(reply.clone())
+                                    .await
+                                    .context("failed to send websocket pong upstream")?;
+                                if let Some(id) = session_id {
+                                    if let Some(frame) = capture_websocket_frame(
+                                        frame_index,
+                                        WebSocketFrameDirection::ClientToServer,
+                                        &reply,
+                                        max_preview,
+                                    ) {
+                                        if session.websockets.append_frame(id, frame).await {
+                                            mark_session_persist_pending(&state, &session);
+                                        }
+                                        frame_index += 1;
+                                    }
                                 }
                             }
                             continue;
@@ -5200,6 +5277,7 @@ mod tests {
             response_headers: HeaderMap::new(),
             notes: Vec::new(),
             original_request_capture: None,
+            request_version: Some(Version::HTTP_11),
             response_version: Version::HTTP_11,
             max_preview: 1024,
         };

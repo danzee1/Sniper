@@ -4926,9 +4926,8 @@ async function loadNewerTransactions({ background = false } = {}) {
       return 0;
     }
     const pageItems = jsonArray(page.items);
-    const trimmedHeadBeforeLoad = paging.trimmedHeadCount || 0;
     const added = mergeHistoryItems(pageItems, { prepend: true });
-    paging.trimmedHeadCount = Math.max(0, trimmedHeadBeforeLoad - added);
+    paging.trimmedHeadCount = 0;
     paging.offset = state.items.length;
     paging.total = page.total ?? paging.total;
     paging.filteredTotal = page.filtered_total ?? paging.filteredTotal;
@@ -11683,6 +11682,9 @@ async function sendReplay() {
     const fallback = tab.baseRequest || createDefaultEditableRequest();
     const replayReqText = tab.requestText || "";
     request = parseEditableRawRequest(replayReqText, fallback);
+    if (request.preview_truncated) {
+      throw new Error("Cannot send Replay because the request body is preview-truncated. Edit the body or reopen it from the original capture.");
+    }
     requestText = request._normalizedRawText || replayReqText;
     if (requestText !== replayReqText) {
       tab.requestText = requestText;
@@ -11930,6 +11932,10 @@ async function followRedirect() {
 
   // 301/302/303 → GET (drop body), 307/308 → keep method
   const useGet = status === 301 || status === 302 || status === 303;
+  if (currentRequest.preview_truncated && !useGet) {
+    showToast("Cannot follow redirect because the request body is preview-truncated.", "error");
+    return;
+  }
   const newMethod = useGet ? "GET" : currentRequest.method;
   const newBody = useGet ? "" : currentRequest.body;
   const newBodyEncoding = useGet ? "utf8" : (currentRequest.body_encoding || "utf8");
@@ -13760,14 +13766,16 @@ function buildRawResponseHead(record) {
   const headers = normalizedHeaders(response.headers)
     .map((header) => `${header.name}: ${header.value}`)
     .join("\n");
-  const httpVer = record.http_version || "HTTP/1.1";
+  const httpVer = record.response_http_version || record.http_version || "HTTP/1.1";
   const statusLine = `${httpVer} ${record.status ?? 0}`;
   return headers ? `${statusLine}\n${headers}` : statusLine;
 }
 
 function buildFindingsRawMessage(record, side) {
   const msg = side === "request" ? record.request : record.response;
-  const httpVer = record.http_version || "HTTP/1.1";
+  const httpVer = side === "request"
+    ? record.http_version || "HTTP/1.1"
+    : record.response_http_version || record.http_version || "HTTP/1.1";
   if (side === "request") {
     const startLine = record.kind === "tunnel"
       ? `CONNECT ${record.host} ${httpVer}`
@@ -14057,6 +14065,12 @@ function parseEditableRawRequest(text, fallback) {
   }
   validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths);
 
+  const fallbackBody = String(fallback?.body ?? fallback?.body_preview ?? "");
+  const fallbackBodyEncoding = fallback?.body_encoding === "base64" ? "base64" : "utf8";
+  const previewTruncated = Boolean(fallback?.preview_truncated)
+    && body === fallbackBody
+    && bodyEncoding === fallbackBodyEncoding;
+
   const request = {
     scheme,
     host,
@@ -14066,7 +14080,7 @@ function parseEditableRawRequest(text, fallback) {
     headers,
     body,
     body_encoding: bodyEncoding,
-    preview_truncated: false,
+    preview_truncated: previewTruncated,
   };
   if (contentLengthChanged) {
     Object.defineProperty(request, "_normalizedRawText", {

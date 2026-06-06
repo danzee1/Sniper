@@ -338,6 +338,8 @@ pub struct TransactionRecord {
     pub original_response: Option<MessageRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_http_version: Option<String>,
 }
 
 impl TransactionRecord {
@@ -374,12 +376,29 @@ impl TransactionRecord {
             original_request,
             original_response,
             http_version: None,
+            response_http_version: None,
         }
+    }
+
+    pub fn with_request_http_version(mut self, version: http::Version) -> Self {
+        self.http_version = Some(format_http_version(version));
+        self
+    }
+
+    pub fn with_response_http_version(mut self, version: http::Version) -> Self {
+        self.response_http_version = Some(format_http_version(version));
+        self
     }
 
     pub fn with_http_version(mut self, version: http::Version) -> Self {
         self.http_version = Some(format_http_version(version));
         self
+    }
+
+    pub fn response_http_version(&self) -> Option<&str> {
+        self.response_http_version
+            .as_deref()
+            .or(self.http_version.as_deref())
     }
 
     pub fn with_response(mut self, response: MessageRecord) -> Self {
@@ -414,6 +433,7 @@ impl TransactionRecord {
             original_request: None,
             original_response: None,
             http_version: None,
+            response_http_version: None,
         }
     }
 

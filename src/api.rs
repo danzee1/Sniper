@@ -1606,6 +1606,11 @@ fn validate_sequence_definition(
                 MAX_SEQUENCE_TEXT_FIELD_BYTES,
             )?;
         }
+        let has_request_parse_error = step
+            .request_parse_error
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|error| !error.is_empty());
         if let Some(parse_error) = &step.request_parse_error {
             validate_text_field(
                 "sequence step parse error",
@@ -1619,8 +1624,11 @@ fn validate_sequence_definition(
                 step.label
             ));
         }
-        validate_editable_request(&step.request)
-            .map_err(|error| format!("invalid request in sequence step {}: {error}", step.label))?;
+        if !has_request_parse_error {
+            validate_editable_request(&step.request).map_err(|error| {
+                format!("invalid request in sequence step {}: {error}", step.label)
+            })?;
+        }
         normalize_replay_http_version(step.http_version.as_deref()).map_err(|error| {
             format!(
                 "invalid HTTP version in sequence step {}: {error}",
@@ -4244,6 +4252,7 @@ async fn events(
     let mut finding_receiver = session.scanner.subscribe();
     let mut websocket_receiver = session.websockets.subscribe();
     let latest_sequence = session.store.latest_sequence();
+    let event_stream_started_for_active_session = state.sessions.active_session_id() == session_id;
 
     let stream = stream! {
         let mut session_check = tokio::time::interval(Duration::from_millis(500));
@@ -4329,7 +4338,9 @@ async fn events(
                             .data(session_id.to_string()));
                         break;
                     }
-                    if !explicit_event_session && state.sessions.active_session_id() != session_id {
+                    if state.sessions.active_session_id() != session_id
+                        && (!explicit_event_session || event_stream_started_for_active_session)
+                    {
                         yield Ok(Event::default()
                             .event("session_changed")
                             .data(state.sessions.active_session_id().to_string()));
@@ -5783,6 +5794,37 @@ mod tests {
         assert!(super::validate_sequence_definition(&definition).is_ok());
         definition.steps[0].http_version = Some("HTTP/3".to_string());
         assert!(super::validate_sequence_definition(&definition).is_err());
+    }
+
+    #[test]
+    fn sequence_validation_allows_invalid_request_draft_with_parse_error() {
+        let request = crate::model::EditableRequest {
+            scheme: "https".to_string(),
+            host: String::new(),
+            method: "GET".to_string(),
+            path: String::new(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "draft".to_string(),
+            steps: vec![SequenceStep {
+                id: uuid::Uuid::new_v4(),
+                label: "draft step".to_string(),
+                request,
+                source_transaction_id: None,
+                http_version: Some("HTTP/1.1".to_string()),
+                target: None,
+                request_text: Some("GET / HTTP/1.1".to_string()),
+                request_parse_error: Some("Request is missing a Host header".to_string()),
+                extractions: Vec::new(),
+            }],
+        };
+
+        assert!(super::validate_sequence_definition(&definition).is_ok());
     }
 
     #[test]
@@ -8663,6 +8705,60 @@ mod tests {
         assert!(
             text.contains(&websocket_id.to_string()),
             "websocket event should include summary id {websocket_id}: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_active_events_stream_emits_session_changed() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-active-events-session-changed-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let active = state.session().await;
+        let events_response = super::events(
+            State(state.clone()),
+            Query(super::EventsQuery {
+                session_id: Some(active.id()),
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(events_response.status(), super::StatusCode::OK);
+        let mut events_body = events_response.into_body();
+
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        for _ in 0..8 {
+            let frame = tokio::time::timeout(Duration::from_secs(1), events_body.frame())
+                .await
+                .expect("active event stream should yield a frame")
+                .expect("active event stream should remain open")
+                .expect("active event frame should be ok");
+            if let Ok(bytes) = frame.into_data() {
+                text.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            if text.contains("event: session_changed") {
+                break;
+            }
+        }
+
+        assert!(
+            text.contains("event: session_changed"),
+            "active explicit event stream should include session_changed: {text}"
         );
 
         let _ = std::fs::remove_dir_all(data_dir);

@@ -91,6 +91,64 @@ async fn proxy_applies_request_match_replace_only_once() {
 }
 
 #[tokio::test]
+async fn proxy_records_request_and_response_http_versions_separately() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let (request_line_tx, request_line_rx) = tokio::sync::oneshot::channel();
+    let upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let mut buffer = [0_u8; 2048];
+        let read = socket.read(&mut buffer).await.unwrap();
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let first_line = request.lines().next().unwrap_or_default().to_string();
+        let _ = request_line_tx.send(first_line);
+        socket
+            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-regression-http-version-{}",
+            Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+    let session = state.session().await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!(
+        "GET http://{upstream_addr}/version HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await.unwrap();
+    assert!(String::from_utf8_lossy(&buffer).contains("200 OK"));
+    assert_eq!(request_line_rx.await.unwrap(), "GET /version HTTP/1.1");
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let list = session.store.list(&ListFilters::default()).await;
+    assert_eq!(list.len(), 1);
+    let detail = session.store.get(list[0].id).await.unwrap();
+    assert_eq!(detail.http_version.as_deref(), Some("HTTP/1.1"));
+    assert_eq!(detail.response_http_version.as_deref(), Some("HTTP/1.0"));
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn replay_rejects_truncated_captured_request_reuse() {
     let config = AppConfig {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
