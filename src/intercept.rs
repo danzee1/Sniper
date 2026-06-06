@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use crate::model::{EditableRequest, EditableResponse};
 
+const MAX_INTERCEPT_QUEUE_ENTRIES: usize = 512;
+
 // ── Intercept Rules ──
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -206,10 +208,14 @@ impl InterceptQueue {
 
     pub async fn enqueue(&self, record: InterceptRecord) -> InterceptResolution {
         let (sender, receiver) = oneshot::channel();
-        self.queue.lock().await.push_back(PendingIntercept {
-            record: record.clone(),
-            responder: sender,
-        });
+        {
+            let mut queue = self.queue.lock().await;
+            queue.push_back(PendingIntercept {
+                record: record.clone(),
+                responder: sender,
+            });
+            trim_pending_request_intercepts(&mut queue, MAX_INTERCEPT_QUEUE_ENTRIES);
+        }
 
         receiver
             .await
@@ -295,6 +301,23 @@ impl Default for InterceptQueue {
     }
 }
 
+fn trim_pending_request_intercepts(
+    queue: &mut VecDeque<PendingIntercept>,
+    max_entries: usize,
+) -> usize {
+    let mut evicted = 0;
+    while queue.len() > max_entries {
+        let Some(pending) = queue.pop_front() else {
+            break;
+        };
+        let _ = pending
+            .responder
+            .send(InterceptResolution::Forward(pending.record.request));
+        evicted += 1;
+    }
+    evicted
+}
+
 // ── Response Intercept Queue ──
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -359,10 +382,14 @@ impl ResponseInterceptQueue {
 
     pub async fn enqueue(&self, record: ResponseInterceptRecord) -> ResponseInterceptResolution {
         let (sender, receiver) = oneshot::channel();
-        self.queue.lock().await.push_back(PendingResponseIntercept {
-            record,
-            responder: sender,
-        });
+        {
+            let mut queue = self.queue.lock().await;
+            queue.push_back(PendingResponseIntercept {
+                record,
+                responder: sender,
+            });
+            trim_pending_response_intercepts(&mut queue, MAX_INTERCEPT_QUEUE_ENTRIES);
+        }
 
         receiver.await.unwrap_or(ResponseInterceptResolution::Drop)
     }
@@ -442,6 +469,23 @@ impl Default for ResponseInterceptQueue {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn trim_pending_response_intercepts(
+    queue: &mut VecDeque<PendingResponseIntercept>,
+    max_entries: usize,
+) -> usize {
+    let mut evicted = 0;
+    while queue.len() > max_entries {
+        let Some(pending) = queue.pop_front() else {
+            break;
+        };
+        let _ = pending.responder.send(ResponseInterceptResolution::Forward(
+            pending.record.response,
+        ));
+        evicted += 1;
+    }
+    evicted
 }
 
 fn host_without_port(host: &str) -> &str {
@@ -528,6 +572,96 @@ mod tests {
 
         request.host = "example.com.".to_string();
         assert!(rule.matches(&request));
+    }
+
+    #[tokio::test]
+    async fn pending_request_intercepts_forward_oldest_when_queue_is_full() {
+        let mut queue = VecDeque::new();
+        let old = request();
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+        let (old_sender, old_receiver) = oneshot::channel();
+        let (new_sender, _new_receiver) = oneshot::channel();
+        queue.push_back(PendingIntercept {
+            record: InterceptRecord {
+                id: old_id,
+                started_at: Utc::now(),
+                peer_addr: "127.0.0.1:11111".to_string(),
+                request: old.clone(),
+                is_websocket: false,
+            },
+            responder: old_sender,
+        });
+        queue.push_back(PendingIntercept {
+            record: InterceptRecord {
+                id: new_id,
+                started_at: Utc::now(),
+                peer_addr: "127.0.0.1:22222".to_string(),
+                request: request(),
+                is_websocket: false,
+            },
+            responder: new_sender,
+        });
+
+        let evicted = trim_pending_request_intercepts(&mut queue, 1);
+
+        assert_eq!(evicted, 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().map(|pending| pending.record.id), Some(new_id));
+        match old_receiver.await.unwrap() {
+            InterceptResolution::Forward(request) => assert_eq!(request.host, old.host),
+            InterceptResolution::Drop(_) => panic!("old request should be forwarded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_response_intercepts_forward_oldest_when_queue_is_full() {
+        let mut queue = VecDeque::new();
+        let old = response();
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+        let (old_sender, old_receiver) = oneshot::channel();
+        let (new_sender, _new_receiver) = oneshot::channel();
+        queue.push_back(PendingResponseIntercept {
+            record: ResponseInterceptRecord {
+                id: old_id,
+                started_at: Utc::now(),
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                method: "GET".to_string(),
+                path: "/old".to_string(),
+                status: old.status,
+                response: old.clone(),
+            },
+            responder: old_sender,
+        });
+        queue.push_back(PendingResponseIntercept {
+            record: ResponseInterceptRecord {
+                id: new_id,
+                started_at: Utc::now(),
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                method: "GET".to_string(),
+                path: "/new".to_string(),
+                status: 201,
+                response: response(),
+            },
+            responder: new_sender,
+        });
+
+        let evicted = trim_pending_response_intercepts(&mut queue, 1);
+
+        assert_eq!(evicted, 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().map(|pending| pending.record.id), Some(new_id));
+        match old_receiver.await.unwrap() {
+            ResponseInterceptResolution::Forward(response) => {
+                assert_eq!(response.status, old.status)
+            }
+            ResponseInterceptResolution::PassThrough | ResponseInterceptResolution::Drop => {
+                panic!("old response should be forwarded")
+            }
+        }
     }
 
     #[tokio::test]

@@ -910,10 +910,7 @@ fn validate_unique_host_header(headers: &[HeaderRecord]) -> std::result::Result<
 fn validate_request_target_override(
     target: &RequestTargetOverride,
 ) -> std::result::Result<(), String> {
-    validate_http_scheme_field(&target.scheme, "replay target scheme")?;
-    validate_replay_target_host(&target.host)?;
-    validate_port_text(&target.port, "replay target port")?;
-    Ok(())
+    validate_workspace_target_fields(&target.scheme, &target.host, &target.port)
 }
 
 fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::Result<(), String> {
@@ -5864,6 +5861,26 @@ mod tests {
 
     #[test]
     fn replay_target_validation_rejects_ambiguous_hosts() {
+        for target in [
+            RequestTargetOverride {
+                scheme: "https".to_string(),
+                host: String::new(),
+                port: "9443".to_string(),
+            },
+            RequestTargetOverride {
+                scheme: String::new(),
+                host: String::new(),
+                port: "9443".to_string(),
+            },
+            RequestTargetOverride {
+                scheme: "https".to_string(),
+                host: String::new(),
+                port: String::new(),
+            },
+        ] {
+            assert!(super::validate_request_target_override(&target).is_ok());
+        }
+
         for host in [
             "victim.test@127.0.0.1",
             "127.0.0.1/path",
@@ -6926,31 +6943,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_oast_payload_rejects_server_url_with_path() {
+    async fn update_runtime_settings_rejects_oast_server_url_with_path() {
         let config = test_app_config("sniper-oast-payload-url-path");
         let data_dir = config.data_dir.clone();
         let state = Arc::new(AppState::new(config).unwrap());
 
-        let runtime: RuntimeSettingsSnapshot = response_json(
-            super::update_runtime_settings(
-                State(state.clone()),
-                Json(RuntimeSettingsUpdate {
-                    oast_enabled: Some(true),
-                    oast_server_url: Some("https://oast.example.test/api".to_string()),
-                    oast_provider: Some(OastProvider::Boast),
-                    ..RuntimeSettingsUpdate::default()
-                }),
-            )
-            .await,
-        )
-        .await;
-        assert!(runtime.oast_enabled);
-
-        let response = super::generate_oast_payload(
-            State(state),
-            Query(super::OastQuery {
-                session_id: None,
-                limit: None,
+        let response = super::update_runtime_settings(
+            State(state.clone()),
+            Json(RuntimeSettingsUpdate {
+                oast_enabled: Some(true),
+                oast_server_url: Some("https://oast.example.test/api".to_string()),
+                oast_provider: Some(OastProvider::Boast),
+                ..RuntimeSettingsUpdate::default()
             }),
         )
         .await;
@@ -6959,7 +6963,8 @@ mod tests {
             .await
             .expect("response body should be readable");
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("path"));
+        assert!(text.contains("OAST server URL"));
+        assert!(!state.session().await.runtime.snapshot().await.oast_enabled);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

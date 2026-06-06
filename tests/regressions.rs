@@ -149,6 +149,71 @@ async fn proxy_records_request_and_response_http_versions_separately() {
 }
 
 #[tokio::test]
+async fn replay_upstream_failure_preserves_request_match_replace_provenance() {
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-regression-replay-failure-match-replace-{}",
+            Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+    let session = state.session().await;
+    session
+        .match_replace
+        .replace_all(vec![MatchReplaceRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            description: "rewrite replay path".to_string(),
+            scope: MatchReplaceScope::Request,
+            target: MatchReplaceTarget::Path,
+            search: "before".to_string(),
+            replace: "after".to_string(),
+            regex: false,
+            case_sensitive: true,
+        }])
+        .await;
+
+    let request = EditableRequest {
+        scheme: "http".to_string(),
+        host: "logical.example.test".to_string(),
+        method: "GET".to_string(),
+        path: "/before".to_string(),
+        headers: vec![sniper::model::HeaderRecord {
+            name: "host".to_string(),
+            value: "logical.example.test".to_string(),
+        }],
+        body: String::new(),
+        body_encoding: BodyEncoding::Utf8,
+        preview_truncated: false,
+    };
+    let target = RequestTargetOverride {
+        scheme: "http".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: closed_port.to_string(),
+    };
+
+    let error = send_replay_request(state, request, Some(target), None, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Upstream request failed"));
+
+    let list = session.store.list(&ListFilters::default()).await;
+    assert_eq!(list.len(), 1);
+    let detail = session.store.get(list[0].id).await.unwrap();
+    assert_eq!(detail.path, "/after");
+    assert!(detail.original_request.is_some());
+    assert!(detail.summary().has_match_replace);
+}
+
+#[tokio::test]
 async fn replay_rejects_truncated_captured_request_reuse() {
     let config = AppConfig {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),

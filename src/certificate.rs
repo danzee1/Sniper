@@ -29,6 +29,7 @@ const ROOT_CERT_DER: &str = "sniper-root-ca.der";
 const ROOT_KEY_PEM: &str = "sniper-root-ca.key";
 const ROOT_METADATA: &str = "sniper-root-ca.json";
 pub const SPECIAL_HOST: &str = "sniper";
+const MAX_HOST_TLS_CACHE_ENTRIES: usize = 1024;
 
 pub struct CertificateAuthority {
     root_cert_pem: String,
@@ -176,10 +177,12 @@ impl CertificateAuthority {
             self.export.expires_at,
         )?;
 
-        self.host_tls_cache
+        let mut cache = self
+            .host_tls_cache
             .lock()
-            .map_err(|_| anyhow::anyhow!("host TLS cache lock poisoned"))?
-            .insert(normalized_host, config.clone());
+            .map_err(|_| anyhow::anyhow!("host TLS cache lock poisoned"))?;
+        reserve_host_tls_cache_slot(&mut cache, now, MAX_HOST_TLS_CACHE_ENTRIES);
+        cache.insert(normalized_host, config.clone());
 
         Ok(config.config)
     }
@@ -509,6 +512,29 @@ impl CertificateAuthority {
 fn is_tls_cache_fresh(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     let refresh_threshold = now.checked_add_days(Days::new(1)).unwrap_or(now);
     expires_at > refresh_threshold
+}
+
+fn reserve_host_tls_cache_slot(
+    cache: &mut HashMap<String, CachedTlsConfig>,
+    now: DateTime<Utc>,
+    max_entries: usize,
+) {
+    if max_entries == 0 {
+        cache.clear();
+        return;
+    }
+
+    cache.retain(|_, cached| is_tls_cache_fresh(cached.expires_at, now));
+    while cache.len() >= max_entries {
+        let Some(host) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.expires_at)
+            .map(|(host, _)| host.clone())
+        else {
+            break;
+        };
+        cache.remove(&host);
+    }
 }
 
 fn leaf_expiration(root_expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
@@ -902,6 +928,48 @@ mod tests {
             .expect("host cert should be reissued");
 
         assert!(!Arc::ptr_eq(&first, &second));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn host_tls_cache_reserves_slot_by_pruning_expired_and_oldest() {
+        let data_dir = temp_data_dir();
+        let authority =
+            CertificateAuthority::load_or_create(&data_dir).expect("certificate should generate");
+        let shared_config = authority
+            .server_config_for_host("seed.example")
+            .expect("host cert should build");
+        let now = chrono::Utc::now();
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "expired.example".to_string(),
+            super::CachedTlsConfig {
+                config: shared_config.clone(),
+                expires_at: now.checked_sub_days(chrono::Days::new(1)).unwrap(),
+            },
+        );
+        cache.insert(
+            "old.example".to_string(),
+            super::CachedTlsConfig {
+                config: shared_config.clone(),
+                expires_at: now.checked_add_days(chrono::Days::new(10)).unwrap(),
+            },
+        );
+        cache.insert(
+            "new.example".to_string(),
+            super::CachedTlsConfig {
+                config: shared_config,
+                expires_at: now.checked_add_days(chrono::Days::new(20)).unwrap(),
+            },
+        );
+
+        super::reserve_host_tls_cache_slot(&mut cache, now, 2);
+
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_key("expired.example"));
+        assert!(!cache.contains_key("old.example"));
+        assert!(cache.contains_key("new.example"));
 
         let _ = fs::remove_dir_all(&data_dir);
     }

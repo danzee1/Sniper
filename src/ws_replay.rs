@@ -287,7 +287,8 @@ impl WsReplayStore {
                 }
             }
         }
-        self.prune_terminal_connections(owner_session_id).await;
+        self.prune_terminal_connections(Some(owner_session_id))
+            .await;
 
         let (task_abort, abort_registration) = AbortHandle::new_pair();
 
@@ -522,6 +523,10 @@ impl WsReplayStore {
             match (expected.as_ref(), connections.get(&id)) {
                 (None, None) => {
                     if connections.len() >= MAX_WS_REPLAY_CONNECTIONS {
+                        drop(connections);
+                        if self.prune_terminal_connections(None).await > 0 {
+                            continue;
+                        }
                         anyhow::bail!(
                             "too many WebSocket replay connections; close stale replay tabs first"
                         );
@@ -538,7 +543,7 @@ impl WsReplayStore {
         }
     }
 
-    async fn prune_terminal_connections(&self, owner_session_id: Uuid) {
+    async fn prune_terminal_connections(&self, owner_session_id: Option<Uuid>) -> usize {
         let candidates = {
             let connections = self.connections.read().await;
             connections
@@ -550,24 +555,28 @@ impl WsReplayStore {
         for (id, conn) in candidates {
             let should_remove = {
                 let connection = conn.read().await;
-                connection.owner_session_id == owner_session_id && connection.is_terminal()
+                owner_session_id.is_none_or(|owner| connection.owner_session_id == owner)
+                    && connection.is_terminal()
             };
             if should_remove {
                 remove_candidates.push((id, conn));
             }
         }
         if remove_candidates.is_empty() {
-            return;
+            return 0;
         }
         let mut connections = self.connections.write().await;
+        let mut removed = 0;
         for (id, candidate) in remove_candidates {
             if connections
                 .get(&id)
                 .is_some_and(|current| Arc::ptr_eq(current, &candidate))
             {
                 connections.remove(&id);
+                removed += 1;
             }
         }
+        removed
     }
 
     pub async fn belongs_to_session(&self, id: Uuid, session_id: Uuid) -> Option<bool> {
@@ -1130,6 +1139,33 @@ mod tests {
 
         assert_eq!(store.connections.read().await.len(), 2);
         assert!(store.snapshot(other_terminal_id).await.is_some());
+        store.remove(id).await;
+    }
+
+    #[tokio::test]
+    async fn connect_prunes_global_terminal_connections_before_connection_cap() {
+        let store = WsReplayStore::new();
+        let owner = Uuid::new_v4();
+        let other_owner = Uuid::new_v4();
+        {
+            let mut connections = store.connections.write().await;
+            for _ in 0..MAX_WS_REPLAY_CONNECTIONS {
+                let mut connection = test_connection(WsReplayStatus::Disconnected, None);
+                connection.owner_session_id = other_owner;
+                connections.insert(Uuid::new_v4(), Arc::new(RwLock::new(connection)));
+            }
+        }
+
+        let id = Uuid::new_v4();
+        store
+            .connect(id, owner, "ws://127.0.0.1:1/", Vec::new(), false)
+            .await
+            .unwrap();
+
+        let connections = store.connections.read().await;
+        assert_eq!(connections.len(), 1);
+        assert!(connections.contains_key(&id));
+        drop(connections);
         store.remove(id).await;
     }
 

@@ -571,6 +571,31 @@ fn oast_payload_domain(server_url: &str) -> Result<String, String> {
     Ok(domain.to_string())
 }
 
+pub fn validate_oast_server_url(server_url: &str) -> Result<(), String> {
+    let trimmed = server_url.trim();
+    if trimmed != server_url {
+        return Err("OAST server URL must not include surrounding whitespace.".to_string());
+    }
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let url = Url::parse(trimmed).map_err(|_| "OAST server URL is invalid.".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("OAST server URL must use http or https.".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("OAST server URL must not include credentials.".to_string());
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("OAST server URL must include a host.".to_string());
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("OAST server URL must not include a path, query, or fragment.".to_string());
+    }
+    Ok(())
+}
+
 fn oast_endpoint_url(base_url: &str, path: &str, query: &[(&str, &str)]) -> String {
     let base = base_url.trim_end_matches('/');
     let path = path.trim_start_matches('/');

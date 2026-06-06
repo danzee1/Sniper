@@ -97,7 +97,9 @@ impl RuntimeSettingsSnapshot {
         self.passthrough_hosts =
             normalize_bounded_scope_patterns("passthrough host", self.passthrough_hosts)
                 .unwrap_or_default();
-        if validate_runtime_text_field("OAST server URL", &self.oast_server_url).is_err() {
+        if validate_runtime_text_field("OAST server URL", &self.oast_server_url).is_err()
+            || crate::oast::validate_oast_server_url(&self.oast_server_url).is_err()
+        {
             self.oast_server_url.clear();
         }
         if validate_runtime_text_field("OAST token", &self.oast_token).is_err() {
@@ -207,6 +209,8 @@ impl RuntimeSettings {
         }
         if let Some(oast_server_url) = update.oast_server_url {
             validate_runtime_text_field("OAST server URL", &oast_server_url)?;
+            crate::oast::validate_oast_server_url(&oast_server_url)
+                .map_err(|error| anyhow::anyhow!(error))?;
             candidate.oast_server_url = oast_server_url;
         }
         if let Some(oast_token) = requested_oast_token.as_deref() {
@@ -439,6 +443,43 @@ mod tests {
         assert_eq!(
             snapshot.oast_polling_interval_secs,
             super::default_oast_interval()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_rejects_oast_server_url_with_request_components() {
+        let settings = RuntimeSettings::new();
+        for server_url in [
+            "http://127.0.0.1/admin?x=1",
+            "http://user@example.test",
+            "file:///tmp/oast",
+            "https://oast.example.test/#frag",
+            " oast.example.test ",
+        ] {
+            let error = settings
+                .update(RuntimeSettingsUpdate {
+                    oast_server_url: Some(server_url.to_string()),
+                    ..RuntimeSettingsUpdate::default()
+                })
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("OAST server URL"),
+                "{server_url} should be rejected"
+            );
+        }
+
+        settings
+            .update(RuntimeSettingsUpdate {
+                oast_server_url: Some("https://oast.example.test:8443".to_string()),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.snapshot().await.oast_server_url,
+            "https://oast.example.test:8443"
         );
     }
 

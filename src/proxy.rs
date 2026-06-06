@@ -2750,7 +2750,7 @@ async fn execute_streaming_http_exchange(
                 request_capture,
                 Some(response_capture),
                 notes,
-                None,
+                original_request_capture,
                 None,
             );
             store_record_and_scan(&state, &session, record).await;
@@ -3319,7 +3319,7 @@ async fn execute_http_exchange(
                             request_capture,
                             Some(response_capture),
                             notes,
-                            None,
+                            original_request_capture,
                             None,
                         ),
                         response: Err(UpstreamError {
@@ -3356,7 +3356,7 @@ async fn execute_http_exchange(
                     request_capture,
                     Some(response_capture),
                     notes,
-                    None,
+                    original_request_capture,
                     None,
                 ),
                 response: Err(UpstreamError {
