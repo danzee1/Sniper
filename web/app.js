@@ -9345,19 +9345,6 @@ function getSortedWebsocketEntries() {
   return getVisibleWebsocketSessions().map((session, index) => ({ session, index }));
 }
 
-function getWebsocketSortValue(session, key) {
-  switch (key) {
-    case "index": return Number.isFinite(Number(session?.index)) ? Number(session.index) : -1;
-    case "host": return String(session?.host || "").toLowerCase();
-    case "path": return String(session?.path || "").toLowerCase();
-    case "status": return Number.isFinite(Number(session?.status)) ? Number(session.status) : -1;
-    case "frame_count": return Number.isFinite(Number(session?.frame_count)) ? Number(session.frame_count) : 0;
-    case "duration_ms": return Number.isFinite(Number(session?.duration_ms)) ? Number(session.duration_ms) : Infinity;
-    case "started_at": return Date.parse(session?.started_at) || 0;
-    default: return "";
-  }
-}
-
 function defaultWebsocketSortDirection(key) {
   return ["index", "started_at", "status", "frame_count", "duration_ms"].includes(key) ? "desc" : "asc";
 }

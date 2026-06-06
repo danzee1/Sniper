@@ -209,7 +209,7 @@ fn normalize_certificate_host(host: &str) -> String {
 }
 
 pub fn default_data_dir() -> PathBuf {
-    if let Some(value) = env::var_os("SNIPER_DATA_DIR") {
+    if let Some(value) = env::var_os("SNIPER_DATA_DIR").filter(|value| !value.is_empty()) {
         return PathBuf::from(value);
     }
 
@@ -682,11 +682,53 @@ fn build_signed_host_tls_config(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{certificate_files, normalize_certificate_host, CertificateAuthority};
-    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+    use super::{
+        certificate_files, default_data_dir, normalize_certificate_host, CertificateAuthority,
+    };
+    use std::{
+        ffi::OsString,
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Mutex},
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set<K: Into<OsString>>(key: &'static str, value: K) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::set_var(key, value.into());
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn temp_data_dir() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("sniper-cert-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn default_data_dir_ignores_empty_sniper_data_dir_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _data_dir_guard = EnvVarGuard::set("SNIPER_DATA_DIR", "");
+
+        assert!(!default_data_dir().as_os_str().is_empty());
     }
 
     #[test]

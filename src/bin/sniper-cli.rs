@@ -12,7 +12,6 @@ use reqwest::{Method, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sniper::{
-    certificate::default_data_dir,
     fuzzer::FuzzerAttackRecord,
     intercept::{
         InterceptRecord, InterceptRule, InterceptSummary, ResponseInterceptRecord,
@@ -46,6 +45,7 @@ const SNIPER_API_PROBE_RETRY_DELAYS: [std::time::Duration; 2] = [
     std::time::Duration::from_millis(400),
 ];
 const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SNIPER_DATA_DIR_ENV: &str = "SNIPER_DATA_DIR";
 
 #[derive(Parser, Debug)]
 #[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.")]
@@ -3182,9 +3182,16 @@ async fn discover_api_base_url(
 }
 
 fn cli_data_dir() -> PathBuf {
-    env::var_os("SNIPER_DATA_DIR")
+    env::var_os(SNIPER_DATA_DIR_ENV)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(default_data_dir)
+        .unwrap_or_else(default_cli_data_dir)
+}
+
+fn default_cli_data_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".sniper"))
+        .unwrap_or_else(|| PathBuf::from(".sniper"))
 }
 
 async fn discover_api_base_url_from_data_dir(
@@ -4391,11 +4398,12 @@ mod tests {
         active_session_id_from_summaries, api_failure_detail, api_url, attach_workspace_save_error,
         build_annotations_payload, build_editable_raw_request,
         build_editable_raw_request_with_version, build_oast_configure_update, cli_data_dir,
-        data_dir_strings_match, default_editable_request, discover_api_base_url,
-        discover_api_base_url_from_data_dir, explicit_or_active_session_id, failed_record_output,
-        fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
-        install_skills, next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
-        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
+        data_dir_strings_match, default_cli_data_dir, default_editable_request,
+        discover_api_base_url, discover_api_base_url_from_data_dir, explicit_or_active_session_id,
+        failed_record_output, fuzzer_active_target_for_request,
+        fuzzer_target_request_authority_for_request, install_skills, next_replay_tab_sequence,
+        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
+        oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
         process_path_strings_match, push_replay_history_entry, read_limited_to_end,
@@ -4409,6 +4417,7 @@ mod tests {
         OastConfigureArgs, SequenceCommand, SequenceCreateInput, SessionCommand, SkillsInstallArgs,
         SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
         CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES, SNIPER_API_PROBE_RETRY_DELAYS,
+        SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -6520,8 +6529,16 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("sniper-cli-env-dir-{}", Uuid::new_v4()));
 
-        let _data_dir_guard = EnvVarGuard::set("SNIPER_DATA_DIR", root.clone().into_os_string());
+        let _data_dir_guard = EnvVarGuard::set(SNIPER_DATA_DIR_ENV, root.clone().into_os_string());
         assert_eq!(cli_data_dir(), root);
+    }
+
+    #[test]
+    fn cli_data_dir_ignores_empty_sniper_data_dir_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _data_dir_guard = EnvVarGuard::set(SNIPER_DATA_DIR_ENV, "");
+
+        assert_eq!(cli_data_dir(), default_cli_data_dir());
     }
 
     #[tokio::test]

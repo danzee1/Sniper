@@ -261,7 +261,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 async fn local_api_write_guard(request: Request, next: Next) -> Response {
-    if request.uri().path().starts_with("/api/") {
+    if is_api_path(request.uri().path()) {
         if !request_host_is_allowed_local_api(request.headers(), request.uri()) {
             return (
                 StatusCode::FORBIDDEN,
@@ -285,13 +285,17 @@ async fn local_api_write_guard(request: Request, next: Next) -> Response {
 }
 
 async fn spa_or_api_not_found(request: Request) -> Response {
-    if request.uri().path().starts_with("/api/") {
+    if is_api_path(request.uri().path()) {
         return (StatusCode::NOT_FOUND, "API endpoint not found").into_response();
     }
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return (StatusCode::NOT_FOUND, "Route not found").into_response();
     }
     index().await.into_response()
+}
+
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
 }
 
 fn request_host_is_allowed_local_api(headers: &HeaderMap, uri: &Uri) -> bool {
@@ -389,14 +393,20 @@ fn request_origin_matches(origin: &str, headers: &HeaderMap, uri: &Uri) -> bool 
 }
 
 fn request_authority(headers: &HeaderMap, uri: &Uri) -> Option<String> {
-    uri.authority()
-        .map(|authority| authority.as_str().to_string())
-        .or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        })
+    let uri_authority = uri.authority().map(|authority| authority.as_str());
+    let host_authority = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    match (uri_authority, host_authority) {
+        (Some(uri_authority), Some(host_authority)) => {
+            let scheme = uri.scheme_str().unwrap_or("http");
+            authorities_equivalent_for_origin(uri_authority, host_authority, scheme)
+                .then(|| host_authority.to_string())
+        }
+        (Some(uri_authority), None) => Some(uri_authority.to_string()),
+        (None, Some(host_authority)) => Some(host_authority.to_string()),
+        (None, None) => None,
+    }
 }
 
 fn format_authority_for_origin(host: &str, port: u16, scheme: &str) -> String {
@@ -5748,6 +5758,15 @@ mod tests {
         assert!(!super::request_host_is_allowed_local_api(&headers, &uri));
     }
 
+    #[test]
+    fn api_path_detection_matches_only_the_api_namespace() {
+        assert!(super::is_api_path("/api"));
+        assert!(super::is_api_path("/api/"));
+        assert!(super::is_api_path("/api/runtime"));
+        assert!(!super::is_api_path("/apiary"));
+        assert!(!super::is_api_path("/decoder/api"));
+    }
+
     #[tokio::test]
     async fn api_fallback_returns_not_found_for_unknown_api_paths() {
         let request = Request::builder()
@@ -5758,6 +5777,42 @@ mod tests {
         let response = super::spa_or_api_not_found(request).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_fallback_returns_not_found_for_api_root_path() {
+        let request = Request::builder()
+            .uri("/api")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = super::spa_or_api_not_found(request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn local_api_guard_applies_to_api_root_path() {
+        let (state, data_dir) = test_state("sniper-api-root-host-guard");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::router(state)).await.unwrap();
+        });
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/api"))
+            .header(reqwest::header::HOST, "attacker.test:23001")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
@@ -5826,6 +5881,22 @@ mod tests {
 
         headers.insert("host", HeaderValue::from_static("user@localhost:23001"));
         assert!(!super::request_host_is_allowed_local_api(&headers, &uri));
+    }
+
+    #[test]
+    fn local_api_host_guard_rejects_absolute_uri_host_mismatch() {
+        let mut headers = HeaderMap::new();
+        let uri: Uri = "http://127.0.0.1:23001/api/runtime".parse().unwrap();
+
+        headers.insert("host", HeaderValue::from_static("attacker.test:23001"));
+        assert!(!super::request_host_is_allowed_local_api(&headers, &uri));
+
+        headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:23001"));
+        assert!(!super::is_allowed_browser_write(&headers, &uri));
+
+        headers.insert("host", HeaderValue::from_static("127.0.0.1:23001"));
+        assert!(super::request_host_is_allowed_local_api(&headers, &uri));
+        assert!(super::is_allowed_browser_write(&headers, &uri));
     }
 
     #[test]

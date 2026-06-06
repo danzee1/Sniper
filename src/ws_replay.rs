@@ -760,7 +760,13 @@ impl WsReplayStore {
         let next_index = frames
             .last()
             .map(|frame| frame.index.saturating_add(1))
-            .unwrap_or(since_index);
+            .unwrap_or_else(|| {
+                if gap {
+                    c.retention_gap_floor.max(since_index)
+                } else {
+                    since_index
+                }
+            });
         Some(WsReplayFramesSince {
             status: c.status.clone(),
             error: c.error.clone(),
@@ -1019,6 +1025,27 @@ mod tests {
         assert!(response.gap);
         assert!(response.truncated);
         assert_eq!(response.frames.first().map(|frame| frame.index), Some(50));
+    }
+
+    #[tokio::test]
+    async fn frames_since_advances_when_retention_gap_has_no_retained_frames() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let mut connection = test_connection(WsReplayStatus::Connected, None);
+        connection.retention_gap_floor = 50;
+        store
+            .connections
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(connection)));
+
+        let response = store.frames_since(id, 10).await.unwrap();
+
+        assert!(response.frames.is_empty());
+        assert_eq!(response.first_retained_index, None);
+        assert_eq!(response.next_index, 50);
+        assert!(response.gap);
+        assert!(response.truncated);
     }
 
     #[tokio::test]

@@ -26,8 +26,8 @@ use crate::{
     scanner::{scan_transaction, ScannerConfig, ScannerFinding, ScannerStore},
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceStore},
     store::{
-        transaction_journal_checkpoint_path, NullableStringPatch, TransactionJournalEntry,
-        TransactionStore,
+        normalize_storage_sequences, transaction_journal_checkpoint_path, NullableStringPatch,
+        TransactionJournalEntry, TransactionStore,
     },
     websocket::WebSocketStore,
     workspace::{validate_workspace_serialized_size, WorkspaceReplaceError},
@@ -1567,6 +1567,7 @@ fn replay_transaction_journal(
     let journal_path = transaction_journal_path(storage_dir);
     let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
 
+    normalize_snapshot_transaction_sequences(&mut snapshot.transactions);
     let mut order = Vec::with_capacity(snapshot.transactions.len());
     let mut records = HashMap::with_capacity(snapshot.transactions.len());
     let mut seen = HashSet::with_capacity(snapshot.transactions.len());
@@ -1629,6 +1630,12 @@ fn replay_transaction_journal(
         .collect();
     replayed_transaction_ids.retain(|id| retained_ids.contains(id));
     Ok(replayed_transaction_ids)
+}
+
+fn normalize_snapshot_transaction_sequences(records: &mut [TransactionRecord]) {
+    records.reverse();
+    normalize_storage_sequences(records);
+    records.reverse();
 }
 
 fn replay_transaction_journal_file(
@@ -4386,6 +4393,100 @@ mod tests {
             .find(|summary| summary.id == active.id())
             .unwrap();
         assert_eq!(summary.request_count, 0);
+    }
+
+    #[tokio::test]
+    async fn registry_replays_journal_after_repairing_unadvanceable_snapshot_sequence() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-sequence-repair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+
+        let mut snapshot_record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "snapshot-max.example:443".to_string(),
+            "/snapshot-max".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        snapshot_record.sequence = u64::MAX;
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &super::StoredSessionSnapshot {
+                transactions: vec![snapshot_record],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut journal_record = TransactionRecord::http(
+            Utc::now(),
+            "POST".to_string(),
+            "https".to_string(),
+            "journal-after-max.example:443".to_string(),
+            "/journal-after-max".to_string(),
+            Some(201),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        journal_record.sequence = 2;
+        let mut journal = Vec::new();
+        serde_json::to_writer(
+            &mut journal,
+            &TransactionJournalEntry::Insert {
+                record: journal_record,
+            },
+        )
+        .unwrap();
+        journal.push(b'\n');
+        std::fs::write(super::transaction_journal_path(&storage_dir), journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|record| (record.host.as_str(), record.sequence))
+                .collect::<Vec<_>>(),
+            vec![
+                ("journal-after-max.example:443", 2),
+                ("snapshot-max.example:443", 1),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

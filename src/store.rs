@@ -790,7 +790,7 @@ impl Default for TransactionStore {
     }
 }
 
-fn normalize_storage_sequences(entries: &mut [TransactionRecord]) {
+pub(crate) fn normalize_storage_sequences(entries: &mut [TransactionRecord]) {
     let has_unadvanceable_sequence = entries.iter().any(|record| record.sequence == u64::MAX);
     let needs_repair = has_unadvanceable_sequence
         || entries

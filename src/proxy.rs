@@ -1267,7 +1267,9 @@ fn resolve_absolute_uri(
     }
 
     let authority = if let Some(authority) = authority_override {
-        parse_client_authority(authority, "CONNECT tunnel authority")?.to_string()
+        let authority = parse_client_authority(authority, "CONNECT tunnel authority")?;
+        validate_origin_form_host_matches_authority_override(headers, default_scheme, &authority)?;
+        authority.to_string()
     } else {
         let host_header = headers
             .get(HOST)
@@ -1321,6 +1323,36 @@ fn validate_forwardable_host_headers(uri: &Uri, headers: &HeaderMap) -> Result<(
     {
         bail!("absolute-form request authority does not match Host header: {host_header}");
     }
+    Ok(())
+}
+
+fn validate_origin_form_host_matches_authority_override(
+    headers: &HeaderMap,
+    default_scheme: &str,
+    override_authority: &Authority,
+) -> Result<()> {
+    let mut host_headers = headers.get_all(HOST).iter();
+    let Some(host_header) = host_headers.next() else {
+        return Ok(());
+    };
+    if host_headers.next().is_some() {
+        bail!("multiple Host headers are not supported");
+    }
+
+    let host_header = host_header.to_str().context("invalid Host header")?;
+    let header_authority = parse_client_authority(host_header, "Host header")?;
+    let header_port = header_authority
+        .port_u16()
+        .unwrap_or(default_port_for_scheme(default_scheme)?);
+    let override_port = override_authority
+        .port_u16()
+        .ok_or_else(|| anyhow!("CONNECT tunnel authority must include a port"))?;
+    if !authority_hosts_equivalent(override_authority.host(), header_authority.host())
+        || override_port != header_port
+    {
+        bail!("origin-form Host header does not match CONNECT tunnel authority: {host_header}");
+    }
+
     Ok(())
 }
 
@@ -4611,6 +4643,10 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) -
     let mut relay_ids_by_session: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for (relay_id, relay) in relays {
         if !state.sessions.contains_session(relay.session.id()) {
+            if pending_session_belongs_to_state(state, relay.session.as_ref()) {
+                relay.abort.abort();
+                forget_live_websocket_relay(relay_id);
+            }
             continue;
         }
         relay.abort.abort();
@@ -5895,6 +5931,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_live_websocket_relays_forgets_same_state_stale_session_relay() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-close-live-ws-stale-session-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let relay_id = Uuid::new_v4();
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(
+            relay_id,
+            Some(Uuid::new_v4()),
+            &session,
+            Instant::now(),
+            abort.clone(),
+        );
+        state
+            .create_session(Some("replacement".to_string()))
+            .await
+            .unwrap();
+        state.sessions.delete_session(session_id).unwrap();
+
+        close_live_websocket_relays(
+            state.as_ref(),
+            "test shutdown closed the live WebSocket relay.",
+        )
+        .await
+        .unwrap();
+
+        assert!(abort.is_aborted());
+        assert!(!session_has_live_websocket_relays(session_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn rebind_proxy_starts_listener_when_same_address_is_offline() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-rebind-offline-same-address-{}",
@@ -6248,6 +6328,52 @@ mod tests {
         let resolved = resolve_absolute_uri(&uri, &headers, "https", Some("[::1]:443")).unwrap();
 
         assert_eq!(resolved, uri);
+    }
+
+    #[test]
+    fn origin_form_inside_connect_rejects_host_mismatch() {
+        let uri: Uri = "/private".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("other.example"));
+        let error =
+            resolve_absolute_uri(&uri, &headers, "https", Some("origin.example:443")).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Host header does not match CONNECT tunnel authority"));
+    }
+
+    #[test]
+    fn origin_form_inside_connect_accepts_matching_host_default_port() {
+        let uri: Uri = "/private".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("origin.example"));
+        let resolved =
+            resolve_absolute_uri(&uri, &headers, "https", Some("origin.example:443")).unwrap();
+
+        assert_eq!(resolved.to_string(), "https://origin.example:443/private");
+    }
+
+    #[test]
+    fn websocket_origin_form_inside_connect_rejects_host_mismatch() {
+        let uri: Uri = "/socket".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("other.example"));
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(
+            SEC_WEBSOCKET_KEY,
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+
+        assert!(websocket_upgrade_validation_error(&Method::GET, &headers).is_none());
+        let error =
+            resolve_absolute_uri(&uri, &headers, "https", Some("origin.example:443")).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Host header does not match CONNECT tunnel authority"));
     }
 
     #[test]

@@ -35,6 +35,7 @@ impl AppConfig {
 
     pub fn from_env_with_defaults(proxy_default: &str, ui_default: &str) -> Result<Self> {
         let data_dir = env::var_os("SNIPER_DATA_DIR")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(default_data_dir);
         let default_proxy_addr = parse_socket_addr_value("default proxy listener", proxy_default)?;
@@ -359,6 +360,50 @@ fn validate_proxy_port(port: u16) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::{StartupSettingsStore, StartupSettingsUpdate};
+    use std::{
+        ffi::OsString,
+        sync::{Mutex, MutexGuard},
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set<K: Into<OsString>>(key: &'static str, value: K) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::set_var(key, value.into());
+            guard
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::remove_var(key);
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap()
+    }
 
     #[test]
     fn max_entries_env_rejects_zero_retention() {
@@ -377,6 +422,26 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("loopback address"));
+    }
+
+    #[test]
+    fn app_config_ignores_empty_sniper_data_dir_env() {
+        let _guard = lock_env();
+        let home =
+            std::env::temp_dir().join(format!("sniper-config-home-{}", uuid::Uuid::new_v4()));
+        let _home_guard = EnvVarGuard::set("HOME", home.clone().into_os_string());
+        let _data_dir_guard = EnvVarGuard::set("SNIPER_DATA_DIR", "");
+        let _proxy_guard = EnvVarGuard::remove("SNIPER_PROXY_ADDR");
+        let _ui_guard = EnvVarGuard::remove("SNIPER_UI_ADDR");
+        let _max_entries_guard = EnvVarGuard::remove("SNIPER_MAX_ENTRIES");
+        let _body_preview_guard = EnvVarGuard::remove("SNIPER_BODY_PREVIEW_BYTES");
+
+        let config =
+            super::AppConfig::from_env_with_defaults("127.0.0.1:18080", "127.0.0.1:0").unwrap();
+
+        assert_eq!(config.data_dir, home.join(".sniper"));
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

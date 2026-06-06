@@ -10,10 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use sniper::{
-    api, certificate::default_data_dir, config::AppConfig, proxy, runtime_state, skills,
-    state::AppState,
-};
+use sniper::{api, config::AppConfig, proxy, runtime_state, skills, state::AppState};
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -35,11 +32,25 @@ const APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
 const OPEN_PATH: &str = "/usr/bin/open";
 const INSTALL_SKILLS_ENV: &str = "SNIPER_INSTALL_AGENT_SKILLS";
 const INSTALL_CLI_PATH_ENV: &str = "SNIPER_INSTALL_CLI_PATH";
+const SNIPER_DATA_DIR_ENV: &str = "SNIPER_DATA_DIR";
 
 fn desktop_data_dir_from_env() -> PathBuf {
-    env::var_os("SNIPER_DATA_DIR")
+    env::var_os(SNIPER_DATA_DIR_ENV)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(default_data_dir)
+        .unwrap_or_else(default_desktop_data_dir)
+}
+
+fn default_desktop_data_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".sniper"))
+        .unwrap_or_else(|| PathBuf::from(".sniper"))
+}
+
+fn normalize_empty_data_dir_env() {
+    if env::var_os(SNIPER_DATA_DIR_ENV).is_some_and(|value| value.is_empty()) {
+        env::remove_var(SNIPER_DATA_DIR_ENV);
+    }
 }
 
 fn request_existing_desktop_focus() {
@@ -59,6 +70,7 @@ fn request_existing_desktop_focus() {
 
 fn main() -> Result<()> {
     sniper::init_tracing();
+    normalize_empty_data_dir_env();
 
     let data_dir = desktop_data_dir_from_env();
     let Some(_runtime_owner_lock) = runtime_state::try_acquire_runtime_owner_lock(&data_dir)?
@@ -906,15 +918,42 @@ mod tests {
         begin_desktop_teardown, block_desktop_shutdown, combine_desktop_persist_results,
         complete_desktop_shutdown, finish_desktop_teardown, handle_navigation_request,
         handle_new_window_request, is_blocked_desktop_navigation_scheme, is_same_origin,
-        load_shell_rc_contents, persist_desktop_session_state, shell_single_quote,
-        should_install_cli_path, should_install_cli_path_on_launch,
+        load_shell_rc_contents, normalize_empty_data_dir_env, persist_desktop_session_state,
+        shell_single_quote, should_install_cli_path, should_install_cli_path_on_launch,
         should_install_skills_on_launch, upsert_managed_path_line, write_shell_rc_atomically,
-        AppConfig, AppState,
+        AppConfig, AppState, SNIPER_DATA_DIR_ENV,
     };
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set<K: Into<std::ffi::OsString>>(key: &'static str, value: K) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::set_var(key, value.into());
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     struct AbortFlag(Arc<AtomicBool>);
 
@@ -930,6 +969,16 @@ mod tests {
             shell_single_quote("/Applications/Sniper 'Beta'.app/Contents/MacOS"),
             "'/Applications/Sniper '\\''Beta'\\''.app/Contents/MacOS'"
         );
+    }
+
+    #[test]
+    fn empty_sniper_data_dir_env_is_removed_before_desktop_config_loads() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _data_dir_guard = EnvVarGuard::set(SNIPER_DATA_DIR_ENV, "");
+
+        normalize_empty_data_dir_env();
+
+        assert!(std::env::var_os(SNIPER_DATA_DIR_ENV).is_none());
     }
 
     #[test]
