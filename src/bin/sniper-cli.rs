@@ -3327,19 +3327,48 @@ fn runtime_state_owner_process_path_matches(pid: u32, expected_process_path: &st
         return false;
     }
     let observed = String::from_utf8_lossy(&buffer[..length as usize]);
-    observed.trim_end_matches('\0') == expected_process_path
+    process_path_strings_match(expected_process_path, observed.trim_end_matches('\0'))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn runtime_state_owner_process_path_matches(pid: u32, expected_process_path: &str) -> bool {
     std::fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
-        .is_some_and(|path| path.display().to_string() == expected_process_path)
+        .is_some_and(|path| {
+            process_path_strings_match(expected_process_path, &path.display().to_string())
+        })
 }
 
 #[cfg(not(unix))]
 fn runtime_state_owner_process_path_matches(_pid: u32, _expected_process_path: &str) -> bool {
     false
+}
+
+fn process_path_strings_match(expected_process_path: &str, observed_process_path: &str) -> bool {
+    let observed_process_path = observed_process_path
+        .strip_suffix(" (deleted)")
+        .unwrap_or(observed_process_path);
+    if expected_process_path == observed_process_path {
+        return true;
+    }
+    paths_refer_to_same_location(
+        Path::new(expected_process_path),
+        Path::new(observed_process_path),
+    )
+}
+
+fn data_dir_strings_match(response_data_dir: &str, expected_data_dir: &Path) -> bool {
+    if Path::new(response_data_dir) == expected_data_dir {
+        return true;
+    }
+    paths_refer_to_same_location(Path::new(response_data_dir), expected_data_dir)
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3467,7 +3496,7 @@ fn validate_sniper_settings_probe(
 
         let response_data_dir = probe_string_field(payload, "data_dir")?;
         let expected_data_dir = expected.data_dir.display().to_string();
-        if response_data_dir != expected_data_dir {
+        if !data_dir_strings_match(response_data_dir, expected.data_dir) {
             bail!(
                 "Sniper API probe response did not match runtime-state data directory \
                  (expected {}, got {})",
@@ -4377,24 +4406,24 @@ mod tests {
         active_session_id_from_summaries, api_failure_detail, api_url, attach_workspace_save_error,
         build_annotations_payload, build_editable_raw_request,
         build_editable_raw_request_with_version, build_oast_configure_update, cli_data_dir,
-        default_editable_request, discover_api_base_url, discover_api_base_url_from_data_dir,
-        explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
-        fuzzer_target_request_authority_for_request, install_skills, next_replay_tab_sequence,
-        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
-        oast_fields_for_output, parse_editable_raw_request,
+        data_dir_strings_match, default_editable_request, discover_api_base_url,
+        discover_api_base_url_from_data_dir, explicit_or_active_session_id, failed_record_output,
+        fuzzer_active_target_for_request, fuzzer_target_request_authority_for_request,
+        install_skills, next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
+        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
-        push_replay_history_entry, read_limited_to_end, read_payloads_input,
-        read_raw_request_input, read_raw_response_input, read_text_input, replay_send_http_version,
-        replay_send_target_for_tab, replay_tab_target_as_request,
+        process_path_strings_match, push_replay_history_entry, read_limited_to_end,
+        read_payloads_input, read_raw_request_input, read_raw_response_input, read_text_input,
+        replay_send_http_version, replay_send_target_for_tab, replay_tab_target_as_request,
         replay_tab_target_matches_request, replay_update_should_preserve_current_port,
         session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
         strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
-        websocket_detail_path, websocket_list_path, workspace_conflict_message, Cli, Command,
-        HistoryCommand, HistoryListResponse, OastConfigureArgs, SequenceCommand,
-        SequenceCreateInput, SessionCommand, SkillsInstallArgs, WebSocketListArgs,
-        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
-        SNIPER_API_PROBE_RETRY_DELAYS,
+        validate_sniper_settings_probe, websocket_detail_path, websocket_list_path,
+        workspace_conflict_message, Cli, Command, HistoryCommand, HistoryListResponse,
+        OastConfigureArgs, SequenceCommand, SequenceCreateInput, SessionCommand, SkillsInstallArgs,
+        SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
+        CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES, SNIPER_API_PROBE_RETRY_DELAYS,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -6431,6 +6460,65 @@ mod tests {
             "features": ["health"]
         });
         assert!(!sniper_settings_probe_matches(&wrong_service));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sniper_settings_probe_accepts_canonicalized_data_dir_alias() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-cli-data-dir-alias-{}", Uuid::new_v4()));
+        let real = root.join("real");
+        let alias = root.join("alias");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let snapshot = RuntimeStateSnapshot::with_proxy_status(
+            "127.0.0.1:18080".parse().unwrap(),
+            "127.0.0.1:19090".parse().unwrap(),
+            true,
+        );
+        let payload = serde_json::json!({
+            "runtime_instance_id": snapshot.instance_id.to_string(),
+            "proxy_addr": "127.0.0.1:18080",
+            "ui_addr": snapshot.ui_addr.to_string(),
+            "data_dir": alias.display().to_string(),
+            "max_entries": 5000,
+            "features": ["http_capture", "session_storage", "replay"]
+        });
+
+        assert!(data_dir_strings_match(&alias.display().to_string(), &real));
+        validate_sniper_settings_probe(
+            &payload,
+            Some(SniperApiProbeExpectation {
+                runtime_state: &snapshot,
+                data_dir: &real,
+            }),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_path_matching_accepts_canonicalized_alias_and_linux_deleted_suffix() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-cli-process-path-alias-{}", Uuid::new_v4()));
+        let real = root.join("sniper");
+        let alias = root.join("sniper-alias");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&real, b"test binary").unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        assert!(process_path_strings_match(
+            &real.display().to_string(),
+            &alias.display().to_string()
+        ));
+        assert!(process_path_strings_match(
+            &real.display().to_string(),
+            &format!("{} (deleted)", real.display())
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

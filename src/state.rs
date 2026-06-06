@@ -601,6 +601,8 @@ impl AppState {
 
         let mut update_guard = self.begin_self_update()?;
         let app_bundle = self.app_bundle_path()?;
+        verify_app_identity(&app_bundle, env!("CARGO_PKG_VERSION"), "current app")
+            .context("current app bundle identity check failed")?;
         ensure_self_update_bundle_is_writable(&app_bundle)?;
 
         tx.send(UpdateProgress::step("Checking for updates..."))
@@ -1431,8 +1433,12 @@ if /usr/bin/ditto "$staged" "$bundle" && /usr/bin/codesign --verify --deep --str
 fi
 rm -rf "$bundle"
 if [ -e "$backup" ]; then
-  mv "$backup" "$bundle"
-  /usr/bin/open "$bundle" || true
+  if mv "$backup" "$bundle"; then
+    /usr/bin/codesign --verify --deep --strict "$bundle" && /usr/bin/open "$bundle" || true
+  else
+    rm -rf "$tmp"
+    exit 1
+  fi
 fi
 rm -rf "$tmp"
 exit 1
@@ -2513,7 +2519,8 @@ mod tests {
         assert!(script.contains("[ \"$wait_attempts\" -ge 150 ]"));
         assert!(script.contains("mv \"$bundle\" \"$backup\""));
         assert!(script.contains("if ! mv \"$bundle\" \"$backup\""));
-        assert!(script.contains("mv \"$backup\" \"$bundle\""));
+        assert!(script.contains("if mv \"$backup\" \"$bundle\"; then"));
+        assert!(script.contains("rm -rf \"$tmp\"\n    exit 1"));
         assert!(script.contains("/usr/bin/codesign --verify --deep --strict \"$bundle\""));
         let open_pos = script
             .find("if /usr/bin/open \"$bundle\"; then")

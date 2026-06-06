@@ -2563,6 +2563,17 @@ fn active_session_conflict_response(state: &AppState) -> Response {
         .into_response()
 }
 
+fn session_proxy_work_conflict_response(session_id: Uuid) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "session has active proxy work",
+            "session_id": session_id,
+        })),
+    )
+        .into_response()
+}
+
 fn ws_replay_connection_owner_conflict_response(owner_session_id: Uuid) -> Response {
     (
         StatusCode::CONFLICT,
@@ -2602,7 +2613,7 @@ async fn resolve_session_for_optional_id(
         return Ok(active_session);
     }
     if proxy::session_has_active_proxy_work(target_session_id) {
-        return Err(active_session_conflict_response(state));
+        return Err(session_proxy_work_conflict_response(target_session_id));
     }
     if let Some(session) = proxy::live_websocket_session_context(target_session_id) {
         return Ok(session);
@@ -4189,16 +4200,6 @@ async fn ws_replay_connect(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let url = match build_ws_replay_url(&payload.scheme, &payload.host, payload.port, &payload.path)
-    {
-        Ok(url) => url,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-    };
-    let extra_headers = match validate_ws_replay_headers(&payload.headers) {
-        Ok(headers) => headers,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-    };
-
     let operation_lock = state.session_operation_lock(session.id()).await;
     let _operation_guard = operation_lock.lock().await;
     if !state.sessions.contains_session(session.id()) {
@@ -4209,6 +4210,15 @@ async fn ws_replay_connect(
             return ws_replay_connection_owner_conflict_response(owner_session_id);
         }
     }
+    let url = match build_ws_replay_url(&payload.scheme, &payload.host, payload.port, &payload.path)
+    {
+        Ok(url) => url,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let extra_headers = match validate_ws_replay_headers(&payload.headers) {
+        Ok(headers) => headers,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     let upstream_insecure = session.runtime.upstream_insecure().await;
 
     match state
@@ -5501,6 +5511,17 @@ mod tests {
                     "id": connection_id,
                     "scheme": "ws",
                     "host": "127.0.0.1",
+                    "port": 80,
+                    "path": "/",
+                    "headers": [],
+                }),
+            ),
+            (
+                "/api/replay/ws-connect",
+                serde_json::json!({
+                    "id": connection_id,
+                    "scheme": "ws",
+                    "host": "",
                     "port": 80,
                     "path": "/",
                     "headers": [],
@@ -8449,6 +8470,20 @@ mod tests {
         )
         .await;
         assert_eq!(blocked_clear_response.status(), StatusCode::CONFLICT);
+        let blocked_clear_body = response_body_json(blocked_clear_response).await;
+        assert_eq!(
+            blocked_clear_body
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("session has active proxy work")
+        );
+        let expected_inactive_id = inactive.id().to_string();
+        assert_eq!(
+            blocked_clear_body
+                .get("session_id")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_inactive_id.as_str())
+        );
 
         drop(active_proxy_owner);
 

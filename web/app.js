@@ -1150,7 +1150,7 @@ function bindEvents() {
     }
     _websocketSearchReloadTimer = window.setTimeout(() => {
       _websocketSearchReloadTimer = 0;
-      loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
+      loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
     }, 160);
   });
   let websocketScrollRaf = 0;
@@ -1212,12 +1212,12 @@ function bindEvents() {
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
+    loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
   });
   document.getElementById("wsHideClosed")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     clearWebsocketQueryBackfill();
-    loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
+    loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
   });
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
@@ -4352,8 +4352,22 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
   }
 }
 
-async function loadWebsocketsPageRefresh(preserveSelection = true) {
-  return loadWebsockets(preserveSelection, { limit: WEBSOCKET_PAGE_SIZE });
+function currentWebsocketRefreshLimit() {
+  const paging = state.websocketPaging || createWebsocketPagingState();
+  const loadedCount = Array.isArray(state.websocketSessions) ? state.websocketSessions.length : 0;
+  const loadedLimit = Math.max(
+    loadedCount,
+    Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
+    WEBSOCKET_PAGE_SIZE,
+  );
+  return normalizeWebsocketLoadLimit(loadedLimit);
+}
+
+async function loadWebsocketsPageRefresh(preserveSelection = true, options = {}) {
+  const limit = options.resetWindow === true
+    ? WEBSOCKET_PAGE_SIZE
+    : currentWebsocketRefreshLimit();
+  return loadWebsockets(preserveSelection, { limit });
 }
 
 async function loadMoreWebsockets() {
@@ -4552,14 +4566,30 @@ function shouldInsertUnknownWebsocketSummary(summary, sessions, paging) {
   if (!websocketSummaryMatchesCurrentQuery(summary)) return false;
   if (!Boolean(paging?.hasMore)) return true;
   if (!Array.isArray(sessions) || !sessions.length) return true;
+  return websocketSummaryStartedAtDescInsertIndex(summary, sessions) < sessions.length;
+}
 
-  const summaryStartedAt = websocketSummaryTimestamp(summary, "started_at");
-  if (!summaryStartedAt) return false;
-  const newestLoadedStartedAt = sessions.reduce(
-    (newest, item) => Math.max(newest, websocketSummaryTimestamp(item, "started_at")),
-    0,
-  );
-  return !newestLoadedStartedAt || summaryStartedAt >= newestLoadedStartedAt;
+function websocketSummaryStartedAtDescCompare(left, right) {
+  const leftStartedAt = websocketSummaryTimestamp(left, "started_at");
+  const rightStartedAt = websocketSummaryTimestamp(right, "started_at");
+  if (leftStartedAt !== rightStartedAt) {
+    return rightStartedAt - leftStartedAt;
+  }
+  return String(left?.id || "").localeCompare(String(right?.id || ""));
+}
+
+function websocketSummaryStartedAtDescInsertIndex(summary, sessions) {
+  if (!Array.isArray(sessions) || !sessions.length) return 0;
+  for (let index = 0; index < sessions.length; index += 1) {
+    if (websocketSummaryStartedAtDescCompare(summary, sessions[index]) <= 0) {
+      return index;
+    }
+  }
+  return sessions.length;
+}
+
+function insertWebsocketSummaryInStartedAtDescOrder(sessions, summary) {
+  sessions.splice(websocketSummaryStartedAtDescInsertIndex(summary, sessions), 0, summary);
 }
 
 function mergeWebsocketPageWithCurrentSummaries(
@@ -4586,11 +4616,14 @@ function mergeWebsocketPageWithCurrentSummaries(
   for (const item of currentItems || []) {
     if (!item?.id || seen.has(item.id)) continue;
     if ((_websocketSummaryMutationById.get(item.id) || 0) <= mutationGenerationAtRequest) continue;
+    if (!websocketServerOrderCanAcceptSummaryEvents()) continue;
     if (!shouldInsertUnknownWebsocketSummary(item, pageItems, paging)) continue;
     preserved.push(item);
     seen.add(item.id);
   }
-  merged.unshift(...preserved);
+  for (const item of preserved) {
+    insertWebsocketSummaryInStartedAtDescOrder(merged, item);
+  }
   if (merged.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
     merged.length = WEBSOCKET_MAX_LOADED_SESSIONS;
   }
@@ -4812,7 +4845,7 @@ function applyWebsocketSummaryEvent(event) {
       }
       return;
     }
-    nextSessions.unshift(summary);
+    insertWebsocketSummaryInStartedAtDescOrder(nextSessions, summary);
     if (nextSessions.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
       nextSessions.length = WEBSOCKET_MAX_LOADED_SESSIONS;
     }
@@ -9191,7 +9224,7 @@ function toggleWebsocketSort(key) {
     state.websocketSortDirection = defaultWebsocketSortDirection(key);
   }
   clearWebsocketQueryBackfill();
-  loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
+  loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
 }
 
 function updateWebsocketSortIndicators() {
