@@ -400,6 +400,119 @@ async fn proxy_rejects_duplicate_host_headers_before_upstream_dial() {
 }
 
 #[tokio::test]
+async fn proxy_rejects_origin_form_host_userinfo_before_upstream_dial() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-host-userinfo-rejection-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!(
+        "GET /userinfo-origin HTTP/1.1\r\nHost: user@{upstream_addr}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.contains("400 Bad Request"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), upstream.accept())
+            .await
+            .is_err()
+    );
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let session = state.session().await;
+    let records = session.store.snapshot(Some(10)).await;
+    let record = records
+        .iter()
+        .find(|record| record.path == "/userinfo-origin")
+        .expect("proxy rejection should be recorded");
+    assert_eq!(record.status, Some(400));
+    assert!(record
+        .notes
+        .iter()
+        .any(|note| note.contains("Host header must not include URI userinfo")));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_rejects_absolute_form_userinfo_even_when_host_header_matches() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-absolute-userinfo-rejection-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!(
+        "GET http://user@{upstream_addr}/userinfo-absolute HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.contains("400 Bad Request"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), upstream.accept())
+            .await
+            .is_err()
+    );
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let session = state.session().await;
+    let records = session.store.snapshot(Some(10)).await;
+    let record = records
+        .iter()
+        .find(|record| record.path == "/userinfo-absolute")
+        .expect("proxy rejection should be recorded");
+    assert_eq!(record.status, Some(400));
+    assert!(
+        record
+            .notes
+            .iter()
+            .any(|note| note
+                .contains("absolute-form request authority must not include URI userinfo"))
+    );
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
 async fn proxy_records_invalid_connect_rejection() {
     let config = AppConfig {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
@@ -465,6 +578,59 @@ async fn proxy_records_invalid_connect_rejection() {
     assert!(visible_with_response_filter
         .iter()
         .any(|summary| summary.id == record_id));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn proxy_rejects_connect_userinfo_authority() {
+    let config = AppConfig {
+        proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        ui_addr: "127.0.0.1:0".parse().unwrap(),
+        max_entries: 100,
+        body_preview_bytes: 4096,
+        data_dir: std::env::temp_dir().join(format!(
+            "sniper-test-connect-userinfo-rejection-{}",
+            uuid::Uuid::new_v4()
+        )),
+    };
+    let state = Arc::new(AppState::new(config).unwrap());
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_state = state.clone();
+    let proxy_handle = tokio::spawn(async move {
+        serve_proxy(proxy_listener, proxy_state).await.unwrap();
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(
+            b"CONNECT user@example.test:443 HTTP/1.1\r\nHost: example.test:443\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer);
+    assert!(response.contains("400 Bad Request"));
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let session = state.session().await;
+    let records = session.store.snapshot(Some(10)).await;
+    let record = records
+        .iter()
+        .find(|record| record.method == "CONNECT")
+        .expect("CONNECT rejection should be recorded");
+    assert_eq!(record.status, Some(400));
+    assert!(record.response.as_ref().is_some_and(|response| response
+        .body_preview
+        .contains("CONNECT target authority must not include URI userinfo")));
+    assert!(record
+        .notes
+        .iter()
+        .any(|note| note.contains("Proxy rejected CONNECT")));
 
     proxy_handle.abort();
 }

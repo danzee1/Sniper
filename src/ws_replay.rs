@@ -24,6 +24,8 @@ use crate::model::{BodyEncoding, WebSocketFrameDirection, WebSocketFrameKind};
 const MAX_WS_REPLAY_FRAMES_PER_CONNECTION: usize = 10_000;
 const MAX_WS_REPLAY_FRAMES_PER_RESPONSE: usize = 1_000;
 const MAX_WS_REPLAY_FRAME_PREVIEW_BYTES: usize = 64 * 1024;
+const MAX_WS_REPLAY_CONNECTIONS: usize = 256;
+const WS_REPLAY_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 const WS_REPLAY_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// A single frame in the WS replay conversation.
@@ -60,7 +62,27 @@ pub struct WsReplaySnapshot {
 }
 
 /// Sender half to push messages into the WebSocket.
-type WsSender = mpsc::UnboundedSender<WsReplayOutboundMessage>;
+type WsSender = mpsc::Sender<WsReplayOutboundMessage>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsReplaySendError {
+    QueueFull,
+    Closed,
+}
+
+impl std::fmt::Display for WsReplaySendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(
+                f,
+                "WebSocket replay send queue is full; wait for pending frames to flush"
+            ),
+            Self::Closed => write!(f, "failed to send message"),
+        }
+    }
+}
+
+impl std::error::Error for WsReplaySendError {}
 
 #[derive(Debug)]
 enum WsReplayOutboundMessage {
@@ -200,6 +222,14 @@ impl WsReplayConnection {
             _ => None,
         }
     }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            WsReplayStatus::Disconnected | WsReplayStatus::Error
+        ) && self.sender.is_none()
+            && self.task_abort.is_none()
+    }
 }
 
 /// Manages all active WS replay connections.
@@ -254,6 +284,7 @@ impl WsReplayStore {
                 }
             }
         }
+        self.prune_terminal_connections().await;
 
         let (task_abort, abort_registration) = AbortHandle::new_pair();
 
@@ -292,7 +323,9 @@ impl WsReplayStore {
                             return;
                         }
 
-                        let (tx, mut rx) = mpsc::unbounded_channel::<WsReplayOutboundMessage>();
+                        let (tx, mut rx) = mpsc::channel::<WsReplayOutboundMessage>(
+                            WS_REPLAY_OUTBOUND_QUEUE_CAPACITY,
+                        );
 
                         {
                             let mut c = conn.write().await;
@@ -454,7 +487,14 @@ impl WsReplayStore {
 
             let mut connections = self.connections.write().await;
             match (expected.as_ref(), connections.get(&id)) {
-                (None, None) => return Ok(connections.insert(id, conn.clone())),
+                (None, None) => {
+                    if connections.len() >= MAX_WS_REPLAY_CONNECTIONS {
+                        anyhow::bail!(
+                            "too many WebSocket replay connections; close stale replay tabs first"
+                        );
+                    }
+                    return Ok(connections.insert(id, conn.clone()));
+                }
                 (Some(expected), Some(current)) if Arc::ptr_eq(expected, current) => {
                     return Ok(connections.insert(id, conn.clone()));
                 }
@@ -462,6 +502,29 @@ impl WsReplayStore {
             }
             drop(connections);
             tokio::task::yield_now().await;
+        }
+    }
+
+    async fn prune_terminal_connections(&self) {
+        let candidates = {
+            let connections = self.connections.read().await;
+            connections
+                .iter()
+                .map(|(id, conn)| (*id, conn.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut remove_ids = Vec::new();
+        for (id, conn) in candidates {
+            if conn.read().await.is_terminal() {
+                remove_ids.push(id);
+            }
+        }
+        if remove_ids.is_empty() {
+            return;
+        }
+        let mut connections = self.connections.write().await;
+        for id in remove_ids {
+            connections.remove(&id);
         }
     }
 
@@ -479,8 +542,15 @@ impl WsReplayStore {
         let c = conn.read().await;
         let sender = c.sender.as_ref().context("connection is not open")?;
         sender
-            .send(WsReplayOutboundMessage::Message(msg))
-            .map_err(|_| anyhow::anyhow!("failed to send message"))?;
+            .try_send(WsReplayOutboundMessage::Message(msg))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::Error::new(WsReplaySendError::QueueFull)
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::Error::new(WsReplaySendError::Closed)
+                }
+            })?;
         Ok(())
     }
 
@@ -514,9 +584,15 @@ impl WsReplayStore {
                         WebSocketFrameDirection::ClientToServer,
                         &WsMessage::Close(None),
                     );
-                    sender
-                        .send(WsReplayOutboundMessage::Close { recorded_index })
-                        .is_ok()
+                    match sender.try_send(WsReplayOutboundMessage::Close { recorded_index }) {
+                        Ok(()) => true,
+                        Err(_) => {
+                            if let Some(index) = recorded_index {
+                                c.remove_frame(index);
+                            }
+                            false
+                        }
+                    }
                 } else {
                     false
                 };
@@ -648,7 +724,7 @@ async fn disconnect_connection_handle(conn: WsReplayConnectionHandle) {
     let mut c = conn.write().await;
     let graceful_close = if let Some(sender) = c.sender.take() {
         sender
-            .send(WsReplayOutboundMessage::Close {
+            .try_send(WsReplayOutboundMessage::Close {
                 recorded_index: None,
             })
             .is_ok()
@@ -712,6 +788,10 @@ mod tests {
             body_size: 0,
             preview_truncated: false,
         }
+    }
+
+    fn test_channel() -> (WsSender, mpsc::Receiver<WsReplayOutboundMessage>) {
+        mpsc::channel(WS_REPLAY_OUTBOUND_QUEUE_CAPACITY)
     }
 
     #[tokio::test]
@@ -927,7 +1007,7 @@ mod tests {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
         let owner = Uuid::new_v4();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_channel();
         let mut previous_connection = test_connection(WsReplayStatus::Connected, Some(tx));
         previous_connection.owner_session_id = owner;
         let previous = Arc::new(RwLock::new(previous_connection));
@@ -972,10 +1052,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_prunes_terminal_connections_before_connection_cap() {
+        let store = WsReplayStore::new();
+        let owner = Uuid::new_v4();
+        {
+            let mut connections = store.connections.write().await;
+            for _ in 0..MAX_WS_REPLAY_CONNECTIONS {
+                let mut connection = test_connection(WsReplayStatus::Error, None);
+                connection.owner_session_id = owner;
+                connection.error = Some("connection refused".to_string());
+                connections.insert(Uuid::new_v4(), Arc::new(RwLock::new(connection)));
+            }
+        }
+
+        let id = Uuid::new_v4();
+        store
+            .connect(id, owner, "ws://127.0.0.1:1/", Vec::new(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(store.connections.read().await.len(), 1);
+        store.remove(id).await;
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_when_active_connection_cap_is_full() {
+        let store = WsReplayStore::new();
+        let owner = Uuid::new_v4();
+        {
+            let mut connections = store.connections.write().await;
+            for _ in 0..MAX_WS_REPLAY_CONNECTIONS {
+                let mut connection = test_connection(WsReplayStatus::Connecting, None);
+                connection.owner_session_id = owner;
+                connections.insert(Uuid::new_v4(), Arc::new(RwLock::new(connection)));
+            }
+        }
+
+        let error = store
+            .connect(
+                Uuid::new_v4(),
+                owner,
+                "ws://127.0.0.1:1/",
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("too many WebSocket replay connections"));
+        assert_eq!(
+            store.connections.read().await.len(),
+            MAX_WS_REPLAY_CONNECTIONS
+        );
+    }
+
+    #[tokio::test]
     async fn remove_deletes_connection_snapshot() {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_channel();
         let connection = Arc::new(RwLock::new(test_connection(
             WsReplayStatus::Connected,
             Some(tx),
@@ -1021,7 +1158,7 @@ mod tests {
     async fn disconnect_connected_connection_queues_close_before_abort_grace() {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_channel();
         let (abort, _registration) = AbortHandle::new_pair();
         let mut connection_state = test_connection(WsReplayStatus::Connected, Some(tx));
         connection_state.task_abort = Some(abort.clone());
@@ -1055,7 +1192,7 @@ mod tests {
     async fn send_ping_queues_control_frame() {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_channel();
         store.connections.write().await.insert(
             id,
             Arc::new(RwLock::new(test_connection(
@@ -1075,10 +1212,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_rejects_when_outbound_queue_is_full() {
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(WsReplayOutboundMessage::Message(WsMessage::Text(
+            "queued".into(),
+        )))
+        .unwrap();
+        store.connections.write().await.insert(
+            id,
+            Arc::new(RwLock::new(test_connection(
+                WsReplayStatus::Connected,
+                Some(tx),
+            ))),
+        );
+
+        let error = store
+            .send_text(id, "overflow".to_string())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<WsReplaySendError>(),
+            Some(WsReplaySendError::QueueFull)
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(WsReplayOutboundMessage::Message(WsMessage::Text(text))) if text == "queued"
+        ));
+    }
+
+    #[tokio::test]
     async fn disconnect_all_closes_and_removes_connections() {
         let store = WsReplayStore::new();
         let id = Uuid::new_v4();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_channel();
         let connection = Arc::new(RwLock::new(test_connection(
             WsReplayStatus::Connected,
             Some(tx),

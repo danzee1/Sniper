@@ -85,6 +85,7 @@ const MAX_MATCH_REPLACE_RULES: usize = 500;
 const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
 const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ANNOTATION_NOTE_BYTES: usize = 32 * 1024;
+const MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const ALLOWED_COLOR_TAGS: &[&str] = &["red", "orange", "yellow", "green", "blue", "purple"];
 const DEFAULT_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
 const MAX_WEBSOCKET_DETAIL_FRAME_LIMIT: usize = 1_000;
@@ -952,6 +953,9 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
             &tab.tab_type,
             MAX_WORKSPACE_REPLAY_TAB_TYPE_BYTES,
         )?;
+        if tab.sequence == usize::MAX {
+            return Err(format!("replay tab {} sequence is too large", tab.id));
+        }
         if !tab_ids.insert(tab.id.as_str()) {
             return Err(format!("duplicate replay tab id: {}", tab.id));
         }
@@ -1920,6 +1924,23 @@ fn replay_send_error_response(error: impl Into<String>) -> Response {
         }),
     )
         .into_response()
+}
+
+fn ws_replay_send_error_response(error: anyhow::Error) -> Response {
+    let status = if matches!(
+        error.downcast_ref::<crate::ws_replay::WsReplaySendError>(),
+        Some(crate::ws_replay::WsReplaySendError::QueueFull)
+    ) {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if error
+        .to_string()
+        .contains("WebSocket replay message cannot exceed")
+    {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, error.to_string()).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -4036,7 +4057,10 @@ async fn ws_replay_send(
         WsReplaySendKind::Text
     });
     let result = match kind {
-        WsReplaySendKind::Text => state.ws_replay.send_text(payload.id, payload.body).await,
+        WsReplaySendKind::Text => match validate_ws_replay_text_payload(&payload.body) {
+            Ok(()) => state.ws_replay.send_text(payload.id, payload.body).await,
+            Err(error) => Err(error),
+        },
         WsReplaySendKind::Binary => match decode_ws_replay_payload(&payload.body) {
             Ok(data) => state.ws_replay.send_binary(payload.id, data).await,
             Err(error) => Err(error),
@@ -4053,15 +4077,39 @@ async fn ws_replay_send(
 
     match result {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(error) => ws_replay_send_error_response(error),
     }
+}
+
+fn validate_ws_replay_text_payload(body: &str) -> anyhow::Result<()> {
+    if body.len() > MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES {
+        return Err(anyhow::anyhow!(
+            "WebSocket replay message cannot exceed {} bytes",
+            MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES
+        ));
+    }
+    Ok(())
 }
 
 fn decode_ws_replay_payload(body: &str) -> anyhow::Result<Vec<u8>> {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD
+    let max_encoded_len = MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES.div_ceil(3) * 4;
+    if body.len() > max_encoded_len {
+        return Err(anyhow::anyhow!(
+            "WebSocket replay message cannot exceed {} bytes",
+            MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES
+        ));
+    }
+    let data = base64::engine::general_purpose::STANDARD
         .decode(body)
-        .map_err(|error| anyhow::anyhow!("invalid base64: {}", error))
+        .map_err(|error| anyhow::anyhow!("invalid base64: {}", error))?;
+    if data.len() > MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES {
+        return Err(anyhow::anyhow!(
+            "WebSocket replay message cannot exceed {} bytes",
+            MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES
+        ));
+    }
+    Ok(data)
 }
 
 fn decode_ws_replay_control_payload(body: &str) -> anyhow::Result<Vec<u8>> {
@@ -4711,12 +4759,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_ws_replay_url, decode_ws_replay_control_payload, fuzzer_attack_error_status,
-        get_target_site_map, normalize_replay_http_version, persist_bound_runtime_state,
-        sequence_run_error_status, validate_annotations_payload, validate_editable_request,
-        validate_editable_response, validate_match_replace_rules, validate_since,
-        validate_status_code, validate_status_range, validate_transaction_query,
-        validate_ws_replay_headers, AnnotationsPayload, TransactionQuery,
+        build_ws_replay_url, decode_ws_replay_control_payload, decode_ws_replay_payload,
+        fuzzer_attack_error_status, get_target_site_map, normalize_replay_http_version,
+        persist_bound_runtime_state, sequence_run_error_status, validate_annotations_payload,
+        validate_editable_request, validate_editable_response, validate_match_replace_rules,
+        validate_since, validate_status_code, validate_status_range, validate_transaction_query,
+        validate_ws_replay_headers, validate_ws_replay_text_payload, AnnotationsPayload,
+        TransactionQuery, MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES,
     };
     use crate::{
         config::AppConfig,
@@ -5151,6 +5200,41 @@ mod tests {
         let oversized_body = base64::engine::general_purpose::STANDARD.encode(vec![0_u8; 126]);
         let error = decode_ws_replay_control_payload(&oversized_body).unwrap_err();
         assert!(error.to_string().contains("cannot exceed 125 bytes"));
+    }
+
+    #[test]
+    fn ws_replay_payload_rejects_oversized_messages() {
+        use base64::Engine;
+
+        let oversized_text = "a".repeat(MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES + 1);
+        let error = validate_ws_replay_text_payload(&oversized_text).unwrap_err();
+        assert!(error.to_string().contains("cannot exceed"));
+
+        let max_encoded_len = MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES.div_ceil(3) * 4;
+        let oversized_encoded = "A".repeat(max_encoded_len + 1);
+        let error = decode_ws_replay_payload(&oversized_encoded).unwrap_err();
+        assert!(error.to_string().contains("cannot exceed"));
+
+        let oversized_binary = base64::engine::general_purpose::STANDARD.encode(vec![
+            0_u8;
+            MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES
+                + 1
+        ]);
+        let error = decode_ws_replay_payload(&oversized_binary).unwrap_err();
+        assert!(error.to_string().contains("cannot exceed"));
+    }
+
+    #[test]
+    fn ws_replay_send_error_response_uses_specific_status_codes() {
+        let response = super::ws_replay_send_error_response(
+            crate::ws_replay::WsReplaySendError::QueueFull.into(),
+        );
+        assert_eq!(response.status(), super::StatusCode::TOO_MANY_REQUESTS);
+
+        let response = super::ws_replay_send_error_response(anyhow::anyhow!(
+            "WebSocket replay message cannot exceed 1 bytes"
+        ));
+        assert_eq!(response.status(), super::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
@@ -6288,6 +6372,15 @@ mod tests {
         snapshot.replay.tab_sequence = usize::MAX;
         let error = super::validate_workspace_state(&snapshot).unwrap_err();
         assert!(error.contains("replay tab sequence is too large"));
+
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "tab-a".to_string(),
+            sequence: usize::MAX,
+            ..ReplayTabState::default()
+        });
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("replay tab tab-a sequence is too large"));
     }
 
     #[tokio::test]

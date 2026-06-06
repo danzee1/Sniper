@@ -1154,6 +1154,11 @@ fn resolve_absolute_uri(
     authority_override: Option<&str>,
 ) -> Result<Uri> {
     if uri.scheme().is_some() && uri.authority().is_some() {
+        validate_authority_for_client_input(
+            uri.authority()
+                .context("absolute-form request URI is missing authority")?,
+            "absolute-form request authority",
+        )?;
         if let Some(authority_override) = authority_override {
             validate_absolute_uri_matches_authority_override(
                 uri,
@@ -1165,13 +1170,14 @@ fn resolve_absolute_uri(
     }
 
     let authority = if let Some(authority) = authority_override {
-        authority
+        parse_client_authority(authority, "CONNECT tunnel authority")?.to_string()
     } else {
-        headers
+        let host_header = headers
             .get(HOST)
             .context("missing Host header for origin-form request")?
             .to_str()
-            .context("invalid Host header")?
+            .context("invalid Host header")?;
+        parse_client_authority(host_header, "Host header")?.to_string()
     };
     let path = uri
         .path_and_query()
@@ -1201,12 +1207,11 @@ fn validate_forwardable_host_headers(uri: &Uri, headers: &HeaderMap) -> Result<(
     };
 
     let host_header = host_header.to_str().context("invalid Host header")?;
-    let header_authority: Authority = host_header
-        .parse()
-        .with_context(|| format!("invalid Host header: {host_header}"))?;
+    let header_authority = parse_client_authority(host_header, "Host header")?;
     let uri_authority = uri
         .authority()
         .context("absolute-form request URI is missing authority")?;
+    validate_authority_for_client_input(uri_authority, "absolute-form request authority")?;
     let scheme = uri.scheme_str().unwrap_or("http");
     let uri_port = uri_authority
         .port_u16()
@@ -1230,9 +1235,9 @@ fn validate_absolute_uri_matches_authority_override(
     let uri_authority = uri
         .authority()
         .context("absolute-form request URI is missing authority")?;
-    let override_authority: Authority = authority_override
-        .parse()
-        .with_context(|| format!("invalid CONNECT tunnel authority: {authority_override}"))?;
+    validate_authority_for_client_input(uri_authority, "absolute-form request authority")?;
+    let override_authority =
+        parse_client_authority(authority_override, "CONNECT tunnel authority")?;
     let scheme = uri.scheme_str().unwrap_or(default_scheme);
     if !scheme.eq_ignore_ascii_case(default_scheme) {
         bail!("absolute-form request scheme does not match CONNECT tunnel scheme: {scheme}");
@@ -1250,6 +1255,24 @@ fn validate_absolute_uri_matches_authority_override(
             "absolute-form request authority does not match CONNECT tunnel authority: {}",
             uri_authority
         );
+    }
+    Ok(())
+}
+
+fn parse_client_authority(authority: &str, label: &str) -> Result<Authority> {
+    let authority: Authority = authority
+        .parse()
+        .with_context(|| format!("invalid {label}: {authority}"))?;
+    validate_authority_for_client_input(&authority, label)?;
+    Ok(authority)
+}
+
+fn validate_authority_for_client_input(authority: &Authority, label: &str) -> Result<()> {
+    if authority.as_str().contains('@') {
+        bail!("{label} must not include URI userinfo");
+    }
+    if authority.port().is_some() && authority.port_u16().is_none() {
+        bail!("{label} includes an invalid port: {authority}");
     }
     Ok(())
 }
@@ -1279,9 +1302,7 @@ fn connect_target(uri: &Uri) -> Result<String> {
     if target.is_empty() {
         return Err(anyhow!("CONNECT request is missing authority"));
     }
-    let authority: Authority = target
-        .parse()
-        .with_context(|| format!("invalid CONNECT target authority: {target}"))?;
+    let authority = parse_client_authority(target, "CONNECT target authority")?;
     authority
         .port_u16()
         .ok_or_else(|| anyhow!("CONNECT target authority must include a port: {target}"))?;

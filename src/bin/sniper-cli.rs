@@ -5316,6 +5316,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("replay tab sequence is too large"));
+
+        let replay = ReplayWorkspaceState {
+            tab_sequence: 1,
+            tabs: vec![ReplayTabState {
+                sequence: usize::MAX,
+                ..ReplayTabState::default()
+            }],
+            ..ReplayWorkspaceState::default()
+        };
+        let error = next_replay_tab_sequence(&replay).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("replay tab sequence is too large"));
     }
 
     #[test]
