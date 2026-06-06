@@ -711,7 +711,6 @@ impl SessionRegistry {
         if registry.active_session_id == id {
             return Err(anyhow!("cannot delete the active session"));
         }
-        let previous = registry.clone();
         let mut next = registry.clone();
         if !next.sessions.iter().any(|session| session.id == id) {
             return Err(anyhow!("session {id} was not found"));
@@ -719,31 +718,46 @@ impl SessionRegistry {
 
         let storage_dir = session_dir(&self.root_dir, id);
         let storage_metadata = session_storage_metadata(&storage_dir)?;
+        let quarantined_storage = if storage_metadata.is_some() {
+            let quarantine_dir = deleted_session_dir(&self.root_dir, id);
+            fs::rename(&storage_dir, &quarantine_dir).with_context(|| {
+                format!(
+                    "failed to quarantine session storage directory {}",
+                    storage_dir.display()
+                )
+            })?;
+            Some(quarantine_dir)
+        } else {
+            None
+        };
 
         next.sessions.retain(|session| session.id != id);
         if !next.deleted_session_ids.contains(&id) {
             next.deleted_session_ids.push(id);
         }
-        write_json(&self.registry_path, &next)?;
-        *registry = next;
-        drop(registry);
-
-        if storage_metadata.is_some() {
-            if let Err(error) = fs::remove_dir_all(&storage_dir) {
-                let mut registry = self.inner.write().expect("session registry lock poisoned");
-                if let Err(rollback_error) = write_json(&self.registry_path, &previous) {
+        if let Err(error) = write_json(&self.registry_path, &next) {
+            if let Some(quarantine_dir) = quarantined_storage.as_ref() {
+                if let Err(rollback_error) = fs::rename(quarantine_dir, &storage_dir) {
                     warn!(
                         ?rollback_error,
                         session_id = %id,
-                        "failed to restore session registry after storage delete failure"
+                        source = %quarantine_dir.display(),
+                        target = %storage_dir.display(),
+                        "failed to restore quarantined session storage after registry delete failure"
                     );
-                } else {
-                    *registry = previous;
                 }
+            }
+            return Err(error);
+        }
+        *registry = next;
+        drop(registry);
+
+        if let Some(quarantine_dir) = quarantined_storage {
+            if let Err(error) = fs::remove_dir_all(&quarantine_dir) {
                 return Err(error).with_context(|| {
                     format!(
                         "failed to delete session storage directory {}",
-                        storage_dir.display()
+                        quarantine_dir.display()
                     )
                 });
             }
@@ -1172,6 +1186,10 @@ fn session_summary(metadata: &SessionMetadata, storage_dir: &Path, active: bool)
 
 fn session_dir(root_dir: &Path, id: Uuid) -> PathBuf {
     root_dir.join(id.to_string())
+}
+
+fn deleted_session_dir(root_dir: &Path, id: Uuid) -> PathBuf {
+    root_dir.join(format!(".deleted-{id}-{}", Uuid::new_v4()))
 }
 
 fn snapshot_path(storage_dir: &Path) -> PathBuf {
@@ -2595,6 +2613,46 @@ mod tests {
                 .starts_with(".registry.corrupt-")
         });
         assert!(has_corrupt_backup);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn registry_corrupt_recovery_ignores_quarantined_deleted_session_dirs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-registry-corrupt-deleted-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let active = super::default_session_metadata("Active");
+        let deleted = super::default_session_metadata("Deleted");
+        super::persist_session_snapshot(
+            &root_dir,
+            &active,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("active snapshot should be written");
+        super::persist_session_snapshot(
+            &root_dir,
+            &deleted,
+            &super::StoredSessionSnapshot::default(),
+        )
+        .expect("deleted snapshot should be written before quarantine");
+        let deleted_storage = super::session_dir(&root_dir, deleted.id);
+        let quarantine_dir = root_dir.join(format!(".deleted-{}", deleted.id));
+        std::fs::rename(&deleted_storage, &quarantine_dir)
+            .expect("deleted session storage should be quarantined");
+        std::fs::write(root_dir.join(super::REGISTRY_FILE), b"{not json")
+            .expect("corrupt registry should be written");
+
+        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
+            .expect("corrupt registry should recover");
+
+        assert_eq!(loaded_active.id(), active.id);
+        assert!(registry.contains_session(active.id));
+        assert!(!registry.contains_session(deleted.id));
+        assert!(!deleted_storage.exists());
+        assert!(quarantine_dir.exists());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

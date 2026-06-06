@@ -5752,6 +5752,10 @@ button.utility-button.replay-tab-add {
   background: #2563eb;
 }
 
+.toast-warning {
+  background: #b45309;
+}
+
 .toast-error {
   background: #cb2431;
 }
@@ -6116,6 +6120,13 @@ button.utility-button.replay-tab-add {
   gap: 2px;
   max-height: 150px;
   overflow-y: auto;
+}
+
+.ws-setup-notice {
+  padding: 4px 6px;
+  color: var(--text-muted);
+  font-size: var(--font-xs);
+  line-height: 1.35;
 }
 
 .ws-setup-row {

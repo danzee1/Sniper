@@ -116,6 +116,8 @@ pub struct ReplayTabState {
     #[serde(default)]
     pub ws_editor_body_encoded: bool,
     #[serde(default)]
+    pub ws_setup_notice: String,
+    #[serde(default)]
     pub ws_setup_queue: Vec<serde_json::Value>,
     #[serde(default)]
     pub ws_frames: Vec<WsReplayFrame>,

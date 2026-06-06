@@ -462,6 +462,7 @@ const state = {
 let _historyPagingGeneration = 0;
 let _websocketLoadGeneration = 0;
 let _websocketDetailGeneration = 0;
+let _eventLogMutationGeneration = 0;
 let _websocketDetailPendingId = null;
 let _websocketDetailPendingPromise = null;
 let _websocketDetailRefreshTimer = null;
@@ -2587,6 +2588,7 @@ function hydrateReplayTab(tab) {
       wsEditorText: tab.ws_editor_text || "",
       wsMessageType: normalizeWsMessageType(tab.ws_message_type),
       wsEditorBodyEncoded: !!tab.ws_editor_body_encoded,
+      wsSetupNotice: tab.ws_setup_notice || "",
       wsSetupQueue: Array.isArray(tab.ws_setup_queue)
         ? tab.ws_setup_queue.map((item) => ({ ...normalizeWsSetupItem(item), sent: false }))
         : [],
@@ -2719,6 +2721,7 @@ function snapshotWorkspaceState(options = {}) {
             ws_editor_text: tab.wsEditorText || "",
             ws_message_type: normalizeWsMessageType(tab.wsMessageType),
             ws_editor_body_encoded: !!tab.wsEditorBodyEncoded,
+            ws_setup_notice: tab.wsSetupNotice || "",
             ws_setup_queue: (Array.isArray(tab.wsSetupQueue) ? tab.wsSetupQueue : []).map((item) => ({
               label: item.label || "",
               body: item.body || "",
@@ -4329,13 +4332,16 @@ function scheduleSelectedWebsocketDetailRefresh(id) {
 
 async function loadEventLog() {
   const sessionId = currentSessionId();
+  const mutationGeneration = _eventLogMutationGeneration;
   const response = await fetch(sessionQueryPath(`/api/event-log?limit=${EVENT_LOG_LIMIT}`, sessionId));
   await requireOkResponse(response, "Failed to load event log.");
   const entries = jsonArray(await response.json());
   if (sessionId !== currentSessionId()) {
     return;
   }
-  state.eventLog = entries;
+  state.eventLog = mutationGeneration === _eventLogMutationGeneration
+    ? entries.slice(0, EVENT_LOG_LIMIT)
+    : mergeEventLogEntries(state.eventLog, entries);
   renderEventLog();
 }
 
@@ -4352,12 +4358,26 @@ function applyEventLogEntry(entry) {
   if (!entry || typeof entry !== "object" || !entry.id) {
     return false;
   }
-  state.eventLog = [
-    entry,
-    ...jsonArray(state.eventLog).filter((existing) => existing?.id !== entry.id),
-  ].slice(0, EVENT_LOG_LIMIT);
+  _eventLogMutationGeneration += 1;
+  state.eventLog = mergeEventLogEntries([entry], state.eventLog);
   renderEventLog();
   return true;
+}
+
+function mergeEventLogEntries(primaryEntries, fallbackEntries) {
+  const seen = new Set();
+  const merged = [];
+  for (const entry of [...jsonArray(primaryEntries), ...jsonArray(fallbackEntries)]) {
+    if (!entry?.id || seen.has(entry.id)) {
+      continue;
+    }
+    seen.add(entry.id);
+    merged.push(entry);
+    if (merged.length >= EVENT_LOG_LIMIT) {
+      break;
+    }
+  }
+  return merged;
 }
 
 async function clearEventLog() {
@@ -4367,6 +4387,7 @@ async function clearEventLog() {
   if (sessionId !== currentSessionId()) {
     return;
   }
+  _eventLogMutationGeneration += 1;
   state.eventLog = [];
   renderEventLog();
 }
@@ -4899,6 +4920,14 @@ function canMergeRecentTransactions() {
 
 function canUseSequenceCursorForHistoryPaging() {
   return state.sortKey === "index" && state.sortDirection === "desc";
+}
+
+function historySortedCapReached(paging = state.historyPaging) {
+  return Boolean(
+    paging?.hasMore
+    && !canUseSequenceCursorForHistoryPaging()
+    && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS
+  );
 }
 
 function isHttpHistoryVisible() {
@@ -7265,7 +7294,9 @@ function renderHistory() {
   if (paging.total && (!isKnownCount(paging.filteredTotal) || paging.total !== paging.filteredTotal)) {
     summary.push(`${paging.total} total captured`);
   }
-  if (!paging.fullyLoaded) {
+  if (historySortedCapReached(paging)) {
+    summary.push(`sorted result cap reached; refine filters or sort by # desc`);
+  } else if (!paging.fullyLoaded) {
     summary.push(paging.loading ? "loading older history" : "scroll for older history");
   }
   if (state.query) summary.push(`search: "${state.query}"`);
@@ -10085,6 +10116,7 @@ function markFuzzerDraftChanged() {
     state._selectedFuzzerResultKey = null;
     state.fuzzerNotice = "Fuzzer draft changed. Start a new run to see results for the current template.";
     hideFuzzerDetailPanel();
+    renderFuzzer();
   }
 }
 
@@ -16134,6 +16166,7 @@ function createWsReplayTab(seed = {}) {
     wsLifecycleToken: 0,
     wsSetupPending: false,
     wsSetupRunning: false,
+    wsSetupNotice: seed.setupQueueNotice || "",
     wsSetupQueue: Array.isArray(seed.setupQueue)
       ? seed.setupQueue.map((item) => normalizeWsSetupItem(item))
       : normalizeWebsocketFrames(seed.capturedFrames)
@@ -16379,12 +16412,13 @@ async function wsDisconnect() {
 async function cleanupWsReplayTab(tab, { markDisconnected = false, removeBackend = true } = {}) {
   if (!tab || tab.type !== "websocket") return;
   tab.wsLifecycleToken = (tab.wsLifecycleToken || 0) + 1;
+  const lifecycleToken = tab.wsLifecycleToken;
   clearWsFrameListRender(tab);
-  await refreshWsReplayFramesOnce(tab);
+  await refreshWsReplayFramesOnce(tab, { lifecycleToken });
   stopWsPoll(tab);
   await disconnectWsReplayBackend(tab.id, { remove: removeBackend, sessionId: tab.wsSessionId || state.activeSession?.id || null });
   if (!removeBackend) {
-    await refreshWsReplayFramesUntilSettled(tab);
+    await refreshWsReplayFramesUntilSettled(tab, { lifecycleToken });
   }
   if (markDisconnected) {
     tab.wsStatus = "disconnected";
@@ -16396,17 +16430,24 @@ async function cleanupWsReplayTab(tab, { markDisconnected = false, removeBackend
   }
 }
 
-async function refreshWsReplayFramesOnce(tab) {
+async function refreshWsReplayFramesOnce(tab, options = {}) {
   if (!tab || tab.type !== "websocket") return false;
-  const sessionId = encodeURIComponent(tab.wsSessionId || state.activeSession?.id || "");
-  if (!sessionId) return false;
+  const lifecycleToken = Number.isFinite(Number(options.lifecycleToken))
+    ? Number(options.lifecycleToken)
+    : tab.wsLifecycleToken;
+  if (!isWsReplayTabAlive(tab, lifecycleToken)) return false;
+  const rawSessionId = tab.wsSessionId || state.activeSession?.id || "";
+  const sessionId = encodeURIComponent(rawSessionId);
+  if (!rawSessionId) return false;
   const sinceIndex = nextWsFrameIndex(tab);
   const resp = await fetch(`/api/replay/ws-frames/${tab.id}?since=${sinceIndex}&session_id=${sessionId}`)
     .catch(() => null);
+  if (!isWsReplayTabAlive(tab, lifecycleToken)) return false;
   if (!resp || !resp.ok) {
     return false;
   }
   const data = await resp.json().catch(() => null) || {};
+  if (!isWsReplayTabAlive(tab, lifecycleToken)) return false;
   const incomingFrames = normalizeWebsocketFrames(data.frames);
   let addedFrames = false;
   if (incomingFrames.length > 0) {
@@ -16434,15 +16475,17 @@ async function refreshWsReplayFramesOnce(tab) {
   return addedFrames;
 }
 
-async function refreshWsReplayFramesUntilSettled(tab) {
+async function refreshWsReplayFramesUntilSettled(tab, options = {}) {
   const started = Date.now();
-  const lifecycleToken = tab.wsLifecycleToken || 0;
+  const lifecycleToken = Number.isFinite(Number(options.lifecycleToken))
+    ? Number(options.lifecycleToken)
+    : (tab.wsLifecycleToken || 0);
   let sawFrame = false;
   do {
     if (!isWsReplayTabAlive(tab, lifecycleToken)) {
       return sawFrame;
     }
-    const added = await refreshWsReplayFramesOnce(tab);
+    const added = await refreshWsReplayFramesOnce(tab, { lifecycleToken });
     sawFrame = sawFrame || added;
     await new Promise((resolve) => window.setTimeout(resolve, WS_REPLAY_FINAL_POLL_INTERVAL_MS));
   } while (Date.now() - started < WS_REPLAY_FINAL_POLL_TIMEOUT_MS);
@@ -16642,10 +16685,11 @@ function renderWsSetupQueue() {
   if (!container) return;
   const tab = getActiveReplayTab();
   const setupQueue = Array.isArray(tab?.wsSetupQueue) ? tab.wsSetupQueue : [];
+  const setupNotice = String(tab?.wsSetupNotice || "");
   if (tab && tab.type === "websocket" && !Array.isArray(tab.wsSetupQueue)) {
     tab.wsSetupQueue = setupQueue;
   }
-  if (!tab || tab.type !== "websocket" || !setupQueue.length) {
+  if (!tab || tab.type !== "websocket" || (!setupQueue.length && !setupNotice)) {
     container.classList.add("hidden");
     return;
   }
@@ -16654,7 +16698,10 @@ function renderWsSetupQueue() {
   const listEl = document.getElementById("wsSetupQueueList");
   if (!listEl) return;
 
-  listEl.innerHTML = setupQueue.map((item, i) => {
+  const noticeHtml = setupNotice
+    ? `<div class="ws-setup-notice">${escapeHtml(setupNotice)}</div>`
+    : "";
+  const queueHtml = setupQueue.map((item, i) => {
     const sentClass = item.sent ? "sent" : "";
     const checked = item.autoSend ? "checked" : "";
     return `<div class="ws-setup-row ${sentClass}" data-idx="${i}">
@@ -16665,6 +16712,7 @@ function renderWsSetupQueue() {
       ${item.sent ? '<span class="ws-setup-sent-badge">✓</span>' : ""}
     </div>`;
   }).join("");
+  listEl.innerHTML = noticeHtml + queueHtml;
 
   // Checkbox toggle
   listEl.querySelectorAll(".ws-setup-check").forEach((cb) => {
@@ -17681,6 +17729,9 @@ function sendWsFrameToReplay(frameIdx) {
   }
   const frame = frames.find((candidate) => candidate.index === requestedIndex);
   if (!frame) return;
+  const firstLoadedFrameIndex = frames.length ? Number(frames[0]?.index) : 0;
+  const setupQueueMayBeIncomplete = !!session.frames_truncated
+    || (Number.isFinite(firstLoadedFrameIndex) && firstLoadedFrameIndex > 0);
 
   // Determine WS scheme
   let wsScheme;
@@ -17708,12 +17759,19 @@ function sendWsFrameToReplay(frameIdx) {
     port,
     path: session.path || "/",
     headers: normalizedHeaders(session.request?.headers),
-    capturedFrames: frames,
+    capturedFrames: setupQueueMayBeIncomplete ? [] : frames,
+    setupQueue: setupQueueMayBeIncomplete ? [] : undefined,
+    setupQueueNotice: setupQueueMayBeIncomplete
+      ? "This WebSocket history is truncated, so earlier client setup frames may be missing. Auto-send setup was disabled for this replay tab."
+      : "",
     selectedFrameIndex: frame.index,
     editorText: body,
     messageType,
     editorBodyEncoded,
   });
+  if (setupQueueMayBeIncomplete) {
+    showToast("WebSocket history is truncated. Replay setup auto-send was disabled.", "warning");
+  }
   state.activeTool = "replay";
   renderToolPanels();
 }

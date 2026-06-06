@@ -898,6 +898,12 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
             &tab.ws_editor_text,
             MAX_WORKSPACE_TEXT_FIELD_BYTES,
         )?;
+        add_workspace_text_bytes(
+            &mut stored_bytes_total,
+            "websocket setup notice",
+            &tab.ws_setup_notice,
+            MAX_WORKSPACE_TEXT_FIELD_BYTES,
+        )?;
         if is_websocket_tab {
             if tab.ws_headers.len() > MAX_WORKSPACE_WS_HEADERS {
                 return Err(format!(
@@ -1078,6 +1084,7 @@ fn replay_tab_has_websocket_payload(tab: &crate::workspace::ReplayTabState) -> b
         || !tab.ws_editor_text.is_empty()
         || !tab.ws_message_type.is_empty()
         || tab.ws_editor_body_encoded
+        || !tab.ws_setup_notice.is_empty()
         || !tab.ws_setup_queue.is_empty()
         || !tab.ws_frames.is_empty()
 }
@@ -5810,6 +5817,10 @@ mod tests {
             "body_encoded": true
         })];
         assert!(super::validate_workspace_state(&snapshot).is_err());
+
+        snapshot.replay.tabs[0].ws_setup_queue.clear();
+        snapshot.replay.tabs[0].ws_setup_notice = "Auto-send setup disabled.".to_string();
+        assert!(super::validate_workspace_state(&snapshot).is_ok());
     }
 
     #[test]
@@ -5836,16 +5847,7 @@ mod tests {
         snapshot.replay.tabs.push(ReplayTabState {
             id: "http-draft".to_string(),
             sequence: 1,
-            ws_frames: vec![WsReplayFrame {
-                index: 0,
-                captured_at: Utc::now().to_rfc3339(),
-                direction: WebSocketFrameDirection::ClientToServer,
-                kind: WebSocketFrameKind::Text,
-                body: "hello".to_string(),
-                body_encoding: BodyEncoding::Utf8,
-                body_size: 5,
-                preview_truncated: false,
-            }],
+            ws_setup_notice: "websocket only".to_string(),
             ..ReplayTabState::default()
         });
 
