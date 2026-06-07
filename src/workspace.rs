@@ -20,6 +20,8 @@ pub struct WorkspaceStateSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_active_session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub client_version: u64,

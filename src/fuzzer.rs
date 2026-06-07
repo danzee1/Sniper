@@ -78,6 +78,8 @@ pub struct FuzzerAttackSummary {
 #[derive(Clone, Debug, Deserialize)]
 pub struct FuzzerAttackPayload {
     pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub expected_active_session_id: Option<Uuid>,
     pub template: EditableRequest,
     pub payloads: Vec<String>,
     pub source_transaction_id: Option<Uuid>,

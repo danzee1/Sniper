@@ -133,6 +133,10 @@ const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 12 * 1024 * 1024;
 const WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS = 2000;
 const WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS = 5000;
 const WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES = 60 * 1024;
+const WORKSPACE_UNLOAD_HISTORY_ENTRIES_MAX_BYTES = 12 * 1024;
+const WORKSPACE_UNLOAD_RESPONSE_RECORD_MAX_BYTES = 12 * 1024;
+const WORKSPACE_UNLOAD_WS_SETUP_QUEUE_MAX_BYTES = 12 * 1024;
+const WORKSPACE_UNLOAD_WS_FRAMES_MAX_BYTES = 24 * 1024;
 const MAX_ANNOTATION_NOTE_BYTES = 32 * 1024;
 const WS_REPLAY_FINAL_POLL_INTERVAL_MS = 100;
 const WS_REPLAY_FINAL_POLL_TIMEOUT_MS = 2200;
@@ -3330,34 +3334,56 @@ function compactWorkspaceUnloadEditableRequest(request, options = {}) {
   };
 }
 
-function compactWorkspaceUnloadArrayLength(snapshotTab, liveTab, snapshotKey, liveKey) {
-  const liveValue = liveTab && typeof liveTab === "object" ? liveTab[liveKey] : null;
-  if (Array.isArray(liveValue)) return liveValue.length;
-  const snapshotValue = snapshotTab && typeof snapshotTab === "object" ? snapshotTab[snapshotKey] : null;
-  return Array.isArray(snapshotValue) ? snapshotValue.length : 0;
+function compactWorkspaceUnloadCompleteArray(items, maxBytes) {
+  const source = Array.isArray(items) ? items : [];
+  if (!source.length) {
+    return { items: [], complete: true };
+  }
+  return utf8ByteLength(JSON.stringify(source)) <= maxBytes
+    ? { items: source, complete: true }
+    : { items: [], complete: false };
 }
 
-function compactWorkspaceUnloadReplayResponseComplete(tab, liveTab) {
-  if (liveTab && typeof liveTab === "object" && Object.prototype.hasOwnProperty.call(liveTab, "responseRecord")) {
-    return !liveTab.responseRecord;
+function compactWorkspaceUnloadTailArray(items, maxBytes) {
+  const source = Array.isArray(items) ? items : [];
+  if (!source.length) {
+    return { items: [], complete: true };
   }
-  if (tab && typeof tab === "object" && Object.prototype.hasOwnProperty.call(tab, "response_record")) {
-    return !tab.response_record;
+  if (utf8ByteLength(JSON.stringify(source)) <= maxBytes) {
+    return { items: source, complete: true };
   }
-  return true;
+  const tail = [];
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    tail.unshift(source[index]);
+    if (utf8ByteLength(JSON.stringify(tail)) > maxBytes) {
+      tail.shift();
+      break;
+    }
+  }
+  return { items: tail, complete: false };
+}
+
+function compactWorkspaceUnloadJsonValue(value, maxBytes) {
+  if (value === null || value === undefined) {
+    return { value: null, complete: true };
+  }
+  return utf8ByteLength(JSON.stringify(value)) <= maxBytes
+    ? { value, complete: true }
+    : { value: null, complete: false };
 }
 
 function compactWorkspaceUnloadReplayTab(tab, options = {}, liveTab = null) {
   if (!tab || typeof tab !== "object") return null;
   if (tab.type === "websocket") {
     const wsFrames = Array.isArray(tab.ws_frames) ? tab.ws_frames : [];
-    const wsSetupQueueLength = compactWorkspaceUnloadArrayLength(
-      tab,
-      liveTab,
-      "ws_setup_queue",
-      "wsSetupQueue",
+    const wsSetupQueue = compactWorkspaceUnloadCompleteArray(
+      Array.isArray(tab.ws_setup_queue) ? tab.ws_setup_queue : [],
+      WORKSPACE_UNLOAD_WS_SETUP_QUEUE_MAX_BYTES,
     );
-    const wsFrameLength = compactWorkspaceUnloadArrayLength(tab, liveTab, "ws_frames", "wsFrames");
+    const wsFrameTail = compactWorkspaceUnloadTailArray(
+      wsFrames,
+      WORKSPACE_UNLOAD_WS_FRAMES_MAX_BYTES,
+    );
     return {
       id: tab.id,
       type: "websocket",
@@ -3375,20 +3401,26 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}, liveTab = null) {
       ws_message_type: normalizeWsMessageType(tab.ws_message_type),
       ws_editor_body_encoded: !!tab.ws_editor_body_encoded,
       ws_setup_notice: tab.ws_setup_notice || "",
-      ws_setup_queue: [],
-      ws_setup_queue_complete: wsSetupQueueLength === 0,
-      ws_frames: [],
-      ws_frames_complete: wsFrameLength === 0,
-      ws_frames_truncated: !!tab.ws_frames_truncated || websocketFramesAreTruncated(wsFrames, null),
+      ws_setup_queue: wsSetupQueue.items,
+      ws_setup_queue_complete: wsSetupQueue.complete,
+      ws_frames: wsFrameTail.items,
+      ws_frames_complete: wsFrameTail.complete,
+      ws_frames_truncated: !!tab.ws_frames_truncated
+        || !wsFrameTail.complete
+        || websocketFramesAreTruncated(wsFrames, null),
       ws_selected_frame_index: tab.ws_selected_frame_index ?? null,
       ws_frame_window_start: tab.ws_frame_window_start ?? null,
     };
   }
-  const historyEntriesLength = compactWorkspaceUnloadArrayLength(
-    tab,
-    liveTab,
-    "history_entries",
-    "historyEntries",
+  const historyEntries = compactWorkspaceUnloadCompleteArray(
+    Array.isArray(tab.history_entries) ? tab.history_entries : [],
+    WORKSPACE_UNLOAD_HISTORY_ENTRIES_MAX_BYTES,
+  );
+  const responseRecord = compactWorkspaceUnloadJsonValue(
+    liveTab && typeof liveTab === "object" && Object.prototype.hasOwnProperty.call(liveTab, "responseRecord")
+      ? liveTab.responseRecord
+      : tab.response_record,
+    WORKSPACE_UNLOAD_RESPONSE_RECORD_MAX_BYTES,
   );
   return {
     id: tab.id,
@@ -3400,15 +3432,15 @@ function compactWorkspaceUnloadReplayTab(tab, options = {}, liveTab = null) {
     notice: tab.notice || "",
     request_text: compactWorkspaceUnloadText(tab.request_text, options),
     http_version_mode: normalizeReplayHttpVersionMode(tab.http_version_mode),
-    response_record: null,
-    response_record_complete: compactWorkspaceUnloadReplayResponseComplete(tab, liveTab),
+    response_record: responseRecord.value,
+    response_record_complete: responseRecord.complete,
     target_scheme: tab.target_scheme || "https",
     target_host: tab.target_host || "",
     target_port: normalizePortValue(tab.target_port),
     target_manually_edited: !!tab.target_manually_edited,
-    history_entries: [],
-    history_entries_complete: historyEntriesLength === 0,
-    history_index: null,
+    history_entries: historyEntries.items,
+    history_entries_complete: historyEntries.complete,
+    history_index: historyEntries.complete ? (tab.history_index ?? null) : null,
   };
 }
 
@@ -3433,7 +3465,7 @@ function disconnectWsReplayTabsOnUnload() {
     if (!tab || tab.type !== "websocket") continue;
     if (tab.wsStatus !== "connected" && tab.wsStatus !== "connecting") continue;
     const sessionId = tab.wsSessionId || activeSessionId;
-    const payload = JSON.stringify({ session_id: sessionId, id: tab.id, remove: true });
+    const payload = JSON.stringify({ session_id: sessionId, id: tab.id, remove: false });
     if (utf8ByteLength(payload) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
     fetch("/api/replay/ws-disconnect", {
       method: "POST",
@@ -17603,9 +17635,6 @@ async function wsConnect() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
   const sessionId = state.activeSession?.id || null;
-  const lifecycleToken = (tab.wsLifecycleToken || 0) + 1;
-  tab.wsLifecycleToken = lifecycleToken;
-  tab.wsSessionId = sessionId;
 
   // Sync fields from UI
   const wsScheme = els.wsSchemeSelect.value;
@@ -17621,6 +17650,9 @@ async function wsConnect() {
     els.wsPathInput.reportValidity();
     return;
   }
+  const lifecycleToken = (tab.wsLifecycleToken || 0) + 1;
+  tab.wsLifecycleToken = lifecycleToken;
+  tab.wsSessionId = sessionId;
   const normalizedTarget = normalizeWsReplayTargetFields(wsScheme, wsHost, wsPortText);
   const wsPort = normalizePortValue(normalizedTarget.port);
   tab.wsScheme = normalizedTarget.scheme;

@@ -1208,9 +1208,10 @@ const CLI_WORKSPACE_CLIENT_ID: &str = "sniper-cli";
 async fn post_workspace_state(
     api: &ApiClient,
     workspace: &mut WorkspaceStateSnapshot,
+    explicit_session_id: Option<Uuid>,
 ) -> Result<WorkspaceStateSnapshot> {
     const PATH: &str = "/api/workspace-state";
-    prepare_cli_workspace_save(workspace);
+    prepare_cli_workspace_save(workspace, explicit_session_id);
     let response = api
         .client
         .post(api.url(PATH))
@@ -1220,11 +1221,16 @@ async fn post_workspace_state(
         .context("failed to POST workspace state")?;
     let status = response.status();
     if status == StatusCode::CONFLICT {
-        let current = response
-            .json::<WorkspaceStateSnapshot>()
-            .await
-            .context("workspace state conflict, but failed to decode current workspace state")?;
-        bail!("{}", workspace_conflict_message(&current));
+        let message = response.text().await.unwrap_or_else(|_| String::new());
+        if let Ok(current) = serde_json::from_str::<WorkspaceStateSnapshot>(&message) {
+            bail!("{}", workspace_conflict_message(&current));
+        }
+        bail!(
+            "request to {} failed ({}): {}",
+            PATH,
+            status,
+            api_failure_detail(status, message)
+        );
     }
     if !status.is_success() {
         let message = response.text().await.unwrap_or_else(|_| String::new());
@@ -1262,9 +1268,27 @@ async fn load_workspace_state(
         .await
 }
 
-fn prepare_cli_workspace_save(workspace: &mut WorkspaceStateSnapshot) {
+fn prepare_cli_workspace_save(
+    workspace: &mut WorkspaceStateSnapshot,
+    explicit_session_id: Option<Uuid>,
+) {
+    workspace.expected_active_session_id = if explicit_session_id.is_none() {
+        workspace.session_id
+    } else {
+        None
+    };
     workspace.client_id = Some(CLI_WORKSPACE_CLIENT_ID.to_string());
     workspace.client_version = workspace.client_version.saturating_add(1).max(1);
+}
+
+fn expected_active_session_for_implicit_write(
+    workspace: &WorkspaceStateSnapshot,
+    explicit_session_id: Option<Uuid>,
+) -> Option<Uuid> {
+    explicit_session_id
+        .is_none()
+        .then_some(workspace.session_id)
+        .flatten()
 }
 
 #[derive(Serialize)]
@@ -1296,6 +1320,7 @@ struct CreateSessionPayload {
 #[derive(Serialize)]
 struct ReplaySendPayload {
     session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
     request: EditableRequest,
     target: Option<RequestTargetOverride>,
     source_transaction_id: Option<Uuid>,
@@ -1316,6 +1341,7 @@ struct ReplaySendErrorBody {
 #[derive(Serialize)]
 struct FuzzerRunPayload {
     session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
     template: EditableRequest,
     payloads: Vec<String>,
     source_transaction_id: Option<Uuid>,
@@ -1547,7 +1573,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
             workspace.fuzzer.request_text = request_text;
             workspace.fuzzer.notice.clear();
             workspace.fuzzer.clear_attack_record_reference();
-            let snapshot = post_workspace_state(&api, &mut workspace).await?;
+            let snapshot = post_workspace_state(&api, &mut workspace, args.session_id).await?;
             print_json_with_session(&snapshot.fuzzer, workspace.session_id)
         }
         HistoryCommand::Annotate(args) => {
@@ -1727,7 +1753,7 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 }
                 tab.response_record = None;
             }
-            let snapshot = post_workspace_state(&api, &mut workspace).await?;
+            let snapshot = post_workspace_state(&api, &mut workspace, args.session_id).await?;
             let tab = find_replay_tab(&snapshot.replay, &args.tab_id)?;
             print_json_with_session(tab, workspace.session_id)
         }
@@ -1744,6 +1770,10 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             let replay_result = api
                 .send_replay(&ReplaySendPayload {
                     session_id: workspace.session_id,
+                    expected_active_session_id: expected_active_session_for_implicit_write(
+                        &workspace,
+                        args.session_id,
+                    ),
                     request: request.clone(),
                     target: target.clone(),
                     source_transaction_id: tab.source_transaction_id,
@@ -1783,7 +1813,9 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             };
             push_replay_history_entry(tab_mut, history_entry);
 
-            let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
+            let workspace_save_error = post_workspace_state(&api, &mut workspace, args.session_id)
+                .await
+                .err();
             if let Some(error) = replay_error {
                 let mut output = json!({
                     "error": error.clone(),
@@ -1842,7 +1874,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.request_text = request_text;
             workspace.fuzzer.notice.clear();
             workspace.fuzzer.clear_attack_record_reference();
-            let snapshot = post_workspace_state(&api, &mut workspace).await?;
+            let snapshot = post_workspace_state(&api, &mut workspace, args.session_id).await?;
             print_json_with_session(&snapshot.fuzzer, workspace.session_id)
         }
         FuzzerCommand::SetPayloads(args) => {
@@ -1851,7 +1883,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 read_payloads_input(args.payloads, args.file, args.stdin)?;
             workspace.fuzzer.notice.clear();
             workspace.fuzzer.clear_attack_record_reference();
-            let snapshot = post_workspace_state(&api, &mut workspace).await?;
+            let snapshot = post_workspace_state(&api, &mut workspace, args.session_id).await?;
             print_json_with_session(&snapshot.fuzzer, workspace.session_id)
         }
         FuzzerCommand::Run(args) => {
@@ -1873,6 +1905,10 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                     "/api/fuzzer/attacks",
                     &FuzzerRunPayload {
                         session_id: workspace.session_id,
+                        expected_active_session_id: expected_active_session_for_implicit_write(
+                            &workspace,
+                            args.session_id,
+                        ),
                         template,
                         payloads,
                         source_transaction_id: workspace.fuzzer.source_transaction_id,
@@ -1884,7 +1920,9 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             workspace.fuzzer.attack_record_id = Some(record.id);
             workspace.fuzzer.attack_record = None;
             workspace.fuzzer.notice.clear();
-            let workspace_save_error = post_workspace_state(&api, &mut workspace).await.err();
+            let workspace_save_error = post_workspace_state(&api, &mut workspace, args.session_id)
+                .await
+                .err();
 
             let record_value =
                 serde_json::to_value(&record).context("failed to inspect JSON status")?;
@@ -2465,7 +2503,7 @@ async fn open_replay_tab(
     workspace.replay.tab_sequence = sequence;
     workspace.replay.active_tab_id = Some(tab.id.clone());
     workspace.replay.tabs.push(tab.clone());
-    let snapshot = post_workspace_state(api, &mut workspace).await?;
+    let snapshot = post_workspace_state(api, &mut workspace, session_id).await?;
     let tab = find_replay_tab(&snapshot.replay, &tab.id)?;
     Ok((workspace.session_id, tab.clone()))
 }
@@ -5932,12 +5970,21 @@ mod tests {
         };
         let session_id = workspace.session_id;
 
-        prepare_cli_workspace_save(&mut workspace);
+        prepare_cli_workspace_save(&mut workspace, None);
 
         assert_eq!(workspace.revision, 7);
         assert_eq!(workspace.session_id, session_id);
+        assert_eq!(workspace.expected_active_session_id, session_id);
         assert_eq!(workspace.client_id.as_deref(), Some("sniper-cli"));
         assert_eq!(workspace.client_version, 42);
+
+        prepare_cli_workspace_save(&mut workspace, session_id);
+
+        assert_eq!(workspace.revision, 7);
+        assert_eq!(workspace.session_id, session_id);
+        assert_eq!(workspace.expected_active_session_id, None);
+        assert_eq!(workspace.client_id.as_deref(), Some("sniper-cli"));
+        assert_eq!(workspace.client_version, 43);
     }
 
     #[test]

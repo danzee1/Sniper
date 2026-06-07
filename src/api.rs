@@ -1963,6 +1963,8 @@ struct ResponseInterceptForwardPayload {
 #[derive(Debug, Deserialize)]
 struct ReplaySendPayload {
     session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
     request: EditableRequest,
     target: Option<RequestTargetOverride>,
     source_transaction_id: Option<Uuid>,
@@ -2206,6 +2208,13 @@ async fn update_workspace_state(
     State(state): State<Arc<AppState>>,
     Json(snapshot): Json<WorkspaceStateSnapshot>,
 ) -> Response {
+    let mut snapshot = snapshot;
+    if let Some(response) =
+        expected_active_session_conflict_response(&state, snapshot.expected_active_session_id)
+    {
+        return response;
+    }
+    snapshot.expected_active_session_id = None;
     let Some(target_session_id) = snapshot.session_id else {
         let active_session = state.session().await;
         let mut current = active_session.workspace.snapshot().await;
@@ -2249,7 +2258,6 @@ async fn update_workspace_state(
             Err(error) => return session_load_failure_response(target_session_id, error),
         }
     };
-    let mut snapshot = snapshot;
     snapshot.fuzzer.migrate_attack_record_to_id();
     let mut current = session.workspace.snapshot().await;
     current.session_id = Some(session.id());
@@ -2284,8 +2292,14 @@ async fn update_workspace_state_keepalive(
     State(state): State<Arc<AppState>>,
     Json(update): Json<WorkspaceKeepaliveUpdate>,
 ) -> Response {
-    let snapshot = update.snapshot;
+    let mut snapshot = update.snapshot;
     let keepalive = update.keepalive;
+    if let Some(response) =
+        expected_active_session_conflict_response(&state, snapshot.expected_active_session_id)
+    {
+        return response;
+    }
+    snapshot.expected_active_session_id = None;
     let Some(target_session_id) = snapshot.session_id else {
         return StatusCode::CONFLICT.into_response();
     };
@@ -2665,6 +2679,15 @@ fn active_session_conflict_response(state: &AppState) -> Response {
         })),
     )
         .into_response()
+}
+
+fn expected_active_session_conflict_response(
+    state: &AppState,
+    expected_active_session_id: Option<Uuid>,
+) -> Option<Response> {
+    let expected_active_session_id = expected_active_session_id?;
+    (state.sessions.active_session_id() != expected_active_session_id)
+        .then(|| active_session_conflict_response(state))
 }
 
 fn session_proxy_work_conflict_response(session_id: Uuid) -> Response {
@@ -4104,6 +4127,11 @@ async fn send_replay(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if let Some(response) =
+        expected_active_session_conflict_response(&state, payload.expected_active_session_id)
+    {
+        return response;
+    }
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
         Ok(value) => value,
         Err(error) => return replay_send_error_response(error),
@@ -4215,6 +4243,11 @@ async fn run_fuzzer_attack(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if let Some(response) =
+        expected_active_session_conflict_response(&state, payload.expected_active_session_id)
+    {
+        return response;
+    }
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
@@ -7206,6 +7239,7 @@ mod tests {
                 payloads_text: "payload-one".to_string(),
                 ..FuzzerWorkspaceState::default()
             },
+            expected_active_session_id: None,
         };
         let incoming = WorkspaceStateSnapshot {
             revision: 7,
@@ -7229,6 +7263,7 @@ mod tests {
                 }],
             },
             fuzzer: FuzzerWorkspaceState::default(),
+            expected_active_session_id: None,
         };
 
         let merged = super::merge_workspace_keepalive_snapshot(
@@ -9892,6 +9927,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_update_rejects_stale_implicit_active_session_guard() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-workspace-active-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let active = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let mut snapshot = WorkspaceStateSnapshot {
+            session_id: Some(original_id),
+            expected_active_session_id: Some(original_id),
+            client_id: Some("sniper-cli".to_string()),
+            client_version: 1,
+            ..WorkspaceStateSnapshot::default()
+        };
+        snapshot.replay.active_tab_id = Some("stale-tab".to_string());
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "stale-tab".to_string(),
+            sequence: 1,
+            ..ReplayTabState::default()
+        });
+
+        let response = super::update_workspace_state(State(state.clone()), Json(snapshot)).await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("active session changed")
+        );
+        let active_id = active.id.to_string();
+        assert_eq!(
+            body.get("session_id").and_then(serde_json::Value::as_str),
+            Some(active_id.as_str())
+        );
+        assert!(original.workspace.snapshot().await.replay.tabs.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_keepalive_rejects_stale_implicit_active_session_guard() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-workspace-keepalive-active-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let active = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let mut snapshot = WorkspaceStateSnapshot {
+            session_id: Some(original_id),
+            expected_active_session_id: Some(original_id),
+            client_id: Some("sniper-cli".to_string()),
+            client_version: 1,
+            ..WorkspaceStateSnapshot::default()
+        };
+        snapshot.replay.active_tab_id = Some("stale-keepalive-tab".to_string());
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "stale-keepalive-tab".to_string(),
+            sequence: 1,
+            ..ReplayTabState::default()
+        });
+
+        let response = super::update_workspace_state_keepalive(
+            State(state.clone()),
+            Json(super::WorkspaceKeepaliveUpdate {
+                snapshot,
+                keepalive: super::WorkspaceKeepaliveMetadata::default(),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("active session changed")
+        );
+        let active_id = active.id.to_string();
+        assert_eq!(
+            body.get("session_id").and_then(serde_json::Value::as_str),
+            Some(active_id.as_str())
+        );
+        assert!(original.workspace.snapshot().await.replay.tabs.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn workspace_update_rejects_inactive_session_with_pending_active_proxy_work() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-workspace-active-proxy-guard-{}",
@@ -9976,6 +10124,7 @@ mod tests {
             State(state.clone()),
             Json(super::ReplaySendPayload {
                 session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -10019,6 +10168,7 @@ mod tests {
             State(state.clone()),
             Json(super::ReplaySendPayload {
                 session_id: None,
+                expected_active_session_id: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -10043,6 +10193,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_send_rejects_stale_implicit_active_session_guard() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-replay-send-active-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let active = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let response = super::send_replay(
+            State(state.clone()),
+            Json(super::ReplaySendPayload {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+                request: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                target: None,
+                source_transaction_id: None,
+                http_version: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("active session changed")
+        );
+        let active_id = active.id.to_string();
+        assert_eq!(
+            body.get("session_id").and_then(serde_json::Value::as_str),
+            Some(active_id.as_str())
+        );
+        assert!(original.store.snapshot(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn replay_send_validation_errors_use_json_error_body() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-replay-send-json-error-{}",
@@ -10062,6 +10271,7 @@ mod tests {
             State(state.clone()),
             Json(super::ReplaySendPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -10112,6 +10322,7 @@ mod tests {
             State(state.clone()),
             Json(super::ReplaySendPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -10178,6 +10389,7 @@ mod tests {
             State(state.clone()),
             Json(super::ReplaySendPayload {
                 session_id: Some(session_id),
+                expected_active_session_id: None,
                 request: EditableRequest {
                     scheme: "http".to_string(),
                     host: addr.to_string(),
@@ -10235,6 +10447,7 @@ mod tests {
             State(state),
             Json(super::ReplaySendPayload {
                 session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
                 request: EditableRequest {
                     scheme: "ftp".to_string(),
                     host: String::new(),
@@ -10277,6 +10490,7 @@ mod tests {
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -10321,6 +10535,7 @@ mod tests {
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: None,
+                expected_active_session_id: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -10346,6 +10561,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fuzzer_run_rejects_stale_implicit_active_session_guard() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-fuzzer-active-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let active = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let response = super::run_fuzzer_attack(
+            State(state.clone()),
+            Json(crate::fuzzer::FuzzerAttackPayload {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+                template: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "GET".to_string(),
+                    path: "/$payload$".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                payloads: vec!["one".to_string()],
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("active session changed")
+        );
+        let active_id = active.id.to_string();
+        assert_eq!(
+            body.get("session_id").and_then(serde_json::Value::as_str),
+            Some(active_id.as_str())
+        );
+        assert!(original.fuzzer.list(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn fuzzer_run_rejects_unknown_session_before_validating_payload() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-invalid-session-guard-{}",
@@ -10364,6 +10639,7 @@ mod tests {
             State(state),
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
                 template: EditableRequest {
                     scheme: "ftp".to_string(),
                     host: String::new(),
@@ -10407,6 +10683,7 @@ mod tests {
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -10462,6 +10739,7 @@ mod tests {
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 template: EditableRequest {
                     scheme: "http".to_string(),
                     host: addr.to_string(),
@@ -10512,6 +10790,7 @@ mod tests {
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
