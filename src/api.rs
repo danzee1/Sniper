@@ -2655,9 +2655,9 @@ fn complete_workspace_keepalive_fuzzer(
     keepalive: &WorkspaceKeepaliveMetadata,
 ) -> FuzzerWorkspaceState {
     if !keepalive.text_complete() {
-        incoming.base_request = current.base_request.clone();
-        incoming.request_text.clone_from(&current.request_text);
-        incoming.payloads_text.clone_from(&current.payloads_text);
+        incoming = current.clone();
+        incoming.attack_record = None;
+        return incoming;
     }
     incoming.attack_record = None;
     incoming
@@ -8397,6 +8397,82 @@ mod tests {
         assert!(merged.fuzzer.target.is_none());
         assert!(merged.fuzzer.target_request_authority.is_none());
         assert!(merged.fuzzer.notice.is_empty());
+    }
+
+    #[test]
+    fn workspace_keepalive_partial_fuzzer_text_preserves_coupled_fields() {
+        let current_source_id = Uuid::new_v4();
+        let current_attack_id = Uuid::new_v4();
+        let incoming_source_id = Uuid::new_v4();
+        let incoming_attack_id = Uuid::new_v4();
+        let current = WorkspaceStateSnapshot {
+            fuzzer: FuzzerWorkspaceState {
+                base_request: Some(test_editable_request("/old")),
+                source_transaction_id: Some(current_source_id),
+                target: Some(RequestTargetOverride {
+                    scheme: "https".to_string(),
+                    host: "old.example".to_string(),
+                    port: "443".to_string(),
+                }),
+                target_request_authority: Some("old.example".to_string()),
+                notice: "old notice".to_string(),
+                request_text: "GET /old HTTP/1.1\r\nHost: old.example\r\n\r\n".to_string(),
+                payloads_text: "old-payload".to_string(),
+                attack_record_id: Some(current_attack_id),
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            fuzzer: FuzzerWorkspaceState {
+                base_request: Some(test_editable_request("/new")),
+                source_transaction_id: Some(incoming_source_id),
+                target: Some(RequestTargetOverride {
+                    scheme: "https".to_string(),
+                    host: "new.example".to_string(),
+                    port: "443".to_string(),
+                }),
+                target_request_authority: Some("new.example".to_string()),
+                notice: "new notice".to_string(),
+                request_text: "GET /new HTTP/1.1\r\nHost: new.example\r\n\r\n".to_string(),
+                payloads_text: "new-payload".to_string(),
+                attack_record_id: Some(incoming_attack_id),
+                ..FuzzerWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                replay_tabs_complete: false,
+                fuzzer_complete: true,
+                text_complete: Some(false),
+                ..super::WorkspaceKeepaliveMetadata::default()
+            },
+        );
+
+        assert_eq!(
+            merged.fuzzer.request_text,
+            "GET /old HTTP/1.1\r\nHost: old.example\r\n\r\n".to_string()
+        );
+        assert_eq!(merged.fuzzer.payloads_text, "old-payload");
+        assert_eq!(merged.fuzzer.source_transaction_id, Some(current_source_id));
+        assert_eq!(merged.fuzzer.attack_record_id, Some(current_attack_id));
+        assert_eq!(
+            merged
+                .fuzzer
+                .target
+                .as_ref()
+                .map(|target| target.host.as_str()),
+            Some("old.example")
+        );
+        assert_eq!(
+            merged.fuzzer.target_request_authority.as_deref(),
+            Some("old.example")
+        );
+        assert_eq!(merged.fuzzer.notice, "old notice");
     }
 
     #[test]

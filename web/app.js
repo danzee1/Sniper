@@ -855,6 +855,7 @@ let workspaceSaveCommittedSnapshot = null;
 const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
+let expectedActiveSessionGuardBypassDepth = 0;
 const uiSettingsClientId = createWorkspaceClientId();
 let uiSettingsSaveVersion = 0;
 const annotationClientId = createWorkspaceClientId();
@@ -1310,7 +1311,7 @@ function bindEvents() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           session_id: sessionId,
-          expected_active_session_id: sessionId,
+          expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
           intercept_scope_only: nextScopeOnly,
         }),
       });
@@ -2990,7 +2991,7 @@ function snapshotWorkspaceState(options = {}) {
   return {
     revision: state.workspaceRevision || 0,
     session_id: state.activeSession?.id || null,
-    expected_active_session_id: state.activeSession?.id || null,
+    expected_active_session_id: expectedActiveSessionIdForWrite(state.activeSession?.id || null),
     client_id: workspaceClientId,
     client_version: workspaceSaveVersion,
     replay: {
@@ -3679,7 +3680,7 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
   return {
     revision: snapshot.revision || 0,
     session_id: snapshot.session_id || null,
-    expected_active_session_id: snapshot.expected_active_session_id || state.activeSession?.id || null,
+    expected_active_session_id: expectedActiveSessionIdForWrite(snapshot.session_id || state.activeSession?.id || null),
     client_id: snapshot.client_id || workspaceClientId,
     client_version: snapshot.client_version || workspaceSaveVersion,
     replay: {
@@ -3860,7 +3861,7 @@ function disconnectWsReplayTabsOnUnload() {
     const sessionId = tab.wsSessionId || activeSessionId;
     const payload = JSON.stringify({
       session_id: sessionId,
-      expected_active_session_id: sessionId,
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
       id: tab.id,
       remove: false,
     });
@@ -4083,29 +4084,38 @@ async function reloadSessionWorkspace() {
 }
 
 async function handleExternalSessionChanged() {
-  try {
-    if (!(await flushSequenceDraft())) {
+  await withExpectedActiveSessionGuardBypassed(async () => {
+    try {
+      if (!(await flushSequenceDraft())) {
+        return;
+      }
+    } catch (error) {
+      handleSequenceActionError(error);
       return;
     }
-  } catch (error) {
-    handleSequenceActionError(error);
-    return;
-  }
-  if (hasPendingWorkspaceStateSave()) {
     try {
-      await flushWorkspaceState();
+      await flushAllPendingAnnotations();
     } catch (error) {
       handleWorkspaceActionError(error);
       return;
     }
-  }
-  await reloadSessionWorkspace();
+    if (hasPendingWorkspaceStateSave()) {
+      try {
+        await flushWorkspaceState();
+      } catch (error) {
+        handleWorkspaceActionError(error);
+        return;
+      }
+    }
+    await reloadSessionWorkspace();
+  });
 }
 
 async function createSession() {
   if (!(await flushSequenceDraft())) {
     return;
   }
+  await flushAllPendingAnnotations();
   await flushWorkspaceState();
   const name = els.dashboardCreateSessionName.value.trim();
   const response = await fetch("/api/sessions", {
@@ -4126,6 +4136,7 @@ async function activateSessionById(id) {
   if (!(await flushSequenceDraft())) {
     return;
   }
+  await flushAllPendingAnnotations();
   await flushWorkspaceState();
   const response = await fetch(`/api/sessions/${id}/activate`, {
     method: "POST",
@@ -4160,13 +4171,30 @@ function sessionQueryPath(path, sessionId = currentSessionId()) {
   return `${path}${separator}session_id=${encodeURIComponent(sessionId)}`;
 }
 
+function expectedActiveSessionIdForWrite(sessionId = currentSessionId()) {
+  if (expectedActiveSessionGuardBypassDepth > 0) {
+    return null;
+  }
+  return sessionId && sessionId === currentSessionId() ? sessionId : null;
+}
+
+async function withExpectedActiveSessionGuardBypassed(callback) {
+  expectedActiveSessionGuardBypassDepth += 1;
+  try {
+    return await callback();
+  } finally {
+    expectedActiveSessionGuardBypassDepth = Math.max(0, expectedActiveSessionGuardBypassDepth - 1);
+  }
+}
+
 function sessionWritePath(path, sessionId = currentSessionId()) {
   const params = new URLSearchParams();
   if (sessionId) {
     params.set("session_id", sessionId);
   }
-  if (sessionId && sessionId === currentSessionId()) {
-    params.set("expected_active_session_id", sessionId);
+  const expectedActiveSessionId = expectedActiveSessionIdForWrite(sessionId);
+  if (expectedActiveSessionId) {
+    params.set("expected_active_session_id", expectedActiveSessionId);
   }
   const query = params.toString();
   if (!query) return path;
@@ -11782,6 +11810,7 @@ async function saveTargetScope() {
     },
     body: JSON.stringify({
       session_id: sessionId,
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
       scope_patterns: scopePatterns,
     }),
   });
@@ -12206,6 +12235,7 @@ async function runFuzzerAttack() {
       },
       body: JSON.stringify({
         session_id: sessionId,
+        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
         template,
         payloads,
         source_transaction_id: state.fuzzerSourceTransactionId,
@@ -12351,7 +12381,11 @@ async function createNewSequence() {
   const response = await fetch("/api/sequences", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...def, session_id: sessionId }),
+    body: JSON.stringify({
+      ...def,
+      session_id: sessionId,
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+    }),
   });
   if (!isCurrentSequenceSession(sessionId)) {
     return false;
@@ -12498,6 +12532,7 @@ async function saveCurrentSequence({ render = true, preserveSelection = false } 
   const draftVersion = state.sequenceDraftVersion || 0;
   const payload = JSON.parse(JSON.stringify(state.editingSequence));
   payload.session_id = sessionId;
+  payload.expected_active_session_id = expectedActiveSessionIdForWrite(sessionId);
   const response = await fetch("/api/sequences", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -12540,7 +12575,7 @@ async function flushSequenceDraft() {
 
 async function deleteSequence(id) {
   const sessionId = currentSequenceSessionId();
-  const response = await fetch(sequenceSessionPath(`/api/sequences/${id}`, sessionId), { method: "DELETE" });
+  const response = await fetch(sessionWritePath(`/api/sequences/${id}`, sessionId), { method: "DELETE" });
   if (!isCurrentSequenceSession(sessionId)) {
     return;
   }
@@ -12585,7 +12620,10 @@ async function runCurrentSequence() {
     const response = await fetch(`/api/sequences/${runSequenceId}/run`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId }),
+      body: JSON.stringify({
+        session_id: sessionId,
+        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+      }),
     });
     if (!isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion)) {
       return;
@@ -12789,7 +12827,7 @@ async function toggleIntercept() {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       session_id: sessionId,
-      expected_active_session_id: sessionId,
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
       intercept_enabled: desiredInterceptEnabled,
     }),
   }).then(async (r) => {
@@ -12867,7 +12905,7 @@ async function saveProxySettings() {
   }
   const normalizedBindHost = normalizeIpLiteralForSettings(bindHost);
   const startupUpdate = {
-    expected_active_session_id: sessionId,
+    expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
     proxy_bind_host: normalizedBindHost,
     proxy_port: proxyPort,
   };
@@ -12889,7 +12927,7 @@ async function saveProxySettings() {
   );
   const runtimeUpdate = {
     session_id: sessionId,
-    expected_active_session_id: sessionId,
+    expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
     intercept_enabled: els.proxySettingIntercept.checked,
     websocket_capture_enabled: els.proxySettingWebsocketCapture.checked,
     upstream_insecure: els.proxySettingUpstreamInsecure.checked,
@@ -13604,6 +13642,7 @@ async function sendReplay() {
       },
       body: JSON.stringify({
         session_id: sendingSessionId,
+        expected_active_session_id: expectedActiveSessionIdForWrite(sendingSessionId),
         request,
         target: targetPayload,
         source_transaction_id: tab.sourceTransactionId,
@@ -13909,6 +13948,7 @@ async function followRedirect() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         session_id: followingSessionId,
+        expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
         request: newRequest,
         target,
         source_transaction_id: null,
@@ -18654,7 +18694,7 @@ async function wsConnect() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: sessionId,
-        expected_active_session_id: sessionId,
+        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
         id: tab.id,
         scheme: tab.wsScheme,
         host: tab.wsHost,
@@ -18732,7 +18772,7 @@ async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             session_id: tab.wsSessionId || state.activeSession?.id || null,
-            expected_active_session_id: tab.wsSessionId || state.activeSession?.id || null,
+            expected_active_session_id: expectedActiveSessionIdForWrite(tab.wsSessionId || state.activeSession?.id || null),
             id: tab.id,
             body: sendBody,
             binary: kind !== "text",
@@ -18809,7 +18849,7 @@ async function wsSend() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: tab.wsSessionId || state.activeSession?.id || null,
-        expected_active_session_id: tab.wsSessionId || state.activeSession?.id || null,
+        expected_active_session_id: expectedActiveSessionIdForWrite(tab.wsSessionId || state.activeSession?.id || null),
         id: tab.id,
         body: sendBody,
         binary,
@@ -18928,7 +18968,7 @@ async function disconnectWsReplayBackend(id, { remove = false, sessionId = state
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: sessionId,
-        expected_active_session_id: sessionId,
+        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
         id,
         remove,
       }),
@@ -19251,7 +19291,7 @@ function renderWsSetupQueue() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             session_id: tab.wsSessionId || state.activeSession?.id || null,
-            expected_active_session_id: tab.wsSessionId || state.activeSession?.id || null,
+            expected_active_session_id: expectedActiveSessionIdForWrite(tab.wsSessionId || state.activeSession?.id || null),
             id: tab.id,
             body: sendBody,
             binary: kind !== "text",

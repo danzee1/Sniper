@@ -1677,7 +1677,20 @@ fn build_annotations_payload(
     if let Some(value) = user_note {
         payload.insert("user_note".to_string(), json!(value));
     }
+    payload.insert("client_id".to_string(), json!(CLI_WORKSPACE_CLIENT_ID));
+    payload.insert(
+        "client_version".to_string(),
+        json!(next_cli_annotation_client_version()),
+    );
     Value::Object(payload)
+}
+
+fn next_cli_annotation_client_version() -> u64 {
+    let nanos_since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(1);
+    nanos_since_epoch.clamp(1, u64::MAX as u128) as u64
 }
 
 fn oast_fields_for_output(
@@ -4727,8 +4740,8 @@ mod tests {
         Command, HistoryCommand, HistoryListArgs, HistoryListResponse, OastConfigureArgs,
         RuntimeUpdatePayload, SequenceCommand, SequenceCreateInput, SessionCommand,
         SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
-        CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES, SNIPER_API_PROBE_RETRY_DELAYS,
-        SNIPER_DATA_DIR_ENV,
+        CLI_REPEATER_HISTORY_LIMIT, CLI_WORKSPACE_CLIENT_ID, MAX_CLI_INPUT_BYTES,
+        SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -5167,14 +5180,16 @@ mod tests {
 
     #[test]
     fn annotation_payload_only_includes_requested_fields() {
+        let color_payload = build_annotations_payload(Some(Some("red".to_string())), None);
         assert_eq!(
-            build_annotations_payload(Some(Some("red".to_string())), None),
-            serde_json::json!({ "color_tag": "red" })
+            color_payload.get("color_tag"),
+            Some(&serde_json::json!("red"))
         );
-        assert_eq!(
-            build_annotations_payload(None, Some(None)),
-            serde_json::json!({ "user_note": null })
-        );
+        assert!(!color_payload.as_object().unwrap().contains_key("user_note"));
+
+        let note_payload = build_annotations_payload(None, Some(None));
+        assert_eq!(note_payload.get("user_note"), Some(&serde_json::json!(null)));
+        assert!(!note_payload.as_object().unwrap().contains_key("color_tag"));
     }
 
     #[test]
@@ -6474,6 +6489,21 @@ mod tests {
             "--clear-note",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn history_annotate_payload_includes_client_clock() {
+        let payload = build_annotations_payload(Some(Some("red".to_string())), None);
+        assert_eq!(
+            payload.get("client_id").and_then(|value| value.as_str()),
+            Some(CLI_WORKSPACE_CLIENT_ID)
+        );
+        assert!(
+            payload
+                .get("client_version")
+                .and_then(|value| value.as_u64())
+                .is_some_and(|version| version > 0)
+        );
     }
 
     #[test]
