@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::{collections::BTreeMap, io::Read};
 use uuid::Uuid;
 
 const MAX_DECODED_CONTENT_BYTES: usize = 16 * 1024 * 1024;
@@ -332,6 +332,10 @@ pub struct TransactionRecord {
     pub color_tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_note: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub annotation_revision: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotation_client_versions: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_request: Option<MessageRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -373,6 +377,8 @@ impl TransactionRecord {
             notes,
             color_tag: None,
             user_note: None,
+            annotation_revision: 0,
+            annotation_client_versions: BTreeMap::new(),
             original_request,
             original_response,
             http_version: None,
@@ -430,6 +436,8 @@ impl TransactionRecord {
             notes,
             color_tag: None,
             user_note: None,
+            annotation_revision: 0,
+            annotation_client_versions: BTreeMap::new(),
             original_request: None,
             original_response: None,
             http_version: None,
@@ -465,6 +473,7 @@ impl TransactionRecord {
             has_match_replace: self.original_request.is_some() || self.original_response.is_some(),
             color_tag: self.color_tag.clone(),
             has_user_note: self.user_note.is_some(),
+            annotation_revision: self.annotation_revision,
         }
     }
 
@@ -527,6 +536,8 @@ pub struct TransactionSummary {
     pub color_tag: Option<String>,
     #[serde(default)]
     pub has_user_note: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub annotation_revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -681,6 +692,10 @@ fn sanitize_decoded_body_headers(headers: Vec<HeaderRecord>) -> Vec<HeaderRecord
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 pub(crate) fn decode_content_encoding(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> {

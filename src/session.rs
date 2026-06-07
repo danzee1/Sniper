@@ -1794,6 +1794,10 @@ fn replay_transaction_journal_file(
                 id,
                 color_tag,
                 user_note,
+                annotation_revision,
+                previous_annotation_revision: _,
+                annotation_client_id,
+                annotation_client_version,
                 previous_color_tag,
                 previous_user_note,
             } => {
@@ -1801,6 +1805,13 @@ fn replay_transaction_journal_file(
                     .get_mut(&id)
                     .or_else(|| backfill_records.get_mut(&id))
                 {
+                    if annotation_client_version_is_stale(
+                        record,
+                        annotation_client_id.as_deref(),
+                        annotation_client_version,
+                    ) {
+                        continue;
+                    }
                     if skip_annotations_for.is_some_and(|ids| ids.contains(&id))
                         && !annotation_previous_values_match(
                             record,
@@ -1810,8 +1821,22 @@ fn replay_transaction_journal_file(
                     {
                         continue;
                     }
+                    let has_annotation_patch = color_tag.is_some() || user_note.is_some();
                     apply_nullable_string_patch(&mut record.color_tag, color_tag);
                     apply_nullable_string_patch(&mut record.user_note, user_note);
+                    if has_annotation_patch {
+                        record.annotation_revision = annotation_revision
+                            .unwrap_or_else(|| record.annotation_revision.saturating_add(1).max(1));
+                        if let (Some(client_id), Some(client_version)) =
+                            (annotation_client_id, annotation_client_version)
+                        {
+                            if !client_id.is_empty() && client_version > 0 {
+                                record
+                                    .annotation_client_versions
+                                    .insert(client_id, client_version);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1967,6 +1992,23 @@ fn annotation_previous_values_match(
     };
     nullable_string_patch_matches(&record.color_tag, previous_color_tag)
         && nullable_string_patch_matches(&record.user_note, previous_user_note)
+}
+
+fn annotation_client_version_is_stale(
+    record: &TransactionRecord,
+    client_id: Option<&str>,
+    client_version: Option<u64>,
+) -> bool {
+    let (Some(client_id), Some(client_version)) = (client_id, client_version) else {
+        return false;
+    };
+    if client_id.is_empty() || client_version == 0 {
+        return false;
+    }
+    record
+        .annotation_client_versions
+        .get(client_id)
+        .is_some_and(|seen_version| client_version <= *seen_version)
 }
 
 fn nullable_string_patch_matches(value: &Option<String>, patch: &NullableStringPatch) -> bool {
@@ -4442,6 +4484,10 @@ mod tests {
                 id: record_id,
                 color_tag: Some(NullableStringPatch::Set("red".to_string())),
                 user_note: Some(NullableStringPatch::Set("remember me".to_string())),
+                annotation_revision: Some(1),
+                previous_annotation_revision: Some(0),
+                annotation_client_id: None,
+                annotation_client_version: None,
                 previous_color_tag: None,
                 previous_user_note: None,
             },
@@ -5100,6 +5146,10 @@ mod tests {
                 id: record_id,
                 color_tag: Some(NullableStringPatch::Set("red".to_string())),
                 user_note: None,
+                annotation_revision: Some(1),
+                previous_annotation_revision: Some(0),
+                annotation_client_id: None,
+                annotation_client_version: None,
                 previous_color_tag: None,
                 previous_user_note: None,
             },
@@ -5166,6 +5216,10 @@ mod tests {
                 id: record_id,
                 color_tag: Some(NullableStringPatch::Set("red".to_string())),
                 user_note: None,
+                annotation_revision: Some(1),
+                previous_annotation_revision: Some(0),
+                annotation_client_id: None,
+                annotation_client_version: None,
                 previous_color_tag: Some(NullableStringPatch::Set("blue".to_string())),
                 previous_user_note: Some(NullableStringPatch::Clear),
             },
@@ -5231,6 +5285,10 @@ mod tests {
                 id: record_id,
                 color_tag: Some(NullableStringPatch::Set("green".to_string())),
                 user_note: None,
+                annotation_revision: Some(1),
+                previous_annotation_revision: Some(0),
+                annotation_client_id: None,
+                annotation_client_version: None,
                 previous_color_tag: None,
                 previous_user_note: None,
             },

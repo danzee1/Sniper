@@ -108,6 +108,14 @@ pub(crate) enum TransactionJournalEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_note: Option<NullableStringPatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotation_revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_annotation_revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotation_client_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotation_client_version: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_color_tag: Option<NullableStringPatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_user_note: Option<NullableStringPatch>,
@@ -606,7 +614,7 @@ impl TransactionStore {
         user_note: Option<Option<String>>,
     ) -> Option<AnnotationUpdate> {
         match self
-            .update_annotations_with_journal_mode(id, color_tag, user_note, false)
+            .update_annotations_with_journal_mode(id, color_tag, user_note, None, None, false)
             .await
         {
             Ok(update) => update,
@@ -626,8 +634,27 @@ impl TransactionStore {
         color_tag: Option<Option<String>>,
         user_note: Option<Option<String>>,
     ) -> io::Result<Option<AnnotationUpdate>> {
-        self.update_annotations_with_journal_mode(id, color_tag, user_note, true)
+        self.update_annotations_with_journal_mode(id, color_tag, user_note, None, None, true)
             .await
+    }
+
+    pub async fn update_annotations_durable_with_client(
+        &self,
+        id: Uuid,
+        color_tag: Option<Option<String>>,
+        user_note: Option<Option<String>>,
+        client_id: Option<String>,
+        client_version: Option<u64>,
+    ) -> io::Result<Option<AnnotationUpdate>> {
+        self.update_annotations_with_journal_mode(
+            id,
+            color_tag,
+            user_note,
+            client_id,
+            client_version,
+            true,
+        )
+        .await
     }
 
     async fn update_annotations_with_journal_mode(
@@ -635,12 +662,18 @@ impl TransactionStore {
         id: Uuid,
         color_tag: Option<Option<String>>,
         user_note: Option<Option<String>>,
+        client_id: Option<String>,
+        client_version: Option<u64>,
         require_journal_append: bool,
     ) -> io::Result<Option<AnnotationUpdate>> {
         let color_patch = nullable_string_patch(color_tag.as_ref());
         let note_patch = nullable_string_patch(user_note.as_ref());
+        let has_annotation_patch = color_patch.is_some() || note_patch.is_some();
+        let annotation_client_id = client_id.unwrap_or_default();
+        let annotation_client_version = client_version.unwrap_or(0);
+        let has_client_clock = !annotation_client_id.is_empty() && annotation_client_version > 0;
         let _mutation_guard = self.insert_lock.lock().await;
-        let (previous_color_tag, previous_user_note) = {
+        let (previous_color_tag, previous_user_note, previous_annotation_revision) = {
             let inner = self.inner.read().await;
             let Some(index) = inner.by_id.get(&id).copied() else {
                 return Ok(None);
@@ -648,15 +681,45 @@ impl TransactionStore {
             let Some(record) = inner.entries.get(index) else {
                 return Ok(None);
             };
-            (record.color_tag.clone(), record.user_note.clone())
+            if has_client_clock
+                && record
+                    .annotation_client_versions
+                    .get(&annotation_client_id)
+                    .is_some_and(|seen_version| annotation_client_version <= *seen_version)
+            {
+                let summary = record.summary();
+                return Ok(Some(AnnotationUpdate {
+                    summary,
+                    previous_color_tag: record.color_tag.clone(),
+                    previous_user_note: record.user_note.clone(),
+                    applied_color_tag: record.color_tag.clone(),
+                    applied_user_note: record.user_note.clone(),
+                }));
+            }
+            (
+                record.color_tag.clone(),
+                record.user_note.clone(),
+                record.annotation_revision,
+            )
         };
-        if color_patch.is_some() || note_patch.is_some() {
+        let next_annotation_revision = if has_annotation_patch {
+            previous_annotation_revision.saturating_add(1).max(1)
+        } else {
+            previous_annotation_revision
+        };
+        if has_annotation_patch {
             if let Some(tx) = &self.journal_tx {
                 if let Some(line) =
                     encode_transaction_journal_line(&TransactionJournalEntry::Annotation {
                         id,
                         color_tag: color_patch,
                         user_note: note_patch,
+                        annotation_revision: Some(next_annotation_revision),
+                        previous_annotation_revision: Some(previous_annotation_revision),
+                        annotation_client_id: has_client_clock
+                            .then(|| annotation_client_id.clone()),
+                        annotation_client_version: has_client_clock
+                            .then_some(annotation_client_version),
                         previous_color_tag: Some(nullable_string_value_patch(
                             previous_color_tag.clone(),
                         )),
@@ -700,6 +763,14 @@ impl TransactionStore {
         if let Some(note) = user_note {
             record.user_note = note;
         }
+        if has_annotation_patch {
+            record.annotation_revision = next_annotation_revision;
+            if has_client_clock {
+                record
+                    .annotation_client_versions
+                    .insert(annotation_client_id, annotation_client_version);
+            }
+        }
         let summary = record.summary();
         let applied_color_tag = record.color_tag.clone();
         let applied_user_note = record.user_note.clone();
@@ -740,6 +811,10 @@ impl TransactionStore {
                 id,
                 color_tag: Some(nullable_string_value_patch(previous_color_tag.clone())),
                 user_note: Some(nullable_string_value_patch(previous_user_note.clone())),
+                annotation_revision: None,
+                previous_annotation_revision: None,
+                annotation_client_id: None,
+                annotation_client_version: None,
                 previous_color_tag: Some(nullable_string_value_patch(expected_color_tag.clone())),
                 previous_user_note: Some(nullable_string_value_patch(expected_user_note.clone())),
             })
@@ -1890,6 +1965,89 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Other);
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed[0].color_tag.as_deref(), Some("old"));
+    }
+
+    #[tokio::test]
+    async fn stale_annotation_client_version_does_not_overwrite_newer_value() {
+        let record = test_record("existing.example");
+        let id = record.id;
+        let store = TransactionStore::from_records_with_max_entries(vec![record], None);
+
+        let newer = store
+            .update_annotations_with_journal_mode(
+                id,
+                Some(Some("blue".to_string())),
+                Some(Some("newer note".to_string())),
+                Some("browser-client".to_string()),
+                Some(2),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer.applied_color_tag.as_deref(), Some("blue"));
+        assert_eq!(newer.summary.annotation_revision, 1);
+
+        let stale = store
+            .update_annotations_with_journal_mode(
+                id,
+                Some(Some("red".to_string())),
+                Some(Some("stale note".to_string())),
+                Some("browser-client".to_string()),
+                Some(1),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.summary.color_tag.as_deref(), Some("blue"));
+        assert!(stale.summary.has_user_note);
+        assert_eq!(stale.summary.annotation_revision, 1);
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.color_tag.as_deref(), Some("blue"));
+        assert_eq!(stored.user_note.as_deref(), Some("newer note"));
+        assert_eq!(stored.annotation_revision, 1);
+        assert_eq!(
+            stored
+                .annotation_client_versions
+                .get("browser-client")
+                .copied(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_durable_annotation_does_not_append_journal_entry() {
+        let mut record = test_record("existing.example");
+        record.color_tag = Some("blue".to_string());
+        record.annotation_revision = 7;
+        record
+            .annotation_client_versions
+            .insert("browser-client".to_string(), 3);
+        let id = record.id;
+        let mut store = TransactionStore::from_records_with_max_entries(vec![record], None);
+        let (tx, rx) = mpsc::channel();
+        store.journal_tx = Some(tx);
+
+        let stale = store
+            .update_annotations_durable_with_client(
+                id,
+                Some(Some("red".to_string())),
+                None,
+                Some("browser-client".to_string()),
+                Some(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stale.summary.color_tag.as_deref(), Some("blue"));
+        assert_eq!(stale.summary.annotation_revision, 7);
+        assert!(rx.try_recv().is_err());
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.color_tag.as_deref(), Some("blue"));
+        assert_eq!(stored.annotation_revision, 7);
     }
 
     #[tokio::test]

@@ -2014,6 +2014,10 @@ struct AnnotationsPayload {
     color_tag: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     user_note: Option<Option<String>>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_version: Option<u64>,
 }
 
 fn validate_annotations_payload(payload: &AnnotationsPayload) -> std::result::Result<(), String> {
@@ -2024,6 +2028,27 @@ fn validate_annotations_payload(payload: &AnnotationsPayload) -> std::result::Re
     }
     if let Some(Some(user_note)) = payload.user_note.as_ref() {
         validate_text_field("user note", user_note, MAX_ANNOTATION_NOTE_BYTES)?;
+    }
+    if let Some(client_id) = payload.client_id.as_deref() {
+        if client_id.is_empty() {
+            return Err("annotation client id is required".to_string());
+        }
+        validate_text_field(
+            "annotation client id",
+            client_id,
+            MAX_WORKSPACE_CLIENT_ID_BYTES,
+        )?;
+        if payload.client_version.is_none() {
+            return Err("annotation client version is required".to_string());
+        }
+    }
+    if let Some(client_version) = payload.client_version {
+        if client_version == 0 {
+            return Err("annotation client version must be greater than zero".to_string());
+        }
+        if payload.client_id.as_deref().is_none_or(str::is_empty) {
+            return Err("annotation client id is required".to_string());
+        }
     }
     Ok(())
 }
@@ -3440,7 +3465,13 @@ async fn update_transaction_annotations(
     let _mutation_guard = session.mutation_guard().await;
     match session
         .store
-        .update_annotations_durable(id, payload.color_tag, payload.user_note)
+        .update_annotations_durable_with_client(
+            id,
+            payload.color_tag,
+            payload.user_note,
+            payload.client_id,
+            payload.client_version,
+        )
         .await
     {
         Ok(Some(update)) => Json(update.summary).into_response(),
@@ -6305,11 +6336,15 @@ mod tests {
         assert!(validate_annotations_payload(&AnnotationsPayload {
             color_tag: Some(Some("blue".to_string())),
             user_note: Some(Some("short note".to_string())),
+            client_id: Some("browser-client".to_string()),
+            client_version: Some(1),
         })
         .is_ok());
         assert!(validate_annotations_payload(&AnnotationsPayload {
             color_tag: Some(None),
             user_note: Some(None),
+            client_id: None,
+            client_version: None,
         })
         .is_ok());
 
@@ -6317,6 +6352,8 @@ mod tests {
             validate_annotations_payload(&AnnotationsPayload {
                 color_tag: Some(Some("chartreuse".to_string())),
                 user_note: None,
+                client_id: None,
+                client_version: None,
             })
             .unwrap_err(),
             "unsupported color tag"
@@ -6324,9 +6361,29 @@ mod tests {
         assert!(validate_annotations_payload(&AnnotationsPayload {
             color_tag: None,
             user_note: Some(Some("x".repeat(super::MAX_ANNOTATION_NOTE_BYTES + 1))),
+            client_id: None,
+            client_version: None,
         })
         .unwrap_err()
         .contains("user note"));
+        assert!(validate_annotations_payload(&AnnotationsPayload {
+            color_tag: None,
+            user_note: None,
+            client_id: Some("x".repeat(super::MAX_WORKSPACE_CLIENT_ID_BYTES + 1)),
+            client_version: Some(1),
+        })
+        .unwrap_err()
+        .contains("annotation client id"));
+        assert_eq!(
+            validate_annotations_payload(&AnnotationsPayload {
+                color_tag: None,
+                user_note: None,
+                client_id: Some("browser-client".to_string()),
+                client_version: Some(0),
+            })
+            .unwrap_err(),
+            "annotation client version must be greater than zero"
+        );
     }
 
     #[test]
@@ -9529,6 +9586,8 @@ mod tests {
             Json(super::AnnotationsPayload {
                 color_tag: Some(Some("blue".to_string())),
                 user_note: Some(Some("durable snapshot".to_string())),
+                client_id: None,
+                client_version: None,
             }),
         )
         .await;
@@ -11025,6 +11084,8 @@ mod tests {
             Json(super::AnnotationsPayload {
                 color_tag: Some(Some("red".to_string())),
                 user_note: None,
+                client_id: None,
+                client_version: None,
             }),
         )
         .await;
@@ -11042,6 +11103,8 @@ mod tests {
             Json(super::AnnotationsPayload {
                 color_tag: Some(Some("blue".to_string())),
                 user_note: Some(Some("inactive note".to_string())),
+                client_id: None,
+                client_version: None,
             }),
         )
         .await;

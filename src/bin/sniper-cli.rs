@@ -2005,9 +2005,9 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             print_json(&intercepts)
         }
         InterceptCommand::Forward(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let read_session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let detail_path =
-                session_query_path(&format!("/api/intercepts/{}", args.id), session_id);
+                session_query_path(&format!("/api/intercepts/{}", args.id), read_session_id);
             let intercept: InterceptRecord = api.get_json(&detail_path).await?;
             let request = if args.request_file.is_some() || args.stdin {
                 read_raw_request_input(args.request_file, args.stdin, Some(&intercept.request))?
@@ -2016,8 +2016,11 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             } else {
                 intercept.request
             };
-            let action_path =
-                session_query_path(&format!("/api/intercepts/{}/forward", args.id), session_id);
+            let session_id = session_id_for_write_payload(args.session_id);
+            let action_path = write_session_query_path(
+                &format!("/api/intercepts/{}/forward", args.id),
+                args.session_id,
+            );
             api.post_status(&action_path, &InterceptForwardPayload { request })
                 .await?;
             print_json(&InterceptActionResult {
@@ -2028,8 +2031,11 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             })
         }
         InterceptCommand::Drop(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path(&format!("/api/intercepts/{}/drop", args.id), session_id);
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path = write_session_query_path(
+                &format!("/api/intercepts/{}/drop", args.id),
+                args.session_id,
+            );
             api.post_status(&path, &json!({})).await?;
             print_json(&InterceptActionResult {
                 ok: true,
@@ -2039,8 +2045,8 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             })
         }
         InterceptCommand::ForwardAll(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path("/api/intercepts/forward-all", session_id);
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path = write_session_query_path("/api/intercepts/forward-all", args.session_id);
             let mut result: serde_json::Value = api
                 .post_json_or_no_content(&path, &json!({}))
                 .await?
@@ -2121,18 +2127,21 @@ async fn handle_response_intercept(
             print_json(&item)
         }
         ResponseInterceptCommand::Forward(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let detail_path =
-                session_query_path(&format!("/api/response-intercepts/{}", args.id), session_id);
+            let read_session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let detail_path = session_query_path(
+                &format!("/api/response-intercepts/{}", args.id),
+                read_session_id,
+            );
             let item: ResponseInterceptRecord = api.get_json(&detail_path).await?;
             let response = if args.response_file.is_some() || args.stdin {
                 read_raw_response_input(args.response_file, args.stdin, Some(&item.response))?
             } else {
                 item.response
             };
-            let action_path = session_query_path(
+            let session_id = session_id_for_write_payload(args.session_id);
+            let action_path = write_session_query_path(
                 &format!("/api/response-intercepts/{}/forward", args.id),
-                session_id,
+                args.session_id,
             );
             api.post_status(&action_path, &ResponseInterceptForwardPayload { response })
                 .await?;
@@ -2144,10 +2153,10 @@ async fn handle_response_intercept(
             })
         }
         ResponseInterceptCommand::Drop(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path(
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path = write_session_query_path(
                 &format!("/api/response-intercepts/{}/drop", args.id),
-                session_id,
+                args.session_id,
             );
             api.post_status(&path, &json!({})).await?;
             print_json(&InterceptActionResult {
@@ -2158,8 +2167,9 @@ async fn handle_response_intercept(
             })
         }
         ResponseInterceptCommand::ForwardAll(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path("/api/response-intercepts/forward-all", session_id);
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path =
+                write_session_query_path("/api/response-intercepts/forward-all", args.session_id);
             let mut result: serde_json::Value = api
                 .post_json_or_no_content(&path, &json!({}))
                 .await?
@@ -2331,8 +2341,8 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             print_json(&result)
         }
         OastCommand::Clear(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path("/api/oast/callbacks/clear", session_id);
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path = write_session_query_path("/api/oast/callbacks/clear", args.session_id);
             api.post_status(&path, &serde_json::json!({})).await?;
             print_json(&serde_json::json!({"status": "cleared", "session_id": session_id}))
         }

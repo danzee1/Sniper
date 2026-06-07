@@ -841,11 +841,14 @@ let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
 const uiSettingsClientId = createWorkspaceClientId();
 let uiSettingsSaveVersion = 0;
+const annotationClientId = createWorkspaceClientId();
+let annotationSaveVersion = 0;
 let uiSettingsSaveTimer = null;
 let uiSettingsDirty = false;
 let uiSettingsInFlight = false;
 let lastUiSettingsPayload = null;
 let proxySettingsSaveInFlight = false;
+let proxySettingsSavePromise = null;
 let toolsBootPromise = null;
 let displaySettingsPreviewActive = false;
 
@@ -1498,7 +1501,8 @@ function bindEvents() {
     if (proxySettingsSaveInFlight) return;
     proxySettingsSaveInFlight = true;
     els.saveProxySettingsButton.disabled = true;
-    saveProxySettings()
+    proxySettingsSavePromise = saveProxySettings();
+    proxySettingsSavePromise
       .then((result) => {
         if (result?.rebound === true) {
           showToast(`Proxy listener moved to ${result.active_proxy_addr}`);
@@ -1514,6 +1518,7 @@ function bindEvents() {
       })
       .finally(() => {
         proxySettingsSaveInFlight = false;
+        proxySettingsSavePromise = null;
         els.saveProxySettingsButton.disabled = false;
       });
   });
@@ -2811,6 +2816,18 @@ function createWorkspaceClientId() {
   return `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+function observeAnnotationRevision(source) {
+  const revision = Number(source?.annotation_revision || 0);
+  if (Number.isSafeInteger(revision) && revision > annotationSaveVersion) {
+    annotationSaveVersion = revision;
+  }
+}
+
+function nextAnnotationClientVersion() {
+  annotationSaveVersion = Math.max(0, annotationSaveVersion) + 1;
+  return annotationSaveVersion;
+}
+
 function isUuidString(value) {
   return typeof value === "string" && UUID_PATTERN.test(value);
 }
@@ -3092,8 +3109,36 @@ async function flushWorkspaceState() {
   }
 }
 
+async function flushProxySettingsSaveBeforeClose() {
+  const pendingSave = proxySettingsSavePromise;
+  if (!pendingSave) {
+    return;
+  }
+  try {
+    await pendingSave;
+  } catch (error) {
+    console.error("Failed to finish proxy settings save before close:", error);
+  }
+}
+
+async function flushWsReplayTabsBeforeClose() {
+  const tabs = (state.replayTabs || []).filter((tab) => (
+    tab
+    && tab.type === "websocket"
+    && (tab.wsStatus === "connected" || tab.wsStatus === "connecting")
+  ));
+  for (const tab of tabs) {
+    await cleanupWsReplayTab(tab, {
+      markDisconnected: true,
+      removeBackend: tab.wsStatus === "connecting",
+    });
+  }
+}
+
 async function flushBeforeNativeClose() {
   await flushAllPendingAnnotations();
+  await flushProxySettingsSaveBeforeClose();
+  await flushWsReplayTabsBeforeClose();
   await flushWorkspaceState();
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = null;
@@ -3936,6 +3981,7 @@ async function loadTransactionDetail(id) {
     return null;
   }
   state.loadingDetailId = null;
+  observeAnnotationRevision(record);
   state.selectedRecord = record;
   renderDetail(state.selectedRecord);
   return record;
@@ -3968,6 +4014,7 @@ function historyRecordSummarySignature(source) {
     Boolean(source.has_match_replace),
     source.color_tag || "",
     Boolean(hasUserNote),
+    source.annotation_revision ?? 0,
   ]);
 }
 
@@ -4321,10 +4368,7 @@ function websocketQuerySignature(queryState = createWebsocketQueryState()) {
 }
 
 function websocketCursorPagingEnabled(queryState = createWebsocketQueryState()) {
-  return !queryState.q
-    && !queryState.inScopeOnly
-    && !queryState.liveOnly
-    && queryState.sortDirection === "desc"
+  return queryState.sortDirection === "desc"
     && (queryState.sortKey === "started_at" || queryState.sortKey === "index");
 }
 
@@ -17025,6 +17069,7 @@ function precomputeItemIndexes() {
 }
 
 function prepareHistoryItem(item) {
+  observeAnnotationRevision(item);
   item._totalBytes = (item.request_bytes ?? 0) + (item.response_bytes ?? 0);
   item._sizeLabel = formatSize(item._totalBytes);
   item._mime = inferMimeType(item);
@@ -18861,9 +18906,15 @@ async function updateAnnotations(transactionId, payload, sessionId = currentSess
   if (!state._annotationInFlight) state._annotationInFlight = new Set();
   const pending = state._pendingAnnotations;
   const existing = pending.get(transactionId);
+  const mergedPayload = {
+    ...(existing?.sessionId === sessionId ? existing.payload : {}),
+    ...payload,
+    client_id: annotationClientId,
+    client_version: nextAnnotationClientVersion(),
+  };
   pending.set(transactionId, {
     sessionId,
-    payload: { ...(existing?.sessionId === sessionId ? existing.payload : {}), ...payload },
+    payload: mergedPayload,
   });
   if (!state._annotationInFlight.has(transactionId)) {
     flushPendingAnnotations(transactionId);
@@ -18942,6 +18993,7 @@ async function flushPendingAnnotations(transactionId, options = {}) {
       throw new Error(failureMessage || "Failed to save annotation");
     }
     const summary = await response.json();
+    observeAnnotationRevision(summary);
     saved = true;
     if (currentSessionId() !== sessionId) {
       return saved;
@@ -18974,6 +19026,9 @@ async function flushPendingAnnotations(transactionId, options = {}) {
         }
         if (payload.user_note !== undefined) {
           state.selectedRecord.user_note = payload.user_note;
+        }
+        if (summary.annotation_revision !== undefined) {
+          state.selectedRecord.annotation_revision = summary.annotation_revision;
         }
         renderDetail(state.selectedRecord, { preserveOriginalToggles: true });
       }

@@ -533,8 +533,41 @@ fn list_filtered_storage_order_page(
         return None;
     }
 
-    let offset = filtered_storage_order_offset_after_id(inner, filters, normalized_query)
-        .unwrap_or_else(|| filters.offset.unwrap_or(0));
+    if let Some(start_index) = storage_order_offset_after_id(inner, filters.after_id) {
+        let mut matched_count = 0usize;
+        let mut items = if limit == 0 {
+            Vec::new()
+        } else {
+            Vec::with_capacity(limit.min(total.saturating_sub(start_index)))
+        };
+
+        for id in inner.order.iter().skip(start_index) {
+            let Some(summary) = inner.sessions.get(id).map(WebSocketSessionEntry::summary) else {
+                continue;
+            };
+            if !websocket_summary_matches_filters(&summary, filters, normalized_query) {
+                continue;
+            }
+            matched_count += 1;
+            if limit != 0 && items.len() < limit {
+                items.push(summary);
+            }
+            if limit != 0 && matched_count > limit {
+                break;
+            }
+        }
+
+        return Some(WebSocketListPage {
+            items,
+            total,
+            filtered_total: None,
+            offset: filters.offset.unwrap_or(0),
+            limit,
+            has_more: limit != 0 && matched_count > limit,
+        });
+    }
+
+    let offset = filters.offset.unwrap_or(0);
     let mut matched_count = 0usize;
     let mut exhausted = true;
     let mut items = if limit == 0 {
@@ -576,28 +609,6 @@ fn list_filtered_storage_order_page(
         limit,
         has_more,
     })
-}
-
-fn filtered_storage_order_offset_after_id(
-    inner: &WebSocketStoreInner,
-    filters: &WebSocketListFilters,
-    normalized_query: Option<&str>,
-) -> Option<usize> {
-    let after_id = filters.after_id?;
-    let mut filtered_index = 0usize;
-    for id in inner.order.iter() {
-        let Some(summary) = inner.sessions.get(id).map(WebSocketSessionEntry::summary) else {
-            continue;
-        };
-        if !websocket_summary_matches_filters(&summary, filters, normalized_query) {
-            continue;
-        }
-        if summary.id == after_id {
-            return Some(filtered_index.saturating_add(1));
-        }
-        filtered_index += 1;
-    }
-    None
 }
 
 fn list_unfiltered_storage_order_page(
@@ -1112,6 +1123,53 @@ mod tests {
             .items
             .iter()
             .all(|summary| !first_page_ids.contains(&summary.id)));
+        assert!(!second_page.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_after_id_survives_cursor_row_leaving_live_filter() {
+        let base = Utc::now();
+        let mut newest = session(vec![frame(1)]);
+        newest.host = "newest.example.test".to_string();
+        newest.started_at = base;
+        let mut middle = session(vec![frame(1)]);
+        middle.host = "middle.example.test".to_string();
+        middle.started_at = base - chrono::Duration::seconds(10);
+        let middle_id = middle.id;
+        let mut oldest = session(vec![frame(1)]);
+        oldest.host = "oldest.example.test".to_string();
+        oldest.started_at = base - chrono::Duration::seconds(20);
+        let oldest_id = oldest.id;
+        let store = WebSocketStore::from_sessions(10, 10, vec![newest, middle, oldest]);
+
+        let first_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(2),
+                live_only: true,
+                sort_key: Some("started_at".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+        let after_id = first_page.items.last().expect("cursor row").id;
+        assert_eq!(after_id, middle_id);
+
+        assert!(store.close(middle_id, Utc::now(), 123, None).await);
+
+        let second_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(2),
+                offset: Some(first_page.items.len()),
+                after_id: Some(after_id),
+                live_only: true,
+                sort_key: Some("started_at".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].id, oldest_id);
         assert!(!second_page.has_more);
     }
 
