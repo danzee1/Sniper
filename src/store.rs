@@ -251,16 +251,18 @@ impl StoreInner {
         self.summaries.push(CachedSummary::new(summary));
     }
 
-    fn trim_to_max_entries(&mut self, max_entries: usize) {
+    fn trim_to_max_entries(&mut self, max_entries: usize) -> bool {
         if max_entries == 0 {
+            let trimmed =
+                !self.entries.is_empty() || !self.summaries.is_empty() || !self.by_id.is_empty();
             self.entries.clear();
             self.summaries.clear();
             self.by_id.clear();
-            return;
+            return trimmed;
         }
 
         if self.entries.len() <= max_entries {
-            return;
+            return false;
         }
 
         let remove_count = self.entries.len().saturating_sub(max_entries);
@@ -271,6 +273,7 @@ impl StoreInner {
         for index in self.by_id.values_mut() {
             *index = index.saturating_sub(remove_count);
         }
+        true
     }
 }
 
@@ -342,12 +345,13 @@ impl TransactionStore {
         let summary = record.summary();
         let mut inner = self.inner.write().await;
         inner.push(record, summary.clone());
+        let mut retention_trimmed = false;
         if let Some(max_entries) = self.max_entries {
-            inner.trim_to_max_entries(max_entries);
+            retention_trimmed = inner.trim_to_max_entries(max_entries);
         }
         drop(inner);
         let _ = self.events.send(summary);
-        needs_snapshot_fallback
+        needs_snapshot_fallback || retention_trimmed
     }
 
     pub async fn list(&self, filters: &ListFilters) -> Vec<TransactionSummary> {

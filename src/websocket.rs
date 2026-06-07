@@ -82,7 +82,12 @@ impl WebSocketSessionEntry {
             host: self.host.clone(),
             path: self.path.clone(),
             status: self.status,
-            frame_count: self.frames.len(),
+            frame_count: self
+                .frames
+                .back()
+                .map(|frame| frame.index.max(self.frames.len()))
+                .unwrap_or(0),
+            retained_frame_count: self.frames.len(),
             last_frame_index: self.frames.back().map(|frame| frame.index),
             note_count: self.notes.len(),
         }
@@ -1129,7 +1134,8 @@ mod tests {
             vec![2, 3]
         );
         let page = store.list_page(Some(10), None).await;
-        assert_eq!(page.items[0].frame_count, 2);
+        assert_eq!(page.items[0].frame_count, 3);
+        assert_eq!(page.items[0].retained_frame_count, 2);
         assert_eq!(page.items[0].last_frame_index, Some(3));
     }
 
@@ -1161,7 +1167,8 @@ mod tests {
 
         let page = store.list_page(Some(10), None).await;
         let summary = &page.items[0];
-        assert_eq!(summary.frame_count, 2);
+        assert_eq!(summary.frame_count, 3);
+        assert_eq!(summary.retained_frame_count, 2);
         assert_eq!(summary.last_frame_index, Some(3));
     }
 
@@ -1185,7 +1192,8 @@ mod tests {
             vec![8, 9, 10]
         );
         let summary = &store.list_page(Some(10), None).await.items[0];
-        assert_eq!(summary.frame_count, 3);
+        assert_eq!(summary.frame_count, 10);
+        assert_eq!(summary.retained_frame_count, 3);
         assert_eq!(summary.last_frame_index, Some(10));
     }
 

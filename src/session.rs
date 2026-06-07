@@ -871,7 +871,15 @@ impl SessionRegistry {
             .ok_or_else(|| anyhow!("session {id} was not found"))?;
         let storage_dir = session_dir(&self.root_dir, id);
         let snapshot = load_session_snapshot(&storage_dir, self.max_entries)?;
-        update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries);
+        if update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries) {
+            if let Err(error) = self.update_metadata(metadata.clone()) {
+                warn!(
+                    ?error,
+                    session_id = %id,
+                    "failed to refresh session registry metadata from loaded snapshot"
+                );
+            }
+        }
         Ok(Arc::new(SessionContext::from_snapshot(
             metadata,
             storage_dir,
@@ -4386,13 +4394,13 @@ mod tests {
         assert_eq!(restored[0].color_tag.as_deref(), Some("red"));
         assert_eq!(restored[0].user_note.as_deref(), Some("remember me"));
         assert_eq!(loaded.summary(true).request_count, 1);
-        assert_eq!(std::fs::read(&registry_path).unwrap(), registry_before);
+        assert_ne!(std::fs::read(&registry_path).unwrap(), registry_before);
         let summary = registry
             .summaries()
             .into_iter()
             .find(|summary| summary.id == active.id())
             .unwrap();
-        assert_eq!(summary.request_count, 0);
+        assert_eq!(summary.request_count, 1);
     }
 
     #[tokio::test]

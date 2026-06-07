@@ -13071,7 +13071,7 @@ function renderReplayTabs() {
     });
     tabElement.querySelector(".replay-tab-close")?.addEventListener("click", (event) => {
       event.stopPropagation();
-      closeRepeaterTab(id);
+      closeRepeaterTab(id).catch(handleWorkspaceActionError);
     });
   });
 
@@ -13164,7 +13164,7 @@ function scrollActiveReplayTabIntoView() {
   }
 }
 
-function closeRepeaterTab(id) {
+async function closeRepeaterTab(id) {
   const index = state.replayTabs.findIndex((tab) => tab.id === id);
   if (index === -1) {
     return;
@@ -13174,7 +13174,11 @@ function closeRepeaterTab(id) {
   const visualIndex = visualOrderBeforeClose.indexOf(id);
   const closingTab = state.replayTabs[index];
   if (closingTab.type === "websocket") {
-    cleanupWsReplayTab(closingTab);
+    await cleanupWsReplayTab(closingTab);
+  }
+  const currentIndex = state.replayTabs.findIndex((tab) => tab.id === id);
+  if (currentIndex === -1) {
+    return;
   }
   const controller = _replaySendControllers.get(id);
   if (controller) {
@@ -13186,7 +13190,7 @@ function closeRepeaterTab(id) {
     state.replayRenamingTabId = null;
   }
 
-  state.replayTabs.splice(index, 1);
+  state.replayTabs.splice(currentIndex, 1);
   if (!state.replayTabs.length) {
     state.replayTabSequence = 0;
     const replacement = createReplayTab();
@@ -13197,7 +13201,7 @@ function closeRepeaterTab(id) {
       tabId !== id && state.replayTabs.some((tab) => tab.id === tabId)
     );
     const replacementIndex = Math.min(Math.max(0, visualIndex - 1), remainingVisualIds.length - 1);
-    state.activeReplayTabId = remainingVisualIds[replacementIndex] || state.replayTabs[Math.max(0, index - 1)].id;
+    state.activeReplayTabId = remainingVisualIds[replacementIndex] || state.replayTabs[Math.max(0, currentIndex - 1)].id;
   }
   scheduleWorkspaceStateSave();
   renderReplay();

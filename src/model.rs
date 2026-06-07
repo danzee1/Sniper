@@ -593,7 +593,8 @@ impl WebSocketSessionRecord {
             host: self.host.clone(),
             path: self.path.clone(),
             status: self.status,
-            frame_count: self.frames.len(),
+            frame_count: websocket_total_frame_count(&self.frames),
+            retained_frame_count: self.frames.len(),
             last_frame_index: self.frames.last().map(|frame| frame.index),
             note_count: self.notes.len(),
         }
@@ -611,9 +612,18 @@ pub struct WebSocketSessionSummary {
     pub path: String,
     pub status: Option<u16>,
     pub frame_count: usize,
+    #[serde(default)]
+    pub retained_frame_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_frame_index: Option<usize>,
     pub note_count: usize,
+}
+
+pub fn websocket_total_frame_count(frames: &[WebSocketFrameRecord]) -> usize {
+    frames
+        .last()
+        .map(|frame| frame.index.max(frames.len()))
+        .unwrap_or(0)
 }
 
 pub fn format_http_version(version: http::Version) -> String {
@@ -984,6 +994,7 @@ mod tests {
 
         assert!(record.notes.is_empty());
         assert_eq!(record.summary().frame_count, 1);
+        assert_eq!(record.summary().retained_frame_count, 1);
         let frame = &record.frames[0];
         assert_eq!(frame.index, 0);
         assert_eq!(frame.body_preview, "");

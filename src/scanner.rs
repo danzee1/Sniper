@@ -1939,14 +1939,23 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
                         "dest",
                         "destination",
                     ];
-                    let matched_param = query
-                        .split('&')
-                        .map(|pair| {
-                            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
-                            let key = key.replace('+', " ");
-                            percent_decode(&key).to_ascii_lowercase()
-                        })
-                        .find(|key| redirect_params.contains(&key.as_str()));
+                    let matched_param = query.split('&').find_map(|pair| {
+                        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                        let key = key.replace('+', " ");
+                        let decoded_key = percent_decode(&key).to_ascii_lowercase();
+                        if !redirect_params.contains(&decoded_key.as_str()) {
+                            return None;
+                        }
+                        let value = value.replace('+', " ");
+                        let decoded_value = percent_decode(&value);
+                        redirect_parameter_controls_location(
+                            &decoded_value,
+                            loc,
+                            &record.scheme,
+                            &record.host,
+                        )
+                        .then_some(decoded_key)
+                    });
                     if let Some(param) = matched_param {
                         // Check if Location points to an external origin.
                         if is_external_redirect_location(loc, &record.scheme, &record.host) {
@@ -2003,6 +2012,34 @@ fn is_external_redirect_location(location: &str, request_scheme: &str, request_h
     };
     !base_host.eq_ignore_ascii_case(redirect_host)
         || base.port_or_known_default() != redirect.port_or_known_default()
+}
+
+fn redirect_parameter_controls_location(
+    value: &str,
+    location: &str,
+    request_scheme: &str,
+    request_host: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let base = match url::Url::parse(&format!("{request_scheme}://{request_host}")) {
+        Ok(base) => base,
+        Err(_) => return false,
+    };
+    let parameter_url = match url::Url::parse(value).or_else(|_| base.join(value)) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    if !is_external_redirect_location(parameter_url.as_str(), request_scheme, request_host) {
+        return false;
+    }
+    let location_url = match url::Url::parse(location).or_else(|_| base.join(location)) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    parameter_url == location_url || location.contains(value)
 }
 
 // ── Utilities ──
@@ -2465,6 +2502,25 @@ mod tests {
                 .iter()
                 .any(|finding| finding.title == "Possible open redirect"),
             "same host with default port should not be reported"
+        );
+    }
+
+    #[test]
+    fn open_redirect_detection_ignores_unrelated_external_sso_location() {
+        let mut record = make_record(
+            vec![],
+            vec![("location", "https://idp.example/login")],
+            "",
+            302,
+        );
+        record.path = "/login?next=/dashboard".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Possible open redirect"),
+            "external SSO redirects should not be reported unless the redirect parameter controls the Location"
         );
     }
 

@@ -20,6 +20,10 @@ use crate::{
     state::AppState,
 };
 
+const MAX_SEQUENCE_EXPANDED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SEQUENCE_VARIABLE_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_SEQUENCE_VARIABLES_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct SequencePersistenceError {
     source: anyhow::Error,
@@ -326,6 +330,62 @@ fn apply_variables_to_request(
     applied
 }
 
+fn expanded_sequence_request_bytes(request: &EditableRequest) -> Result<usize> {
+    let body_len = request
+        .try_body_bytes()
+        .map_err(|_| anyhow!("request body is not valid base64"))?
+        .len();
+    let mut bytes = request
+        .scheme
+        .len()
+        .saturating_add(request.host.len())
+        .saturating_add(request.method.len())
+        .saturating_add(request.path.len())
+        .saturating_add(body_len);
+    for header in &request.headers {
+        bytes = bytes
+            .saturating_add(header.name.len())
+            .saturating_add(header.value.len());
+    }
+    Ok(bytes)
+}
+
+fn validate_sequence_expanded_request_budget(label: &str, request: &EditableRequest) -> Result<()> {
+    let request_bytes = expanded_sequence_request_bytes(request)?;
+    if request_bytes > MAX_SEQUENCE_EXPANDED_REQUEST_BYTES {
+        return Err(anyhow!(
+            "Sequence step {label} expanded request to {request_bytes} bytes, above the {MAX_SEQUENCE_EXPANDED_REQUEST_BYTES} byte limit"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sequence_variable_budget(
+    current: &HashMap<String, String>,
+    extracted: &HashMap<String, String>,
+) -> Result<()> {
+    for (name, value) in extracted {
+        if value.len() > MAX_SEQUENCE_VARIABLE_VALUE_BYTES {
+            return Err(anyhow!(
+                "Extraction {name} produced {} bytes, above the {MAX_SEQUENCE_VARIABLE_VALUE_BYTES} byte limit",
+                value.len()
+            ));
+        }
+    }
+
+    let mut combined = current.clone();
+    combined.extend(extracted.clone());
+    let total_bytes = combined.iter().fold(0usize, |total, (name, value)| {
+        total.saturating_add(name.len()).saturating_add(value.len())
+    });
+    if total_bytes > MAX_SEQUENCE_VARIABLES_TOTAL_BYTES {
+        return Err(anyhow!(
+            "Sequence variables total {total_bytes} bytes, above the {MAX_SEQUENCE_VARIABLES_TOTAL_BYTES} byte limit"
+        ));
+    }
+    Ok(())
+}
+
 fn extract_from_response(
     rules: &[ExtractionRule],
     response_body: &str,
@@ -437,6 +497,19 @@ pub async fn run_sequence(
             failed = true;
             break;
         }
+        if let Err(error) = validate_sequence_expanded_request_budget(&step.label, &request) {
+            step_results.push(StepResult {
+                step_id: step.id,
+                label: step.label.clone(),
+                transaction_id: None,
+                status: None,
+                duration_ms: None,
+                extracted: HashMap::new(),
+                error: Some(error.to_string()),
+            });
+            failed = true;
+            break;
+        }
 
         match proxy::try_send_replay_request_for_session(
             state.clone(),
@@ -476,6 +549,21 @@ pub async fn run_sequence(
                     response_preview_truncated,
                 ) {
                     Ok(extracted) => {
+                        if let Err(error) =
+                            validate_sequence_variable_budget(&variables, &extracted)
+                        {
+                            step_results.push(StepResult {
+                                step_id: step.id,
+                                label: step.label.clone(),
+                                transaction_id: Some(record.id),
+                                status: record.status,
+                                duration_ms: Some(record.duration_ms),
+                                extracted: HashMap::new(),
+                                error: Some(error.to_string()),
+                            });
+                            failed = true;
+                            break;
+                        }
                         variables.extend(extracted.clone());
 
                         step_results.push(StepResult {
@@ -772,6 +860,44 @@ mod tests {
         let error = ensure_sequence_requests_are_runnable(&definition).unwrap_err();
 
         assert!(error.to_string().contains("preview is truncated"));
+    }
+
+    #[test]
+    fn sequence_expanded_request_budget_rejects_large_substitution() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "POST".to_string(),
+            path: "/upload".to_string(),
+            headers: Vec::new(),
+            body: "{{blob}}{{blob}}".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let variables = HashMap::from([(
+            "blob".to_string(),
+            "x".repeat((MAX_SEQUENCE_EXPANDED_REQUEST_BYTES / 2) + 1),
+        )]);
+
+        let applied = apply_variables_to_request(&request, &variables);
+        let error = validate_sequence_expanded_request_budget("send", &applied).unwrap_err();
+
+        assert!(error.to_string().contains("expanded request"));
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn sequence_variable_budget_rejects_large_extraction_values() {
+        let current = HashMap::new();
+        let extracted = HashMap::from([(
+            "blob".to_string(),
+            "x".repeat(MAX_SEQUENCE_VARIABLE_VALUE_BYTES + 1),
+        )]);
+
+        let error = validate_sequence_variable_budget(&current, &extracted).unwrap_err();
+
+        assert!(error.to_string().contains("Extraction blob produced"));
+        assert!(error.to_string().contains("byte limit"));
     }
 
     #[test]

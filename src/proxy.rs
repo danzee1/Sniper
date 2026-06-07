@@ -5584,6 +5584,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journaled_capture_compacts_after_retention_eviction() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-proxy-journaled-capture-retention-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 2,
+            body_preview_bytes: 1024,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let mut scanner_config = session.scanner.get_config().await;
+        scanner_config.enabled = false;
+        session.scanner.update_config(scanner_config).await;
+
+        let first = captured_transaction("oldest.example");
+        let first_id = first.id;
+        let second = captured_transaction("middle.example");
+        let second_id = second.id;
+        let third = captured_transaction("newest.example");
+        let third_id = third.id;
+
+        store_record_and_scan(&state, &session, first).await;
+        store_record_and_scan(&state, &session, second).await;
+        drain_proxy_connections(Duration::from_secs(1)).await;
+        assert!(!session_has_pending_persist(session_id));
+
+        store_record_and_scan(&state, &session, third).await;
+        drain_proxy_connections(Duration::from_secs(1)).await;
+        flush_pending_session_persists(state.as_ref())
+            .await
+            .unwrap();
+
+        assert!(!session_has_pending_persist(session_id));
+        let storage_dir = state.session_storage_path(session_id).unwrap();
+        let journal_len = std::fs::metadata(storage_dir.join("transactions.journal"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        assert_eq!(journal_len, 0);
+
+        let reloaded = state.sessions.load_context(session_id).unwrap();
+        assert!(reloaded.store.get(first_id).await.is_none());
+        assert!(reloaded.store.get(second_id).await.is_some());
+        assert!(reloaded.store.get(third_id).await.is_some());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn streamed_capture_store_clears_clean_pending_persist_context() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-proxy-streamed-capture-cleans-pending-{}",

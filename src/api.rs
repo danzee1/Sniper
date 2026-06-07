@@ -4150,9 +4150,6 @@ async fn run_fuzzer_attack(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(error) = validate_runnable_editable_request(&payload.template) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
-    }
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
@@ -10147,6 +10144,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fuzzer_run_accepts_base64_template_that_is_valid_after_expansion() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-fuzzer-expanded-base64-template-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let response = super::run_fuzzer_attack(
+            State(state.clone()),
+            Json(crate::fuzzer::FuzzerAttackPayload {
+                session_id: Some(session.id()),
+                template: EditableRequest {
+                    scheme: "http".to_string(),
+                    host: addr.to_string(),
+                    method: "POST".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: "AA$payload$".to_string(),
+                    body_encoding: BodyEncoding::Base64,
+                    preview_truncated: false,
+                },
+                payloads: vec!["EC".to_string()],
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::OK);
+        let attack: crate::fuzzer::FuzzerAttackRecord = response_json(response).await;
+        assert!(matches!(
+            attack.status,
+            crate::fuzzer::FuzzerAttackStatus::Completed
+        ));
+        assert_eq!(attack.results.len(), 1);
+        assert_eq!(attack.results[0].status, Some(200));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn fuzzer_run_rejects_preview_truncated_template_before_attack() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-truncated-template-{}",
@@ -11071,6 +11129,7 @@ mod tests {
         .await;
         let legacy_list: Vec<WebSocketSessionSummary> = response_json(legacy_list_response).await;
         assert_eq!(legacy_list[0].frame_count, 1002);
+        assert_eq!(legacy_list[0].retained_frame_count, 1002);
         assert_eq!(legacy_list[0].last_frame_index, Some(1002));
 
         let list_response = super::list_websockets_page(
@@ -11086,6 +11145,7 @@ mod tests {
         .await;
         let page: super::WebSocketPageResponse = response_json(list_response).await;
         assert_eq!(page.items[0].frame_count, 1002);
+        assert_eq!(page.items[0].retained_frame_count, 1002);
         assert_eq!(page.items[0].last_frame_index, Some(1002));
 
         let _ = std::fs::remove_dir_all(data_dir);

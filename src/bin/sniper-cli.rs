@@ -232,6 +232,12 @@ struct HistoryListArgs {
     /// Filter by response MIME type (substring match), e.g. "json" or "text/html"
     #[arg(long)]
     mime: Option<String>,
+    /// Sort key for paged history output, e.g. index, host, method, path, status, length, mime, notes, tls, started_at.
+    #[arg(long)]
+    sort_key: Option<String>,
+    /// Sort direction for paged history output.
+    #[arg(long, value_parser = ["asc", "desc"])]
+    sort_direction: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1461,53 +1467,11 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
         HistoryCommand::List(args) => {
             let include_page = args.page;
-            let use_paged_api = include_page || args.offset.is_some();
-            let mut params = Vec::new();
             let session_id = match args.session_id {
                 Some(session_id) => Some(session_id),
                 None => active_session_id(&api).await?,
             };
-            if let Some(session_id) = session_id {
-                params.push(("session_id".to_string(), session_id.to_string()));
-            }
-            if let Some(query) = args.query {
-                params.push(("q".to_string(), query));
-            }
-            if let Some(method) = args.method {
-                params.push(("method".to_string(), method));
-            }
-            if let Some(limit) = args.limit {
-                params.push(("limit".to_string(), limit.to_string()));
-            }
-            if let Some(offset) = args.offset {
-                params.push(("offset".to_string(), offset.to_string()));
-            }
-            if let Some(host) = args.host {
-                params.push(("host".to_string(), host));
-            }
-            if let Some(status) = args.status {
-                params.push(("status".to_string(), status.to_string()));
-            }
-            if let Some(status_range) = args.status_range {
-                params.push(("status_range".to_string(), status_range));
-            }
-            if let Some(since) = args.since {
-                params.push(("since".to_string(), since));
-            }
-            if let Some(mime) = args.mime {
-                params.push(("mime".to_string(), mime));
-            }
-            let query = encode_query(params);
-            let endpoint = if use_paged_api {
-                "/api/transactions-page"
-            } else {
-                "/api/transactions"
-            };
-            let path = if query.is_empty() {
-                endpoint.to_string()
-            } else {
-                format!("{endpoint}?{query}")
-            };
+            let path = history_list_path(session_id, &args);
             let history: HistoryListResponse = api.get_json(&path).await?;
             print_json(&history.into_cli_output(include_page))
         }
@@ -2578,6 +2542,98 @@ fn transaction_detail_path(transaction_id: Uuid, session_id: Option<Uuid>) -> St
             format!("/api/transactions/{transaction_id}?{query}")
         }
         None => format!("/api/transactions/{transaction_id}"),
+    }
+}
+
+fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> String {
+    let mut params = Vec::new();
+    if let Some(session_id) = session_id {
+        params.push(("session_id".to_string(), session_id.to_string()));
+    }
+    if let Some(query) = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("q".to_string(), query.to_string()));
+    }
+    if let Some(method) = args
+        .method
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("method".to_string(), method.to_string()));
+    }
+    if let Some(limit) = args.limit {
+        params.push(("limit".to_string(), limit.to_string()));
+    }
+    if let Some(offset) = args.offset {
+        params.push(("offset".to_string(), offset.to_string()));
+    }
+    if let Some(host) = args
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("host".to_string(), host.to_string()));
+    }
+    if let Some(status) = args.status {
+        params.push(("status".to_string(), status.to_string()));
+    }
+    if let Some(status_range) = args
+        .status_range
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("status_range".to_string(), status_range.to_string()));
+    }
+    if let Some(since) = args
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("since".to_string(), since.to_string()));
+    }
+    if let Some(mime) = args
+        .mime
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("mime".to_string(), mime.to_string()));
+    }
+    let sort_key = args
+        .sort_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(sort_key) = sort_key {
+        params.push(("sort_key".to_string(), sort_key.to_string()));
+    }
+    let sort_direction = args
+        .sort_direction
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(sort_direction) = sort_direction {
+        params.push(("sort_direction".to_string(), sort_direction.to_string()));
+    }
+    let endpoint =
+        if args.page || args.offset.is_some() || sort_key.is_some() || sort_direction.is_some() {
+            "/api/transactions-page"
+        } else {
+            "/api/transactions"
+        };
+    let query = encode_query(params);
+    if query.is_empty() {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}?{query}")
     }
 }
 
@@ -4401,9 +4457,9 @@ mod tests {
         data_dir_strings_match, default_cli_data_dir, default_editable_request,
         discover_api_base_url, discover_api_base_url_from_data_dir, explicit_or_active_session_id,
         failed_record_output, fuzzer_active_target_for_request,
-        fuzzer_target_request_authority_for_request, install_skills, next_replay_tab_sequence,
-        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
-        oast_fields_for_output, parse_editable_raw_request,
+        fuzzer_target_request_authority_for_request, history_list_path, install_skills,
+        next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
+        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
         process_path_strings_match, push_replay_history_entry, read_limited_to_end,
@@ -4413,11 +4469,11 @@ mod tests {
         session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
         strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
         validate_sniper_settings_probe, websocket_detail_path, websocket_list_path,
-        workspace_conflict_message, Cli, Command, HistoryCommand, HistoryListResponse,
-        OastConfigureArgs, SequenceCommand, SequenceCreateInput, SessionCommand, SkillsInstallArgs,
-        SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
-        CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES, SNIPER_API_PROBE_RETRY_DELAYS,
-        SNIPER_DATA_DIR_ENV,
+        workspace_conflict_message, Cli, Command, HistoryCommand, HistoryListArgs,
+        HistoryListResponse, OastConfigureArgs, SequenceCommand, SequenceCreateInput,
+        SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs,
+        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -4500,6 +4556,32 @@ mod tests {
         assert_eq!(
             transaction_detail_path(transaction_id, None),
             "/api/transactions/11111111-1111-1111-1111-111111111111"
+        );
+    }
+
+    #[test]
+    fn history_list_path_uses_page_endpoint_for_sorting() {
+        let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        let sorted_args = HistoryListArgs {
+            limit: Some(1),
+            sort_key: Some("host".to_string()),
+            sort_direction: Some("asc".to_string()),
+            ..HistoryListArgs::default()
+        };
+        assert_eq!(
+            history_list_path(Some(session_id), &sorted_args),
+            "/api/transactions-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&sort_key=host&sort_direction=asc"
+        );
+
+        let legacy_args = HistoryListArgs {
+            limit: Some(1),
+            sort_key: Some("   ".to_string()),
+            ..HistoryListArgs::default()
+        };
+        assert_eq!(
+            history_list_path(Some(session_id), &legacy_args),
+            "/api/transactions?session_id=22222222-2222-2222-2222-222222222222&limit=1"
         );
     }
 
@@ -6043,6 +6125,10 @@ mod tests {
             "50",
             "--offset",
             "100",
+            "--sort-key",
+            "host",
+            "--sort-direction",
+            "asc",
             "--page",
         ])
         .unwrap();
@@ -6054,6 +6140,8 @@ mod tests {
         };
         assert_eq!(args.limit, Some(50));
         assert_eq!(args.offset, Some(100));
+        assert_eq!(args.sort_key.as_deref(), Some("host"));
+        assert_eq!(args.sort_direction.as_deref(), Some("asc"));
         assert!(args.page);
     }
 
@@ -6267,6 +6355,10 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["sniper-cli", "history", "list", "--limit", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["sniper-cli", "history", "list", "--sort-direction", "up",])
+                .is_err()
+        );
         assert!(Cli::try_parse_from(["sniper-cli", "fuzzer", "list", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from([
             "sniper-cli",
