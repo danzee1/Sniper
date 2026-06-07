@@ -1466,6 +1466,14 @@ fn explicit_or_active_session_id(
     explicit_session_id.or(active_session_id)
 }
 
+fn session_id_for_write_payload(explicit_session_id: Option<Uuid>) -> Option<Uuid> {
+    explicit_session_id
+}
+
+fn write_session_query_path(path: &str, explicit_session_id: Option<Uuid>) -> String {
+    session_query_path(path, session_id_for_write_payload(explicit_session_id))
+}
+
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
         HistoryCommand::List(args) => {
@@ -1544,10 +1552,10 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
                 bail!("provide at least one of --color, --clear-color, --note, or --clear-note");
             }
             let payload = build_annotations_payload(color_tag, user_note);
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path(
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path = write_session_query_path(
                 &format!("/api/transactions/{}/annotations", args.id),
-                session_id,
+                args.session_id,
             );
             let summary: TransactionSummary = api
                 .request_json(Method::PATCH, &path, Some(&payload))
@@ -1603,7 +1611,7 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             })
         }
         TargetCommand::SetScope(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let session_id = session_id_for_write_payload(args.session_id);
             let scope_patterns = if args.clear {
                 Vec::new()
             } else {
@@ -1948,7 +1956,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
 async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<()> {
     match command {
         InterceptCommand::On(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let session_id = session_id_for_write_payload(args.session_id);
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
@@ -1963,7 +1971,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             print_json_with_session(&runtime, session_id)
         }
         InterceptCommand::Off(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let session_id = session_id_for_write_payload(args.session_id);
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
@@ -2066,7 +2074,6 @@ async fn handle_auto_replace(api: ApiClient, command: AutoReplaceCommand) -> Res
             print_json(&rules)
         }
         AutoReplaceCommand::Set(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let raw = read_text_input(args.file, args.stdin)?;
             let parsed: AutoReplaceInput = serde_json::from_str(&raw).context(
                 "failed to parse auto-replace JSON; expected either an array of rules or {\"rules\": [...]}",
@@ -2075,7 +2082,7 @@ async fn handle_auto_replace(api: ApiClient, command: AutoReplaceCommand) -> Res
                 AutoReplaceInput::Rules(rules) => MatchReplaceRulesPayload { rules },
                 AutoReplaceInput::Payload(payload) => payload,
             };
-            let path = session_query_path("/api/match-replace", session_id);
+            let path = write_session_query_path("/api/match-replace", args.session_id);
             let rules: Vec<MatchReplaceRule> = api.post_json(&path, &payload).await?;
             print_json(&rules)
         }
@@ -2164,7 +2171,7 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
             print_json(&rules)
         }
         InterceptRuleCommand::Create(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let session_id = session_id_for_write_payload(args.session_id);
             let _explicit_all = args.all;
             let rule = json!({
                 "id": Uuid::new_v4(),
@@ -2174,13 +2181,16 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
                 "path_pattern": args.path_pattern.unwrap_or_default(),
                 "method_filter": if args.method_filter.is_empty() { vec![] } else { args.method_filter },
             });
-            let path = session_query_path("/api/intercept-rules", session_id);
+            let path = write_session_query_path("/api/intercept-rules", args.session_id);
             api.post_status(&path, &rule).await?;
             print_json_with_session(&rule, session_id)
         }
         InterceptRuleCommand::Delete(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path(&format!("/api/intercept-rules/{}", args.id), session_id);
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path = write_session_query_path(
+                &format!("/api/intercept-rules/{}", args.id),
+                args.session_id,
+            );
             api.delete_status(&path).await?;
             print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
         }
@@ -2318,17 +2328,18 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             print_json(&serde_json::json!({"status": "cleared", "session_id": session_id}))
         }
         OastCommand::Configure(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let session_id = session_id_for_write_payload(args.session_id);
             if args.provider.as_deref() == Some("boast") && args.token.is_some() {
                 bail!("BOAST provider does not use an OAST token");
             }
             let update = build_oast_configure_update(&args, session_id);
             if update.len() == usize::from(session_id.is_some()) {
                 // Just show current settings
-                let path = session_query_path("/api/runtime", session_id);
+                let read_session_id = resolve_session_id_arg(&api, args.session_id).await?;
+                let path = session_query_path("/api/runtime", read_session_id);
                 let runtime: serde_json::Value = api.get_json(&path).await?;
                 let mut output = Value::Object(oast_fields_for_output(runtime));
-                attach_session_id(&mut output, session_id);
+                attach_session_id(&mut output, read_session_id);
                 print_json(&output)
             } else {
                 let result: serde_json::Value = api
@@ -4469,13 +4480,13 @@ mod tests {
         read_payloads_input, read_raw_request_input, read_raw_response_input, read_text_input,
         replay_send_http_version, replay_send_target_for_tab, replay_tab_target_as_request,
         replay_tab_target_matches_request, replay_update_should_preserve_current_port,
-        session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
-        strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
-        validate_sniper_settings_probe, websocket_detail_path, websocket_list_path,
-        workspace_conflict_message, Cli, Command, HistoryCommand, HistoryListArgs,
-        HistoryListResponse, OastConfigureArgs, SequenceCommand, SequenceCreateInput,
-        SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs,
-        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        session_id_for_write_payload, session_query_path, sniper_settings_probe_matches,
+        split_host_port, split_payload_lines, strip_host_port, sync_replay_tab_target_to_request,
+        transaction_detail_path, validate_sniper_settings_probe, websocket_detail_path,
+        websocket_list_path, workspace_conflict_message, write_session_query_path, Cli, Command,
+        HistoryCommand, HistoryListArgs, HistoryListResponse, OastConfigureArgs, SequenceCommand,
+        SequenceCreateInput, SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation,
+        WebSocketListArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
         SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
@@ -4766,6 +4777,32 @@ mod tests {
             Some(active)
         );
         assert_eq!(explicit_or_active_session_id(None, None), None);
+    }
+
+    #[test]
+    fn implicit_write_payload_does_not_pin_active_session() {
+        let active = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        assert_eq!(
+            explicit_or_active_session_id(None, Some(active)),
+            Some(active)
+        );
+        assert_eq!(session_id_for_write_payload(None), None);
+        assert_eq!(session_id_for_write_payload(Some(active)), Some(active));
+    }
+
+    #[test]
+    fn write_session_query_path_only_pins_explicit_session_id() {
+        let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        assert_eq!(
+            write_session_query_path("/api/match-replace", None),
+            "/api/match-replace"
+        );
+        assert_eq!(
+            write_session_query_path("/api/match-replace", Some(session_id)),
+            "/api/match-replace?session_id=22222222-2222-2222-2222-222222222222"
+        );
     }
 
     #[test]

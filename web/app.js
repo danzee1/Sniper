@@ -843,6 +843,7 @@ let uiSettingsSaveTimer = null;
 let uiSettingsDirty = false;
 let uiSettingsInFlight = false;
 let lastUiSettingsPayload = null;
+let proxySettingsSaveInFlight = false;
 let toolsBootPromise = null;
 let displaySettingsPreviewActive = false;
 
@@ -1492,19 +1493,26 @@ function bindEvents() {
     toggleIntercept().catch((error) => console.error(error));
   });
   els.saveProxySettingsButton.addEventListener("click", () => {
+    if (proxySettingsSaveInFlight) return;
+    proxySettingsSaveInFlight = true;
+    els.saveProxySettingsButton.disabled = true;
     saveProxySettings()
       .then((result) => {
         if (result?.rebound === true) {
           showToast(`Proxy listener moved to ${result.active_proxy_addr}`);
         } else if (result?.rebound === false && result?.rebind_error) {
           showToast(result.rebind_error, "error");
-      } else {
-        showToast("Proxy settings saved");
-      }
-    })
+        } else {
+          showToast("Proxy settings saved");
+        }
+      })
       .catch((error) => {
         console.error(error);
         showToast(error?.message || "Failed to save proxy settings", "error");
+      })
+      .finally(() => {
+        proxySettingsSaveInFlight = false;
+        els.saveProxySettingsButton.disabled = false;
       });
   });
   els.reloadProxySettingsButton.addEventListener("click", () => {
@@ -11915,6 +11923,10 @@ async function saveProxySettings() {
     proxy_bind_host: normalizedBindHost,
     proxy_port: proxyPort,
   };
+  const currentStartup = state.settings?.startup || null;
+  const startupChanged = !currentStartup
+    || currentStartup.proxy_bind_host !== normalizedBindHost
+    || Number(currentStartup.proxy_port) !== proxyPort;
   const oastTokenValue = document.getElementById("proxySettingOastToken")?.value?.trim() || "";
   const oastIntervalText = document.getElementById("proxySettingOastInterval")?.value?.trim() || "";
   const oastInterval = oastIntervalText ? strictIntegerInRange(oastIntervalText, 1, 300) : 5;
@@ -11924,6 +11936,9 @@ async function saveProxySettings() {
   const oastProvider = document.getElementById("proxySettingOastProvider")?.value || "custom";
   const previousOastProvider = state.runtime?.oast_provider || "custom";
   const oastProviderChanged = oastProvider !== previousOastProvider;
+  const oastServerUrl = validateOastServerUrlForSettings(
+    document.getElementById("proxySettingOastServerUrl")?.value || "",
+  );
   const runtimeUpdate = {
     session_id: sessionId,
     intercept_enabled: els.proxySettingIntercept.checked,
@@ -11933,7 +11948,7 @@ async function saveProxySettings() {
     passthrough_hosts: passthroughHosts,
     oast_enabled: document.getElementById("proxySettingOastEnabled")?.checked ?? false,
     oast_provider: oastProvider,
-    oast_server_url: document.getElementById("proxySettingOastServerUrl")?.value?.trim() || "",
+    oast_server_url: oastServerUrl,
     oast_polling_interval_secs: oastInterval,
   };
   if (
@@ -11947,6 +11962,30 @@ async function saveProxySettings() {
   }
 
   const tokenWillBeUpdated = Object.prototype.hasOwnProperty.call(runtimeUpdate, "oast_token");
+  let startupResult = currentStartup;
+  if (startupChanged) {
+    const startupResponse = await fetch("/api/startup-settings", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(startupUpdate),
+    });
+
+    if (!startupResponse.ok) {
+      const message = await startupResponse.text();
+      if (sessionId === currentSessionId()) {
+        try {
+          await loadSettings(0);
+        } catch (reloadError) {
+          console.error(reloadError);
+        }
+      }
+      throw new Error(message);
+    }
+    startupResult = await startupResponse.json();
+  }
+
   const runtimeResponse = await fetch("/api/runtime", {
     method: "POST",
     headers: {
@@ -11956,20 +11995,7 @@ async function saveProxySettings() {
   });
 
   if (!runtimeResponse.ok) {
-    throw new Error(await runtimeResponse.text());
-  }
-  const runtimeResult = await runtimeResponse.json();
-
-  const startupResponse = await fetch("/api/startup-settings", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(startupUpdate),
-  });
-
-  if (!startupResponse.ok) {
-    const message = await startupResponse.text();
+    const message = await runtimeResponse.text();
     if (sessionId === currentSessionId()) {
       try {
         await loadSettings(0);
@@ -11979,16 +12005,18 @@ async function saveProxySettings() {
     }
     throw new Error(message);
   }
-  const startupResult = await startupResponse.json();
+  const runtimeResult = await runtimeResponse.json();
   if (sessionId !== currentSessionId()) {
     return startupResult;
   }
   state.runtime = runtimeResult;
   state.oastTokenClearPending = false;
-  state.settings.startup = startupResult;
+  if (startupResult) {
+    state.settings.startup = startupResult;
+  }
 
   // If proxy was rebound, update the main proxy_addr in settings too
-  if (startupResult.rebound === true) {
+  if (startupResult?.rebound === true) {
     state.settings.proxy_addr = startupResult.active_proxy_addr;
   }
 
@@ -12032,6 +12060,30 @@ function normalizeIpLiteralForSettings(value) {
     return host.slice(1, -1);
   }
   return host;
+}
+
+function validateOastServerUrlForSettings(value) {
+  const serverUrl = String(value || "").trim();
+  if (!serverUrl) return "";
+  let parsed;
+  try {
+    parsed = new URL(serverUrl);
+  } catch (_error) {
+    throw new Error("OAST server URL is invalid.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("OAST server URL must use http or https.");
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error("OAST server URL must not include credentials.");
+  }
+  if (!parsed.hostname) {
+    throw new Error("OAST server URL must include a host.");
+  }
+  if ((parsed.pathname && parsed.pathname !== "/") || parsed.search || parsed.hash) {
+    throw new Error("OAST server URL must not include a path, query, or fragment.");
+  }
+  return serverUrl;
 }
 
 async function requireOkResponse(response, fallbackMessage) {
