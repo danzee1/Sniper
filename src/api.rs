@@ -3997,6 +3997,7 @@ struct SequenceUpsertPayload {
 #[derive(Debug, Deserialize)]
 struct SequenceRunPayload {
     session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
 }
 
 async fn list_sequences(
@@ -4100,10 +4101,20 @@ async fn run_sequence(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _session_owner = match begin_session_proxy_operation(&state, &session, None).await {
-        Ok(owner) => owner,
-        Err(response) => return response,
-    };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        payload.expected_active_session_id,
+        Some(session.id()),
+    ) {
+        return response;
+    }
+    let _session_owner =
+        match begin_session_proxy_operation(&state, &session, payload.expected_active_session_id)
+            .await
+        {
+            Ok(owner) => owner,
+            Err(response) => return response,
+        };
     let definition = match session.sequence.get_definition(id).await {
         Some(def) => def,
         None => return (StatusCode::NOT_FOUND, "Sequence not found").into_response(),
@@ -12551,12 +12562,69 @@ mod tests {
             Path(definition.id.to_string()),
             Json(super::SequenceRunPayload {
                 session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
             }),
         )
         .await;
 
         assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
         assert!(session.sequence.list_runs(None).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn sequence_run_rejects_stale_implicit_active_session_guard() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-sequence-run-active-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Stale active sequence run".to_string(),
+            steps: Vec::new(),
+        };
+        original
+            .sequence
+            .upsert_definition(definition.clone())
+            .await;
+        let active = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let response = super::run_sequence(
+            State(state.clone()),
+            Path(definition.id.to_string()),
+            Json(super::SequenceRunPayload {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("active session changed")
+        );
+        let active_id = active.id.to_string();
+        assert_eq!(
+            body.get("session_id").and_then(serde_json::Value::as_str),
+            Some(active_id.as_str())
+        );
+        assert!(original.sequence.list_runs(None).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -12598,6 +12666,7 @@ mod tests {
             Path(definition.id.to_string()),
             Json(super::SequenceRunPayload {
                 session_id: Some(original_id),
+                expected_active_session_id: None,
             }),
         ));
         let blocked = tokio::time::timeout(Duration::from_millis(30), &mut run_future).await;
@@ -12677,6 +12746,7 @@ mod tests {
             Path(definition.id.to_string()),
             Json(super::SequenceRunPayload {
                 session_id: Some(session_id),
+                expected_active_session_id: None,
             }),
         ));
 
@@ -12906,6 +12976,7 @@ mod tests {
             Path(definition.id.to_string()),
             Json(super::SequenceRunPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
             }),
         )
         .await;

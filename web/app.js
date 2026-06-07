@@ -482,7 +482,7 @@ let _websocketDetailPendingId = null;
 let _websocketDetailPendingSessionId = null;
 let _websocketDetailPendingPromise = null;
 let _websocketDetailRefreshTimer = null;
-let _websocketDetailRefreshNeededId = null;
+let _websocketDetailRefreshNeeded = null;
 let _websocketSummaryMutationGeneration = 0;
 let _websocketSummaryMutationById = new Map();
 let _websocketVisibleSyncTimer = null;
@@ -840,6 +840,7 @@ let workspaceSaveInFlight = false;
 let workspaceSaveDirty = false;
 let workspaceSaveVersion = 0;
 let workspaceSaveLastSnapshot = null;
+let workspaceSaveCommittedSnapshot = null;
 const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
@@ -2678,6 +2679,7 @@ function applyWorkspaceState(snapshot) {
     state.fuzzerNotice = state.fuzzerNotice || "Loading saved fuzzer run...";
     hydrateFuzzerAttackRecordById(state.fuzzerAttackRecordId, snapshot?.session_id || currentSessionId());
   }
+  workspaceSaveCommittedSnapshot = cloneWorkspaceSnapshotForBaseline(snapshotWorkspaceState());
 }
 
 function workspaceSnapshotMatchesActiveSession(snapshot) {
@@ -2830,6 +2832,15 @@ function observeAnnotationRevision(source) {
 function nextAnnotationClientVersion() {
   annotationSaveVersion = Math.max(0, annotationSaveVersion) + 1;
   return annotationSaveVersion;
+}
+
+function cloneWorkspaceSnapshotForBaseline(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  try {
+    return JSON.parse(JSON.stringify(snapshot));
+  } catch (_error) {
+    return null;
+  }
 }
 
 function isUuidString(value) {
@@ -3064,6 +3075,7 @@ async function saveWorkspaceState(snapshot = snapshotWorkspaceState()) {
     return;
   }
   state.workspaceRevision = Number.isFinite(saved?.revision) ? saved.revision : state.workspaceRevision;
+  workspaceSaveCommittedSnapshot = cloneWorkspaceSnapshotForBaseline(snapshot);
   workspaceSaveConflictPending = false;
 }
 
@@ -3214,6 +3226,56 @@ function flushWorkspaceStateOnUnload() {
   }).catch(() => {});
 }
 
+function workspaceReplayTabsById(snapshot) {
+  return new Map(
+    (Array.isArray(snapshot?.replay?.tabs) ? snapshot.replay.tabs : [])
+      .filter((tab) => tab && typeof tab.id === "string" && tab.id)
+      .map((tab) => [tab.id, tab]),
+  );
+}
+
+function workspaceSnapshotValueChanged(left, right) {
+  try {
+    return JSON.stringify(left ?? null) !== JSON.stringify(right ?? null);
+  } catch (_error) {
+    return true;
+  }
+}
+
+function changedWorkspaceReplayTabIds(snapshot, baselineSnapshot) {
+  const tabs = Array.isArray(snapshot?.replay?.tabs) ? snapshot.replay.tabs : [];
+  if (!tabs.length) return new Set();
+  if (!baselineSnapshot || typeof baselineSnapshot !== "object") {
+    return new Set(tabs.map((tab) => tab?.id).filter((id) => typeof id === "string" && id));
+  }
+  const baselineById = workspaceReplayTabsById(baselineSnapshot);
+  const changed = new Set();
+  for (const tab of tabs) {
+    if (!tab || typeof tab.id !== "string" || !tab.id) continue;
+    if (workspaceSnapshotValueChanged(tab, baselineById.get(tab.id))) {
+      changed.add(tab.id);
+    }
+  }
+  return changed;
+}
+
+function activeAndChangedReplayTabIds(snapshot) {
+  const ids = changedWorkspaceReplayTabIds(snapshot, workspaceSaveCommittedSnapshot);
+  const activeTabId = snapshot?.replay?.active_tab_id || null;
+  if (activeTabId) {
+    ids.add(activeTabId);
+  }
+  return ids;
+}
+
+function workspaceUnloadSnapshotPayload(snapshot) {
+  if (!snapshot) return null;
+  const payload = JSON.stringify(snapshot);
+  return utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES
+    ? payload
+    : null;
+}
+
 function workspaceUnloadPayload(primarySnapshot) {
   const primaryPayload = JSON.stringify(primarySnapshot);
   if (utf8ByteLength(primaryPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
@@ -3231,6 +3293,26 @@ function workspaceUnloadPayload(primarySnapshot) {
     const compactPayload = JSON.stringify(compactSnapshot);
     if (utf8ByteLength(compactPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
       return { payload: compactPayload, endpoint: "/api/workspace-state/keepalive" };
+    }
+  }
+  const changedReplayTabIds = activeAndChangedReplayTabIds(primarySnapshot);
+  if (changedReplayTabIds.size) {
+    const changedTabsSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+      replayTabIdFilter: changedReplayTabIds,
+      sourceReplayTabById,
+    });
+    const changedTabsPayload = workspaceUnloadSnapshotPayload(changedTabsSnapshot);
+    if (changedTabsPayload) {
+      return { payload: changedTabsPayload, endpoint: "/api/workspace-state/keepalive" };
+    }
+    const changedTabsReplayOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+      replayTabIdFilter: changedReplayTabIds,
+      dropFuzzer: true,
+      sourceReplayTabById,
+    });
+    const changedTabsReplayOnlyPayload = workspaceUnloadSnapshotPayload(changedTabsReplayOnlySnapshot);
+    if (changedTabsReplayOnlyPayload) {
+      return { payload: changedTabsReplayOnlyPayload, endpoint: "/api/workspace-state/keepalive" };
     }
   }
   const activeOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
@@ -3293,10 +3375,15 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
   const sourceReplayTabById = options.sourceReplayTabById instanceof Map
     ? options.sourceReplayTabById
     : null;
-  const tabs = (options.activeOnly && activeTabId
-    ? sourceTabs.filter((tab) => tab?.id === activeTabId)
-    : sourceTabs
-  ).map((tab) => compactWorkspaceUnloadReplayTab(
+  const replayTabIdFilter = options.replayTabIdFilter instanceof Set
+    ? options.replayTabIdFilter
+    : null;
+  const selectedTabs = replayTabIdFilter
+    ? sourceTabs.filter((tab) => replayTabIdFilter.has(tab?.id))
+    : (options.activeOnly && activeTabId
+      ? sourceTabs.filter((tab) => tab?.id === activeTabId)
+      : sourceTabs);
+  const tabs = selectedTabs.map((tab) => compactWorkspaceUnloadReplayTab(
     tab,
     options,
     sourceReplayTabById?.get(tab?.id) || null,
@@ -3312,7 +3399,7 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
       tab_sequence: replay.tab_sequence || state.replayTabSequence || 0,
     },
     keepalive: {
-      replay_tabs_complete: !options.activeOnly,
+      replay_tabs_complete: !options.activeOnly && !replayTabIdFilter,
       replay_tab_ids: replayTabIds,
       fuzzer_complete: !options.dropFuzzer,
       text_complete: !Number.isFinite(options.textByteLimit),
@@ -3531,6 +3618,8 @@ function resetSessionScopedUiState() {
   wsTranscriptSaveTimer = null;
   wsTranscriptFirstDirtyAt = 0;
   workspaceSaveDirty = false;
+  workspaceSaveLastSnapshot = null;
+  workspaceSaveCommittedSnapshot = null;
   workspaceSaveConflictPending = false;
   clearHistoryBackfill();
   window.clearTimeout(_incrementalTimer);
@@ -3577,7 +3666,7 @@ function resetSessionScopedUiState() {
     window.clearTimeout(_websocketDetailRefreshTimer);
     _websocketDetailRefreshTimer = null;
   }
-  _websocketDetailRefreshNeededId = null;
+  _websocketDetailRefreshNeeded = null;
   _websocketSummaryMutationGeneration += 1;
   _websocketSummaryMutationById.clear();
   _lastWebsocketFallbackPoll = Date.now();
@@ -4874,6 +4963,35 @@ function mergeWebsocketAppendPage(pageItems, currentItems, mutationGenerationAtR
   return merged;
 }
 
+function normalizeWebsocketFrameIndex(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function mergeWebsocketDetailRefreshTarget(id, lastFrameIndex = null) {
+  if (!id) return null;
+  const nextIndex = normalizeWebsocketFrameIndex(lastFrameIndex);
+  const current = _websocketDetailRefreshNeeded?.id === id
+    ? normalizeWebsocketFrameIndex(_websocketDetailRefreshNeeded.lastFrameIndex)
+    : null;
+  return {
+    id,
+    lastFrameIndex: current == null
+      ? nextIndex
+      : (nextIndex == null ? current : Math.max(current, nextIndex)),
+  };
+}
+
+function selectedWebsocketDetailMeetsRefreshTarget(target) {
+  if (!target || target.id !== state.selectedWebsocketId) return true;
+  const targetIndex = normalizeWebsocketFrameIndex(target.lastFrameIndex);
+  if (targetIndex == null) return false;
+  const loadedIndex = normalizeWebsocketFrameIndex(
+    state.selectedWebsocketRecord?.loaded_last_frame_index,
+  );
+  return loadedIndex != null && loadedIndex >= targetIndex;
+}
+
 async function loadWebsocketDetail(id, options = {}) {
   const force = Boolean(options.force);
   const sessionId = currentSessionId();
@@ -4883,12 +5001,12 @@ async function loadWebsocketDetail(id, options = {}) {
     && _websocketDetailPendingPromise
   ) {
     if (force) {
-      _websocketDetailRefreshNeededId = id;
+      _websocketDetailRefreshNeeded = mergeWebsocketDetailRefreshTarget(id, options.lastFrameIndex);
     }
     return _websocketDetailPendingPromise;
   }
-  if (force && _websocketDetailRefreshNeededId === id) {
-    _websocketDetailRefreshNeededId = null;
+  if (force && _websocketDetailRefreshNeeded?.id === id) {
+    _websocketDetailRefreshNeeded = null;
   }
   const generation = ++_websocketDetailGeneration;
   if (state.selectedWebsocketId !== id) {
@@ -4982,8 +5100,13 @@ async function loadWebsocketDetail(id, options = {}) {
       _websocketDetailPendingSessionId = null;
       _websocketDetailPendingPromise = null;
     }
-    if (_websocketDetailRefreshNeededId === id && id === state.selectedWebsocketId) {
-      scheduleSelectedWebsocketDetailRefresh(id);
+    const refreshTarget = _websocketDetailRefreshNeeded;
+    if (
+      refreshTarget?.id === id
+      && id === state.selectedWebsocketId
+      && !selectedWebsocketDetailMeetsRefreshTarget(refreshTarget)
+    ) {
+      scheduleSelectedWebsocketDetailRefresh(id, refreshTarget.lastFrameIndex);
     }
   }
 }
@@ -5130,10 +5253,10 @@ function applySelectedWebsocketSummary(summary) {
       frames_truncated: websocketFramesAreTruncated(state.selectedWebsocketRecord.frames, summary),
     };
     if (Number(loadedLastFrameIndex ?? -1) !== Number(summary.last_frame_index ?? -1)) {
-      scheduleSelectedWebsocketDetailRefresh(summary.id);
+      scheduleSelectedWebsocketDetailRefresh(summary.id, summary.last_frame_index);
     }
   } else {
-    scheduleSelectedWebsocketDetailRefresh(summary.id);
+    scheduleSelectedWebsocketDetailRefresh(summary.id, summary.last_frame_index);
   }
   return true;
 }
@@ -5150,24 +5273,28 @@ function pruneWebsocketSummaryMutationCache() {
   }
 }
 
-function scheduleSelectedWebsocketDetailRefresh(id) {
+function scheduleSelectedWebsocketDetailRefresh(id, lastFrameIndex = null) {
   if (id !== state.selectedWebsocketId) {
     return;
   }
-  _websocketDetailRefreshNeededId = id;
+  _websocketDetailRefreshNeeded = mergeWebsocketDetailRefreshTarget(id, lastFrameIndex);
   if (_websocketDetailRefreshTimer) {
     return;
   }
   _websocketDetailRefreshTimer = window.setTimeout(() => {
     _websocketDetailRefreshTimer = null;
-    const refreshId = _websocketDetailRefreshNeededId;
+    const refreshTarget = _websocketDetailRefreshNeeded;
+    const refreshId = refreshTarget?.id || null;
     if (
       refreshId
       && refreshId === state.selectedWebsocketId
       && state.activeTool === "proxy"
       && state.activeProxyTab === "websockets-history"
     ) {
-      loadWebsocketDetail(refreshId, { force: true }).catch((error) => console.error(error));
+      loadWebsocketDetail(refreshId, {
+        force: true,
+        lastFrameIndex: refreshTarget.lastFrameIndex,
+      }).catch((error) => console.error(error));
     }
   }, 750);
 }

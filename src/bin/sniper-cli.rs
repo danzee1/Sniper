@@ -1368,8 +1368,9 @@ struct FuzzerRunPayload {
 }
 
 #[derive(Serialize)]
-struct SessionIdPayload {
+struct SequenceRunPayload {
     session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -2312,11 +2313,18 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             print_json_with_session(&def, session_id)
         }
         SequenceCommand::Run(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
+            let workspace = load_workspace_state(&api, args.session_id).await?;
+            let session_id = workspace.session_id;
             let mut result: serde_json::Value = api
                 .post_json_long(
                     &format!("/api/sequences/{}/run", args.id),
-                    &SessionIdPayload { session_id },
+                    &SequenceRunPayload {
+                        session_id,
+                        expected_active_session_id: expected_active_session_for_implicit_write(
+                            &workspace,
+                            args.session_id,
+                        ),
+                    },
                 )
                 .await?;
             attach_session_id(&mut result, session_id);
