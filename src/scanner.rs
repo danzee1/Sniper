@@ -102,6 +102,8 @@ pub struct ScannerFinding {
     pub id: Uuid,
     pub record_id: Uuid,
     pub found_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rule_id: String,
     pub severity: Severity,
     pub category: String,
     pub title: String,
@@ -116,6 +118,8 @@ pub struct FindingSummary {
     pub id: Uuid,
     pub record_id: Uuid,
     pub found_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rule_id: String,
     pub severity: Severity,
     pub category: String,
     pub title: String,
@@ -129,6 +133,7 @@ impl ScannerFinding {
             id: self.id,
             record_id: self.record_id,
             found_at: self.found_at,
+            rule_id: self.rule_id.clone(),
             severity: self.severity.clone(),
             category: self.category.clone(),
             title: self.title.clone(),
@@ -286,6 +291,7 @@ struct FindingDedupKey {
     record_id: Uuid,
     host: String,
     path: String,
+    rule_id: String,
     category: String,
     title: String,
 }
@@ -295,6 +301,7 @@ fn finding_dedup_key(finding: &ScannerFinding) -> FindingDedupKey {
         record_id: finding.record_id,
         host: finding.host.clone(),
         path: finding.path.clone(),
+        rule_id: finding.rule_id.clone(),
         category: finding.category.clone(),
         title: finding.title.clone(),
     }
@@ -445,14 +452,16 @@ fn check_custom_rule(
 
     for (_source, text) in targets {
         if let Some(m) = re.find(&text) {
-            findings.push(make_finding(
+            let mut finding = make_finding(
                 record,
                 rule.severity.clone(),
                 &rule.category,
                 &rule.name,
                 &rule.description,
                 truncate_evidence(m.as_str(), 120),
-            ));
+            );
+            finding.rule_id = rule.id.clone();
+            findings.push(finding);
             break; // one match per rule per request is enough
         }
     }
@@ -470,6 +479,7 @@ fn make_finding(
         id: Uuid::new_v4(),
         record_id: record.id,
         found_at: Utc::now(),
+        rule_id: String::new(),
         severity,
         category: category.to_string(),
         title: title.into(),
@@ -2439,6 +2449,7 @@ mod tests {
             id: Uuid::new_v4(),
             record_id: Uuid::new_v4(),
             found_at: Utc::now(),
+            rule_id: String::new(),
             severity: Severity::Low,
             category: "test".to_string(),
             title: title.to_string(),
@@ -2547,6 +2558,73 @@ mod tests {
 
         let findings = store.list(None).await;
         assert_eq!(findings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scanner_store_keeps_distinct_custom_rule_ids() {
+        let store = ScannerStore::new(10);
+        let record_id = Uuid::new_v4();
+        let mut first = finding("Custom Secret");
+        first.record_id = record_id;
+        first.category = "custom".to_string();
+        first.rule_id = "custom-rule-a".to_string();
+        let mut second = finding("Custom Secret");
+        second.record_id = record_id;
+        second.category = "custom".to_string();
+        second.rule_id = "custom-rule-b".to_string();
+
+        assert!(store.push(first).await);
+        assert!(store.push(second).await);
+
+        let findings = store.list(None).await;
+        assert_eq!(findings.len(), 2);
+    }
+
+    #[test]
+    fn custom_rules_with_same_display_fields_keep_distinct_findings() {
+        let record = make_record(vec![], vec![], "token-one token-two", 200);
+        let rules = BUILTIN_RULES
+            .iter()
+            .map(|(id, _)| ((*id).to_string(), false))
+            .collect();
+        let config = ScannerConfig {
+            enabled: true,
+            rules,
+            custom_rules: vec![
+                CustomRule {
+                    id: "custom-token-one".to_string(),
+                    name: "Token Leak".to_string(),
+                    enabled: true,
+                    target: "response_body".to_string(),
+                    header_name: String::new(),
+                    pattern: "token-one".to_string(),
+                    severity: Severity::Medium,
+                    category: "custom".to_string(),
+                    description: "first custom token".to_string(),
+                },
+                CustomRule {
+                    id: "custom-token-two".to_string(),
+                    name: "Token Leak".to_string(),
+                    enabled: true,
+                    target: "response_body".to_string(),
+                    header_name: String::new(),
+                    pattern: "token-two".to_string(),
+                    severity: Severity::Medium,
+                    category: "custom".to_string(),
+                    description: "second custom token".to_string(),
+                },
+            ],
+        };
+
+        let findings = scan_transaction(&record, &config);
+
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == "custom-token-one"));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == "custom-token-two"));
     }
 
     #[tokio::test]

@@ -297,6 +297,9 @@ fn normalize_scope_pattern(pattern: &str) -> Option<String> {
         value = rest.to_string();
     }
     let host = value.split(['/', '?', '#']).next().unwrap_or("").trim();
+    if host.contains('@') {
+        return None;
+    }
     let host = host_without_port(host).to_string();
     (!host.is_empty()).then_some(host)
 }
@@ -511,6 +514,29 @@ mod tests {
         assert!(settings.is_in_scope("example.org.:9443").await);
         assert!(settings.is_passthrough("passthrough.test:443").await);
         assert!(settings.is_passthrough("passthrough.test.:443").await);
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_rejects_scope_url_patterns_with_userinfo() {
+        let settings = RuntimeSettings::new();
+        let snapshot = settings
+            .update(RuntimeSettingsUpdate {
+                scope_patterns: Some(vec![
+                    "https://user:pass@example.com/path".to_string(),
+                    "//user@example.org".to_string(),
+                    "https://safe.example.test/path".to_string(),
+                ]),
+                passthrough_hosts: Some(vec![
+                    "https://user:pass@passthrough.test/path".to_string(),
+                    "passthrough-safe.test".to_string(),
+                ]),
+                ..RuntimeSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.scope_patterns, vec!["safe.example.test"]);
+        assert_eq!(snapshot.passthrough_hosts, vec!["passthrough-safe.test"]);
     }
 
     #[tokio::test]

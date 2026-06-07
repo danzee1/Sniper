@@ -1734,6 +1734,7 @@ fn validate_scanner_config(
             "scanner config cannot contain more than {MAX_SCANNER_CUSTOM_RULES} custom rules"
         ));
     }
+    let mut custom_rule_ids = HashSet::new();
     for rule in &config.custom_rules {
         validate_text_field("custom scanner rule id", &rule.id, MAX_SCANNER_FIELD_BYTES)?;
         validate_text_field(
@@ -1768,6 +1769,12 @@ fn validate_scanner_config(
         )?;
         if rule.id.trim().is_empty() {
             return Err("custom scanner rule id is required".to_string());
+        }
+        if !custom_rule_ids.insert(rule.id.trim().to_string()) {
+            return Err(format!(
+                "custom scanner rule {} id is duplicated",
+                rule.id.trim()
+            ));
         }
         if rule.name.trim().is_empty() {
             return Err(format!("custom scanner rule {} name is required", rule.id));
@@ -6685,6 +6692,35 @@ mod tests {
     }
 
     #[test]
+    fn scanner_config_rejects_duplicate_custom_rule_ids() {
+        let rule = CustomRule {
+            id: "duplicate".to_string(),
+            name: "Custom".to_string(),
+            enabled: true,
+            target: "response_body".to_string(),
+            header_name: String::new(),
+            pattern: "x".to_string(),
+            severity: Severity::Info,
+            category: "custom".to_string(),
+            description: String::new(),
+        };
+        let config = ScannerConfig {
+            custom_rules: vec![
+                rule.clone(),
+                CustomRule {
+                    name: "Other display name".to_string(),
+                    ..rule
+                },
+            ],
+            ..ScannerConfig::default()
+        };
+
+        assert!(super::validate_scanner_config(&config)
+            .unwrap_err()
+            .contains("duplicated"));
+    }
+
+    #[test]
     fn sequence_validation_rejects_invalid_extraction_regex() {
         let request = crate::model::EditableRequest {
             scheme: "https".to_string(),
@@ -9167,6 +9203,7 @@ mod tests {
             id: Uuid::new_v4(),
             record_id: Uuid::new_v4(),
             found_at: Utc::now(),
+            rule_id: String::new(),
             severity: Severity::Info,
             category: "active".to_string(),
             title: "Active finding".to_string(),
@@ -9179,6 +9216,7 @@ mod tests {
             id: Uuid::new_v4(),
             record_id: Uuid::new_v4(),
             found_at: Utc::now(),
+            rule_id: String::new(),
             severity: Severity::High,
             category: "inactive".to_string(),
             title: "Inactive finding".to_string(),

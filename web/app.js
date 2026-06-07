@@ -7328,8 +7328,10 @@ async function openScannerSettings() {
 
 function renderCustomRulesEditor(customRules) {
   els.scannerCustomRules.innerHTML = customRules
-    .map((rule, idx) => `
-      <div class="scanner-custom-rule-card" data-custom-idx="${idx}">
+    .map((rule, idx) => {
+      const ruleId = customRuleId(rule.id);
+      return `
+      <div class="scanner-custom-rule-card" data-custom-idx="${idx}" data-rule-id="${escapeHtml(ruleId)}">
         <div class="scanner-custom-rule-header">
           <label><input type="checkbox" class="custom-rule-enabled" ${rule.enabled ? "checked" : ""} /></label>
           <input type="text" class="custom-rule-name" value="${escapeHtml(rule.name)}" placeholder="Rule name" style="margin: 0 6px;" />
@@ -7354,7 +7356,8 @@ function renderCustomRulesEditor(customRules) {
           <input type="text" class="custom-rule-description scanner-custom-rule-fullrow" value="${escapeHtml(rule.description)}" placeholder="Description" />
         </div>
       </div>
-    `)
+    `;
+    })
     .join("");
 
   // Delete button events
@@ -7370,7 +7373,7 @@ function renderCustomRulesEditor(customRules) {
 function collectCustomRulesFromEditor() {
   const cards = els.scannerCustomRules.querySelectorAll(".scanner-custom-rule-card");
   return Array.from(cards).map((card, idx) => ({
-    id: `custom_${idx}_${Date.now()}`,
+    id: customRuleId(card.dataset.ruleId),
     enabled: card.querySelector(".custom-rule-enabled").checked,
     name: card.querySelector(".custom-rule-name").value.trim() || `Custom Rule ${idx + 1}`,
     target: card.querySelector(".custom-rule-target").value,
@@ -7380,6 +7383,15 @@ function collectCustomRulesFromEditor() {
     category: card.querySelector(".custom-rule-category").value.trim() || "custom",
     description: card.querySelector(".custom-rule-description").value.trim(),
   }));
+}
+
+function customRuleId(value) {
+  const id = String(value || "").trim();
+  if (id) return id;
+  if (globalThis.crypto?.randomUUID) {
+    return `custom_${globalThis.crypto.randomUUID()}`;
+  }
+  return `custom_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function collectScannerConfig() {
@@ -10807,8 +10819,6 @@ async function saveTargetScope() {
     body: JSON.stringify({
       session_id: sessionId,
       scope_patterns: scopePatterns,
-      intercept_enabled: state.runtime?.intercept_enabled,
-      websocket_capture_enabled: state.runtime?.websocket_capture_enabled,
     }),
   });
   if (!response.ok) {
@@ -11946,7 +11956,15 @@ async function saveProxySettings() {
   });
 
   if (!startupResponse.ok) {
-    throw new Error(await startupResponse.text());
+    const message = await startupResponse.text();
+    if (sessionId === currentSessionId()) {
+      try {
+        await loadSettings(0);
+      } catch (reloadError) {
+        console.error(reloadError);
+      }
+    }
+    throw new Error(message);
   }
   const startupResult = await startupResponse.json();
   if (sessionId !== currentSessionId()) {
@@ -14344,28 +14362,30 @@ function scheduleUiSettingsSave(delay = 180) {
 }
 
 async function persistUiSettings() {
-  const payload = JSON.stringify(snapshotUiSettings());
-  lastUiSettingsPayload = payload;
+  if (uiSettingsInFlight) {
+    return;
+  }
   uiSettingsInFlight = true;
   try {
-    const response = await fetch("/api/ui-settings", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: payload,
-    });
-
-    if (!response.ok) {
-      throw new Error(await response.text());
-    }
-    if (lastUiSettingsPayload === payload) {
+    while (uiSettingsDirty) {
       uiSettingsDirty = false;
+      const payload = JSON.stringify(snapshotUiSettings());
+      lastUiSettingsPayload = payload;
+      const response = await fetch("/api/ui-settings", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: payload,
+      });
+
+      if (!response.ok) {
+        uiSettingsDirty = true;
+        throw new Error(await response.text());
+      }
     }
   } finally {
-    if (lastUiSettingsPayload === payload) {
-      uiSettingsInFlight = false;
-    }
+    uiSettingsInFlight = false;
   }
 }
 

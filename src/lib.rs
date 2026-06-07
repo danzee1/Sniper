@@ -193,6 +193,14 @@ async fn shutdown_headless_runtime(
         }
     }
     state.ws_replay.disconnect_all().await;
+    let relay_result = proxy::close_live_websocket_relays(
+        state,
+        "Sniper headless shutdown closed the live WebSocket relay.",
+    )
+    .await
+    .context("failed to persist closed live WebSocket relays before headless shutdown");
+    state.abort_proxy_task().await;
+    proxy::drain_proxy_connections(Duration::from_secs(1)).await;
     let flush_result = proxy::flush_pending_session_persists(state)
         .await
         .context("failed to flush pending session snapshots before headless shutdown");
@@ -208,21 +216,13 @@ async fn shutdown_headless_runtime(
         );
         return Err(error);
     }
-    if let Err(error) = proxy::close_live_websocket_relays(
-        state,
-        "Sniper headless shutdown closed the live WebSocket relay.",
-    )
-    .await
-    .context("failed to persist closed live WebSocket relays before headless shutdown")
-    {
+    if let Err(error) = relay_result {
         warn!(
             ?error,
             "leaving runtime state after failed live WebSocket relay persistence"
         );
         return Err(error);
     }
-    state.abort_proxy_task().await;
-    proxy::drain_proxy_connections(Duration::from_secs(1)).await;
     match runtime_state::remove_runtime_state_if_owner(
         &state.config.data_dir,
         state.runtime_instance_id,

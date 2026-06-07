@@ -4064,6 +4064,7 @@ mod tests {
             id: Uuid::new_v4(),
             record_id: Uuid::new_v4(),
             found_at: Utc::now(),
+            rule_id: String::new(),
             severity: crate::scanner::Severity::Low,
             category: "old".to_string(),
             title: "Old persisted finding".to_string(),
