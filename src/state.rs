@@ -398,6 +398,16 @@ impl AppState {
                         "failed to remove session created before activation failure"
                     );
                 }
+                self.ws_replay.remove_session(metadata.id).await;
+                self.session_operation_locks
+                    .lock()
+                    .await
+                    .remove(&metadata.id);
+                self.session_contexts.lock().await.remove(&metadata.id);
+                self.read_only_session_contexts
+                    .lock()
+                    .await
+                    .remove(&metadata.id);
                 Err(error)
             }
         }
@@ -430,6 +440,11 @@ impl AppState {
         let current = active_session.clone();
         let current_id = current.id();
         if current_id != id {
+            if crate::proxy::session_has_active_proxy_work(current_id)
+                || crate::proxy::session_has_active_proxy_work(id)
+            {
+                anyhow::bail!("cannot switch sessions while proxy activity is still running");
+            }
             self.persist_session_context(&current).await?;
             {
                 let mut contexts = self.session_contexts.lock().await;
@@ -3189,6 +3204,115 @@ mod tests {
 
         drop(operation_guard);
         assert_eq!(state.activate_session(next.id).await.unwrap().id, next.id);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn activate_session_rejects_current_active_proxy_work_until_owner_dropped() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-activate-current-active-proxy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        let next = state
+            .sessions
+            .create_session(Some("Second".to_string()))
+            .unwrap();
+
+        let owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        let error = state.activate_session(next.id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("proxy activity is still running"));
+        assert_eq!(state.active_session_summary().await.id, original_id);
+
+        drop(owner);
+        assert_eq!(state.activate_session(next.id).await.unwrap().id, next.id);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_activation_failure_removes_transient_operation_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-create-session-active-proxy-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        let _current_operation_lock = state.session_operation_lock(original_id).await;
+        let before = state.session_operation_lock_count().await;
+
+        let owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        for index in 0..3 {
+            let error = state
+                .create_session(Some(format!("Blocked {index}")))
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("proxy activity is still running"));
+            assert_eq!(state.session_operation_lock_count().await, before);
+        }
+        assert_eq!(state.active_session_summary().await.id, original_id);
+
+        drop(owner);
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn activate_session_rejects_target_active_proxy_work_until_owner_dropped() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-activate-target-active-proxy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        let next = state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+
+        let owner = crate::proxy::remember_active_proxy_session_owner(original_id);
+        let error = state.activate_session(original_id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("proxy activity is still running"));
+        assert_eq!(state.active_session_summary().await.id, next.id);
+
+        drop(owner);
+        assert_eq!(
+            state.activate_session(original_id).await.unwrap().id,
+            original_id
+        );
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -20,7 +20,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use regex::{Regex, RegexBuilder};
 
-use crate::model::{TrafficKind, TransactionRecord, TransactionSummary};
+use crate::model::{
+    compact_annotation_client_versions_for_insert, TrafficKind, TransactionRecord,
+    TransactionSummary,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct ListFilters {
@@ -766,6 +769,10 @@ impl TransactionStore {
         if has_annotation_patch {
             record.annotation_revision = next_annotation_revision;
             if has_client_clock {
+                compact_annotation_client_versions_for_insert(
+                    &mut record.annotation_client_versions,
+                    &annotation_client_id,
+                );
                 record
                     .annotation_client_versions
                     .insert(annotation_client_id, annotation_client_version);
@@ -2015,6 +2022,64 @@ mod tests {
                 .copied(),
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn cli_annotation_client_versions_are_compacted_per_record() {
+        let record = test_record("existing.example");
+        let id = record.id;
+        let store = TransactionStore::from_records_with_max_entries(vec![record], None);
+
+        store
+            .update_annotations_with_journal_mode(
+                id,
+                Some(Some("blue".to_string())),
+                None,
+                Some("browser-client".to_string()),
+                Some(7),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        for index in 0..3 {
+            store
+                .update_annotations_with_journal_mode(
+                    id,
+                    Some(Some(format!("cli-{index}"))),
+                    None,
+                    Some(format!("sniper-cli:{index}")),
+                    Some(1),
+                    false,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.annotation_client_versions.len(), 2);
+        assert_eq!(
+            stored
+                .annotation_client_versions
+                .get("browser-client")
+                .copied(),
+            Some(7)
+        );
+        assert_eq!(
+            stored
+                .annotation_client_versions
+                .get("sniper-cli:2")
+                .copied(),
+            Some(1)
+        );
+        assert!(!stored
+            .annotation_client_versions
+            .contains_key("sniper-cli:0"));
+        assert!(!stored
+            .annotation_client_versions
+            .contains_key("sniper-cli:1"));
     }
 
     #[tokio::test]

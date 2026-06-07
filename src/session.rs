@@ -22,7 +22,9 @@ use crate::{
     fuzzer::{FuzzerAttackRecord, FuzzerStore},
     intercept::{InterceptQueue, ResponseInterceptQueue},
     match_replace::{MatchReplaceRule, MatchReplaceStore},
-    model::{TransactionRecord, WebSocketSessionRecord},
+    model::{
+        compact_annotation_client_versions_for_insert, TransactionRecord, WebSocketSessionRecord,
+    },
     runtime::{RuntimeSettings, RuntimeSettingsSnapshot},
     scanner::{scan_transaction, ScannerConfig, ScannerFinding, ScannerStore},
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceStore},
@@ -1870,6 +1872,10 @@ fn replay_transaction_journal_file(
                             (annotation_client_id, annotation_client_version)
                         {
                             if !client_id.is_empty() && client_version > 0 {
+                                compact_annotation_client_versions_for_insert(
+                                    &mut record.annotation_client_versions,
+                                    &client_id,
+                                );
                                 record
                                     .annotation_client_versions
                                     .insert(client_id, client_version);

@@ -855,6 +855,7 @@ let workspaceSaveCommittedSnapshot = null;
 const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
+let workspaceSaveConflictLatest = null;
 const uiSettingsClientId = createWorkspaceClientId();
 let uiSettingsSaveVersion = 0;
 const annotationClientId = createWorkspaceClientId();
@@ -2906,6 +2907,7 @@ function createWsReplaySnapshotBudgetAllocator(replayTabs, options = {}) {
 }
 
 function snapshotWorkspaceState(options = {}) {
+  const sessionId = options.sessionId || state.activeSession?.id || null;
   const replayTabs = Array.isArray(state.replayTabs) ? state.replayTabs : [];
   const wsFrameBudgetForTab = createWsReplaySnapshotBudgetAllocator(replayTabs, options);
   const replayTabSnapshots = new Map();
@@ -2989,8 +2991,8 @@ function snapshotWorkspaceState(options = {}) {
   }
   return {
     revision: state.workspaceRevision || 0,
-    session_id: state.activeSession?.id || null,
-    expected_active_session_id: expectedActiveSessionIdForWrite(state.activeSession?.id || null, options),
+    session_id: sessionId,
+    expected_active_session_id: expectedActiveSessionIdForWrite(sessionId, options),
     client_id: workspaceClientId,
     client_version: workspaceSaveVersion,
     replay: {
@@ -3057,11 +3059,29 @@ function scheduleWsTranscriptWorkspaceSave() {
   }, delay);
 }
 
+function isActiveSessionChangedConflict(latest) {
+  return latest && typeof latest === "object" && latest.error === "active session changed";
+}
+
+function clearBypassableWorkspaceConflict(options = {}) {
+  if (
+    workspaceSaveConflictPending
+    && options.bypassExpectedActiveSessionGuard
+    && isActiveSessionChangedConflict(workspaceSaveConflictLatest)
+  ) {
+    workspaceSaveConflictPending = false;
+    workspaceSaveConflictLatest = null;
+    workspaceSaveDirty = true;
+    return true;
+  }
+  return false;
+}
+
 async function flushQueuedWorkspaceStateSave(options = {}) {
   if (!state.activeSession) {
     return;
   }
-  if (workspaceSaveConflictPending) {
+  if (workspaceSaveConflictPending && !clearBypassableWorkspaceConflict(options)) {
     return;
   }
   if (workspaceSaveLoopPromise) {
@@ -3095,6 +3115,7 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
         throw error;
       }
       workspaceSaveConflictPending = true;
+      workspaceSaveConflictLatest = error.latest || null;
       workspaceSaveDirty = true;
       window.clearTimeout(workspaceSaveTimer);
       workspaceSaveTimer = null;
@@ -3111,6 +3132,7 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
       workspaceSaveDirty = true;
     }
     workspaceSaveConflictPending = false;
+    workspaceSaveConflictLatest = null;
   }
 }
 
@@ -3148,6 +3170,7 @@ async function saveWorkspaceState(snapshot = null, options = {}) {
   state.workspaceRevision = Number.isFinite(saved?.revision) ? saved.revision : state.workspaceRevision;
   workspaceSaveCommittedSnapshot = cloneWorkspaceSnapshotForBaseline(snapshot);
   workspaceSaveConflictPending = false;
+  workspaceSaveConflictLatest = null;
 }
 
 class WorkspaceStateConflictError extends Error {
@@ -3183,7 +3206,7 @@ async function flushWorkspaceState(options = {}) {
   if (!state.activeSession || (!hasQueuedChanges && !hasInFlightSave && !hasPendingConflict)) {
     return;
   }
-  if (hasPendingConflict) {
+  if (hasPendingConflict && !clearBypassableWorkspaceConflict(options)) {
     throw new WorkspaceStateConflictError(null);
   }
   if (hasQueuedChanges) {
@@ -3191,6 +3214,11 @@ async function flushWorkspaceState(options = {}) {
     workspaceSaveVersion += 1;
   }
   await flushQueuedWorkspaceStateSave(options);
+  if (workspaceSaveConflictPending) {
+    if (clearBypassableWorkspaceConflict(options)) {
+      await flushQueuedWorkspaceStateSave(options);
+    }
+  }
   if (workspaceSaveConflictPending) {
     throw new WorkspaceStateConflictError(null);
   }
@@ -3887,6 +3915,7 @@ function hasPendingWorkspaceStateSave() {
 }
 
 async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
+  const sessionId = options.sessionId || null;
   const tabs = (state.replayTabs || []).filter((tab) => (
     tab
     && tab.type === "websocket"
@@ -3897,6 +3926,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
     markDisconnected: true,
     removeBackend: tab.wsStatus === "connecting",
     bypassExpectedActiveSessionGuard: !!options.bypassExpectedActiveSessionGuard,
+    sessionId,
   })));
   for (const result of results) {
     if (result.status === "rejected") {
@@ -3922,6 +3952,7 @@ function resetSessionScopedUiState() {
   workspaceSaveLastSnapshot = null;
   workspaceSaveCommittedSnapshot = null;
   workspaceSaveConflictPending = false;
+  workspaceSaveConflictLatest = null;
   clearHistoryBackfill();
   window.clearTimeout(_incrementalTimer);
   _incrementalTimer = 0;
@@ -4092,10 +4123,18 @@ async function reloadSessionWorkspace({ cleanupBeforeReset = true } = {}) {
 }
 
 async function handleExternalSessionChanged() {
-  const staleSessionWriteOptions = { bypassExpectedActiveSessionGuard: true };
+  const staleSessionWriteOptions = {
+    bypassExpectedActiveSessionGuard: true,
+    sessionId: currentSessionId(),
+  };
   let shouldReload = false;
   try {
-    if (!(await flushSequenceDraft(staleSessionWriteOptions))) {
+    if (!(await flushSequenceDraftBeforeExternalSessionReload(staleSessionWriteOptions))) {
+      showToast(
+        "Session changed before the Sequence draft finished saving. Save or discard the draft before reloading sessions.",
+        "error",
+        7000,
+      );
       return;
     }
   } catch (error) {
@@ -12537,10 +12576,12 @@ async function saveCurrentSequence({
   render = true,
   preserveSelection = false,
   bypassExpectedActiveSessionGuard = false,
+  sessionId: targetSessionId = null,
+  skipPostSaveStateSync = false,
 } = {}) {
   if (!state.editingSequence) return false;
   syncSequenceStepFromDom({ allowInvalidRequests: true });
-  const sessionId = currentSequenceSessionId();
+  const sessionId = targetSessionId || currentSequenceSessionId();
   const savedId = state.editingSequence.id;
   const selectedBeforeSave = state.selectedSequenceId;
   const draftVersion = state.sequenceDraftVersion || 0;
@@ -12554,12 +12595,20 @@ async function saveCurrentSequence({
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!isCurrentSequenceSession(sessionId)) {
+  if (!skipPostSaveStateSync && !isCurrentSequenceSession(sessionId)) {
     return false;
   }
   await requireOkResponse(response, "Failed to save sequence.");
-  if (!isCurrentSequenceSession(sessionId)) {
+  if (!skipPostSaveStateSync && !isCurrentSequenceSession(sessionId)) {
     return false;
+  }
+  if (skipPostSaveStateSync) {
+    if ((state.sequenceDraftVersion || 0) !== draftVersion) {
+      state.sequenceDirty = true;
+      return false;
+    }
+    state.sequenceDirty = false;
+    return true;
   }
   const loaded = await loadSequences({ sessionId });
   if (!loaded) {
@@ -12587,6 +12636,16 @@ async function saveCurrentSequence({
 async function flushSequenceDraft(options = {}) {
   if (!state.sequenceDirty || !state.editingSequence) return true;
   return saveCurrentSequence({ render: false, preserveSelection: true, ...options });
+}
+
+async function flushSequenceDraftBeforeExternalSessionReload(options = {}) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (!state.sequenceDirty || !state.editingSequence) return true;
+    if (await flushSequenceDraft({ ...options, skipPostSaveStateSync: true })) {
+      return true;
+    }
+  }
+  return !state.sequenceDirty || !state.editingSequence;
 }
 
 async function deleteSequence(id) {
@@ -18897,17 +18956,19 @@ async function cleanupWsReplayTab(tab, {
   markDisconnected = false,
   removeBackend = true,
   bypassExpectedActiveSessionGuard = false,
+  sessionId = null,
 } = {}) {
   if (!tab || tab.type !== "websocket") return;
+  const targetSessionId = sessionId || tab.wsSessionId || state.activeSession?.id || null;
   const previousStatus = tab.wsStatus;
   tab.wsLifecycleToken = (tab.wsLifecycleToken || 0) + 1;
   const lifecycleToken = tab.wsLifecycleToken;
   clearWsFrameListRender(tab);
-  await refreshWsReplayFramesOnce(tab, { lifecycleToken });
+  await refreshWsReplayFramesOnce(tab, { lifecycleToken, sessionId: targetSessionId });
   stopWsPoll(tab);
   const disconnectResult = await disconnectWsReplayBackend(tab.id, {
     remove: removeBackend,
-    sessionId: tab.wsSessionId || state.activeSession?.id || null,
+    sessionId: targetSessionId,
     bypassExpectedActiveSessionGuard,
   });
   if (!disconnectResult.ok) {
@@ -18926,7 +18987,7 @@ async function cleanupWsReplayTab(tab, {
     throw new Error(disconnectResult.message || "WebSocket replay disconnect failed.");
   }
   if (!removeBackend) {
-    await refreshWsReplayFramesUntilSettled(tab, { lifecycleToken });
+    await refreshWsReplayFramesUntilSettled(tab, { lifecycleToken, sessionId: targetSessionId });
   }
   if (markDisconnected) {
     tab.wsStatus = "disconnected";
@@ -18944,7 +19005,7 @@ async function refreshWsReplayFramesOnce(tab, options = {}) {
     ? Number(options.lifecycleToken)
     : tab.wsLifecycleToken;
   if (!isWsReplayTabAlive(tab, lifecycleToken)) return false;
-  const rawSessionId = tab.wsSessionId || state.activeSession?.id || "";
+  const rawSessionId = options.sessionId || tab.wsSessionId || state.activeSession?.id || "";
   const sessionId = encodeURIComponent(rawSessionId);
   if (!rawSessionId) return false;
   const sinceIndex = nextWsFrameIndex(tab);
@@ -18978,7 +19039,10 @@ async function refreshWsReplayFramesUntilSettled(tab, options = {}) {
     if (!isWsReplayTabAlive(tab, lifecycleToken)) {
       return sawFrame;
     }
-    const added = await refreshWsReplayFramesOnce(tab, { lifecycleToken });
+    const added = await refreshWsReplayFramesOnce(tab, {
+      lifecycleToken,
+      sessionId: options.sessionId || null,
+    });
     sawFrame = sawFrame || added;
     await new Promise((resolve) => window.setTimeout(resolve, WS_REPLAY_FINAL_POLL_INTERVAL_MS));
   } while (Date.now() - started < WS_REPLAY_FINAL_POLL_TIMEOUT_MS);
@@ -20131,8 +20195,8 @@ async function flushAllPendingAnnotations(options = {}) {
     const idleIds = pendingIds.filter((id) => !inFlight.has(id));
     if (idleIds.length) {
       await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, {
+        ...options,
         throwOnError: true,
-        bypassExpectedActiveSessionGuard: !!options.bypassExpectedActiveSessionGuard,
       })));
     }
     if ((!state._pendingAnnotations || state._pendingAnnotations.size === 0) && (!state._annotationInFlight || state._annotationInFlight.size === 0)) {

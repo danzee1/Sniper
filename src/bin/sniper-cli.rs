@@ -5191,7 +5191,10 @@ mod tests {
         assert!(!color_payload.as_object().unwrap().contains_key("user_note"));
 
         let note_payload = build_annotations_payload(None, Some(None));
-        assert_eq!(note_payload.get("user_note"), Some(&serde_json::json!(null)));
+        assert_eq!(
+            note_payload.get("user_note"),
+            Some(&serde_json::json!(null))
+        );
         assert!(!note_payload.as_object().unwrap().contains_key("color_tag"));
     }
 
@@ -6503,7 +6506,9 @@ mod tests {
             .expect("annotation payload should include client id");
         assert!(client_id.starts_with(&format!("{CLI_WORKSPACE_CLIENT_ID}:")));
         assert_eq!(
-            payload.get("client_version").and_then(|value| value.as_u64()),
+            payload
+                .get("client_version")
+                .and_then(|value| value.as_u64()),
             Some(1)
         );
     }

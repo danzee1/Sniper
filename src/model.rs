@@ -6,6 +6,19 @@ use std::{collections::BTreeMap, io::Read};
 use uuid::Uuid;
 
 const MAX_DECODED_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+const CLI_ANNOTATION_CLIENT_ID_PREFIX: &str = "sniper-cli:";
+
+pub(crate) fn compact_annotation_client_versions_for_insert(
+    versions: &mut BTreeMap<String, u64>,
+    client_id: &str,
+) {
+    if client_id.starts_with(CLI_ANNOTATION_CLIENT_ID_PREFIX) {
+        versions.retain(|stored_client_id, _| {
+            !stored_client_id.starts_with(CLI_ANNOTATION_CLIENT_ID_PREFIX)
+                || stored_client_id == client_id
+        });
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
