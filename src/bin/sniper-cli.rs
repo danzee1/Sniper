@@ -651,6 +651,8 @@ struct WebSocketGetArgs {
     session_id: Option<Uuid>,
     #[arg(long)]
     frame_limit: Option<usize>,
+    #[arg(long)]
+    before_index: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2162,6 +2164,7 @@ async fn handle_websocket(api: ApiClient, command: WebSocketCommand) -> Result<(
                     args.id,
                     session_id,
                     args.frame_limit,
+                    args.before_index,
                 ))
                 .await?;
             print_json(&websocket)
@@ -2838,6 +2841,7 @@ fn websocket_detail_path(
     websocket_id: Uuid,
     session_id: Option<Uuid>,
     frame_limit: Option<usize>,
+    before_index: Option<usize>,
 ) -> String {
     let mut params = Vec::new();
     if let Some(session_id) = session_id {
@@ -2847,6 +2851,9 @@ fn websocket_detail_path(
         "frame_limit".to_string(),
         websocket_detail_frame_limit(frame_limit).to_string(),
     ));
+    if let Some(before_index) = before_index {
+        params.push(("before_index".to_string(), before_index.to_string()));
+    }
     let query = encode_query(params);
     if query.is_empty() {
         format!("/api/websockets/{websocket_id}")
@@ -4782,19 +4789,23 @@ mod tests {
         let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 
         assert_eq!(
-            websocket_detail_path(websocket_id, Some(session_id), Some(0)),
+            websocket_detail_path(websocket_id, Some(session_id), Some(0), None),
             "/api/websockets/11111111-1111-1111-1111-111111111111?session_id=22222222-2222-2222-2222-222222222222&frame_limit=0"
         );
         assert_eq!(
-            websocket_detail_path(websocket_id, None, Some(2)),
+            websocket_detail_path(websocket_id, None, Some(2), Some(1000)),
+            "/api/websockets/11111111-1111-1111-1111-111111111111?frame_limit=2&before_index=1000"
+        );
+        assert_eq!(
+            websocket_detail_path(websocket_id, None, Some(2), None),
             "/api/websockets/11111111-1111-1111-1111-111111111111?frame_limit=2"
         );
         assert_eq!(
-            websocket_detail_path(websocket_id, Some(session_id), None),
+            websocket_detail_path(websocket_id, Some(session_id), None, None),
             "/api/websockets/11111111-1111-1111-1111-111111111111?session_id=22222222-2222-2222-2222-222222222222&frame_limit=1000"
         );
         assert_eq!(
-            websocket_detail_path(websocket_id, None, Some(50_000)),
+            websocket_detail_path(websocket_id, None, Some(50_000), None),
             "/api/websockets/11111111-1111-1111-1111-111111111111?frame_limit=1000"
         );
     }

@@ -96,11 +96,15 @@ impl WebSocketSessionEntry {
     }
 
     fn to_record(&self) -> WebSocketSessionRecord {
-        self.to_record_with_frame_window(None)
+        self.to_record_with_frame_window(None, None)
     }
 
-    fn to_record_with_frame_window(&self, frame_limit: Option<usize>) -> WebSocketSessionRecord {
-        let frames = frame_window(&self.frames, frame_limit);
+    fn to_record_with_frame_window(
+        &self,
+        frame_limit: Option<usize>,
+        before_index: Option<usize>,
+    ) -> WebSocketSessionRecord {
+        let frames = frame_window(&self.frames, frame_limit, before_index);
 
         WebSocketSessionRecord {
             id: self.id,
@@ -345,13 +349,14 @@ impl WebSocketStore {
         &self,
         id: Uuid,
         frame_limit: Option<usize>,
+        before_index: Option<usize>,
     ) -> Option<WebSocketSessionRecord> {
         self.inner
             .read()
             .await
             .sessions
             .get(&id)
-            .map(|session| session.to_record_with_frame_window(frame_limit))
+            .map(|session| session.to_record_with_frame_window(frame_limit, before_index))
     }
 
     pub async fn len(&self) -> usize {
@@ -400,7 +405,7 @@ impl WebSocketStore {
                 closed_remaining -= 1;
                 true
             })
-            .map(|session| session.to_record_with_frame_window(frame_limit))
+            .map(|session| session.to_record_with_frame_window(frame_limit, None))
             .collect()
     }
 
@@ -472,13 +477,20 @@ fn inner_from_records(
 fn frame_window(
     frames: &VecDeque<WebSocketFrameRecord>,
     frame_limit: Option<usize>,
+    before_index: Option<usize>,
 ) -> Vec<WebSocketFrameRecord> {
+    let end = before_index
+        .and_then(|before| {
+            frames
+                .iter()
+                .position(|frame| frame.index >= before)
+                .or(Some(frames.len()))
+        })
+        .unwrap_or(frames.len());
     match frame_limit {
         Some(0) => Vec::new(),
-        Some(limit) if frames.len() > limit => {
-            frames.iter().skip(frames.len() - limit).cloned().collect()
-        }
-        _ => frames.iter().cloned().collect(),
+        Some(limit) if end > limit => frames.iter().take(end).skip(end - limit).cloned().collect(),
+        _ => frames.iter().take(end).cloned().collect(),
     }
 }
 
@@ -1371,7 +1383,7 @@ mod tests {
         let record_id = record.id;
         let store = WebSocketStore::from_sessions(10, 10, vec![record]);
 
-        let detail = store.get_windowed(record_id, Some(2)).await.unwrap();
+        let detail = store.get_windowed(record_id, Some(2), None).await.unwrap();
 
         assert_eq!(
             detail
@@ -1381,6 +1393,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
+
+        let older_detail = store
+            .get_windowed(record_id, Some(2), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            older_detail
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let exhausted_detail = store
+            .get_windowed(record_id, Some(2), Some(0))
+            .await
+            .unwrap();
+        assert!(exhausted_detail.frames.is_empty());
     }
 
     #[tokio::test]

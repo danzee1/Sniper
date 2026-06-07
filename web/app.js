@@ -860,6 +860,7 @@ let annotationSaveVersion = 0;
 let uiSettingsSaveTimer = null;
 let uiSettingsDirty = false;
 let uiSettingsInFlight = false;
+let uiSettingsSavePromise = null;
 let lastUiSettingsPayload = null;
 let proxySettingsSaveInFlight = false;
 let proxySettingsSavePromise = null;
@@ -1239,6 +1240,11 @@ function bindEvents() {
     loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
   });
   els.websocketFramesBody?.addEventListener("click", (event) => {
+    const loadOlderButton = event.target.closest("[data-ws-load-older-frames]");
+    if (loadOlderButton && els.websocketFramesBody.contains(loadOlderButton)) {
+      loadOlderWebsocketFrames().catch((error) => console.error(error));
+      return;
+    }
     const row = event.target.closest(".history-row[data-frame-index]");
     if (!row || !els.websocketFramesBody.contains(row)) {
       return;
@@ -3292,6 +3298,44 @@ function activeAndChangedReplayTabIds(snapshot) {
   return ids;
 }
 
+function replayTabTextSaveShape(tab) {
+  if (!tab || typeof tab !== "object") return null;
+  if (tab.type === "websocket") {
+    return {
+      type: "websocket",
+      ws_headers: normalizedHeaders(tab.ws_headers),
+      ws_handshake_text: tab.ws_handshake_text || "",
+      ws_editor_text: tab.ws_editor_text || "",
+      ws_message_type: normalizeWsMessageType(tab.ws_message_type),
+      ws_editor_body_encoded: !!tab.ws_editor_body_encoded,
+    };
+  }
+  return {
+    type: "http",
+    base_request: tab.base_request || null,
+    request_text: tab.request_text || "",
+    http_version_mode: normalizeReplayHttpVersionMode(tab.http_version_mode),
+  };
+}
+
+function changedReplayTabsIncludeTextChanges(snapshot, tabIds, baselineSnapshot) {
+  if (!(tabIds instanceof Set) || !tabIds.size) return false;
+  const currentById = workspaceReplayTabsById(snapshot);
+  const baselineById = workspaceReplayTabsById(baselineSnapshot);
+  for (const id of tabIds) {
+    const current = currentById.get(id);
+    const baseline = baselineById.get(id);
+    if (!current || !baseline) return true;
+    if (workspaceSnapshotValueChanged(
+      replayTabTextSaveShape(current),
+      replayTabTextSaveShape(baseline),
+    )) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function workspaceUnloadSnapshotPayload(snapshot) {
   if (!snapshot) return null;
   const payload = JSON.stringify(snapshot);
@@ -3450,6 +3494,14 @@ function workspaceUnloadPayload(primarySnapshot) {
   }
   const changedReplayTabIds = activeAndChangedReplayTabIds(primarySnapshot);
   if (changedReplayTabIds.size) {
+    const activeTabId = primarySnapshot?.replay?.active_tab_id || null;
+    const changedIncludesNonActive = Array.from(changedReplayTabIds)
+      .some((id) => id && id !== activeTabId);
+    const changedTextFields = changedReplayTabsIncludeTextChanges(
+      primarySnapshot,
+      changedReplayTabIds,
+      workspaceSaveCommittedSnapshot,
+    );
     const changedTabsSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
       replayTabIdFilter: changedReplayTabIds,
       sourceReplayTabById,
@@ -3466,6 +3518,32 @@ function workspaceUnloadPayload(primarySnapshot) {
     const changedTabsReplayOnlyPayload = workspaceUnloadSnapshotPayload(changedTabsReplayOnlySnapshot);
     if (changedTabsReplayOnlyPayload) {
       return { payload: changedTabsReplayOnlyPayload, endpoint: "/api/workspace-state/keepalive" };
+    }
+    if (!changedTextFields) {
+      const boundedChangedTabsSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+        replayTabIdFilter: changedReplayTabIds,
+        textByteLimit: 8 * 1024,
+        wsTextByteLimit: 8 * 1024,
+        sourceReplayTabById,
+      });
+      const boundedChangedTabsPayload = workspaceUnloadSnapshotPayload(boundedChangedTabsSnapshot);
+      if (boundedChangedTabsPayload) {
+        return { payload: boundedChangedTabsPayload, endpoint: "/api/workspace-state/keepalive" };
+      }
+      const minimalChangedTabsSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
+        replayTabIdFilter: changedReplayTabIds,
+        dropFuzzer: true,
+        textByteLimit: 2 * 1024,
+        wsTextByteLimit: 2 * 1024,
+        sourceReplayTabById,
+      });
+      const minimalChangedTabsPayload = workspaceUnloadSnapshotPayload(minimalChangedTabsSnapshot);
+      if (minimalChangedTabsPayload) {
+        return { payload: minimalChangedTabsPayload, endpoint: "/api/workspace-state/keepalive" };
+      }
+    }
+    if (changedIncludesNonActive) {
+      return null;
     }
   }
   const activeOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
@@ -5232,6 +5310,30 @@ function selectedWebsocketDetailMeetsRefreshTarget(target) {
   return loadedIndex != null && loadedIndex >= targetIndex;
 }
 
+function websocketDetailRequestPath(id, sessionId, options = {}) {
+  const params = new URLSearchParams();
+  params.set("frame_limit", String(WEBSOCKET_DETAIL_FRAME_LIMIT));
+  const beforeIndex = normalizeWebsocketFrameIndex(options.beforeIndex);
+  if (beforeIndex != null) {
+    params.set("before_index", String(beforeIndex));
+  }
+  return sessionQueryPath(
+    `/api/websockets/${encodeURIComponent(id)}?${params.toString()}`,
+    sessionId,
+  );
+}
+
+function mergeWebsocketFrameWindows(currentFrames, incomingFrames) {
+  const mergedByIndex = new Map();
+  for (const frame of normalizeWebsocketFrames(currentFrames)) {
+    mergedByIndex.set(frame.index, frame);
+  }
+  for (const frame of normalizeWebsocketFrames(incomingFrames)) {
+    mergedByIndex.set(frame.index, frame);
+  }
+  return Array.from(mergedByIndex.values()).sort((left, right) => left.index - right.index);
+}
+
 async function loadWebsocketDetail(id, options = {}) {
   const force = Boolean(options.force);
   const sessionId = currentSessionId();
@@ -5254,10 +5356,7 @@ async function loadWebsocketDetail(id, options = {}) {
   }
 
   const pending = (async () => {
-    const detailPath = sessionQueryPath(
-      `/api/websockets/${encodeURIComponent(id)}?frame_limit=${WEBSOCKET_DETAIL_FRAME_LIMIT}`,
-      sessionId,
-    );
+    const detailPath = websocketDetailRequestPath(id, sessionId);
     const response = await fetch(detailPath);
     if (sessionId !== currentSessionId()) {
       return;
@@ -5303,24 +5402,39 @@ async function loadWebsocketDetail(id, options = {}) {
       return;
     }
     const summary = state.websocketSessions.find((item) => item.id === id);
-    const loadedLastFrameIndex = Array.isArray(detail.frames) && detail.frames.length
-      ? Number(detail.frames[detail.frames.length - 1]?.index)
+    const previousFrames = state.selectedWebsocketRecord?.id === id
+      ? state.selectedWebsocketRecord.frames
+      : [];
+    const mergedFrames = mergeWebsocketFrameWindows(previousFrames, detail.frames);
+    const loadedFirstFrameIndex = mergedFrames.length
+      ? Number(mergedFrames[0]?.index)
+      : null;
+    const loadedLastFrameIndex = mergedFrames.length
+      ? Number(mergedFrames[mergedFrames.length - 1]?.index)
       : null;
     state.selectedWebsocketRecord = {
       ...detail,
+      frames: mergedFrames,
       frame_count: Number.isFinite(Number(summary?.frame_count))
         ? Number(summary.frame_count)
-        : (Array.isArray(detail.frames) ? detail.frames.length : 0),
+        : mergedFrames.length,
       last_frame_index: Number.isFinite(Number(summary?.last_frame_index))
         ? Number(summary.last_frame_index)
         : loadedLastFrameIndex,
+      loaded_first_frame_index: Number.isFinite(loadedFirstFrameIndex)
+        ? loadedFirstFrameIndex
+        : null,
       loaded_last_frame_index: Number.isFinite(loadedLastFrameIndex)
         ? loadedLastFrameIndex
         : null,
       note_count: Number.isFinite(Number(summary?.note_count))
         ? Number(summary.note_count)
         : (Array.isArray(detail.notes) ? detail.notes.length : 0),
-      frames_truncated: websocketFramesAreTruncated(detail.frames, summary),
+      frames_truncated: websocketFramesAreTruncated(mergedFrames, summary),
+      older_frames_loading: false,
+      older_frames_exhausted: Number.isFinite(loadedFirstFrameIndex)
+        ? loadedFirstFrameIndex <= 0 || normalizeWebsocketFrames(detail.frames).length < WEBSOCKET_DETAIL_FRAME_LIMIT
+        : true,
     };
     state.selectedWebsocketDetailError = "";
     renderWebsocketSessions();
@@ -5507,6 +5621,79 @@ function applyWebsocketSummary(summary) {
         deferStaleDetail: true,
       });
     }
+  }
+}
+
+async function loadOlderWebsocketFrames() {
+  const session = state.selectedWebsocketRecord;
+  const id = state.selectedWebsocketId;
+  if (!session || !id || session.id !== id || session.older_frames_loading) {
+    return;
+  }
+  const frames = getWebsocketFrames(session);
+  const firstLoadedFrameIndex = frames.length ? normalizeWebsocketFrameIndex(frames[0]?.index) : null;
+  if (firstLoadedFrameIndex == null || firstLoadedFrameIndex <= 0 || session.older_frames_exhausted) {
+    session.older_frames_exhausted = true;
+    renderWebsocketFrameTable();
+    return;
+  }
+
+  const sessionId = currentSessionId();
+  const generation = _websocketDetailGeneration;
+  const shell = websocketFramesShell();
+  const previousScrollHeight = shell?.scrollHeight || 0;
+  const previousScrollTop = shell?.scrollTop || 0;
+  session.older_frames_loading = true;
+  renderWebsocketFrameTable();
+
+  try {
+    const response = await fetch(websocketDetailRequestPath(id, sessionId, {
+      beforeIndex: firstLoadedFrameIndex,
+    }));
+    if (
+      generation !== _websocketDetailGeneration
+      || sessionId !== currentSessionId()
+      || state.selectedWebsocketId !== id
+    ) {
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(await response.text().catch(() => "Failed to load older WebSocket frames."));
+    }
+    const detail = await response.json();
+    const incomingFrames = normalizeWebsocketFrames(detail.frames)
+      .filter((frame) => frame.index < firstLoadedFrameIndex);
+    const current = state.selectedWebsocketRecord;
+    if (!current || current.id !== id) {
+      return;
+    }
+    current.frames = mergeWebsocketFrameWindows(current.frames, incomingFrames);
+    const mergedFrames = getWebsocketFrames(current);
+    const nextFirstFrameIndex = mergedFrames.length
+      ? normalizeWebsocketFrameIndex(mergedFrames[0]?.index)
+      : null;
+    current.loaded_first_frame_index = nextFirstFrameIndex;
+    current.loaded_last_frame_index = mergedFrames.length
+      ? normalizeWebsocketFrameIndex(mergedFrames[mergedFrames.length - 1]?.index)
+      : null;
+    current.older_frames_exhausted = incomingFrames.length < WEBSOCKET_DETAIL_FRAME_LIMIT
+      || nextFirstFrameIndex == null
+      || nextFirstFrameIndex <= 0;
+    current.frames_truncated = websocketFramesAreTruncated(current.frames, current);
+    current.older_frames_loading = false;
+    renderWebsocketSessions();
+    if (shell) {
+      const nextScrollHeight = shell.scrollHeight || 0;
+      shell.scrollTop = previousScrollTop + Math.max(0, nextScrollHeight - previousScrollHeight);
+    }
+  } catch (error) {
+    const current = state.selectedWebsocketRecord;
+    if (current?.id === id) {
+      current.older_frames_loading = false;
+      renderWebsocketFrameTable();
+    }
+    console.error("Failed to load older WebSocket frames:", error);
+    showToast(error?.message || "Failed to load older WebSocket frames.", "error");
   }
 }
 
@@ -9737,6 +9924,8 @@ function renderWebsocketFrameTable() {
   const olderFrameCount = Number.isFinite(firstLoadedFrameIndex)
     ? Math.max(0, firstLoadedFrameIndex)
     : Math.max(0, fullFrameCount - frames.length);
+  const canLoadOlderFrames = olderFrameCount > 0 && !session.older_frames_exhausted;
+  const olderFramesLoading = !!session.older_frames_loading;
   const framePositions = new Map(frames.map((frame, index) => {
     const frameIndex = Number(frame.index);
     return [
@@ -9747,7 +9936,12 @@ function renderWebsocketFrameTable() {
   const frameWindowNotice = (session.frames_truncated || olderFrameCount > 0) && olderFrameCount > 0
     ? `
           <tr class="ws-frame-window-row">
-            <td colspan="5">Showing latest ${frames.length} frames (${olderFrameCount} older not loaded).</td>
+            <td colspan="5">
+              Showing ${frames.length} loaded frame(s) (${olderFrameCount} older not loaded).
+              ${canLoadOlderFrames
+                ? `<button type="button" class="link-button${olderFramesLoading ? " disabled" : ""}" data-ws-load-older-frames ${olderFramesLoading ? "disabled" : ""}>${olderFramesLoading ? "Loading..." : "Load older frames"}</button>`
+                : ""}
+            </td>
           </tr>`
     : "";
   const frameTopSpacer = frameWindow.topPadding > 0
@@ -15037,30 +15231,40 @@ function scheduleUiSettingsSave(delay = 180) {
 }
 
 async function persistUiSettings() {
-  if (uiSettingsInFlight) {
-    return;
+  if (uiSettingsSavePromise) {
+    return uiSettingsSavePromise;
   }
-  uiSettingsInFlight = true;
-  try {
-    while (uiSettingsDirty) {
-      uiSettingsDirty = false;
-      const payload = nextUiSettingsPayload();
-      lastUiSettingsPayload = payload;
-      const response = await fetch("/api/ui-settings", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: payload,
-      });
+  const savePromise = (async () => {
+    uiSettingsInFlight = true;
+    try {
+      while (uiSettingsDirty) {
+        uiSettingsDirty = false;
+        const payload = nextUiSettingsPayload();
+        lastUiSettingsPayload = payload;
+        const response = await fetch("/api/ui-settings", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: payload,
+        });
 
-      if (!response.ok) {
-        uiSettingsDirty = true;
-        throw new Error(await response.text());
+        if (!response.ok) {
+          uiSettingsDirty = true;
+          throw new Error(await response.text());
+        }
       }
+    } finally {
+      uiSettingsInFlight = false;
     }
+  })();
+  uiSettingsSavePromise = savePromise;
+  try {
+    return await savePromise;
   } finally {
-    uiSettingsInFlight = false;
+    if (uiSettingsSavePromise === savePromise) {
+      uiSettingsSavePromise = null;
+    }
   }
 }
 

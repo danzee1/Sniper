@@ -1949,6 +1949,7 @@ struct WebSocketQuery {
     offset: Option<usize>,
     after_id: Option<Uuid>,
     frame_limit: Option<usize>,
+    before_index: Option<usize>,
     sort_key: Option<String>,
     sort_direction: Option<String>,
     in_scope_only: Option<bool>,
@@ -4554,7 +4555,11 @@ async fn get_websocket(
         Err(response) => return response,
     };
     let frame_limit = Some(websocket_detail_frame_limit(query.frame_limit));
-    match session.websockets.get_windowed(id, frame_limit).await {
+    match session
+        .websockets
+        .get_windowed(id, frame_limit, query.before_index)
+        .await
+    {
         Some(record) => Json(record).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -12554,6 +12559,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1000, 1001]
         );
+
+        let older_detail_response = super::get_websocket(
+            State(state.clone()),
+            Path(websocket_id.to_string()),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                frame_limit: Some(3),
+                before_index: Some(1000),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(older_detail_response.status(), super::StatusCode::OK);
+        let older_detail: WebSocketSessionRecord = response_json(older_detail_response).await;
+        assert_eq!(
+            older_detail
+                .frames
+                .iter()
+                .map(|frame| frame.index)
+                .collect::<Vec<_>>(),
+            vec![997, 998, 999]
+        );
+
+        let exhausted_older_detail_response = super::get_websocket(
+            State(state.clone()),
+            Path(websocket_id.to_string()),
+            Query(super::WebSocketQuery {
+                session_id: Some(session.id()),
+                frame_limit: Some(3),
+                before_index: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(
+            exhausted_older_detail_response.status(),
+            super::StatusCode::OK
+        );
+        let exhausted_older_detail: WebSocketSessionRecord =
+            response_json(exhausted_older_detail_response).await;
+        assert!(exhausted_older_detail.frames.is_empty());
 
         let empty_detail_response = super::get_websocket(
             State(state.clone()),
