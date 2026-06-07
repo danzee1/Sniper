@@ -2103,11 +2103,9 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             } else {
                 intercept.request
             };
-            let session_id = session_id_for_write_payload(args.session_id);
-            let action_path = write_session_query_path(
-                &format!("/api/intercepts/{}/forward", args.id),
-                args.session_id,
-            );
+            let session_id = read_session_id;
+            let action_path =
+                session_query_path(&format!("/api/intercepts/{}/forward", args.id), session_id);
             api.post_status(&action_path, &InterceptForwardPayload { request })
                 .await?;
             print_json(&InterceptActionResult {
@@ -2185,9 +2183,16 @@ async fn handle_auto_replace(api: ApiClient, command: AutoReplaceCommand) -> Res
                 "failed to parse auto-replace JSON; expected either an array of rules or {\"rules\": [...]}",
             )?;
             let (payload, input_session_id) = match parsed {
-                AutoReplaceInput::Rules(rules) => (MatchReplaceRulesPayload { rules }, None),
+                AutoReplaceInput::Rules(rules) => (
+                    MatchReplaceRulesPayload {
+                        session_id: None,
+                        rules,
+                    },
+                    None,
+                ),
                 AutoReplaceInput::Payload(payload) => (
                     MatchReplaceRulesPayload {
+                        session_id: None,
                         rules: payload.rules,
                     },
                     payload.session_id,
@@ -2231,10 +2236,10 @@ async fn handle_response_intercept(
             } else {
                 item.response
             };
-            let session_id = session_id_for_write_payload(args.session_id);
-            let action_path = write_session_query_path(
+            let session_id = read_session_id;
+            let action_path = session_query_path(
                 &format!("/api/response-intercepts/{}/forward", args.id),
-                args.session_id,
+                session_id,
             );
             api.post_status(&action_path, &ResponseInterceptForwardPayload { response })
                 .await?;

@@ -2003,6 +2003,36 @@ struct SessionScopedQuery {
     session_id: Option<Uuid>,
 }
 
+fn reconcile_write_session_id(
+    query_session_id: Option<Uuid>,
+    body_session_id: Option<Uuid>,
+) -> std::result::Result<(Option<Uuid>, bool), &'static str> {
+    match (query_session_id, body_session_id) {
+        (Some(query_session_id), Some(body_session_id)) if query_session_id != body_session_id => {
+            Err("query session_id conflicts with JSON session_id")
+        }
+        (Some(session_id), _) | (None, Some(session_id)) => Ok((Some(session_id), true)),
+        (None, None) => Ok((None, false)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InterceptRulePayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(flatten)]
+    rule: crate::intercept::InterceptRule,
+}
+
+impl From<crate::intercept::InterceptRule> for InterceptRulePayload {
+    fn from(rule: crate::intercept::InterceptRule) -> Self {
+        Self {
+            session_id: None,
+            rule,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct InterceptForwardPayload {
     request: EditableRequest,
@@ -3200,6 +3230,23 @@ struct FindingsCountResponse {
     count: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct ScannerConfigPayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(flatten)]
+    config: crate::scanner::ScannerConfig,
+}
+
+impl From<crate::scanner::ScannerConfig> for ScannerConfigPayload {
+    fn from(config: crate::scanner::ScannerConfig) -> Self {
+        Self {
+            session_id: None,
+            config,
+        }
+    }
+}
+
 async fn list_findings(
     State(state): State<Arc<AppState>>,
     Query(query): Query<FindingsQuery>,
@@ -3295,23 +3342,28 @@ async fn get_scanner_config(
 async fn update_scanner_config(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
-    Json(config): Json<crate::scanner::ScannerConfig>,
+    Json(payload): Json<ScannerConfigPayload>,
 ) -> Response {
-    if let Err(error) = validate_scanner_config(&config) {
+    if let Err(error) = validate_scanner_config(&payload.config) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.scanner.get_config().await;
-    session.scanner.update_config(config).await;
+    session.scanner.update_config(payload.config).await;
     if let Err(response) = persist_session_mutation_locked_or_response(&state, &session).await {
         session.scanner.update_config(previous).await;
         persist_rolled_back_session_snapshot(&state, &session, "scanner config update").await;
@@ -3378,12 +3430,17 @@ async fn update_match_replace_rules(
     if let Err(error) = validate_match_replace_rules(&payload.rules) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -3789,20 +3846,25 @@ async fn list_intercept_rules(
 async fn upsert_intercept_rule(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
-    Json(rule): Json<crate::intercept::InterceptRule>,
+    Json(payload): Json<InterceptRulePayload>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.intercept_rules.snapshot().await;
-    session.intercept_rules.upsert(rule).await;
+    session.intercept_rules.upsert(payload.rule).await;
     if persist_session_mutation_locked_or_status(&state, &session)
         .await
         .is_err()
@@ -9636,6 +9698,7 @@ mod tests {
                 session_id: Some(inactive_id),
             }),
             Json(MatchReplaceRulesPayload {
+                session_id: None,
                 rules: vec![match_rule.clone()],
             }),
         )
@@ -9655,7 +9718,7 @@ mod tests {
             Query(super::SessionScopedQuery {
                 session_id: Some(inactive_id),
             }),
-            Json(intercept_rule.clone()),
+            Json(super::InterceptRulePayload::from(intercept_rule.clone())),
         )
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -9667,7 +9730,7 @@ mod tests {
             Query(super::SessionScopedQuery {
                 session_id: Some(inactive_id),
             }),
-            Json(scanner_config.clone()),
+            Json(super::ScannerConfigPayload::from(scanner_config.clone())),
         )
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -9770,6 +9833,196 @@ mod tests {
         let reloaded_after_clear = state.sessions.load_context(inactive_id).unwrap();
         assert!(reloaded_after_clear.scanner.list(Some(10)).await.is_empty());
         assert_eq!(active.scanner.list(Some(10)).await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn rule_write_body_session_id_targets_inactive_session_and_rejects_conflicts() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-body-session-rule-write-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let active = state.session().await;
+        let active_id = active.id();
+        let inactive_metadata = state
+            .sessions
+            .create_session(Some("Inactive".to_string()))
+            .unwrap();
+        let inactive = state.sessions.load_context(inactive_metadata.id).unwrap();
+        let inactive_id = inactive.id();
+
+        let match_rule = MatchReplaceRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            description: "body pinned inactive".to_string(),
+            scope: MatchReplaceScope::Request,
+            target: MatchReplaceTarget::Path,
+            search: "/before".to_string(),
+            replace: "/after".to_string(),
+            regex: false,
+            case_sensitive: true,
+        };
+        let response = super::update_match_replace_rules(
+            State(state.clone()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Json(MatchReplaceRulesPayload {
+                session_id: Some(inactive_id),
+                rules: vec![match_rule.clone()],
+            }),
+        )
+        .await;
+        assert!(response.status().is_success());
+        assert!(active.match_replace.snapshot().await.is_empty());
+        let inactive_rules: Vec<MatchReplaceRule> = response_json(
+            super::list_match_replace_rules(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(inactive_rules[0].id, match_rule.id);
+
+        let conflict_response = super::update_match_replace_rules(
+            State(state.clone()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(active_id),
+            }),
+            Json(MatchReplaceRulesPayload {
+                session_id: Some(inactive_id),
+                rules: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(conflict_response.status(), StatusCode::BAD_REQUEST);
+        let inactive_rules_after_conflict: Vec<MatchReplaceRule> = response_json(
+            super::list_match_replace_rules(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(inactive_rules_after_conflict.len(), 1);
+
+        let intercept_rule = InterceptRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            scope: InterceptScope::Both,
+            host_pattern: "inactive.example".to_string(),
+            path_pattern: "/ws".to_string(),
+            method_filter: vec!["GET".to_string()],
+        };
+        let response = super::upsert_intercept_rule(
+            State(state.clone()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Json(super::InterceptRulePayload {
+                session_id: Some(inactive_id),
+                rule: intercept_rule.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(active.intercept_rules.list().await.is_empty());
+        let inactive_intercept_rules: Vec<InterceptRule> = response_json(
+            super::list_intercept_rules(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(inactive_intercept_rules[0].id, intercept_rule.id);
+
+        let conflict_response = super::upsert_intercept_rule(
+            State(state.clone()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(active_id),
+            }),
+            Json(super::InterceptRulePayload {
+                session_id: Some(inactive_id),
+                rule: intercept_rule,
+            }),
+        )
+        .await;
+        assert_eq!(conflict_response.status(), StatusCode::BAD_REQUEST);
+        assert!(active.intercept_rules.list().await.is_empty());
+        let inactive_intercept_rules_after_conflict: Vec<InterceptRule> = response_json(
+            super::list_intercept_rules(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(inactive_intercept_rules_after_conflict.len(), 1);
+
+        let mut scanner_config = inactive.scanner.get_config().await;
+        scanner_config.enabled = false;
+        let response = super::update_scanner_config(
+            State(state.clone()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Json(super::ScannerConfigPayload {
+                session_id: Some(inactive_id),
+                config: scanner_config.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(active.scanner.get_config().await.enabled);
+        let inactive_scanner_config: ScannerConfig = response_json(
+            super::get_scanner_config(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(!inactive_scanner_config.enabled);
+
+        let conflict_response = super::update_scanner_config(
+            State(state.clone()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(active_id),
+            }),
+            Json(super::ScannerConfigPayload {
+                session_id: Some(inactive_id),
+                config: scanner_config,
+            }),
+        )
+        .await;
+        assert_eq!(conflict_response.status(), StatusCode::BAD_REQUEST);
+        assert!(active.scanner.get_config().await.enabled);
+        let inactive_scanner_config_after_conflict: ScannerConfig = response_json(
+            super::get_scanner_config(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(inactive_id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(!inactive_scanner_config_after_conflict.enabled);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -12446,7 +12699,7 @@ mod tests {
         let response = super::update_scanner_config(
             State(state),
             Query(super::SessionScopedQuery { session_id: None }),
-            Json(next_config),
+            Json(super::ScannerConfigPayload::from(next_config)),
         )
         .await;
 
@@ -12487,7 +12740,7 @@ mod tests {
         let response = super::update_scanner_config(
             State(state.clone()),
             Query(super::SessionScopedQuery { session_id: None }),
-            Json(next_config),
+            Json(super::ScannerConfigPayload::from(next_config)),
         )
         .await;
 

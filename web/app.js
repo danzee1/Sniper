@@ -120,6 +120,7 @@ const WEBSOCKET_PAGE_SIZE = 500;
 const WEBSOCKET_MAX_LOADED_SESSIONS = 5000;
 const WEBSOCKET_SCROLL_PREFETCH_PX = 240;
 const WEBSOCKET_QUERY_BACKFILL_DELAY_MS = 100;
+const WEBSOCKET_SUMMARY_EVENT_BATCH_MS = 250;
 const WEBSOCKET_DETAIL_FRAME_LIMIT = 1000;
 const WEBSOCKET_FRAME_ROW_PREVIEW_CHARS = 160;
 const FINDINGS_BADGE_POLL_INTERVAL_MS = 30000;
@@ -354,6 +355,7 @@ const state = {
   selectedRecord: null,
   loadingDetailId: null,
   historyPaging: createHistoryPagingState(),
+  historyListError: "",
   historyDirty: false,
   historyResetScrollOnNextLoad: false,
   sessions: [],
@@ -410,6 +412,7 @@ const state = {
   responseInterceptEditorSeedId: null,
   websocketSessions: [],
   websocketPaging: createWebsocketPagingState(),
+  websocketListError: "",
   websocketHistoryDirty: false,
   websocketQuery: "",
   websocketSortKey: "started_at",
@@ -485,6 +488,8 @@ let _websocketDetailRefreshTimer = null;
 let _websocketDetailRefreshNeeded = null;
 let _websocketSummaryMutationGeneration = 0;
 let _websocketSummaryMutationById = new Map();
+let _websocketSummaryEventBuffer = new Map();
+let _websocketSummaryEventTimer = 0;
 let _websocketVisibleSyncTimer = null;
 let _websocketVisibleSyncEnsureSelected = false;
 let _websocketVisibleSyncDeferStaleDetail = false;
@@ -3352,7 +3357,6 @@ function syncActiveWsReplayDraftFromDom() {
   let changed = false;
   if (els.wsSchemeSelect && els.wsHostInput && els.wsPortInput && els.wsPathInput) {
     const rawPort = els.wsPortInput.value.trim();
-    const normalizedPort = normalizePortValue(rawPort);
     const validation = validateWsReplayTargetInput(
       els.wsSchemeSelect.value,
       els.wsHostInput.value,
@@ -3360,19 +3364,25 @@ function syncActiveWsReplayDraftFromDom() {
       els.wsPathInput.value,
     );
     setWsReplayTargetInputValidity(validation);
-    if (validation.valid && normalizedPort) {
-      const nextScheme = els.wsSchemeSelect.value;
-      const nextHost = els.wsHostInput.value.trim();
+    if (validation.valid) {
+      const normalizedTarget = normalizeWsReplayTargetFields(
+        els.wsSchemeSelect.value,
+        els.wsHostInput.value,
+        rawPort,
+      );
+      const nextScheme = normalizedTarget.scheme;
+      const nextHost = normalizedTarget.host;
+      const nextPort = normalizedTarget.port;
       const nextPath = els.wsPathInput.value.trim();
       if (
         tab.wsScheme !== nextScheme
         || tab.wsHost !== nextHost
-        || tab.wsPort !== normalizedPort
+        || tab.wsPort !== nextPort
         || tab.wsPath !== nextPath
       ) {
         tab.wsScheme = nextScheme;
         tab.wsHost = nextHost;
-        tab.wsPort = normalizedPort;
+        tab.wsPort = nextPort;
         tab.wsPath = nextPath;
         scheduleWorkspaceStateSave();
         changed = true;
@@ -3525,6 +3535,7 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
   return {
     revision: snapshot.revision || 0,
     session_id: snapshot.session_id || null,
+    expected_active_session_id: snapshot.expected_active_session_id || state.activeSession?.id || null,
     client_id: snapshot.client_id || workspaceClientId,
     client_version: snapshot.client_version || workspaceSaveVersion,
     replay: {
@@ -3763,6 +3774,7 @@ function resetSessionScopedUiState() {
   _pendingTransactionSummaries.length = 0;
   state.items = [];
   state.historyPaging = createHistoryPagingState();
+  state.historyListError = "";
   state.selectedId = null;
   state.selectedRecord = null;
   state._connectCount = 0;
@@ -3784,6 +3796,7 @@ function resetSessionScopedUiState() {
   updateInterceptQueueBadges();
   state.websocketSessions = [];
   state.websocketPaging = createWebsocketPagingState();
+  state.websocketListError = "";
   state.selectedWebsocketId = null;
   state.selectedWebsocketRecord = null;
   state.selectedWebsocketDetailError = "";
@@ -3803,6 +3816,11 @@ function resetSessionScopedUiState() {
   _websocketDetailRefreshNeeded = null;
   _websocketSummaryMutationGeneration += 1;
   _websocketSummaryMutationById.clear();
+  if (_websocketSummaryEventTimer) {
+    window.clearTimeout(_websocketSummaryEventTimer);
+    _websocketSummaryEventTimer = 0;
+  }
+  _websocketSummaryEventBuffer.clear();
   _lastWebsocketFallbackPoll = Date.now();
   state.eventLog = [];
   state.matchReplaceRules = [];
@@ -4179,12 +4197,35 @@ async function loadTransactions(preserveSelection = true, options = {}) {
   try {
     const queryState = createHistoryQueryState();
     const querySignature = historyQuerySignature(queryState);
+    const previousQuerySignature = state.historyPaging?.querySignature || "";
+    const queryChanged = Boolean(previousQuerySignature) && previousQuerySignature !== querySignature;
     clearHistoryBackfill();
     state.historyPaging = createHistoryPagingState();
     state.historyPaging.generation = ++_historyPagingGeneration;
     state.historyPaging.querySignature = querySignature;
+    state.historyPaging.loading = true;
+    state.historyListError = "";
     const generation = state.historyPaging.generation;
-    const page = await fetchTransactionPage({ offset: 0, queryState, querySignature });
+    if (options.resetScroll || queryChanged) {
+      clearHttpHistoryLoadedRowsForPendingQuery();
+    }
+    let page;
+    try {
+      page = await fetchTransactionPage({ offset: 0, queryState, querySignature });
+    } catch (error) {
+      if (
+        state.historyPaging.generation === generation
+        && state.historyPaging.querySignature === querySignature
+        && isCurrentHistoryQuerySignature(querySignature)
+      ) {
+        state.historyPaging.loading = false;
+        state.historyPaging.hasMore = false;
+        state.historyPaging.fullyLoaded = true;
+        state.historyListError = error?.message || "Failed to load HTTP History.";
+        clearHttpHistoryLoadedRowsForPendingQuery();
+      }
+      throw error;
+    }
     if (!page) {
       return;
     }
@@ -4201,6 +4242,7 @@ async function loadTransactions(preserveSelection = true, options = {}) {
     applyPendingAnnotationsToItems(freshItems);
     state.items = freshItems;
     state._itemsVersion += 1;
+    state.historyListError = "";
     // Pre-compute search haystacks and CONNECT count to avoid first-search latency
     precomputeItemIndexes();
     updateHistoryPagingCursor(freshItems);
@@ -4208,6 +4250,7 @@ async function loadTransactions(preserveSelection = true, options = {}) {
     state.historyPaging.total = page.total ?? freshItems.length;
     state.historyPaging.filteredTotal = page.filtered_total ?? null;
     state.historyPaging.hiddenConnectTotal = page.hidden_connect_total ?? null;
+    state.historyPaging.loading = false;
     state.historyPaging.hasMore = Boolean(page.has_more);
     state.historyPaging.fullyLoaded = !state.historyPaging.hasMore;
     state.historyDirty = false;
@@ -4703,6 +4746,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
   const requestedAfterId = append && websocketCursorPagingEnabled(queryState)
     ? (options.afterId || websocketAppendAfterId())
     : null;
+  const resetWindow = !append && (options.resetWindow === true || queryChanged);
   if (queryChanged) {
     resetWebsocketHistoryScroll();
   }
@@ -4714,6 +4758,10 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     afterId: requestedAfterId,
     loading: true,
   };
+  state.websocketListError = "";
+  if (resetWindow) {
+    clearWebsocketLoadedSessionsForPendingQuery();
+  }
   try {
     const response = await fetch(sessionQueryPath(
       buildWebsocketsPageUrl({
@@ -4773,15 +4821,27 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
       capReached,
       loading: false,
     };
+    state.websocketListError = "";
     state.websocketHistoryDirty = false;
     await syncVisibleWebsocketSelection(preserveSelection);
   } catch (error) {
-    if (generation === _websocketLoadGeneration && sessionId === currentSessionId()) {
+    if (
+      generation === _websocketLoadGeneration
+      && sessionId === currentSessionId()
+      && querySignature === websocketQuerySignature()
+    ) {
       state.websocketPaging = {
         ...(state.websocketPaging || createWebsocketPagingState()),
         querySignature,
+        hasMore: false,
         loading: false,
       };
+      state.websocketListError = error?.message || "Failed to load WebSocket history.";
+      if (!append) {
+        clearWebsocketLoadedSessionsForPendingQuery();
+      } else {
+        renderWebsocketSessions();
+      }
     }
     throw error;
   }
@@ -4920,6 +4980,12 @@ function clearWebsocketSelectionPreview(options = {}) {
   if (options.render) {
     renderWebsocketSessions();
   }
+}
+
+function clearWebsocketLoadedSessionsForPendingQuery() {
+  state.websocketSessions = [];
+  clearWebsocketSelectionPreview();
+  renderWebsocketSessions();
 }
 
 function resetWebsocketHistoryScroll() {
@@ -5286,7 +5352,19 @@ function websocketServerOrderCanAcceptSummaryEvents() {
     && (state.websocketSortDirection || "desc") === "desc";
 }
 
-function applyWebsocketSummaryEvent(event) {
+function flushWebsocketSummaryEvents() {
+  _websocketSummaryEventTimer = 0;
+  if (!_websocketSummaryEventBuffer.size) {
+    return;
+  }
+  const summaries = Array.from(_websocketSummaryEventBuffer.values());
+  _websocketSummaryEventBuffer.clear();
+  for (const summary of summaries) {
+    applyWebsocketSummary(summary);
+  }
+}
+
+function queueWebsocketSummaryEvent(event) {
   let summary;
   try {
     summary = JSON.parse(event.data);
@@ -5294,6 +5372,18 @@ function applyWebsocketSummaryEvent(event) {
     console.error("invalid websocket event", error);
     return;
   }
+  if (!summary?.id) return;
+  _websocketSummaryEventBuffer.set(summary.id, summary);
+  if (_websocketSummaryEventTimer) {
+    return;
+  }
+  _websocketSummaryEventTimer = window.setTimeout(
+    flushWebsocketSummaryEvents,
+    WEBSOCKET_SUMMARY_EVENT_BATCH_MS,
+  );
+}
+
+function applyWebsocketSummary(summary) {
   if (!summary?.id) return;
   if (!websocketServerOrderCanAcceptSummaryEvents()) {
     scheduleWebsocketPageRefresh();
@@ -5756,7 +5846,7 @@ function connectEvents() {
       return;
     }
     _lastWebsocketFallbackPoll = Date.now();
-    applyWebsocketSummaryEvent(event);
+    queueWebsocketSummaryEvent(event);
   });
 
   eventSource.addEventListener("websockets_gap", () => {
@@ -5823,6 +5913,16 @@ function clearHttpHistorySelectionPreview() {
   state.selectedRecord = null;
   updateHistorySelection(null);
   renderEmptyDetail();
+}
+
+function clearHttpHistoryLoadedRowsForPendingQuery() {
+  state.items = [];
+  state._itemsVersion += 1;
+  state._historyEntries = [];
+  state._connectCount = 0;
+  invalidateVisibleEntriesCache();
+  clearHttpHistorySelectionPreview();
+  renderHistory();
 }
 
 function mergeHistoryItems(items, { prepend = false } = {}) {
@@ -8542,7 +8642,7 @@ function renderHistory() {
   if (!visibleEntries.length) {
     els.historyTableBody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="${state.historyColumnOrder.length}">${historyEmptyMessage(hiddenConnectCount, paging)}</td>
+        <td colspan="${state.historyColumnOrder.length}">${escapeHtml(historyEmptyMessage(hiddenConnectCount, paging))}</td>
       </tr>
     `;
     if (paging.hasMore && !paging.loading && !paging.fullyLoaded) {
@@ -8612,6 +8712,9 @@ function renderHistoryVirtual() {
 }
 
 function historyEmptyMessage(hiddenConnectCount, paging) {
+  if (state.historyListError) {
+    return `HTTP History filter error: ${state.historyListError}`;
+  }
   if (hiddenConnectCount) {
     return "Only CONNECT tunnels were captured, and they are hidden from HTTP history. Trust the Sniper Root CA and retry the HTTPS client if you expect decrypted traffic.";
   }
@@ -9457,15 +9560,19 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
   if (!sortedEntries.length) {
     els.websocketTableBody.innerHTML = `
         <tr class="empty-row">
-          <td colspan="7">${
-            state.websocketSessions.length || websocketFilterIsActive()
+          <td colspan="7">${escapeHtml(
+            state.websocketListError
+              ? `WebSocket history filter error: ${state.websocketListError}`
+              : (state.websocketPaging?.loading
+                ? "Loading WebSocket sessions..."
+                : (state.websocketSessions.length || websocketFilterIsActive()
               ? (websocketFilterIsActive() && state.websocketPaging?.hasMore
                 ? "Loading more matching WebSocket sessions..."
                 : (websocketFilterIsActive() && state.websocketPaging?.capReached
                   ? "WebSocket history cap reached for this filter."
                   : "No WebSocket sessions match the current filter."))
-              : "No WebSocket sessions have been captured yet."
-          }</td>
+              : "No WebSocket sessions have been captured yet."))
+          )}</td>
         </tr>
       `;
     return;
@@ -9854,7 +9961,8 @@ function toggleWebsocketSort(key) {
   }
   scheduleUiSettingsSave();
   clearWebsocketQueryBackfill();
-  loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
+  clearWebsocketSelectionPreview({ render: true });
+  loadWebsocketsPageRefresh(false, { resetWindow: true }).catch((error) => console.error(error));
 }
 
 function updateWebsocketSortIndicators() {
@@ -19017,7 +19125,6 @@ function syncWsReplayPortInput(options = {}) {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return false;
   const rawPort = els.wsPortInput.value.trim();
-  const normalizedPort = normalizePortValue(rawPort);
   const validation = validateWsReplayTargetInput(
     els.wsSchemeSelect.value,
     els.wsHostInput.value,
@@ -19025,20 +19132,34 @@ function syncWsReplayPortInput(options = {}) {
     els.wsPathInput.value,
   );
   setWsReplayTargetInputValidity(validation);
-  if (!validation.valid || !normalizedPort) {
+  if (!validation.valid) {
     if (options.reportValidity) {
       els.wsPortInput.reportValidity();
     }
     return false;
   }
-  if (tab.wsPort !== normalizedPort) {
-    tab.wsPort = normalizedPort;
+  const normalizedTarget = normalizeWsReplayTargetFields(
+    els.wsSchemeSelect.value,
+    els.wsHostInput.value,
+    rawPort,
+  );
+  let changed = false;
+  if (
+    tab.wsScheme !== normalizedTarget.scheme
+    || tab.wsHost !== normalizedTarget.host
+    || tab.wsPort !== normalizedTarget.port
+  ) {
+    tab.wsScheme = normalizedTarget.scheme;
+    tab.wsHost = normalizedTarget.host;
+    tab.wsPort = normalizedTarget.port;
     scheduleWorkspaceStateSave();
+    changed = true;
   }
   if (options.normalizeInput) {
-    els.wsPortInput.value = normalizedPort;
+    els.wsHostInput.value = normalizedTarget.host;
+    els.wsPortInput.value = normalizedTarget.port;
   }
-  return true;
+  return changed;
 }
 
 function bindWsReplayEvents() {
@@ -19073,13 +19194,25 @@ function bindWsReplayEvents() {
   els.wsHostInput.addEventListener("input", () => {
     const tab = getActiveReplayTab();
     if (tab && tab.type === "websocket") {
-      tab.wsHost = els.wsHostInput.value.trim();
-      setWsReplayTargetInputValidity(validateWsReplayTargetInput(
+      const validation = validateWsReplayTargetInput(
         els.wsSchemeSelect.value,
-        tab.wsHost,
+        els.wsHostInput.value,
         els.wsPortInput.value,
         els.wsPathInput.value,
-      ));
+      );
+      setWsReplayTargetInputValidity(validation);
+      if (validation.valid) {
+        const normalizedTarget = normalizeWsReplayTargetFields(
+          els.wsSchemeSelect.value,
+          els.wsHostInput.value,
+          els.wsPortInput.value,
+        );
+        tab.wsScheme = normalizedTarget.scheme;
+        tab.wsHost = normalizedTarget.host;
+        tab.wsPort = normalizedTarget.port;
+      } else {
+        tab.wsHost = els.wsHostInput.value.trim();
+      }
       renderReplayTabs();
       scheduleWorkspaceStateSave();
     }

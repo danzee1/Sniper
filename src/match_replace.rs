@@ -40,6 +40,8 @@ pub struct MatchReplaceRule {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MatchReplaceRulesPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
     pub rules: Vec<MatchReplaceRule>,
 }
 
