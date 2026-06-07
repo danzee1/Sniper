@@ -1685,8 +1685,7 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
 
     // CSP with unsafe-inline or unsafe-eval
     if let Some(csp) = header_value("content-security-policy") {
-        let csp_lower = csp.to_ascii_lowercase();
-        if csp_lower.contains("'unsafe-inline'") {
+        if csp_script_sources_contain(&csp, "'unsafe-inline'") {
             findings.push(make_finding(
                 record,
                 Severity::Medium,
@@ -1696,7 +1695,7 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
                 truncate_evidence(&csp, 120),
             ));
         }
-        if csp_lower.contains("'unsafe-eval'") {
+        if csp_script_sources_contain(&csp, "'unsafe-eval'") {
             findings.push(make_finding(
                 record,
                 Severity::Medium,
@@ -1767,6 +1766,41 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
                 break;
             }
         }
+    }
+}
+
+fn csp_script_sources_contain(csp: &str, token: &str) -> bool {
+    let token = token.to_ascii_lowercase();
+    let mut default_sources: Option<Vec<String>> = None;
+    let mut has_script_directive = false;
+    let mut matched_script_directive = false;
+
+    for directive in csp.split(';') {
+        let mut parts = directive.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
+        let sources = parts.map(str::to_ascii_lowercase).collect::<Vec<String>>();
+        if name == "default-src" {
+            default_sources = Some(sources);
+            continue;
+        }
+        if matches!(
+            name.as_str(),
+            "script-src" | "script-src-elem" | "script-src-attr"
+        ) {
+            has_script_directive = true;
+            matched_script_directive |= sources.iter().any(|source| source == &token);
+        }
+    }
+
+    if has_script_directive {
+        matched_script_directive
+    } else {
+        default_sources
+            .as_deref()
+            .is_some_and(|sources| sources.iter().any(|source| source == &token))
     }
 }
 
@@ -3341,6 +3375,55 @@ mod tests {
                 .iter()
                 .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
             "Should detect CSP unsafe-inline"
+        );
+    }
+
+    #[test]
+    fn csp_unsafe_inline_check_ignores_style_only_directive() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                (
+                    "content-security-policy",
+                    "default-src 'self'; script-src 'self'; style-src 'unsafe-inline' 'unsafe-eval'",
+                ),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|f| {
+                f.category == "misconfig"
+                    && (f.title.contains("unsafe-inline") || f.title.contains("unsafe-eval"))
+            }),
+            "style-only unsafe tokens should not be reported as script CSP risks"
+        );
+    }
+
+    #[test]
+    fn csp_unsafe_inline_uses_default_src_only_without_script_directive() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                (
+                    "content-security-policy",
+                    "default-src 'self' 'unsafe-inline'; style-src 'self'",
+                ),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
+            "default-src should be checked when no script directive is present"
         );
     }
 

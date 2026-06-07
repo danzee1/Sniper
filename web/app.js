@@ -1844,8 +1844,12 @@ function bindEvents() {
     els.oastTableBody.addEventListener("click", (event) => {
       const row = event.target.closest("tr[data-oast-id]");
       if (!row) return;
-      state.selectedOastId = row.dataset.oastId;
-      loadOastDetail(row.dataset.oastId).catch(handleOastActionError);
+      const id = row.dataset.oastId;
+      if (state.selectedOastId !== id) {
+        renderOastDetailLoading();
+      }
+      state.selectedOastId = id;
+      loadOastDetail(id).catch(handleOastActionError);
       renderOastCallbacks();
     });
   }
@@ -7522,6 +7526,11 @@ function updateOastBadge() {
 function clearOastDetail() {
   if (els.oastDetailView) els.oastDetailView.textContent = "Select an OAST callback to view details.";
   if (els.oastDetailTitle) els.oastDetailTitle.textContent = "Select a callback";
+}
+
+function renderOastDetailLoading() {
+  if (els.oastDetailView) els.oastDetailView.textContent = "Loading selected OAST callback...";
+  if (els.oastDetailTitle) els.oastDetailTitle.textContent = "Loading callback";
 }
 
 function resetOastUiState() {

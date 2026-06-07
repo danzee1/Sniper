@@ -484,6 +484,7 @@ struct FuzzerSetTemplateArgs {
 #[command(group(
     ArgGroup::new("payload_source")
         .args(["payloads", "file", "stdin"])
+        .required(true)
         .multiple(false)
 ))]
 struct FuzzerSetPayloadsArgs {
@@ -6276,6 +6277,7 @@ mod tests {
             "payloads.txt",
         ])
         .is_err());
+        assert!(Cli::try_parse_from(["sniper-cli", "fuzzer", "set-payloads"]).is_err());
         assert!(Cli::try_parse_from([
             "sniper-cli",
             "capture",

@@ -1247,7 +1247,7 @@ fn matches_filters(
         return false;
     }
 
-    if filters.only_notes && summary.note_count == 0 && !summary.has_user_note {
+    if filters.only_notes && visible_note_count(summary) == 0 {
         return false;
     }
 
@@ -1323,9 +1323,8 @@ fn sort_filtered_records(records: &mut [&CachedSummary], filters: &ListFilters) 
                 .then_with(|| compare_sequence(left, right))
         }),
         "notes" => records.sort_by(|left, right| {
-            left.summary
-                .note_count
-                .cmp(&right.summary.note_count)
+            visible_note_count(&left.summary)
+                .cmp(&visible_note_count(&right.summary))
                 .then_with(|| compare_sequence(left, right))
         }),
         "tls" => records.sort_by(|left, right| {
@@ -1340,6 +1339,10 @@ fn sort_filtered_records(records: &mut [&CachedSummary], filters: &ListFilters) 
     if !ascending {
         records.reverse();
     }
+}
+
+fn visible_note_count(summary: &TransactionSummary) -> usize {
+    summary.note_count + usize::from(summary.has_user_note)
 }
 
 fn compare_sequence(left: &CachedSummary, right: &CachedSummary) -> std::cmp::Ordering {
@@ -2204,6 +2207,36 @@ mod tests {
         assert!(hosts.contains(&"user-note.local"));
         assert!(hosts.contains(&"internal-note.local"));
         assert!(!hosts.contains(&"plain.local"));
+    }
+
+    #[tokio::test]
+    async fn notes_sort_counts_user_notes() {
+        let mut plain = test_record("plain.local");
+        plain.sequence = 1;
+        let mut user_noted = test_record("user-note.local");
+        user_noted.sequence = 2;
+        user_noted.user_note = Some("manual note".to_string());
+        let mut internal_noted = test_record("internal-note.local");
+        internal_noted.sequence = 3;
+        internal_noted.notes = vec!["scanner note".to_string(), "manual marker".to_string()];
+        let store = TransactionStore::from_records(vec![plain, user_noted, internal_noted]);
+
+        let page = store
+            .list_page(&ListFilters {
+                sort_key: Some("notes".to_string()),
+                sort_direction: Some("desc".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["internal-note.local", "user-note.local", "plain.local"]
+        );
     }
 
     #[tokio::test]
