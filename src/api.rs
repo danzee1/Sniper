@@ -2996,6 +2996,7 @@ async fn guard_ws_replay_connection_owner_operation(
     state: &Arc<AppState>,
     id: Uuid,
     session_id: Uuid,
+    expected_active_session_id: Option<Uuid>,
 ) -> std::result::Result<OwnedMutexGuard<()>, Response> {
     if !state.sessions.contains_session(session_id) {
         return Err(StatusCode::NOT_FOUND.into_response());
@@ -3004,6 +3005,13 @@ async fn guard_ws_replay_connection_owner_operation(
     let guard = operation_lock.lock_owned().await;
     if !state.sessions.contains_session(session_id) {
         return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    if let Some(response) = expected_active_session_conflict_response(
+        state,
+        expected_active_session_id,
+        Some(session_id),
+    ) {
+        return Err(response);
     }
     if state.sessions.active_session_id() != session_id
         && proxy::session_has_active_proxy_work(session_id)
@@ -3024,12 +3032,21 @@ async fn update_runtime_settings(
     Json(update): Json<RuntimeSettingsUpdate>,
 ) -> Response {
     let target_session_id = update.session_id;
+    let expected_active_session_id = update.expected_active_session_id;
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
+    let require_still_active = target_session_id.is_none() || expected_active_session_id.is_some();
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, target_session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, require_still_active).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -3111,9 +3128,19 @@ async fn update_startup_settings(
     State(state): State<Arc<AppState>>,
     Json(update): Json<StartupSettingsUpdate>,
 ) -> Response {
-    let event_session = state.session().await;
+    let expected_active_session_id = update.expected_active_session_id;
+    if let Some(response) =
+        expected_active_session_conflict_response(&state, expected_active_session_id, None)
+    {
+        return response;
+    }
     let _startup_guard = state.startup_settings_lock.lock().await;
     let _rebind_guard = state.proxy_rebind_lock.lock().await;
+    if let Some(response) =
+        expected_active_session_conflict_response(&state, expected_active_session_id, None)
+    {
+        return response;
+    }
     match state.startup.update(update).await {
         Ok(snapshot) => {
             let active_addr = state.get_active_proxy_addr().await;
@@ -3156,9 +3183,10 @@ async fn update_startup_settings(
                 _ => None,
             };
             if let Some((level, title, message)) = rebind_event {
-                let operation_lock = state.session_operation_lock(event_session.id()).await;
-                let _operation_guard = operation_lock.lock().await;
-                if state.sessions.contains_session(event_session.id()) {
+                let event_session = state.session().await;
+                let operation_guard =
+                    guard_session_write_operation(&state, &event_session, true).await;
+                if let Ok(_operation_guard) = operation_guard {
                     let _mutation_guard = event_session.mutation_guard().await;
                     let previous_events = event_session
                         .event_log
@@ -4606,6 +4634,8 @@ fn websocket_detail_frame_limit(frame_limit: Option<usize>) -> usize {
 #[derive(Debug, Deserialize)]
 struct WsReplayConnectPayload {
     session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
     id: Uuid,
     scheme: String,
     host: String,
@@ -4619,11 +4649,24 @@ async fn ws_replay_connect(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<WsReplayConnectPayload>,
 ) -> Response {
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        payload.expected_active_session_id,
+        payload.session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_required_id(&state, payload.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session, false).await {
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        payload.expected_active_session_id.is_some(),
+    )
+    .await
+    {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -4822,6 +4865,8 @@ fn parse_ws_replay_port(port: &str) -> std::result::Result<u16, String> {
 #[derive(Debug, Deserialize)]
 struct WsReplaySendPayload {
     session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
     id: Uuid,
     body: String,
     #[serde(default)]
@@ -4845,11 +4890,17 @@ async fn ws_replay_send(
     let Some(session_id) = payload.session_id else {
         return active_session_conflict_response(&state);
     };
-    let _operation_guard =
-        match guard_ws_replay_connection_owner_operation(&state, payload.id, session_id).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_ws_replay_connection_owner_operation(
+        &state,
+        payload.id,
+        session_id,
+        payload.expected_active_session_id,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let kind = payload.kind.unwrap_or(if payload.binary {
         WsReplaySendKind::Binary
     } else {
@@ -4924,6 +4975,8 @@ fn decode_ws_replay_control_payload(body: &str) -> anyhow::Result<Vec<u8>> {
 #[derive(Debug, Deserialize)]
 struct WsReplayDisconnectPayload {
     session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
     id: Uuid,
     #[serde(default)]
     remove: bool,
@@ -4936,11 +4989,17 @@ async fn ws_replay_disconnect(
     let Some(session_id) = payload.session_id else {
         return active_session_conflict_response(&state);
     };
-    let _operation_guard =
-        match guard_ws_replay_connection_owner_operation(&state, payload.id, session_id).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_ws_replay_connection_owner_operation(
+        &state,
+        payload.id,
+        session_id,
+        payload.expected_active_session_id,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let result = if payload.remove {
         state.ws_replay.remove(payload.id).await;
         Ok(())
@@ -9296,6 +9355,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_update_rejects_stale_expected_active_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-runtime-expected-active-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let response = super::update_runtime_settings(
+            State(state.clone()),
+            Json(RuntimeSettingsUpdate {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+                intercept_enabled: Some(true),
+                ..RuntimeSettingsUpdate::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(!original.runtime.snapshot().await.intercept_enabled);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn explicit_inactive_runtime_update_rechecks_proxy_work_after_lock_wait() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-runtime-proxy-work-race-{}",
@@ -9543,7 +9639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_settings_rebind_event_stays_on_request_start_session() {
+    async fn startup_settings_rebind_event_follows_active_session_after_lock_wait() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-startup-rebind-event-session-{}",
             uuid::Uuid::new_v4()
@@ -9565,6 +9661,7 @@ mod tests {
         let mut update_future = Box::pin(super::update_startup_settings(
             State(state.clone()),
             Json(StartupSettingsUpdate {
+                expected_active_session_id: None,
                 proxy_bind_host: Some("127.0.0.1".to_string()),
                 proxy_port: Some(desired_port),
             }),
@@ -9585,12 +9682,12 @@ mod tests {
         assert_eq!(view["rebound"].as_bool(), Some(true));
 
         let original_events = original.event_log.list(Some(10)).await;
-        assert!(original_events
+        assert!(!original_events
             .iter()
             .any(|entry| entry.title == "Proxy listener rebound"));
         let active = state.session().await;
         assert_eq!(active.id(), next.id);
-        assert!(!active
+        assert!(active
             .event_log
             .list(Some(10))
             .await
@@ -9598,6 +9695,57 @@ mod tests {
             .any(|entry| entry.title == "Proxy listener rebound"));
 
         state.abort_proxy_task().await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_settings_rejects_stale_expected_active_session_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-startup-expected-active-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let reserved_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let desired_port = reserved_listener.local_addr().unwrap().port();
+        drop(reserved_listener);
+
+        let rebind_guard = state.proxy_rebind_lock.lock().await;
+        let mut update_future = Box::pin(super::update_startup_settings(
+            State(state.clone()),
+            Json(StartupSettingsUpdate {
+                expected_active_session_id: Some(original_id),
+                proxy_bind_host: Some("127.0.0.1".to_string()),
+                proxy_port: Some(desired_port),
+            }),
+        ));
+
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut update_future).await;
+        assert!(blocked.is_err());
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        drop(rebind_guard);
+
+        let response = update_future.await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert_ne!(state.startup.snapshot().await.proxy_port, desired_port);
+        assert!(!original
+            .event_log
+            .list(Some(10))
+            .await
+            .iter()
+            .any(|entry| entry.title == "Proxy listener rebound"));
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -11780,6 +11928,7 @@ mod tests {
             State(state),
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 id: Uuid::new_v4(),
                 remove: false,
             }),
@@ -11810,6 +11959,7 @@ mod tests {
             State(state),
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 id: Uuid::new_v4(),
                 remove: true,
             }),
@@ -11848,6 +11998,7 @@ mod tests {
             State(state.clone()),
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(session_id),
+                expected_active_session_id: None,
                 id: connection_id,
                 remove: true,
             }),
@@ -11988,6 +12139,7 @@ mod tests {
             State(state.clone()),
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(original_id),
+                expected_active_session_id: None,
                 id: connection_id,
                 remove: true,
             }),
@@ -12041,6 +12193,7 @@ mod tests {
             State(state.clone()),
             Json(super::WsReplaySendPayload {
                 session_id: Some(original_id),
+                expected_active_session_id: None,
                 id: connection_id,
                 body: "hello".to_string(),
                 binary: false,
@@ -12092,6 +12245,7 @@ mod tests {
             State(state.clone()),
             Json(super::WsReplayConnectPayload {
                 session_id: Some(original_id),
+                expected_active_session_id: None,
                 id: connection_id,
                 scheme: "wss".to_string(),
                 host: "example.test".to_string(),
@@ -12118,6 +12272,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_replay_actions_reject_stale_expected_active_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-expected-active-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let connect_id = Uuid::new_v4();
+        let response = super::ws_replay_connect(
+            State(state.clone()),
+            Json(super::WsReplayConnectPayload {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+                id: connect_id,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                port: 443,
+                path: "/socket".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(connect_id).await.is_none());
+
+        let send_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(send_id, original_id)
+            .await;
+        let response = super::ws_replay_send(
+            State(state.clone()),
+            Json(super::WsReplaySendPayload {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+                id: send_id,
+                body: "hello".to_string(),
+                binary: false,
+                kind: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(send_id).await.is_some());
+
+        let remove_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(remove_id, original_id)
+            .await;
+        let response = super::ws_replay_disconnect(
+            State(state.clone()),
+            Json(super::WsReplayDisconnectPayload {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+                id: remove_id,
+                remove: true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(remove_id).await.is_some());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn ws_replay_connect_rejects_unknown_session() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-ws-replay-connect-unknown-session-{}",
@@ -12136,6 +12370,7 @@ mod tests {
             State(state),
             Json(super::WsReplayConnectPayload {
                 session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
                 id: Uuid::new_v4(),
                 scheme: "wss".to_string(),
                 host: "example.test".to_string(),
@@ -12169,6 +12404,7 @@ mod tests {
             State(state),
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
                 id: Uuid::new_v4(),
                 remove: true,
             }),

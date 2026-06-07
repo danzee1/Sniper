@@ -122,6 +122,7 @@ const WEBSOCKET_SCROLL_PREFETCH_PX = 240;
 const WEBSOCKET_QUERY_BACKFILL_DELAY_MS = 100;
 const WEBSOCKET_SUMMARY_EVENT_BATCH_MS = 250;
 const WEBSOCKET_DETAIL_FRAME_LIMIT = 1000;
+const WEBSOCKET_MAX_LOADED_FRAMES = 5000;
 const WEBSOCKET_FRAME_ROW_PREVIEW_CHARS = 160;
 const FINDINGS_BADGE_POLL_INTERVAL_MS = 30000;
 const EVENT_LOG_LIMIT = 200;
@@ -1306,7 +1307,11 @@ function bindEvents() {
       const response = await fetch("/api/runtime", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, intercept_scope_only: nextScopeOnly }),
+        body: JSON.stringify({
+          session_id: sessionId,
+          expected_active_session_id: sessionId,
+          intercept_scope_only: nextScopeOnly,
+        }),
       });
       await requireOkResponse(response, "Failed to update intercept scope.");
       const runtime = await response.json();
@@ -2874,6 +2879,85 @@ function snapshotWorkspaceState(options = {}) {
       ? Math.max(0, options.wsBodyByteLimit)
       : WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES,
   };
+  const replayTabs = Array.isArray(state.replayTabs) ? state.replayTabs : [];
+  const replayTabSnapshots = new Map();
+  const snapshotReplayTab = (tab) => {
+    if (tab.type === "websocket") {
+      const wsFramesSnapshot = snapshotWsReplayFrames(tab, wsFrameBudget);
+      const wsFrames = wsFramesSnapshot.frames;
+      const wsSetupQueueSnapshot = limitWsSetupQueueItems(
+        Array.isArray(tab.wsSetupQueue)
+          ? tab.wsSetupQueue.map((item) => normalizeWsSetupItem(item))
+          : [],
+      );
+      return {
+        id: tab.id,
+        type: "websocket",
+        sequence: tab.sequence,
+        custom_label: tab.customLabel || "",
+        pinned: !!tab.pinned,
+        ws_scheme: tab.wsScheme || "wss",
+        ws_host: tab.wsHost || "",
+        ws_port: tab.wsPort || defaultWsPortForScheme(tab.wsScheme),
+        ws_path: tab.wsPath || "/",
+        ws_headers: normalizedHeaders(tab.wsHeaders),
+        ws_handshake_text: tab.wsHandshakeText || "",
+        ws_handshake_edited: !!tab.wsHandshakeEdited,
+        ws_editor_text: tab.wsEditorText || "",
+        ws_message_type: normalizeWsMessageType(tab.wsMessageType),
+        ws_editor_body_encoded: !!tab.wsEditorBodyEncoded,
+        ws_setup_notice: appendWsSetupNotice(tab.wsSetupNotice || "", wsSetupQueueSnapshot.notice),
+        ws_setup_queue: wsSetupQueueSnapshot.items.map((item) => ({
+          label: item.label || "",
+          body: item.body || "",
+          kind: normalizeWsMessageType(item.kind),
+          body_encoded: !!item.bodyEncoded,
+          autoSend: !!item.autoSend,
+        })),
+        ws_frames: wsFrames,
+        ws_frames_truncated: !!tab.wsFramesTruncated || wsFramesSnapshot.truncated,
+        ws_selected_frame_index: snapshotWsReplaySelectedFrameIndex(tab, wsFrames),
+        ws_frame_window_start: snapshotWsReplayFrameWindowStart(tab, wsFrames),
+      };
+    }
+    const historyEntries = Array.isArray(tab.historyEntries)
+      ? tab.historyEntries.filter((entry) => entry && typeof entry === "object")
+      : [];
+    return {
+      id: tab.id,
+      sequence: tab.sequence,
+      custom_label: tab.customLabel || "",
+      pinned: !!tab.pinned,
+      base_request: tab.baseRequest ? cloneEditableRequest(tab.baseRequest) : null,
+      source_transaction_id: tab.sourceTransactionId || null,
+      notice: tab.notice || "",
+      request_text: tab.requestText || "",
+      http_version_mode: normalizeReplayHttpVersionMode(tab.httpVersionMode),
+      response_record: tab.responseRecord || null,
+      target_scheme: tab.targetScheme || "https",
+      target_host: tab.targetHost || "",
+      target_port: normalizePortValue(tab.targetPort),
+      target_manually_edited: !!tab.targetManuallyEdited,
+      history_entries: historyEntries.map((entry) => ({
+        request: cloneEditableRequest(entry.request),
+        request_text: entry.requestText || "",
+        http_version_mode: normalizeReplayHttpVersionMode(entry.httpVersionMode),
+        response_record: entry.responseRecord || null,
+        notice: entry.notice || "",
+        target_scheme: entry.targetScheme || "https",
+        target_host: entry.targetHost || "",
+        target_port: normalizePortValue(entry.targetPort),
+      })),
+      history_index: normalizeRepeaterHistoryIndex(tab.historyIndex, historyEntries.length),
+    };
+  };
+  const activeReplayTab = replayTabs.find((tab) => tab.id === state.activeReplayTabId) || null;
+  const snapshotOrder = activeReplayTab
+    ? [activeReplayTab, ...replayTabs.filter((tab) => tab !== activeReplayTab)]
+    : replayTabs;
+  for (const tab of snapshotOrder) {
+    replayTabSnapshots.set(tab.id, snapshotReplayTab(tab));
+  }
   return {
     revision: state.workspaceRevision || 0,
     session_id: state.activeSession?.id || null,
@@ -2881,76 +2965,7 @@ function snapshotWorkspaceState(options = {}) {
     client_id: workspaceClientId,
     client_version: workspaceSaveVersion,
     replay: {
-      tabs: state.replayTabs.map((tab) => {
-        if (tab.type === "websocket") {
-          const wsFramesSnapshot = snapshotWsReplayFrames(tab, wsFrameBudget);
-          const wsFrames = wsFramesSnapshot.frames;
-          const wsSetupQueueSnapshot = limitWsSetupQueueItems(
-            Array.isArray(tab.wsSetupQueue)
-              ? tab.wsSetupQueue.map((item) => normalizeWsSetupItem(item))
-              : [],
-          );
-          return {
-            id: tab.id,
-            type: "websocket",
-            sequence: tab.sequence,
-            custom_label: tab.customLabel || "",
-            pinned: !!tab.pinned,
-            ws_scheme: tab.wsScheme || "wss",
-            ws_host: tab.wsHost || "",
-            ws_port: tab.wsPort || defaultWsPortForScheme(tab.wsScheme),
-            ws_path: tab.wsPath || "/",
-            ws_headers: normalizedHeaders(tab.wsHeaders),
-            ws_handshake_text: tab.wsHandshakeText || "",
-            ws_handshake_edited: !!tab.wsHandshakeEdited,
-            ws_editor_text: tab.wsEditorText || "",
-            ws_message_type: normalizeWsMessageType(tab.wsMessageType),
-            ws_editor_body_encoded: !!tab.wsEditorBodyEncoded,
-            ws_setup_notice: appendWsSetupNotice(tab.wsSetupNotice || "", wsSetupQueueSnapshot.notice),
-            ws_setup_queue: wsSetupQueueSnapshot.items.map((item) => ({
-              label: item.label || "",
-              body: item.body || "",
-              kind: normalizeWsMessageType(item.kind),
-              body_encoded: !!item.bodyEncoded,
-              autoSend: !!item.autoSend,
-            })),
-            ws_frames: wsFrames,
-            ws_frames_truncated: !!tab.wsFramesTruncated || wsFramesSnapshot.truncated,
-            ws_selected_frame_index: snapshotWsReplaySelectedFrameIndex(tab, wsFrames),
-            ws_frame_window_start: snapshotWsReplayFrameWindowStart(tab, wsFrames),
-          };
-        }
-        const historyEntries = Array.isArray(tab.historyEntries)
-          ? tab.historyEntries.filter((entry) => entry && typeof entry === "object")
-          : [];
-        return {
-          id: tab.id,
-          sequence: tab.sequence,
-          custom_label: tab.customLabel || "",
-          pinned: !!tab.pinned,
-          base_request: tab.baseRequest ? cloneEditableRequest(tab.baseRequest) : null,
-          source_transaction_id: tab.sourceTransactionId || null,
-          notice: tab.notice || "",
-          request_text: tab.requestText || "",
-          http_version_mode: normalizeReplayHttpVersionMode(tab.httpVersionMode),
-          response_record: tab.responseRecord || null,
-          target_scheme: tab.targetScheme || "https",
-          target_host: tab.targetHost || "",
-          target_port: normalizePortValue(tab.targetPort),
-          target_manually_edited: !!tab.targetManuallyEdited,
-          history_entries: historyEntries.map((entry) => ({
-            request: cloneEditableRequest(entry.request),
-            request_text: entry.requestText || "",
-            http_version_mode: normalizeReplayHttpVersionMode(entry.httpVersionMode),
-            response_record: entry.responseRecord || null,
-            notice: entry.notice || "",
-            target_scheme: entry.targetScheme || "https",
-            target_host: entry.targetHost || "",
-            target_port: normalizePortValue(entry.targetPort),
-          })),
-          history_index: normalizeRepeaterHistoryIndex(tab.historyIndex, historyEntries.length),
-        };
-      }),
+      tabs: replayTabs.map((tab) => replayTabSnapshots.get(tab.id)),
       active_tab_id: state.activeReplayTabId,
       tab_sequence: state.replayTabSequence,
     },
@@ -3805,7 +3820,12 @@ function disconnectWsReplayTabsOnUnload() {
     if (!tab || tab.type !== "websocket") continue;
     if (tab.wsStatus !== "connected" && tab.wsStatus !== "connecting") continue;
     const sessionId = tab.wsSessionId || activeSessionId;
-    const payload = JSON.stringify({ session_id: sessionId, id: tab.id, remove: false });
+    const payload = JSON.stringify({
+      session_id: sessionId,
+      expected_active_session_id: sessionId,
+      id: tab.id,
+      remove: false,
+    });
     if (utf8ByteLength(payload) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
     fetch("/api/replay/ws-disconnect", {
       method: "POST",
@@ -5350,7 +5370,45 @@ function websocketDetailRequestPath(id, sessionId, options = {}) {
   );
 }
 
-function mergeWebsocketFrameWindows(currentFrames, incomingFrames) {
+function capWebsocketFrameWindow(frames, options = {}) {
+  const normalizedFrames = Array.isArray(frames) ? frames : [];
+  if (normalizedFrames.length <= WEBSOCKET_MAX_LOADED_FRAMES) {
+    return normalizedFrames;
+  }
+  const capped = options.prefer === "older"
+    ? normalizedFrames.slice(0, WEBSOCKET_MAX_LOADED_FRAMES)
+    : normalizedFrames.slice(normalizedFrames.length - WEBSOCKET_MAX_LOADED_FRAMES);
+  const preserveIndexes = Array.isArray(options.preserveIndexes)
+    ? options.preserveIndexes
+      .map((index) => normalizeWebsocketFrameIndex(index))
+      .filter((index) => index != null)
+    : [];
+  if (!preserveIndexes.length) {
+    return capped;
+  }
+  const cappedIndexes = new Set(capped.map((frame) => normalizeWebsocketFrameIndex(frame?.index)));
+  const replacementOffset = options.prefer === "older" ? capped.length - 1 : 0;
+  let replacementCount = 0;
+  for (const preserveIndex of preserveIndexes) {
+    if (cappedIndexes.has(preserveIndex)) continue;
+    const preservedFrame = normalizedFrames.find(
+      (frame) => normalizeWebsocketFrameIndex(frame?.index) === preserveIndex,
+    );
+    if (!preservedFrame) continue;
+    const replacementIndex = options.prefer === "older"
+      ? replacementOffset - replacementCount
+      : replacementOffset + replacementCount;
+    if (replacementIndex < 0 || replacementIndex >= capped.length) break;
+    const replacedIndex = normalizeWebsocketFrameIndex(capped[replacementIndex]?.index);
+    capped[replacementIndex] = preservedFrame;
+    cappedIndexes.delete(replacedIndex);
+    cappedIndexes.add(preserveIndex);
+    replacementCount += 1;
+  }
+  return capped.sort((left, right) => left.index - right.index);
+}
+
+function mergeWebsocketFrameWindows(currentFrames, incomingFrames, options = {}) {
   const mergedByIndex = new Map();
   for (const frame of normalizeWebsocketFrames(currentFrames)) {
     mergedByIndex.set(frame.index, frame);
@@ -5358,7 +5416,10 @@ function mergeWebsocketFrameWindows(currentFrames, incomingFrames) {
   for (const frame of normalizeWebsocketFrames(incomingFrames)) {
     mergedByIndex.set(frame.index, frame);
   }
-  return Array.from(mergedByIndex.values()).sort((left, right) => left.index - right.index);
+  return capWebsocketFrameWindow(
+    Array.from(mergedByIndex.values()).sort((left, right) => left.index - right.index),
+    options,
+  );
 }
 
 async function loadWebsocketDetail(id, options = {}) {
@@ -5432,7 +5493,10 @@ async function loadWebsocketDetail(id, options = {}) {
     const previousFrames = state.selectedWebsocketRecord?.id === id
       ? state.selectedWebsocketRecord.frames
       : [];
-    const mergedFrames = mergeWebsocketFrameWindows(previousFrames, detail.frames);
+    const mergedFrames = mergeWebsocketFrameWindows(previousFrames, detail.frames, {
+      prefer: "latest",
+      preserveIndexes: [state.selectedFrameIdx],
+    });
     const loadedFirstFrameIndex = mergedFrames.length
       ? Number(mergedFrames[0]?.index)
       : null;
@@ -5712,7 +5776,10 @@ async function loadOlderWebsocketFrames() {
     if (!current || current.id !== id) {
       return;
     }
-    current.frames = mergeWebsocketFrameWindows(current.frames, incomingFrames);
+    current.frames = mergeWebsocketFrameWindows(current.frames, incomingFrames, {
+      prefer: "older",
+      preserveIndexes: [state.selectedFrameIdx],
+    });
     const mergedFrames = getWebsocketFrames(current);
     const nextFirstFrameIndex = mergedFrames.length
       ? normalizeWebsocketFrameIndex(mergedFrames[0]?.index)
@@ -9981,6 +10048,9 @@ function renderWebsocketFrameTable() {
   const olderFrameNotice = [
     loadableOlderFrameCount > 0 ? `${loadableOlderFrameCount} older not loaded` : "",
     discardedOlderFrameCount > 0 ? `${discardedOlderFrameCount} discarded by retention` : "",
+    frames.length >= WEBSOCKET_MAX_LOADED_FRAMES && fullFrameCount > frames.length
+      ? `${WEBSOCKET_MAX_LOADED_FRAMES}-frame browser cache active`
+      : "",
   ].filter(Boolean).join(", ");
   const framePositions = new Map(frames.map((frame, index) => {
     const frameIndex = Number(frame.index);
@@ -12652,7 +12722,11 @@ async function toggleIntercept() {
   fetch("/api/runtime", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, intercept_enabled: desiredInterceptEnabled }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      expected_active_session_id: sessionId,
+      intercept_enabled: desiredInterceptEnabled,
+    }),
   }).then(async (r) => {
     await requireOkResponse(r, "Failed to update intercept mode.");
     return r.json();
@@ -12728,6 +12802,7 @@ async function saveProxySettings() {
   }
   const normalizedBindHost = normalizeIpLiteralForSettings(bindHost);
   const startupUpdate = {
+    expected_active_session_id: sessionId,
     proxy_bind_host: normalizedBindHost,
     proxy_port: proxyPort,
   };
@@ -12749,6 +12824,7 @@ async function saveProxySettings() {
   );
   const runtimeUpdate = {
     session_id: sessionId,
+    expected_active_session_id: sessionId,
     intercept_enabled: els.proxySettingIntercept.checked,
     websocket_capture_enabled: els.proxySettingWebsocketCapture.checked,
     upstream_insecure: els.proxySettingUpstreamInsecure.checked,
@@ -18513,6 +18589,7 @@ async function wsConnect() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: sessionId,
+        expected_active_session_id: sessionId,
         id: tab.id,
         scheme: tab.wsScheme,
         host: tab.wsHost,
@@ -18588,7 +18665,14 @@ async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
         const resp = await fetch("/api/replay/ws-send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: tab.wsSessionId || state.activeSession?.id || null, id: tab.id, body: sendBody, binary: kind !== "text", kind }),
+          body: JSON.stringify({
+            session_id: tab.wsSessionId || state.activeSession?.id || null,
+            expected_active_session_id: tab.wsSessionId || state.activeSession?.id || null,
+            id: tab.id,
+            body: sendBody,
+            binary: kind !== "text",
+            kind,
+          }),
         });
         if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
         if (resp.ok) {
@@ -18658,7 +18742,14 @@ async function wsSend() {
     const resp = await fetch("/api/replay/ws-send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: tab.wsSessionId || state.activeSession?.id || null, id: tab.id, body: sendBody, binary, kind: tab.wsMessageType }),
+      body: JSON.stringify({
+        session_id: tab.wsSessionId || state.activeSession?.id || null,
+        expected_active_session_id: tab.wsSessionId || state.activeSession?.id || null,
+        id: tab.id,
+        body: sendBody,
+        binary,
+        kind: tab.wsMessageType,
+      }),
     });
     if (!resp.ok) {
       const text = await resp.text().catch(() => "Send failed");
@@ -18770,7 +18861,12 @@ async function disconnectWsReplayBackend(id, { remove = false, sessionId = state
     const response = await fetch("/api/replay/ws-disconnect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, id, remove }),
+      body: JSON.stringify({
+        session_id: sessionId,
+        expected_active_session_id: sessionId,
+        id,
+        remove,
+      }),
     });
     if (response.ok || response.status === 404) {
       return { ok: true, message: "" };
@@ -19088,7 +19184,14 @@ function renderWsSetupQueue() {
         const resp = await fetch("/api/replay/ws-send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: tab.wsSessionId || state.activeSession?.id || null, id: tab.id, body: sendBody, binary: kind !== "text", kind }),
+          body: JSON.stringify({
+            session_id: tab.wsSessionId || state.activeSession?.id || null,
+            expected_active_session_id: tab.wsSessionId || state.activeSession?.id || null,
+            id: tab.id,
+            body: sendBody,
+            binary: kind !== "text",
+            kind,
+          }),
         });
         if (!isWsReplayTabAlive(tab, lifecycleToken) || tab.wsStatus !== "connected") return;
         if (!resp.ok) {

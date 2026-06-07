@@ -120,6 +120,8 @@ impl RuntimeSettingsSnapshot {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct RuntimeSettingsUpdate {
     pub session_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub expected_active_session_id: Option<uuid::Uuid>,
     pub intercept_enabled: Option<bool>,
     pub websocket_capture_enabled: Option<bool>,
     pub scope_patterns: Option<Vec<String>>,

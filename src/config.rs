@@ -106,6 +106,8 @@ impl StoredStartupSettingsSnapshot {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct StartupSettingsUpdate {
+    #[serde(default)]
+    pub expected_active_session_id: Option<uuid::Uuid>,
     pub proxy_bind_host: Option<String>,
     pub proxy_port: Option<u16>,
 }
@@ -460,6 +462,7 @@ mod tests {
 
         let snapshot = store
             .update(StartupSettingsUpdate {
+                expected_active_session_id: None,
                 proxy_bind_host: Some("0.0.0.0".to_string()),
                 proxy_port: Some(8081),
             })
