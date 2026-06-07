@@ -73,6 +73,60 @@ fn request_existing_desktop_focus() {
     }
 }
 
+fn should_request_existing_desktop_focus(data_dir: &Path) -> bool {
+    match runtime_state::load_runtime_state(data_dir) {
+        Ok(Some(snapshot)) => {
+            process_path_points_to_desktop_bundle(snapshot.process_path.as_deref())
+        }
+        Ok(None) => false,
+        Err(error) => {
+            warn!(
+                ?error,
+                data_dir = %data_dir.display(),
+                "could not inspect existing Sniper runtime owner"
+            );
+            false
+        }
+    }
+}
+
+fn process_path_points_to_desktop_bundle(process_path: Option<&str>) -> bool {
+    let Some(process_path) = process_path else {
+        return false;
+    };
+    let path = Path::new(process_path);
+    if path.file_name().and_then(|name| name.to_str()) != Some("Sniper") {
+        return false;
+    }
+
+    let mut components = path.components().rev();
+    if components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        != Some("Sniper")
+    {
+        return false;
+    }
+    if components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        != Some("MacOS")
+    {
+        return false;
+    }
+    if components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        != Some("Contents")
+    {
+        return false;
+    }
+    components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        .is_some_and(|bundle| bundle == "Sniper.app")
+}
+
 fn main() -> Result<()> {
     sniper::init_tracing();
     normalize_empty_data_dir_env();
@@ -84,8 +138,14 @@ fn main() -> Result<()> {
             data_dir = %data_dir.display(),
             "another Sniper runtime is already using this data directory"
         );
-        request_existing_desktop_focus();
-        return Ok(());
+        if should_request_existing_desktop_focus(&data_dir) {
+            request_existing_desktop_focus();
+            return Ok(());
+        }
+        anyhow::bail!(
+            "another Sniper runtime is already using data dir {}; stop the existing Sniper CLI/server process or use a different SNIPER_DATA_DIR before launching Sniper.app",
+            data_dir.display()
+        );
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1049,9 +1109,10 @@ mod tests {
         complete_desktop_shutdown, desktop_close_flush_script, desktop_user_event_from_ipc,
         finish_desktop_teardown, handle_navigation_request, handle_new_window_request,
         is_blocked_desktop_navigation_scheme, is_same_origin, load_shell_rc_contents,
-        normalize_empty_data_dir_env, persist_desktop_session_state, shell_single_quote,
-        should_install_cli_path, should_install_cli_path_on_launch,
-        should_install_skills_on_launch, upsert_managed_path_line, write_shell_rc_atomically,
+        normalize_empty_data_dir_env, persist_desktop_session_state,
+        process_path_points_to_desktop_bundle, shell_single_quote, should_install_cli_path,
+        should_install_cli_path_on_launch, should_install_skills_on_launch,
+        should_request_existing_desktop_focus, upsert_managed_path_line, write_shell_rc_atomically,
         AppConfig, AppState, DesktopUserEvent, SNIPER_DATA_DIR_ENV,
     };
     use std::sync::{
@@ -1110,6 +1171,53 @@ mod tests {
         normalize_empty_data_dir_env();
 
         assert!(std::env::var_os(SNIPER_DATA_DIR_ENV).is_none());
+    }
+
+    #[test]
+    fn existing_runtime_focus_requires_desktop_bundle_process_path() {
+        assert!(process_path_points_to_desktop_bundle(Some(
+            "/Applications/Sniper.app/Contents/MacOS/Sniper"
+        )));
+        assert!(process_path_points_to_desktop_bundle(Some(
+            "/Users/test/Desktop/Sniper.app/Contents/MacOS/Sniper"
+        )));
+        assert!(!process_path_points_to_desktop_bundle(Some(
+            "/Applications/Sniper.app/Contents/MacOS/sniper"
+        )));
+        assert!(!process_path_points_to_desktop_bundle(Some(
+            "/Users/test/Desktop/git/Sniper/target/debug/sniper"
+        )));
+        assert!(!process_path_points_to_desktop_bundle(Some(
+            "/Users/test/Desktop/git/Sniper/target/debug/sniper-desktop"
+        )));
+        assert!(!process_path_points_to_desktop_bundle(None));
+    }
+
+    #[test]
+    fn existing_runtime_focus_ignores_headless_runtime_state() {
+        let root = std::env::temp_dir().join(format!(
+            "sniper-desktop-existing-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut snapshot = super::runtime_state::RuntimeStateSnapshot::new(
+            "127.0.0.1:18080".parse().unwrap(),
+            "127.0.0.1:23001".parse().unwrap(),
+        );
+
+        snapshot.process_path = Some("/Applications/Sniper.app/Contents/MacOS/Sniper".to_string());
+        super::runtime_state::persist_runtime_state(&root, &snapshot).unwrap();
+        assert!(should_request_existing_desktop_focus(&root));
+
+        snapshot.process_path = Some("/usr/local/bin/sniper".to_string());
+        super::runtime_state::persist_runtime_state(&root, &snapshot).unwrap();
+        assert!(!should_request_existing_desktop_focus(&root));
+
+        snapshot.process_path = None;
+        super::runtime_state::persist_runtime_state(&root, &snapshot).unwrap();
+        assert!(!should_request_existing_desktop_focus(&root));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
