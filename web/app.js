@@ -3139,6 +3139,20 @@ async function flushWsReplayTabsBeforeClose() {
   }
 }
 
+async function drainWsReplayFramesBeforeHidden() {
+  const tabs = (state.replayTabs || []).filter((tab) => (
+    tab
+    && tab.type === "websocket"
+    && (tab.wsStatus === "connected" || tab.wsStatus === "connecting")
+  ));
+  const results = await Promise.allSettled(tabs.map((tab) => refreshWsReplayFramesOnce(tab)));
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.warn("Failed to drain WebSocket replay frames before page hide:", result.reason);
+    }
+  }
+}
+
 async function flushBeforeNativeClose() {
   await flushAllPendingAnnotations();
   await flushProxySettingsSaveBeforeClose();
@@ -3155,8 +3169,11 @@ window.__sniperFlushBeforeNativeClose = flushBeforeNativeClose;
 
 function flushWorkspaceStateBeforeHidden() {
   if (document.visibilityState !== "hidden") return;
-  if (!hasPendingWorkspaceStateSave()) return;
-  flushWorkspaceState().catch((error) => {
+  (async () => {
+    await drainWsReplayFramesBeforeHidden();
+    if (!hasPendingWorkspaceStateSave()) return;
+    await flushWorkspaceState();
+  })().catch((error) => {
     if (error instanceof WorkspaceStateConflictError) return;
     console.warn("Failed to flush workspace state before page hide:", error);
   });
@@ -3482,6 +3499,27 @@ function hasPendingWorkspaceStateSave() {
   return !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer || workspaceSaveInFlight || workspaceSaveLoopPromise);
 }
 
+async function cleanupWsReplayTabsBeforeStateReset() {
+  const tabs = (state.replayTabs || []).filter((tab) => (
+    tab
+    && tab.type === "websocket"
+    && (tab.wsStatus === "connected" || tab.wsStatus === "connecting")
+  ));
+  if (!tabs.length) return;
+  const results = await Promise.allSettled(tabs.map((tab) => cleanupWsReplayTab(tab, {
+    markDisconnected: true,
+    removeBackend: tab.wsStatus === "connecting",
+  })));
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.warn("Failed to clean up WebSocket replay tab before session reset:", result.reason);
+    }
+  }
+  if (hasPendingWorkspaceStateSave()) {
+    await flushWorkspaceState();
+  }
+}
+
 function resetSessionScopedUiState() {
   clearReplaySendInFlight();
   closeContextMenu();
@@ -3558,9 +3596,6 @@ function resetSessionScopedUiState() {
     closeScannerSettings();
   }
   resetFindingsUiState();
-  state.replayTabs.forEach((tab) => {
-    if (tab.type === "websocket") cleanupWsReplayTab(tab);
-  });
   state.replayTabs = [];
   state.activeReplayTabId = null;
   state.replayTabSequence = 0;
@@ -3624,6 +3659,7 @@ function renderReplayClearedState() {
 }
 
 async function reloadSessionWorkspace() {
+  await cleanupWsReplayTabsBeforeStateReset();
   resetSessionScopedUiState();
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await loadSessions();
@@ -5679,10 +5715,11 @@ async function loadNewerTransactions({ background = false } = {}) {
 
   let shouldRenderAfterLoad = !background;
   const generation = paging.generation;
+  const newerOffset = Math.max(0, paging.trimmedHeadCount - paging.pageSize);
   paging.loading = true;
   if (!background) renderHistory();
   try {
-    const page = await fetchTransactionPage({ offset: 0, queryState, querySignature });
+    const page = await fetchTransactionPage({ offset: newerOffset, queryState, querySignature });
     if (!page) {
       return 0;
     }
@@ -5696,7 +5733,7 @@ async function loadNewerTransactions({ background = false } = {}) {
     }
     const pageItems = jsonArray(page.items);
     const added = mergeHistoryItems(pageItems, { prepend: true });
-    paging.trimmedHeadCount = 0;
+    paging.trimmedHeadCount = Math.max(0, paging.trimmedHeadCount - pageItems.length);
     paging.offset = state.items.length;
     paging.total = page.total ?? paging.total;
     paging.filteredTotal = page.filtered_total ?? paging.filteredTotal;
@@ -17849,12 +17886,28 @@ async function wsDisconnect() {
 
 async function cleanupWsReplayTab(tab, { markDisconnected = false, removeBackend = true } = {}) {
   if (!tab || tab.type !== "websocket") return;
+  const previousStatus = tab.wsStatus;
   tab.wsLifecycleToken = (tab.wsLifecycleToken || 0) + 1;
   const lifecycleToken = tab.wsLifecycleToken;
   clearWsFrameListRender(tab);
   await refreshWsReplayFramesOnce(tab, { lifecycleToken });
   stopWsPoll(tab);
-  await disconnectWsReplayBackend(tab.id, { remove: removeBackend, sessionId: tab.wsSessionId || state.activeSession?.id || null });
+  const disconnectResult = await disconnectWsReplayBackend(tab.id, { remove: removeBackend, sessionId: tab.wsSessionId || state.activeSession?.id || null });
+  if (!disconnectResult.ok) {
+    if (isWsReplayTabAlive(tab, lifecycleToken)) {
+      tab.wsStatus = previousStatus === "connecting" ? "error" : previousStatus;
+      tab.wsError = disconnectResult.message || "WebSocket replay disconnect failed.";
+      if (previousStatus === "connected" || previousStatus === "connecting") {
+        startWsPoll(tab);
+      }
+      scheduleWorkspaceStateSave();
+      if (state.activeReplayTabId === tab.id) {
+        renderWsStatus();
+      }
+      renderReplayTabs();
+    }
+    throw new Error(disconnectResult.message || "WebSocket replay disconnect failed.");
+  }
   if (!removeBackend) {
     await refreshWsReplayFramesUntilSettled(tab, { lifecycleToken });
   }
@@ -17917,13 +17970,24 @@ async function refreshWsReplayFramesUntilSettled(tab, options = {}) {
 
 async function disconnectWsReplayBackend(id, { remove = false, sessionId = state.activeSession?.id || null } = {}) {
   try {
-    await fetch("/api/replay/ws-disconnect", {
+    const response = await fetch("/api/replay/ws-disconnect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: sessionId, id, remove }),
     });
+    if (response.ok || response.status === 404) {
+      return { ok: true, message: "" };
+    }
+    const message = await response.text().catch(() => "");
+    return {
+      ok: false,
+      message: message || `WebSocket replay disconnect failed (${response.status}).`,
+    };
   } catch (e) {
-    // ignore disconnect errors
+    return {
+      ok: false,
+      message: e?.message ? `WebSocket replay disconnect failed: ${e.message}` : "WebSocket replay disconnect failed.",
+    };
   }
 }
 

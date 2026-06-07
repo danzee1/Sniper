@@ -4322,7 +4322,7 @@ fn spawn_persist_task(state: Arc<AppState>, session: Arc<SessionContext>, genera
             let generation = current_persist_generation(session.id()).unwrap_or(generation);
             schedule_delayed_persist(&state, &session, PERSIST_DEBOUNCE, generation);
         } else {
-            forget_persist_context_if_generation(session.id(), generation);
+            forget_persist_context_if_clean(session.id(), generation);
         }
     });
 }
@@ -5789,6 +5789,38 @@ mod tests {
         assert!(session_has_pending_persist(session_id));
         clear_trailing_persist(session_id);
         assert!(!session_has_pending_persist(session_id));
+    }
+
+    #[tokio::test]
+    async fn clean_forget_preserves_dirty_pending_context() {
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: std::env::temp_dir().join(format!(
+                "sniper-proxy-clean-forget-dirty-{}",
+                Uuid::new_v4()
+            )),
+        };
+        let data_dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let generation = remember_persist_context(&session);
+
+        mark_persist_dirty_generation(session_id, generation);
+
+        assert!(!forget_persist_context_if_clean(session_id, generation));
+        assert!(pending_session_context(session_id).is_some());
+        assert!(session_has_pending_persist(session_id));
+
+        assert!(take_persist_dirty_if_generation(session_id, generation));
+        assert!(forget_persist_context_if_clean(session_id, generation));
+        assert!(pending_session_context(session_id).is_none());
+        assert!(!session_has_pending_persist(session_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

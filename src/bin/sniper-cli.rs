@@ -1222,15 +1222,7 @@ async fn post_workspace_state(
     let status = response.status();
     if status == StatusCode::CONFLICT {
         let message = response.text().await.unwrap_or_else(|_| String::new());
-        if let Ok(current) = serde_json::from_str::<WorkspaceStateSnapshot>(&message) {
-            bail!("{}", workspace_conflict_message(&current));
-        }
-        bail!(
-            "request to {} failed ({}): {}",
-            PATH,
-            status,
-            api_failure_detail(status, message)
-        );
+        bail!("{}", workspace_state_conflict_detail(PATH, status, message));
     }
     if !status.is_success() {
         let message = response.text().await.unwrap_or_else(|_| String::new());
@@ -1256,6 +1248,32 @@ fn workspace_conflict_message(current: &WorkspaceStateSnapshot) -> String {
     format!(
         "workspace state revision conflict: current revision {}, session_id {}, client_id {}, client_version {}; reload workspace state and retry",
         current.revision, session, client, current.client_version,
+    )
+}
+
+fn workspace_state_conflict_detail(path: &str, status: StatusCode, message: String) -> String {
+    if let Ok(body) = serde_json::from_str::<StructuredApiErrorBody>(&message) {
+        if body
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty())
+        {
+            return format!(
+                "request to {} failed ({}): {}",
+                path,
+                status,
+                api_failure_detail(status, message)
+            );
+        }
+    }
+    if let Ok(current) = serde_json::from_str::<WorkspaceStateSnapshot>(&message) {
+        return workspace_conflict_message(&current);
+    }
+    format!(
+        "request to {} failed ({}): {}",
+        path,
+        status,
+        api_failure_detail(status, message)
     )
 }
 
@@ -4541,10 +4559,10 @@ mod tests {
         sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
         sync_replay_tab_target_to_request, transaction_detail_path, validate_sniper_settings_probe,
         websocket_detail_path, websocket_list_path, workspace_conflict_message,
-        write_session_query_path, Cli, Command, HistoryCommand, HistoryListArgs,
-        HistoryListResponse, OastConfigureArgs, SequenceCommand, SequenceCreateInput,
-        SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs,
-        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        workspace_state_conflict_detail, write_session_query_path, Cli, Command, HistoryCommand,
+        HistoryListArgs, HistoryListResponse, OastConfigureArgs, SequenceCommand,
+        SequenceCreateInput, SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation,
+        WebSocketListArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
         SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
@@ -6045,6 +6063,25 @@ mod tests {
         assert!(message.contains(&session_id.to_string()));
         assert!(message.contains("client_id browser-client"));
         assert!(message.contains("client_version 77"));
+    }
+
+    #[test]
+    fn cli_workspace_conflict_detail_prefers_structured_errors() {
+        let session_id = uuid::Uuid::new_v4();
+
+        let message = workspace_state_conflict_detail(
+            "/api/workspace-state",
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "active session changed",
+                "session_id": session_id,
+            })
+            .to_string(),
+        );
+
+        assert!(message.contains("active session changed"));
+        assert!(message.contains(&session_id.to_string()));
+        assert!(!message.contains("workspace state revision conflict"));
     }
 
     #[test]
