@@ -1318,6 +1318,17 @@ fn expected_active_session_for_implicit_write(
         .flatten()
 }
 
+async fn runtime_write_session_ids(
+    api: &ApiClient,
+    explicit_session_id: Option<Uuid>,
+) -> Result<(Option<Uuid>, Option<Uuid>)> {
+    if let Some(session_id) = explicit_session_id {
+        return Ok((Some(session_id), None));
+    }
+    let active_session_id = active_session_id(api).await?;
+    Ok((active_session_id, active_session_id))
+}
+
 #[derive(Serialize)]
 struct ScopeOutput {
     scope_patterns: Vec<String>,
@@ -1334,6 +1345,7 @@ struct InterceptActionResult {
 #[derive(Serialize)]
 struct RuntimeUpdatePayload {
     session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
     intercept_enabled: Option<bool>,
     websocket_capture_enabled: Option<bool>,
     scope_patterns: Option<Vec<String>>,
@@ -1702,7 +1714,8 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             })
         }
         TargetCommand::SetScope(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
             let scope_patterns = if args.clear {
                 Vec::new()
             } else {
@@ -1713,6 +1726,7 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
                     "/api/runtime",
                     &RuntimeUpdatePayload {
                         session_id,
+                        expected_active_session_id,
                         intercept_enabled: None,
                         websocket_capture_enabled: None,
                         scope_patterns: Some(scope_patterns),
@@ -2059,12 +2073,14 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
 async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<()> {
     match command {
         InterceptCommand::On(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
                     &RuntimeUpdatePayload {
                         session_id,
+                        expected_active_session_id,
                         intercept_enabled: Some(true),
                         websocket_capture_enabled: None,
                         scope_patterns: None,
@@ -2074,12 +2090,14 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             print_json_with_session(&runtime, session_id)
         }
         InterceptCommand::Off(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
                     &RuntimeUpdatePayload {
                         session_id,
+                        expected_active_session_id,
                         intercept_enabled: Some(false),
                         websocket_capture_enabled: None,
                         scope_patterns: None,
@@ -2109,7 +2127,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             let session_id = read_session_id;
             let action_path = write_session_query_path(
                 &format!("/api/intercepts/{}/forward", args.id),
-                args.session_id,
+                read_session_id,
             );
             api.post_status(&action_path, &InterceptForwardPayload { request })
                 .await?;
@@ -2245,7 +2263,7 @@ async fn handle_response_intercept(
             let session_id = read_session_id;
             let action_path = write_session_query_path(
                 &format!("/api/response-intercepts/{}/forward", args.id),
-                args.session_id,
+                read_session_id,
             );
             api.post_status(&action_path, &ResponseInterceptForwardPayload { response })
                 .await?;
@@ -2475,18 +2493,20 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             print_json(&serde_json::json!({"status": "cleared", "session_id": session_id}))
         }
         OastCommand::Configure(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
             if args.provider.as_deref() == Some("boast") && args.token.is_some() {
                 bail!("BOAST provider does not use an OAST token");
             }
-            let update = build_oast_configure_update(&args, session_id);
-            if update.len() == usize::from(session_id.is_some()) {
+            let update = build_oast_configure_update(&args, session_id, expected_active_session_id);
+            let identity_field_count = usize::from(session_id.is_some())
+                + usize::from(expected_active_session_id.is_some());
+            if update.len() == identity_field_count {
                 // Just show current settings
-                let read_session_id = resolve_session_id_arg(&api, args.session_id).await?;
-                let path = session_query_path("/api/runtime", read_session_id);
+                let path = session_query_path("/api/runtime", session_id);
                 let runtime: serde_json::Value = api.get_json(&path).await?;
                 let mut output = Value::Object(oast_fields_for_output(runtime));
-                attach_session_id(&mut output, read_session_id);
+                attach_session_id(&mut output, session_id);
                 print_json(&output)
             } else {
                 let result: serde_json::Value = api
@@ -2503,10 +2523,17 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
 fn build_oast_configure_update(
     args: &OastConfigureArgs,
     session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut update = serde_json::Map::new();
     if let Some(session_id) = session_id {
         update.insert("session_id".into(), serde_json::json!(session_id));
+    }
+    if let Some(expected_active_session_id) = expected_active_session_id {
+        update.insert(
+            "expected_active_session_id".into(),
+            serde_json::json!(expected_active_session_id),
+        );
     }
     if let Some(provider) = args.provider.as_deref() {
         update.insert(
@@ -4653,10 +4680,11 @@ mod tests {
         sync_replay_tab_target_to_request, transaction_detail_path, validate_sniper_settings_probe,
         websocket_detail_path, websocket_list_path, workspace_conflict_message,
         workspace_state_conflict_detail, write_session_query_path, Cli, Command, HistoryCommand,
-        HistoryListArgs, HistoryListResponse, OastConfigureArgs, SequenceCommand,
-        SequenceCreateInput, SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation,
-        WebSocketListArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
-        SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
+        HistoryListArgs, HistoryListResponse, OastConfigureArgs, RuntimeUpdatePayload,
+        SequenceCommand, SequenceCreateInput, SessionCommand, SkillsInstallArgs,
+        SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
+        CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES, SNIPER_API_PROBE_RETRY_DELAYS,
+        SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -5132,6 +5160,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         );
 
         assert_eq!(
@@ -5149,6 +5178,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         );
 
         assert_eq!(
@@ -5156,6 +5186,51 @@ mod tests {
             Some(&serde_json::json!("boast"))
         );
         assert!(update.get("oast_token").is_none());
+    }
+
+    #[test]
+    fn runtime_update_payload_serializes_expected_active_session_guard() {
+        let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let payload = RuntimeUpdatePayload {
+            session_id: Some(session_id),
+            expected_active_session_id: Some(session_id),
+            intercept_enabled: Some(true),
+            websocket_capture_enabled: None,
+            scope_patterns: None,
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+        assert_eq!(
+            value.get("session_id"),
+            Some(&serde_json::json!("11111111-1111-1111-1111-111111111111"))
+        );
+        assert_eq!(
+            value.get("expected_active_session_id"),
+            Some(&serde_json::json!("11111111-1111-1111-1111-111111111111"))
+        );
+    }
+
+    #[test]
+    fn oast_configure_update_includes_expected_active_session_guard() {
+        let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let update = build_oast_configure_update(
+            &OastConfigureArgs {
+                enable: true,
+                ..Default::default()
+            },
+            Some(session_id),
+            Some(session_id),
+        );
+
+        assert_eq!(
+            update.get("session_id"),
+            Some(&serde_json::json!("11111111-1111-1111-1111-111111111111"))
+        );
+        assert_eq!(
+            update.get("expected_active_session_id"),
+            Some(&serde_json::json!("11111111-1111-1111-1111-111111111111"))
+        );
+        assert_eq!(update.get("oast_enabled"), Some(&serde_json::json!(true)));
     }
 
     #[test]

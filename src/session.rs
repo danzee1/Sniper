@@ -151,6 +151,11 @@ enum SessionSnapshotLoadMode {
     ReadOnly,
 }
 
+struct TransactionJournalReplayResult {
+    replayed_transaction_ids: HashSet<Uuid>,
+    mutated_snapshot: bool,
+}
+
 fn deserialize_workspace_state_lossy<'de, D>(
     deserializer: D,
 ) -> std::result::Result<WorkspaceStateSnapshot, D::Error>
@@ -871,8 +876,27 @@ impl SessionRegistry {
         let storage_dir = session_dir(&self.root_dir, id);
         let mut snapshot = load_session_snapshot(&storage_dir, self.max_entries)?;
         let repaired_open_websockets = close_restored_open_websockets(&mut snapshot.websockets);
-        if repaired_open_websockets {
+        let replayed_transaction_journal = snapshot.replayed_transaction_journal;
+        if replayed_transaction_journal && !snapshot.replayed_transaction_ids.is_empty() {
+            snapshot.scanner_findings = recover_missing_scanner_findings(
+                std::mem::take(&mut snapshot.scanner_findings),
+                &snapshot.transactions,
+                &snapshot.replayed_transaction_ids,
+                &snapshot.scanner_config,
+                self.max_entries,
+            );
+        }
+        if repaired_open_websockets || replayed_transaction_journal {
             write_json(&snapshot_path(&storage_dir), &snapshot)?;
+        }
+        if replayed_transaction_journal {
+            if let Err(error) = compact_replayed_transaction_journal(&storage_dir) {
+                warn!(
+                    %error,
+                    session_id = %id,
+                    "failed to compact replayed transaction journal after loading session"
+                );
+            }
         }
         if update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries) {
             if let Err(error) = self.update_metadata(metadata.clone()) {
@@ -1548,13 +1572,14 @@ fn load_session_snapshot_with_mode(
         );
         snapshot.workspace = WorkspaceStateSnapshot::default();
     }
-    snapshot.replayed_transaction_ids = replay_transaction_journal(
+    let replay_result = replay_transaction_journal(
         storage_dir,
         max_entries,
         &mut snapshot,
         mode == SessionSnapshotLoadMode::Writable,
     )?;
-    snapshot.replayed_transaction_journal = !snapshot.replayed_transaction_ids.is_empty();
+    snapshot.replayed_transaction_ids = replay_result.replayed_transaction_ids;
+    snapshot.replayed_transaction_journal = replay_result.mutated_snapshot;
     Ok(snapshot)
 }
 
@@ -1575,7 +1600,7 @@ fn replay_transaction_journal(
     max_entries: usize,
     snapshot: &mut StoredSessionSnapshot,
     repair_files: bool,
-) -> Result<HashSet<Uuid>> {
+) -> Result<TransactionJournalReplayResult> {
     let journal_path = transaction_journal_path(storage_dir);
     let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
 
@@ -1611,7 +1636,8 @@ fn replay_transaction_journal(
                 .unwrap_or(0)
         });
 
-    replay_transaction_journal_file(
+    let mut annotation_mutated_snapshot = false;
+    annotation_mutated_snapshot |= replay_transaction_journal_file(
         &checkpoint_path,
         replay_insert_after_sequence,
         &mut order,
@@ -1624,7 +1650,7 @@ fn replay_transaction_journal(
         max_entries,
         repair_files,
     )?;
-    replay_transaction_journal_file(
+    annotation_mutated_snapshot |= replay_transaction_journal_file(
         &journal_path,
         replay_insert_after_sequence,
         &mut order,
@@ -1658,7 +1684,11 @@ fn replay_transaction_journal(
         .map(|record| record.id)
         .collect();
     replayed_transaction_ids.retain(|id| retained_ids.contains(id));
-    Ok(replayed_transaction_ids)
+    let mutated_snapshot = annotation_mutated_snapshot || !replayed_transaction_ids.is_empty();
+    Ok(TransactionJournalReplayResult {
+        replayed_transaction_ids,
+        mutated_snapshot,
+    })
 }
 
 fn normalize_snapshot_transaction_sequences(records: &mut [TransactionRecord]) {
@@ -1679,10 +1709,10 @@ fn replay_transaction_journal_file(
     skip_annotations_for: Option<&HashSet<Uuid>>,
     max_entries: usize,
     repair_files: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let file = match fs::File::open(journal_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) if journal_path.exists() => {
             warn!(
                 ?error,
@@ -1692,7 +1722,7 @@ fn replay_transaction_journal_file(
             if repair_files {
                 move_unreadable_transaction_journal_aside(journal_path);
             }
-            return Ok(());
+            return Ok(false);
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -1715,11 +1745,12 @@ fn replay_transaction_journal_file(
         if repair_files {
             move_unreadable_transaction_journal_aside(journal_path);
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let mut reader = BufReader::new(file);
     let mut inserted_order = VecDeque::new();
+    let mut annotation_mutated_snapshot = false;
     let mut line = Vec::new();
     let mut line_number = 0usize;
     let mut offset = 0u64;
@@ -1829,6 +1860,7 @@ fn replay_transaction_journal_file(
                     apply_nullable_string_patch(&mut record.color_tag, color_tag);
                     apply_nullable_string_patch(&mut record.user_note, user_note);
                     if has_annotation_patch {
+                        annotation_mutated_snapshot = true;
                         record.annotation_revision = annotation_revision
                             .unwrap_or_else(|| record.annotation_revision.saturating_add(1).max(1));
                         if let (Some(client_id), Some(client_version)) =
@@ -1852,7 +1884,7 @@ fn replay_transaction_journal_file(
         replayed_order.append(order);
         *order = replayed_order;
     }
-    Ok(())
+    Ok(annotation_mutated_snapshot)
 }
 
 fn apply_transaction_journal_backfill(
@@ -2045,6 +2077,28 @@ fn discard_transaction_journal_checkpoint(storage_dir: &Path) -> Result<()> {
             format!(
                 "failed to remove transaction journal checkpoint {}",
                 checkpoint_path.display()
+            )
+        }),
+    }
+}
+
+fn compact_replayed_transaction_journal(storage_dir: &Path) -> Result<()> {
+    discard_transaction_journal_checkpoint(storage_dir)?;
+    let journal_path = transaction_journal_path(storage_dir);
+    match create_private_file(&journal_path) {
+        Ok(file) => {
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", journal_path.display()))?;
+            if let Some(parent) = journal_path.parent() {
+                sync_directory(parent, "transaction journal directory")?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to compact transaction journal {}",
+                journal_path.display()
             )
         }),
     }
@@ -3732,9 +3786,7 @@ mod tests {
                 .starts_with(".transactions.journal.corrupt-")
         });
         assert!(has_corrupt_backup);
-        let repaired_journal = std::fs::read_to_string(&journal_path).unwrap();
-        assert!(repaired_journal.contains("valid-journal.example"));
-        assert!(!repaired_journal.contains("{not json}"));
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -4247,7 +4299,7 @@ mod tests {
         )
         .unwrap();
         lines.push(b'\n');
-        std::fs::write(journal_path, lines).unwrap();
+        std::fs::write(&journal_path, lines).unwrap();
 
         let loaded = registry.load_context(active.id()).unwrap();
         let records = loaded.store.snapshot(Some(32)).await;
@@ -4260,6 +4312,16 @@ mod tests {
             .iter()
             .any(|finding| finding.record_id == journal_record_id));
         assert!(!findings
+            .iter()
+            .any(|finding| finding.record_id == cleared_record_id));
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
+
+        let reloaded = registry.load_context(active.id()).unwrap();
+        let reloaded_findings = reloaded.scanner.snapshot(Some(32)).await;
+        assert!(reloaded_findings
+            .iter()
+            .any(|finding| finding.record_id == journal_record_id));
+        assert!(!reloaded_findings
             .iter()
             .any(|finding| finding.record_id == cleared_record_id));
 
@@ -4627,7 +4689,7 @@ mod tests {
         )
         .unwrap();
         lines.push(b'\n');
-        std::fs::write(journal_path, lines).unwrap();
+        std::fs::write(&journal_path, lines).unwrap();
         let registry_path = data_dir
             .join(super::SESSIONS_DIR)
             .join(super::REGISTRY_FILE);
@@ -4651,6 +4713,7 @@ mod tests {
             .find(|summary| summary.id == active.id())
             .unwrap();
         assert_eq!(summary.request_count, 1);
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -5122,7 +5185,7 @@ mod tests {
         )
         .unwrap();
         checkpoint.push(b'\n');
-        std::fs::write(checkpoint_path, checkpoint).unwrap();
+        std::fs::write(&checkpoint_path, checkpoint).unwrap();
 
         let mut active_journal = Vec::new();
         serde_json::to_writer(
@@ -5131,7 +5194,7 @@ mod tests {
         )
         .unwrap();
         active_journal.push(b'\n');
-        std::fs::write(journal_path, active_journal).unwrap();
+        std::fs::write(&journal_path, active_journal).unwrap();
 
         let loaded = registry.load_context(active.id()).unwrap();
         let restored = loaded.store.snapshot(Some(10)).await;
@@ -5139,6 +5202,8 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].host, "active.example:443");
         assert_eq!(restored[1].host, "checkpoint.example:443");
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
+        assert!(!checkpoint_path.exists());
     }
 
     #[tokio::test]
@@ -5428,13 +5493,26 @@ mod tests {
         )
         .unwrap();
         journal.push(b'\n');
-        std::fs::write(journal_path, journal).unwrap();
+        std::fs::write(&journal_path, journal).unwrap();
 
         let loaded = registry.load_context(active.id()).unwrap();
         let restored = loaded.store.snapshot(Some(10)).await;
 
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].color_tag.as_deref(), Some("green"));
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
+
+        let disk_snapshot: super::StoredSessionSnapshot =
+            serde_json::from_slice(&std::fs::read(super::snapshot_path(&storage_dir)).unwrap())
+                .unwrap();
+        assert_eq!(
+            disk_snapshot.transactions[0].color_tag.as_deref(),
+            Some("green")
+        );
+
+        let reloaded = registry.load_context(active.id()).unwrap();
+        let reloaded_records = reloaded.store.snapshot(Some(10)).await;
+        assert_eq!(reloaded_records[0].color_tag.as_deref(), Some("green"));
     }
 
     #[tokio::test]

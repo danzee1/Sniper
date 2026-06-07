@@ -2870,20 +2870,47 @@ function isUuidString(value) {
   return typeof value === "string" && UUID_PATTERN.test(value);
 }
 
+function createWsReplaySnapshotBudgetAllocator(replayTabs, options = {}) {
+  const totalFrames = Number.isFinite(options.wsFrameLimit)
+    ? Math.floor(Math.max(0, options.wsFrameLimit))
+    : WS_REPLAY_MAX_PERSISTED_TOTAL_FRAMES;
+  const totalBodyBytes = Number.isFinite(options.wsBodyByteLimit)
+    ? Math.floor(Math.max(0, options.wsBodyByteLimit))
+    : WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES;
+  const tabsWithFrames = (Array.isArray(replayTabs) ? replayTabs : [])
+    .filter((tab) => tab?.type === "websocket" && getRawWsReplayFrames(tab).length > 0);
+
+  if (!tabsWithFrames.length || totalFrames <= 0 || totalBodyBytes <= 0) {
+    return () => ({ frames: 0, bytes: 0 });
+  }
+
+  // Full workspace saves replace every Replay tab; keep one active tab from
+  // consuming a shared budget and serializing inactive transcripts as empty.
+  const frameBase = Math.floor(totalFrames / tabsWithFrames.length);
+  const frameRemainder = totalFrames % tabsWithFrames.length;
+  const bodyByteBase = Math.floor(totalBodyBytes / tabsWithFrames.length);
+  const bodyByteRemainder = totalBodyBytes % tabsWithFrames.length;
+  const budgetsByTab = new WeakMap();
+  tabsWithFrames.forEach((tab, index) => {
+    budgetsByTab.set(tab, {
+      frames: Math.min(
+        WS_REPLAY_MAX_PERSISTED_FRAMES,
+        frameBase + (index < frameRemainder ? 1 : 0),
+      ),
+      bytes: bodyByteBase + (index < bodyByteRemainder ? 1 : 0),
+    });
+  });
+
+  return (tab) => budgetsByTab.get(tab) || { frames: 0, bytes: 0 };
+}
+
 function snapshotWorkspaceState(options = {}) {
-  const wsFrameBudget = {
-    frames: Number.isFinite(options.wsFrameLimit)
-      ? Math.max(0, options.wsFrameLimit)
-      : WS_REPLAY_MAX_PERSISTED_TOTAL_FRAMES,
-    bytes: Number.isFinite(options.wsBodyByteLimit)
-      ? Math.max(0, options.wsBodyByteLimit)
-      : WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES,
-  };
   const replayTabs = Array.isArray(state.replayTabs) ? state.replayTabs : [];
+  const wsFrameBudgetForTab = createWsReplaySnapshotBudgetAllocator(replayTabs, options);
   const replayTabSnapshots = new Map();
   const snapshotReplayTab = (tab) => {
     if (tab.type === "websocket") {
-      const wsFramesSnapshot = snapshotWsReplayFrames(tab, wsFrameBudget);
+      const wsFramesSnapshot = snapshotWsReplayFrames(tab, wsFrameBudgetForTab(tab));
       const wsFrames = wsFramesSnapshot.frames;
       const wsSetupQueueSnapshot = limitWsSetupQueueItems(
         Array.isArray(tab.wsSetupQueue)

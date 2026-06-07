@@ -2048,6 +2048,12 @@ struct ResponseInterceptForwardPayload {
     response: EditableResponse,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SessionActionPayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ReplaySendPayload {
     session_id: Option<Uuid>,
@@ -3800,12 +3806,22 @@ async fn drop_intercept(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<SessionScopedQuery>,
+    payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) = match reconcile_write_session_id(
+        query.session_id,
+        payload
+            .map(|Json(payload)| payload.session_id)
+            .unwrap_or(None),
+    ) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3814,7 +3830,7 @@ async fn drop_intercept(
     }
 
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -3848,13 +3864,23 @@ async fn drop_intercept(
 async fn forward_all_intercepts(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
+    payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) = match reconcile_write_session_id(
+        query.session_id,
+        payload
+            .map(|Json(payload)| payload.session_id)
+            .unwrap_or(None),
+    ) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -4065,12 +4091,22 @@ async fn drop_response_intercept(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<SessionScopedQuery>,
+    payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) = match reconcile_write_session_id(
+        query.session_id,
+        payload
+            .map(|Json(payload)| payload.session_id)
+            .unwrap_or(None),
+    ) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -4079,7 +4115,7 @@ async fn drop_response_intercept(
     }
 
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -4113,13 +4149,23 @@ async fn drop_response_intercept(
 async fn forward_all_response_intercepts(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
+    payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) = match reconcile_write_session_id(
+        query.session_id,
+        payload
+            .map(|Json(payload)| payload.session_id)
+            .unwrap_or(None),
+    ) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -8793,6 +8839,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_intercept_drop_body_session_id_targets_inactive_session() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-drop-request-body-session")).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let record = InterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            peer_addr: "127.0.0.1:12345".to_string(),
+            request: test_editable_request("/queued"),
+            is_websocket: false,
+        };
+        let record_id = record.id;
+        let queue = original.intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(record).await }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+
+        let response = super::drop_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Some(Json(super::SessionActionPayload {
+                session_id: Some(original_id),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(queue.list().await.is_empty());
+        assert!(matches!(task.await.unwrap(), InterceptResolution::Drop(_)));
+    }
+
+    #[tokio::test]
+    async fn response_intercept_drop_body_session_id_targets_inactive_session() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-drop-response-body-session")).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let record = ResponseInterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "GET".to_string(),
+            path: "/queued".to_string(),
+            status: 200,
+            response: test_editable_response(200),
+        };
+        let record_id = record.id;
+        let queue = original.response_intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(record).await }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+
+        let response = super::drop_response_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Some(Json(super::SessionActionPayload {
+                session_id: Some(original_id),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(queue.list().await.is_empty());
+        assert!(matches!(
+            task.await.unwrap(),
+            ResponseInterceptResolution::Drop
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_forward_all_body_session_id_targets_inactive_session() {
+        let state = Arc::new(
+            AppState::new(test_app_config("sniper-forward-all-request-body-session")).unwrap(),
+        );
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let queue = original.intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move {
+                queue
+                    .enqueue(InterceptRecord {
+                        id: Uuid::new_v4(),
+                        started_at: Utc::now(),
+                        peer_addr: "127.0.0.1:12345".to_string(),
+                        request: test_editable_request("/queued"),
+                        is_websocket: false,
+                    })
+                    .await
+            }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let response = super::forward_all_intercepts(
+            State(state.clone()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Some(Json(super::SessionActionPayload {
+                session_id: Some(original_id),
+            })),
+        )
+        .await;
+        let payload = response_body_json(response).await;
+        assert_eq!(payload["forwarded"], 1);
+        assert!(queue.list().await.is_empty());
+        assert!(matches!(
+            task.await.unwrap(),
+            InterceptResolution::Forward(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_forward_all_body_session_id_targets_inactive_session() {
+        let state = Arc::new(
+            AppState::new(test_app_config("sniper-forward-all-response-body-session")).unwrap(),
+        );
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let queue = original.response_intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move {
+                queue
+                    .enqueue(ResponseInterceptRecord {
+                        id: Uuid::new_v4(),
+                        started_at: Utc::now(),
+                        scheme: "https".to_string(),
+                        host: "example.test".to_string(),
+                        method: "GET".to_string(),
+                        path: "/queued".to_string(),
+                        status: 200,
+                        response: test_editable_response(200),
+                    })
+                    .await
+            }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let response = super::forward_all_response_intercepts(
+            State(state.clone()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Some(Json(super::SessionActionPayload {
+                session_id: Some(original_id),
+            })),
+        )
+        .await;
+        let payload = response_body_json(response).await;
+        assert_eq!(payload["forwarded"], 1);
+        assert!(queue.list().await.is_empty());
+        assert!(matches!(
+            task.await.unwrap(),
+            ResponseInterceptResolution::Forward(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn request_forward_all_returns_json_count() {
         let state =
             Arc::new(AppState::new(test_app_config("sniper-forward-all-requests")).unwrap());
@@ -8831,6 +9076,7 @@ mod tests {
         let response = super::forward_all_intercepts(
             State(state.clone()),
             Query(super::SessionScopedQuery { session_id: None }),
+            None,
         )
         .await;
         let payload = response_body_json(response).await;
@@ -8894,6 +9140,7 @@ mod tests {
         let response = super::forward_all_response_intercepts(
             State(state.clone()),
             Query(super::SessionScopedQuery { session_id: None }),
+            None,
         )
         .await;
         let payload = response_body_json(response).await;
