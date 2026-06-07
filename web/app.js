@@ -5449,6 +5449,15 @@ function mergeWebsocketFrameWindows(currentFrames, incomingFrames, options = {})
   );
 }
 
+function newestWebsocketFrameIndexes(frames, limit) {
+  const normalizedFrames = normalizeWebsocketFrames(frames);
+  const maxCount = Math.max(0, Math.floor(Number(limit) || 0));
+  return normalizedFrames
+    .slice(Math.max(0, normalizedFrames.length - maxCount))
+    .map((frame) => normalizeWebsocketFrameIndex(frame?.index))
+    .filter((index) => index != null);
+}
+
 async function loadWebsocketDetail(id, options = {}) {
   const force = Boolean(options.force);
   const sessionId = currentSessionId();
@@ -5779,6 +5788,7 @@ async function loadOlderWebsocketFrames() {
   const shell = websocketFramesShell();
   const previousScrollHeight = shell?.scrollHeight || 0;
   const previousScrollTop = shell?.scrollTop || 0;
+  const newestAnchorFrameIndexes = newestWebsocketFrameIndexes(frames, WEBSOCKET_DETAIL_FRAME_LIMIT);
   session.older_frames_loading = true;
   renderWebsocketFrameTable();
 
@@ -5805,7 +5815,10 @@ async function loadOlderWebsocketFrames() {
     }
     current.frames = mergeWebsocketFrameWindows(current.frames, incomingFrames, {
       prefer: "older",
-      preserveIndexes: [state.selectedFrameIdx],
+      preserveIndexes: [
+        state.selectedFrameIdx,
+        ...newestAnchorFrameIndexes,
+      ],
     });
     const mergedFrames = getWebsocketFrames(current);
     const nextFirstFrameIndex = mergedFrames.length

@@ -2316,7 +2316,8 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
             print_json(&rules)
         }
         InterceptRuleCommand::Create(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
             let _explicit_all = args.all;
             let rule = json!({
                 "id": Uuid::new_v4(),
@@ -2326,15 +2327,21 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
                 "path_pattern": args.path_pattern.unwrap_or_default(),
                 "method_filter": if args.method_filter.is_empty() { vec![] } else { args.method_filter },
             });
-            let path = write_session_query_path("/api/intercept-rules", args.session_id);
+            let path = session_query_path_with_expected_active(
+                "/api/intercept-rules",
+                session_id,
+                expected_active_session_id,
+            );
             api.post_status(&path, &rule).await?;
             print_json_with_session(&rule, session_id)
         }
         InterceptRuleCommand::Delete(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path = write_session_query_path(
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
+            let path = session_query_path_with_expected_active(
                 &format!("/api/intercept-rules/{}", args.id),
-                args.session_id,
+                session_id,
+                expected_active_session_id,
             );
             api.delete_status(&path).await?;
             print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
@@ -2487,8 +2494,13 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             print_json(&result)
         }
         OastCommand::Clear(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path = write_session_query_path("/api/oast/callbacks/clear", args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
+            let path = session_query_path_with_expected_active(
+                "/api/oast/callbacks/clear",
+                session_id,
+                expected_active_session_id,
+            );
             api.post_status(&path, &serde_json::json!({})).await?;
             print_json(&serde_json::json!({"status": "cleared", "session_id": session_id}))
         }

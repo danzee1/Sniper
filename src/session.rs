@@ -1636,8 +1636,8 @@ fn replay_transaction_journal(
                 .unwrap_or(0)
         });
 
-    let mut annotation_mutated_snapshot = false;
-    annotation_mutated_snapshot |= replay_transaction_journal_file(
+    let mut annotation_mutated_record_ids = HashSet::new();
+    annotation_mutated_record_ids.extend(replay_transaction_journal_file(
         &checkpoint_path,
         replay_insert_after_sequence,
         &mut order,
@@ -1649,8 +1649,8 @@ fn replay_transaction_journal(
         Some(&snapshot_record_ids),
         max_entries,
         repair_files,
-    )?;
-    annotation_mutated_snapshot |= replay_transaction_journal_file(
+    )?);
+    annotation_mutated_record_ids.extend(replay_transaction_journal_file(
         &journal_path,
         replay_insert_after_sequence,
         &mut order,
@@ -1662,7 +1662,7 @@ fn replay_transaction_journal(
         None,
         max_entries,
         repair_files,
-    )?;
+    )?);
     apply_transaction_journal_backfill(
         max_entries,
         &snapshot_record_ids,
@@ -1684,7 +1684,10 @@ fn replay_transaction_journal(
         .map(|record| record.id)
         .collect();
     replayed_transaction_ids.retain(|id| retained_ids.contains(id));
-    let mutated_snapshot = annotation_mutated_snapshot || !replayed_transaction_ids.is_empty();
+    let mutated_snapshot = !replayed_transaction_ids.is_empty()
+        || annotation_mutated_record_ids
+            .iter()
+            .any(|id| retained_ids.contains(id));
     Ok(TransactionJournalReplayResult {
         replayed_transaction_ids,
         mutated_snapshot,
@@ -1709,10 +1712,10 @@ fn replay_transaction_journal_file(
     skip_annotations_for: Option<&HashSet<Uuid>>,
     max_entries: usize,
     repair_files: bool,
-) -> Result<bool> {
+) -> Result<HashSet<Uuid>> {
     let file = match fs::File::open(journal_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(error) if journal_path.exists() => {
             warn!(
                 ?error,
@@ -1722,7 +1725,7 @@ fn replay_transaction_journal_file(
             if repair_files {
                 move_unreadable_transaction_journal_aside(journal_path);
             }
-            return Ok(false);
+            return Ok(HashSet::new());
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -1745,12 +1748,12 @@ fn replay_transaction_journal_file(
         if repair_files {
             move_unreadable_transaction_journal_aside(journal_path);
         }
-        return Ok(false);
+        return Ok(HashSet::new());
     }
 
     let mut reader = BufReader::new(file);
     let mut inserted_order = VecDeque::new();
-    let mut annotation_mutated_snapshot = false;
+    let mut annotation_mutated_record_ids = HashSet::new();
     let mut line = Vec::new();
     let mut line_number = 0usize;
     let mut offset = 0u64;
@@ -1860,7 +1863,7 @@ fn replay_transaction_journal_file(
                     apply_nullable_string_patch(&mut record.color_tag, color_tag);
                     apply_nullable_string_patch(&mut record.user_note, user_note);
                     if has_annotation_patch {
-                        annotation_mutated_snapshot = true;
+                        annotation_mutated_record_ids.insert(id);
                         record.annotation_revision = annotation_revision
                             .unwrap_or_else(|| record.annotation_revision.saturating_add(1).max(1));
                         if let (Some(client_id), Some(client_version)) =
@@ -1884,7 +1887,7 @@ fn replay_transaction_journal_file(
         replayed_order.append(order);
         *order = replayed_order;
     }
-    Ok(annotation_mutated_snapshot)
+    Ok(annotation_mutated_record_ids)
 }
 
 fn apply_transaction_journal_backfill(
@@ -5638,6 +5641,94 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["4.example:443", "3.example:443"]
         );
+    }
+
+    #[tokio::test]
+    async fn registry_keeps_journal_when_only_trimmed_backfill_annotation_mutates() {
+        fn record(sequence: u64) -> TransactionRecord {
+            let mut record = TransactionRecord::http(
+                Utc::now(),
+                "GET".to_string(),
+                "https".to_string(),
+                format!("{sequence}.example:443"),
+                format!("/{sequence}"),
+                Some(200),
+                1,
+                MessageRecord {
+                    headers: vec![],
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                None,
+                vec![],
+                None,
+                None,
+            );
+            record.sequence = sequence;
+            record
+        }
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-backfill-annotation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 1, 32).unwrap();
+        let retained_record = record(2);
+        let backfill_record = record(1);
+        let backfill_record_id = backfill_record.id;
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![retained_record],
+            ..Default::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut journal = Vec::new();
+        serde_json::to_writer(
+            &mut journal,
+            &TransactionJournalEntry::Insert {
+                record: backfill_record,
+            },
+        )
+        .unwrap();
+        journal.push(b'\n');
+        serde_json::to_writer(
+            &mut journal,
+            &TransactionJournalEntry::Annotation {
+                id: backfill_record_id,
+                color_tag: Some(NullableStringPatch::Set("red".to_string())),
+                user_note: None,
+                annotation_revision: Some(1),
+                previous_annotation_revision: Some(0),
+                annotation_client_id: None,
+                annotation_client_version: None,
+                previous_color_tag: None,
+                previous_user_note: None,
+            },
+        )
+        .unwrap();
+        journal.push(b'\n');
+        std::fs::write(&journal_path, journal).unwrap();
+        let journal_len_before = std::fs::metadata(&journal_path).unwrap().len();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].host, "2.example:443");
+        assert_eq!(
+            std::fs::metadata(&journal_path).unwrap().len(),
+            journal_len_before
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

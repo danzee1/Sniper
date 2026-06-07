@@ -2004,6 +2004,13 @@ struct SessionScopedQuery {
     session_id: Option<Uuid>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct SessionWriteQuery {
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
+}
+
 fn reconcile_write_session_id(
     query_session_id: Option<Uuid>,
     body_session_id: Option<Uuid>,
@@ -3243,17 +3250,29 @@ async fn list_event_log(
 
 async fn clear_event_log(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<EventLogQuery>,
+    Query(query): Query<SessionWriteQuery>,
 ) -> Response {
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        query.session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        query.session_id.is_none() || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session
         .event_log
@@ -3350,17 +3369,29 @@ async fn get_finding(
 
 async fn clear_findings(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
 ) -> Response {
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        query.session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        query.session_id.is_none() || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session
         .scanner
@@ -3929,7 +3960,7 @@ async fn list_intercept_rules(
 
 async fn upsert_intercept_rule(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     Json(payload): Json<InterceptRulePayload>,
 ) -> Response {
     let (target_session_id, session_id_is_explicit) =
@@ -3937,15 +3968,27 @@ async fn upsert_intercept_rule(
             Ok(value) => value,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.intercept_rules.snapshot().await;
     session.intercept_rules.upsert(payload.rule).await;
@@ -3963,21 +4006,33 @@ async fn upsert_intercept_rule(
 async fn delete_intercept_rule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        query.session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        query.session_id.is_none() || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.intercept_rules.snapshot().await;
     if session.intercept_rules.delete(id).await {
@@ -5537,17 +5592,29 @@ async fn get_oast_callback(
 
 async fn clear_oast_callbacks(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<OastQuery>,
+    Query(query): Query<SessionWriteQuery>,
 ) -> Response {
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        query.session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        query.session_id.is_none() || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.oast.snapshot().await;
     let previous_cleared_keys = session.oast.snapshot_cleared_keys().await;
@@ -9038,6 +9105,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_write_queries_reject_stale_expected_active_session() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-stale-session-write-query")).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let stale_query = super::SessionWriteQuery {
+            session_id: Some(original_id),
+            expected_active_session_id: Some(original_id),
+        };
+
+        let event_response =
+            super::clear_event_log(State(state.clone()), Query(stale_query.clone())).await;
+        assert_eq!(event_response.status(), StatusCode::CONFLICT);
+
+        let findings_response =
+            super::clear_findings(State(state.clone()), Query(stale_query.clone())).await;
+        assert_eq!(findings_response.status(), StatusCode::CONFLICT);
+
+        let rule_response = super::delete_intercept_rule(
+            State(state.clone()),
+            Path(Uuid::new_v4().to_string()),
+            Query(stale_query.clone()),
+        )
+        .await;
+        assert_eq!(rule_response.status(), StatusCode::CONFLICT);
+
+        let intercept_rule = InterceptRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            scope: InterceptScope::Both,
+            host_pattern: "stale.example".to_string(),
+            path_pattern: "/api".to_string(),
+            method_filter: vec!["GET".to_string()],
+        };
+        let upsert_response = super::upsert_intercept_rule(
+            State(state.clone()),
+            Query(stale_query.clone()),
+            Json(super::InterceptRulePayload::from(intercept_rule)),
+        )
+        .await;
+        assert_eq!(upsert_response.status(), StatusCode::CONFLICT);
+        assert!(original.intercept_rules.list().await.is_empty());
+
+        let oast_response =
+            super::clear_oast_callbacks(State(state.clone()), Query(stale_query)).await;
+        assert_eq!(oast_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn request_forward_all_returns_json_count() {
         let state =
             Arc::new(AppState::new(test_app_config("sniper-forward-all-requests")).unwrap());
@@ -9860,9 +9980,9 @@ mod tests {
             Duration::from_millis(30),
             super::clear_oast_callbacks(
                 State(state.clone()),
-                Query(super::OastQuery {
+                Query(super::SessionWriteQuery {
                     session_id: Some(session.id()),
-                    limit: None,
+                    expected_active_session_id: None,
                 }),
             ),
         )
@@ -9873,9 +9993,9 @@ mod tests {
         drop(operation_guard);
         let response = super::clear_oast_callbacks(
             State(state.clone()),
-            Query(super::OastQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(session.id()),
-                limit: None,
+                expected_active_session_id: None,
             }),
         )
         .await;
@@ -10230,9 +10350,9 @@ mod tests {
 
         let blocked_clear_response = super::clear_event_log(
             State(state.clone()),
-            Query(super::EventLogQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(inactive.id()),
-                limit: None,
+                expected_active_session_id: None,
             }),
         )
         .await;
@@ -10256,9 +10376,9 @@ mod tests {
 
         let clear_response = super::clear_event_log(
             State(state.clone()),
-            Query(super::EventLogQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(inactive.id()),
-                limit: None,
+                expected_active_session_id: None,
             }),
         )
         .await;
@@ -10397,8 +10517,9 @@ mod tests {
         };
         let response = super::upsert_intercept_rule(
             State(state.clone()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(inactive_id),
+                expected_active_session_id: None,
             }),
             Json(super::InterceptRulePayload::from(intercept_rule.clone())),
         )
@@ -10506,8 +10627,9 @@ mod tests {
 
         let response = super::clear_findings(
             State(state.clone()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(inactive_id),
+                expected_active_session_id: None,
             }),
         )
         .await;
@@ -10610,7 +10732,10 @@ mod tests {
         };
         let response = super::upsert_intercept_rule(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::InterceptRulePayload {
                 session_id: Some(inactive_id),
                 rule: intercept_rule.clone(),
@@ -10633,8 +10758,9 @@ mod tests {
 
         let conflict_response = super::upsert_intercept_rule(
             State(state.clone()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(active_id),
+                expected_active_session_id: None,
             }),
             Json(super::InterceptRulePayload {
                 session_id: Some(inactive_id),
