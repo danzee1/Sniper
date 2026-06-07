@@ -3062,6 +3062,7 @@ async function flushWorkspaceState() {
 }
 
 async function flushBeforeNativeClose() {
+  await flushAllPendingAnnotations();
   await flushWorkspaceState();
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = null;
@@ -3597,6 +3598,7 @@ async function activateSessionById(id) {
   if (!response.ok) {
     throw new Error(await response.text());
   }
+  state.selectedSessionId = id;
   await reloadSessionWorkspace();
 }
 
@@ -6493,6 +6495,9 @@ const BUILTIN_RULE_LABELS = {
   cors: "CORS Misconfiguration",
   server: "Server Disclosure",
   error: "Error Messages",
+  misconfig: "Security Misconfiguration",
+  info: "Information Disclosure",
+  auth: "Authentication Issues",
 };
 
 let selectedFindingId = null;
@@ -18674,16 +18679,38 @@ function flushAnnotationsOnUnload() {
   }
 }
 
-async function flushPendingAnnotations(transactionId) {
-  if (!state._pendingAnnotations) return;
+async function flushAllPendingAnnotations() {
+  flushContextMenuPendingNote();
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const pendingIds = state._pendingAnnotations ? Array.from(state._pendingAnnotations.keys()) : [];
+    const inFlight = state._annotationInFlight || new Set();
+    if (!pendingIds.length && !inFlight.size) {
+      return;
+    }
+    const idleIds = pendingIds.filter((id) => !inFlight.has(id));
+    if (idleIds.length) {
+      await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, { throwOnError: true })));
+    }
+    if ((!state._pendingAnnotations || state._pendingAnnotations.size === 0) && (!state._annotationInFlight || state._annotationInFlight.size === 0)) {
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+  }
+  throw new Error("Timed out saving pending annotations.");
+}
+
+async function flushPendingAnnotations(transactionId, options = {}) {
+  if (!state._pendingAnnotations) return false;
   if (!state._annotationInFlight) state._annotationInFlight = new Set();
+  if (state._annotationInFlight.has(transactionId)) return false;
   const pending = state._pendingAnnotations;
   const entry = pending.get(transactionId);
-  if (!entry) return;
+  if (!entry) return false;
   const { sessionId, payload } = entry;
 
   state._annotationInFlight.add(transactionId);
   let failureMessage = "";
+  let saved = false;
   try {
     const response = await fetch(sessionQueryPath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, sessionId), {
       method: "PATCH",
@@ -18695,8 +18722,9 @@ async function flushPendingAnnotations(transactionId) {
       throw new Error(failureMessage || "Failed to save annotation");
     }
     const summary = await response.json();
+    saved = true;
     if (currentSessionId() !== sessionId) {
-      return;
+      return saved;
     } else if (pending.get(transactionId) === entry) {
       const index = getHistoryItemIndex(transactionId);
       if (index !== -1) {
@@ -18736,14 +18764,21 @@ async function flushPendingAnnotations(transactionId) {
       showToast(failureMessage || error.message || "Failed to save annotation", "error");
       loadTransactions(true).catch((reloadError) => console.error(reloadError));
     }
+    if (options.throwOnError) {
+      throw error;
+    }
+    return false;
   } finally {
     state._annotationInFlight.delete(transactionId);
     if (pending.get(transactionId) === entry) {
-      pending.delete(transactionId);
-    } else if (pending.get(transactionId) !== entry) {
+      if (saved) {
+        pending.delete(transactionId);
+      }
+    } else if (pending.has(transactionId)) {
       flushPendingAnnotations(transactionId);
     }
   }
+  return saved;
 }
 
 document.addEventListener("click", (event) => {

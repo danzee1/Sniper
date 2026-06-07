@@ -48,6 +48,16 @@ const LIPO_PATH: &str = "/usr/bin/lipo";
 const SH_PATH: &str = "/bin/sh";
 const SELF_UPDATE_INSTALLER_LOG_FILE: &str = "self-update-installer.log";
 
+fn validate_self_update_app_bundle_path(app_bundle: &Path) -> Result<()> {
+    if app_bundle.file_name().and_then(|value| value.to_str()) != Some("Sniper.app")
+        || app_bundle.extension().and_then(|value| value.to_str()) != Some("app")
+        || !app_bundle.join("Contents/MacOS").is_dir()
+    {
+        anyhow::bail!("self-update is only supported when running from Sniper.app");
+    }
+    Ok(())
+}
+
 fn proxy_listener_status_word(generation: u64, online: bool) -> u64 {
     (generation << 1) | u64::from(online)
 }
@@ -1081,11 +1091,7 @@ impl AppState {
             .and_then(|p| p.parent()) // Contents/
             .and_then(|p| p.parent()) // Sniper.app/
             .context("executable is not inside a .app bundle")?;
-        if contents.extension().and_then(|value| value.to_str()) != Some("app")
-            || !contents.join("Contents/MacOS").is_dir()
-        {
-            anyhow::bail!("self-update is only supported when running from Sniper.app");
-        }
+        validate_self_update_app_bundle_path(contents)?;
         Ok(contents.to_path_buf())
     }
 
@@ -2125,9 +2131,10 @@ mod tests {
         release_asset_archs_match_binary_archs, release_asset_matches_arch,
         release_proxy_env_targets_loopback, release_update_available, select_release_dmg_asset,
         self_update_bundle_is_writable, self_update_installer_log_path, update_installer_script,
-        validate_downloaded_update_size, verify_app_identity, AppState, GitHubAsset, GitHubRelease,
-        UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH, EXPECTED_APP_BUNDLE_IDENTIFIER,
-        EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
+        validate_downloaded_update_size, validate_self_update_app_bundle_path, verify_app_identity,
+        AppState, GitHubAsset, GitHubRelease, UpdateArtifactGuard, CODESIGN_PATH, DITTO_PATH,
+        EXPECTED_APP_BUNDLE_IDENTIFIER, EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH,
+        PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
     use crate::event_log::EventLevel;
@@ -2480,6 +2487,26 @@ mod tests {
         fs::remove_dir_all(root.join("Other.app")).unwrap();
         fs::rename(&sniper_app, root.join("Other.app")).unwrap();
         assert!(find_update_app_bundle(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("Sniper.app"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn self_update_requires_current_app_bundle_named_sniper_app() {
+        let root = std::env::temp_dir().join(format!(
+            "sniper-current-app-bundle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sniper_app = root.join("Sniper.app");
+        let renamed_app = root.join("Sniper Beta.app");
+        fs::create_dir_all(sniper_app.join("Contents/MacOS")).unwrap();
+        fs::create_dir_all(renamed_app.join("Contents/MacOS")).unwrap();
+
+        validate_self_update_app_bundle_path(&sniper_app).unwrap();
+        assert!(validate_self_update_app_bundle_path(&renamed_app)
             .unwrap_err()
             .to_string()
             .contains("Sniper.app"));
