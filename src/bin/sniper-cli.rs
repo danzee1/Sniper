@@ -1522,6 +1522,7 @@ fn write_session_query_path(path: &str, explicit_session_id: Option<Uuid>) -> St
 fn sequence_write_session_id(
     cli_session_id: Option<Uuid>,
     input_session_id: Option<Uuid>,
+    active_session_id: Option<Uuid>,
 ) -> Result<Option<Uuid>> {
     if let Some(input_session_id) = input_session_id {
         let Some(cli_session_id) = cli_session_id else {
@@ -1532,7 +1533,10 @@ fn sequence_write_session_id(
         }
         return Ok(Some(cli_session_id));
     }
-    Ok(session_id_for_write_payload(cli_session_id))
+    Ok(explicit_or_active_session_id(
+        session_id_for_write_payload(cli_session_id),
+        active_session_id,
+    ))
 }
 
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
@@ -2303,7 +2307,13 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             let raw = read_text_input(file, stdin)?;
             let input: SequenceCreateInput =
                 serde_json::from_str(&raw).context("failed to parse sequence JSON")?;
-            let session_id = sequence_write_session_id(session_id, input.session_id)?;
+            let active_session_id = if session_id.is_none() && input.session_id.is_none() {
+                active_session_id(&api).await?
+            } else {
+                None
+            };
+            let session_id =
+                sequence_write_session_id(session_id, input.session_id, active_session_id)?;
             let def = input.definition;
             api.post_status(
                 "/api/sequences",
@@ -4897,22 +4907,27 @@ mod tests {
         let cli_session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let input_session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 
-        assert_eq!(sequence_write_session_id(None, None).unwrap(), None);
         assert_eq!(
-            sequence_write_session_id(Some(cli_session_id), None).unwrap(),
+            sequence_write_session_id(None, None, Some(cli_session_id)).unwrap(),
             Some(cli_session_id)
         );
-        let error = sequence_write_session_id(None, Some(input_session_id))
+        assert_eq!(sequence_write_session_id(None, None, None).unwrap(), None);
+        assert_eq!(
+            sequence_write_session_id(Some(cli_session_id), None, Some(input_session_id)).unwrap(),
+            Some(cli_session_id)
+        );
+        let error = sequence_write_session_id(None, Some(input_session_id), Some(cli_session_id))
             .expect_err("sequence JSON session_id without --session-id should fail");
         assert!(error
             .to_string()
             .contains("sequence JSON session_id requires matching --session-id"));
         assert_eq!(
-            sequence_write_session_id(Some(input_session_id), Some(input_session_id)).unwrap(),
+            sequence_write_session_id(Some(input_session_id), Some(input_session_id), None)
+                .unwrap(),
             Some(input_session_id)
         );
 
-        let error = sequence_write_session_id(Some(cli_session_id), Some(input_session_id))
+        let error = sequence_write_session_id(Some(cli_session_id), Some(input_session_id), None)
             .expect_err("conflicting explicit sequence session ids should fail");
         assert!(error
             .to_string()

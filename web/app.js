@@ -13022,12 +13022,17 @@ async function sendReplay() {
     }
     target = getRepeaterTargetConfig(tab, request);
   } catch (e) {
+    tab.responseRecord = null;
+    tab.notice = e.message || "Failed to parse request.";
+    els.replayFollowRedirectButton?.classList.add("hidden");
     els.replayResponseMeta.textContent = "Error";
-    renderReplayResponseView(e.message || "Failed to parse request.");
+    renderReplayResponseView(tab.notice);
+    updateReplaySearchPane("response", tab.notice);
+    scheduleWorkspaceStateSave();
     return;
   }
 
-  // Enter sending state after validation so parse errors do not discard the last response.
+  // Enter sending state after validation so only a valid send clears the response pane.
   tab.responseRecord = null;
   tab.notice = "";
   els.replayFollowRedirectButton?.classList.add("hidden");
@@ -13604,6 +13609,39 @@ function renderReplayTabs() {
   Array.from(els.replayTabStrip.querySelectorAll(".replay-tab")).forEach((tabElement) => {
     const id = tabElement.dataset.replayTabId;
     const nameInput = tabElement.querySelector(".replay-tab-name-input");
+    tabElement.addEventListener("pointerdown", (event) => {
+      const editingId = state.replayRenamingTabId;
+      if (!editingId || event.target.closest(".replay-tab-name-input")) {
+        return;
+      }
+      const actionTabElement = event.target.closest(".replay-tab");
+      const actionTabId = actionTabElement?.dataset.replayTabId;
+      if (!actionTabId) {
+        return;
+      }
+      const closeButton = event.target.closest(".replay-tab-close");
+      const pinButton = event.target.closest(".replay-tab-pin-btn");
+      const tabButton = event.target.closest(".replay-tab-button");
+      if (!closeButton && !pinButton && !tabButton) {
+        return;
+      }
+      const editingInput = els.replayTabStrip.querySelector(
+        `.replay-tab[data-replay-tab-id="${CSS.escape(editingId)}"] .replay-tab-name-input`,
+      );
+      event.preventDefault();
+      event.stopPropagation();
+      commitReplayTabRename(editingId, editingInput?.value || "");
+      if (closeButton) {
+        closeRepeaterTab(actionTabId).catch(handleWorkspaceActionError);
+      } else if (pinButton) {
+        toggleReplayTabPin(actionTabId);
+      } else if (tabButton && state.activeReplayTabId !== actionTabId) {
+        state.activeReplayTabId = actionTabId;
+        state.replayRenamingTabId = null;
+        scheduleWorkspaceStateSave();
+        renderReplay();
+      }
+    }, { capture: true });
     if (nameInput) {
       nameInput.addEventListener("click", (event) => event.stopPropagation());
       nameInput.addEventListener("keydown", (event) => {
@@ -13745,7 +13783,13 @@ async function closeRepeaterTab(id) {
   const visualIndex = visualOrderBeforeClose.indexOf(id);
   const closingTab = state.replayTabs[index];
   if (closingTab.type === "websocket") {
-    await cleanupWsReplayTab(closingTab);
+    try {
+      await cleanupWsReplayTab(closingTab);
+    } catch (error) {
+      console.warn("Failed to clean up WebSocket replay tab before close:", error);
+      stopWsPoll(closingTab);
+      closingTab.wsStatus = "disconnected";
+    }
   }
   const currentIndex = state.replayTabs.findIndex((tab) => tab.id === id);
   if (currentIndex === -1) {
@@ -20234,13 +20278,26 @@ function parseCurlCommand(text) {
     "--unix-socket",
   ]);
   const curlShortOptionsWithValue = new Set(["-E", "-m", "-o", "-x", "-y", "-Y"]);
-  const addHeader = (rawHeader) => {
+  const requireOptionValue = (flag) => {
+    if (t + 1 >= tokens.length) {
+      return { error: `cURL ${flag} requires a value.` };
+    }
+    const value = tokens[t + 1];
+    if (value === undefined || value === "") {
+      return { error: `cURL ${flag} requires a value.` };
+    }
+    t += 1;
+    return { value };
+  };
+  const addHeader = (rawHeader, flag = "-H") => {
     const hVal = String(rawHeader || "");
     const ci = hVal.indexOf(":");
-    if (ci <= 0) return;
+    if (ci <= 0) return `cURL ${flag} requires a header in Name: Value form.`;
     const name = hVal.slice(0, ci).trim();
-    if (headerNameEquals({ name }, "content-length")) return;
+    if (!name) return `cURL ${flag} requires a header name.`;
+    if (headerNameEquals({ name }, "content-length")) return "";
     headers.push({ name, value: hVal.slice(ci + 1).trim() });
+    return "";
   };
   const addBodyPart = (flag, value, options = {}) => {
     if (flag === "--data-urlencode") {
@@ -20280,10 +20337,12 @@ function parseCurlCommand(text) {
     ensureHeader("Accept", "application/json");
     return "";
   };
-  for (let t = 0; t < tokens.length; t++) {
+  for (var t = 0; t < tokens.length; t++) {
     const tok = tokens[t];
     if (tok === "-X" || tok === "--request") {
-      method = (tokens[++t] || "GET").toUpperCase();
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      method = value.value.toUpperCase();
       methodExplicit = true;
     }
     else if (tok.startsWith("-X") && tok.length > 2) {
@@ -20315,20 +20374,29 @@ function parseCurlCommand(text) {
       return { error: "cURL HTTP/3 imports are not supported by Replay." };
     }
     else if (tok === "-H" || tok === "--header") {
-      addHeader(tokens[++t] || "");
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      const error = addHeader(value.value, tok);
+      if (error) return { error };
     }
     else if (tok.startsWith("-H") && tok.length > 2) {
-      addHeader(tok.slice(2));
+      const error = addHeader(tok.slice(2), "-H");
+      if (error) return { error };
     }
     else if (tok.startsWith("--header=")) {
-      addHeader(tok.slice("--header=".length));
+      const error = addHeader(tok.slice("--header=".length), "--header");
+      if (error) return { error };
     }
     else if (tok === "-d" || tok === "--data" || tok === "--data-raw" || tok === "--data-binary" || tok === "--data-urlencode") {
-      const error = addBodyPart(tok, tokens[++t] || "");
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      const error = addBodyPart(tok, value.value);
       if (error) return { error };
     }
     else if (tok === "--json") {
-      const error = addJsonBody(tokens[++t] || "");
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      const error = addJsonBody(value.value);
       if (error) return { error };
     }
     else if (tok.startsWith("-d") && tok.length > 2) {
@@ -20345,15 +20413,17 @@ function parseCurlCommand(text) {
       if (error) return { error };
     }
     else if (tok === "-F" || tok === "--form" || tok === "--form-string") {
-      t++;
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
       return { error: "cURL multipart form imports are not supported yet." };
     }
     else if ((tok.startsWith("-F") && tok.length > 2) || tok.startsWith("--form=") || tok.startsWith("--form-string=")) {
       return { error: "cURL multipart form imports are not supported yet." };
     }
     else if (tok === "-u" || tok === "--user") {
-      const cred = tokens[++t] || "";
-      headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(cred)}` });
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(value.value)}` });
     }
     else if (tok.startsWith("-u") && tok.length > 2) {
       const cred = tok.slice(2);
@@ -20364,7 +20434,9 @@ function parseCurlCommand(text) {
       headers.push({ name: "Authorization", value: `Basic ${safeEncodeBase64(cred)}` });
     }
     else if (tok === "-A" || tok === "--user-agent") {
-      headers.push({ name: "User-Agent", value: tokens[++t] || "" });
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      headers.push({ name: "User-Agent", value: value.value });
     }
     else if (tok.startsWith("-A") && tok.length > 2) {
       headers.push({ name: "User-Agent", value: tok.slice(2) });
@@ -20373,7 +20445,9 @@ function parseCurlCommand(text) {
       headers.push({ name: "User-Agent", value: tok.slice("--user-agent=".length) });
     }
     else if (tok === "-e" || tok === "--referer") {
-      headers.push({ name: "Referer", value: tokens[++t] || "" });
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      headers.push({ name: "Referer", value: value.value });
     }
     else if (tok.startsWith("-e") && tok.length > 2) {
       headers.push({ name: "Referer", value: tok.slice(2) });
@@ -20382,7 +20456,9 @@ function parseCurlCommand(text) {
       headers.push({ name: "Referer", value: tok.slice("--referer=".length) });
     }
     else if (tok === "-b" || tok === "--cookie") {
-      headers.push({ name: "Cookie", value: tokens[++t] || "" });
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      headers.push({ name: "Cookie", value: value.value });
     }
     else if (tok.startsWith("-b") && tok.length > 2) {
       headers.push({ name: "Cookie", value: tok.slice(2) });
@@ -20391,7 +20467,9 @@ function parseCurlCommand(text) {
       headers.push({ name: "Cookie", value: tok.slice("--cookie=".length) });
     }
     else if (tok === "--url") {
-      url = tokens[++t] || "";
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+      url = value.value;
     }
     else if (tok.startsWith("--url=")) {
       url = tok.slice("--url=".length);
@@ -20400,7 +20478,10 @@ function parseCurlCommand(text) {
       pathAsIs = true;
     }
     else if (tok === "--compressed" || tok === "-k" || tok === "--insecure" || tok === "-s" || tok === "--silent" || tok === "-v" || tok === "--verbose" || tok === "-L" || tok === "--location") { /* skip flags */ }
-    else if (curlShortOptionsWithValue.has(tok) || curlOptionsWithValue.has(tok)) { t++; }
+    else if (curlShortOptionsWithValue.has(tok) || curlOptionsWithValue.has(tok)) {
+      const value = requireOptionValue(tok);
+      if (value.error) return value;
+    }
     else if (/^--[^=]+=.*/.test(tok) && curlOptionsWithValue.has(tok.slice(0, tok.indexOf("=")))) { /* skip option=value */ }
     else if (!tok.startsWith("-") && !url) { url = tok; }
   }
