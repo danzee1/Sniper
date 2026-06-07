@@ -2703,27 +2703,40 @@ async fn forward_websocket_request(
             captured_websocket_id,
             started,
         );
-        let result = Abortable::new(relay, relay_registration).await.ok();
-        if let Some(Err(error)) = result {
-            warn!(
-                %peer_addr,
-                host = %forwarded_request.host,
-                path = %request_path,
-                ?error,
-                "websocket relay failed"
-            );
-            if let Some(id) = captured_websocket_id {
-                session
-                    .websockets
-                    .close(
-                        id,
-                        Utc::now(),
-                        started.elapsed().as_millis() as u64,
-                        Some(format!("Relay error: {error}")),
-                    )
-                    .await;
-                persist_session_quiet(&state, &session).await;
+        match Abortable::new(relay, relay_registration).await {
+            Ok(Err(error)) => {
+                warn!(
+                    %peer_addr,
+                    host = %forwarded_request.host,
+                    path = %request_path,
+                    ?error,
+                    "websocket relay failed"
+                );
+                if let Some(id) = captured_websocket_id {
+                    session
+                        .websockets
+                        .close(
+                            id,
+                            Utc::now(),
+                            started.elapsed().as_millis() as u64,
+                            Some(format!("Relay error: {error}")),
+                        )
+                        .await;
+                    persist_session_quiet(&state, &session).await;
+                }
             }
+            Err(_aborted) => {
+                close_aborted_live_websocket_relay(
+                    &state,
+                    &session,
+                    relay_id,
+                    captured_websocket_id,
+                    started,
+                    "Proxy shutdown closed the live WebSocket relay.",
+                )
+                .await;
+            }
+            Ok(Ok(())) => {}
         }
         forget_live_websocket_relay_unless_close_pending(relay_id);
     });
@@ -4480,6 +4493,48 @@ fn forget_live_websocket_relay_unless_close_pending(relay_id: Uuid) {
     relays.remove(&relay_id);
 }
 
+fn claim_live_websocket_relay_close_persist(relay_id: Uuid) -> bool {
+    let relays = LIVE_WEBSOCKET_RELAYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    relays
+        .get(&relay_id)
+        .map(|relay| {
+            relay
+                .close_persist_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+        .unwrap_or(false)
+}
+
+async fn close_aborted_live_websocket_relay(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    relay_id: Uuid,
+    captured_websocket_id: Option<Uuid>,
+    started: Instant,
+    note: &'static str,
+) {
+    let Some(websocket_id) = captured_websocket_id else {
+        return;
+    };
+    if !claim_live_websocket_relay_close_persist(relay_id) {
+        return;
+    }
+    session
+        .websockets
+        .close(
+            websocket_id,
+            Utc::now(),
+            started.elapsed().as_millis() as u64,
+            Some(note.to_string()),
+        )
+        .await;
+    persist_session_quiet(state, session).await;
+    forget_live_websocket_relay(relay_id);
+}
+
 fn remember_streamed_response_pump(
     pump_id: Uuid,
     session_id: Uuid,
@@ -5882,6 +5937,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborted_live_websocket_relay_closes_and_persists_capture() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-test-live-ws-abort-{}", Uuid::new_v4()));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let websocket_id = Uuid::new_v4();
+        session
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now(),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                path: "/ws".to_string(),
+                status: Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        let relay_id = Uuid::new_v4();
+        let (abort, _registration) = AbortHandle::new_pair();
+        remember_live_websocket_relay(
+            relay_id,
+            Some(websocket_id),
+            &session,
+            Instant::now(),
+            abort,
+        );
+
+        close_aborted_live_websocket_relay(
+            &state,
+            &session,
+            relay_id,
+            Some(websocket_id),
+            Instant::now(),
+            "test abort closed the live WebSocket relay.",
+        )
+        .await;
+        forget_live_websocket_relay_unless_close_pending(relay_id);
+        flush_pending_session_persists(state.as_ref())
+            .await
+            .expect("pending websocket close persist should flush");
+
+        let live = session.websockets.get(websocket_id).await.unwrap();
+        assert!(live.closed_at.is_some());
+        assert!(live.notes.iter().any(|note| note.contains("test abort")));
+        assert!(!session_has_live_websocket_relays(session.id()));
+
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        let durable = reloaded.websockets.get(websocket_id).await.unwrap();
+        assert!(durable.closed_at.is_some());
+        assert!(durable.notes.iter().any(|note| note.contains("test abort")));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn close_live_websocket_relays_clears_clean_pending_persist_after_direct_save() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-close-live-ws-clears-pending-{}",
@@ -6011,7 +6134,19 @@ mod tests {
         forget_live_websocket_relay_unless_close_pending(websocket_id);
         assert!(session_has_live_websocket_relays(session.id()));
 
-        forget_live_websocket_relay(websocket_id);
+        std::fs::remove_dir_all(&registry_path).unwrap();
+        close_live_websocket_relays(
+            state.as_ref(),
+            "test retry closed the live WebSocket relay.",
+        )
+        .await
+        .unwrap();
+
+        assert!(!session_has_live_websocket_relays(session.id()));
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        let durable = reloaded.websockets.get(websocket_id).await.unwrap();
+        assert!(durable.closed_at.is_some());
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

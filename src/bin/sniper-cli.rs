@@ -2456,7 +2456,11 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
                 )
                 .await?;
             attach_session_id(&mut result, session_id);
-            print_failed_json_record_and_bail("sequence run", &result)?;
+            if let Some(mut output) = failed_record_output("sequence run", &result) {
+                attach_session_id(&mut output, session_id);
+                print_json(&output)?;
+                bail!("sequence run failed");
+            }
             print_json(&result)?;
             Ok(())
         }
@@ -4428,14 +4432,6 @@ fn attach_session_id(output: &mut Value, session_id: Option<Uuid>) {
     }
 }
 
-fn print_failed_json_record_and_bail(label: &str, value: &Value) -> Result<()> {
-    if let Some(output) = failed_record_output(label, value) {
-        print_json(&output)?;
-        bail!("{label} failed");
-    }
-    Ok(())
-}
-
 fn failed_record_output(label: &str, value: &Value) -> Option<Value> {
     if value.get("status").and_then(Value::as_str) == Some("failed") {
         Some(json!({
@@ -4720,12 +4716,12 @@ fn parse_response_status_line(status_line: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_session_id_from_summaries, api_failure_detail, api_url, attach_workspace_save_error,
-        auto_replace_write_session_id, build_annotations_payload, build_editable_raw_request,
-        build_editable_raw_request_with_version, build_oast_configure_update, cli_data_dir,
-        data_dir_strings_match, default_cli_data_dir, default_editable_request,
-        discover_api_base_url, discover_api_base_url_from_data_dir, explicit_or_active_session_id,
-        failed_record_output, fuzzer_active_target_for_request,
+        active_session_id_from_summaries, api_failure_detail, api_url, attach_session_id,
+        attach_workspace_save_error, auto_replace_write_session_id, build_annotations_payload,
+        build_editable_raw_request, build_editable_raw_request_with_version,
+        build_oast_configure_update, cli_data_dir, data_dir_strings_match, default_cli_data_dir,
+        default_editable_request, discover_api_base_url, discover_api_base_url_from_data_dir,
+        explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
         fuzzer_target_request_authority_for_request, history_list_path, install_skills,
         next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
         normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
@@ -5372,6 +5368,10 @@ mod tests {
         assert_eq!(output["error"], "sequence run failed");
         assert_eq!(output["record"]["id"], "run-1");
         assert_eq!(output["record"]["status"], "failed");
+
+        let session_id = Uuid::new_v4();
+        attach_session_id(&mut output, Some(session_id));
+        assert_eq!(output["session_id"], serde_json::json!(session_id));
 
         attach_workspace_save_error(&mut output, &anyhow::anyhow!("workspace conflict"));
         assert_eq!(output["workspace_save_error"], "workspace conflict");

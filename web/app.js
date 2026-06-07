@@ -1021,7 +1021,7 @@ function bindEvents() {
       setActiveTool(tab.dataset.tool);
       renderToolPanels();
       if (state.activeTool === "dashboard") {
-        loadSessions().catch((error) => console.error(error));
+        loadSessions({ reloadOnActiveChange: true }).catch((error) => console.error(error));
       }
       if (state.activeTool === "target") {
         loadTargetSiteMap(true).catch((error) => console.error(error));
@@ -1425,7 +1425,7 @@ function bindEvents() {
     renderToolPanels();
   });
   els.dashboardReloadSessionsButton?.addEventListener("click", () => {
-    loadSessions().catch((error) => console.error(error));
+    loadSessions({ reloadOnActiveChange: true }).catch((error) => console.error(error));
   });
   els.dashboardCreateSessionButton?.addEventListener("click", () => {
     createSession().catch(handleWorkspaceActionError);
@@ -2620,11 +2620,25 @@ async function performSelfUpdate() {
   }
 }
 
-async function loadSessions() {
+async function loadSessions({ reloadOnActiveChange = false } = {}) {
   const response = await fetch("/api/sessions");
   await requireOkResponse(response, "Failed to load sessions.");
-  state.sessions = jsonArray(await response.json());
-  state.activeSession = state.sessions.find((session) => session.active) || state.sessions[0] || null;
+  const sessions = jsonArray(await response.json());
+  const previousActiveSessionId = currentSessionId();
+  const nextActiveSession = sessions.find((session) => session.active) || sessions[0] || null;
+  if (
+    reloadOnActiveChange
+    && previousActiveSessionId
+    && nextActiveSession?.id
+    && nextActiveSession.id !== previousActiveSessionId
+  ) {
+    state.sessions = sessions;
+    renderDashboard();
+    await handleExternalSessionChanged(previousActiveSessionId);
+    return;
+  }
+  state.sessions = sessions;
+  state.activeSession = nextActiveSession;
   renderDashboard();
 }
 
@@ -4122,10 +4136,11 @@ async function reloadSessionWorkspace({ cleanupBeforeReset = true } = {}) {
   renderToolPanels();
 }
 
-async function handleExternalSessionChanged() {
+async function handleExternalSessionChanged(previousSessionId = currentSessionId()) {
+  const targetSessionId = previousSessionId || currentSessionId();
   const staleSessionWriteOptions = {
     bypassExpectedActiveSessionGuard: true,
-    sessionId: currentSessionId(),
+    sessionId: targetSessionId,
   };
   let shouldReload = false;
   try {
@@ -6336,7 +6351,7 @@ function connectEvents() {
   });
 
   eventSource.addEventListener("session_changed", () => {
-    handleExternalSessionChanged().catch((error) => console.error(error));
+    handleExternalSessionChanged(eventSessionId).catch((error) => console.error(error));
   });
 
   eventSource.onerror = () => {
@@ -20155,15 +20170,20 @@ async function updateAnnotations(transactionId, payload, sessionId = currentSess
   }
 }
 
-function flushContextMenuPendingNote() {
+function flushContextMenuPendingNote(options = {}) {
   window.clearTimeout(contextMenuNoteTimer);
   contextMenuNoteTimer = null;
   const pending = contextMenuPendingNote;
-  contextMenuPendingNote = null;
-  if (!pending?.id || pending.sessionId !== currentSessionId()) {
-    return;
+  if (!pending?.id || !pending.sessionId) {
+    contextMenuPendingNote = null;
+    return false;
   }
+  if (options.sessionId && pending.sessionId !== options.sessionId) {
+    return false;
+  }
+  contextMenuPendingNote = null;
   updateAnnotations(pending.id, { user_note: pending.value || null }, pending.sessionId);
+  return true;
 }
 
 function flushAnnotationsOnUnload() {
@@ -20185,7 +20205,7 @@ function flushAnnotationsOnUnload() {
 }
 
 async function flushAllPendingAnnotations(options = {}) {
-  flushContextMenuPendingNote();
+  flushContextMenuPendingNote(options);
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const pendingIds = state._pendingAnnotations ? Array.from(state._pendingAnnotations.keys()) : [];
     const inFlight = state._annotationInFlight || new Set();
