@@ -17,6 +17,7 @@ use uuid::Uuid;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
+    api::validate_workspace_state,
     event_log::{EventLogEntry, EventLogStore},
     fuzzer::{FuzzerAttackRecord, FuzzerStore},
     intercept::{InterceptQueue, ResponseInterceptQueue},
@@ -1536,7 +1537,7 @@ fn load_session_snapshot_with_mode(
             .with_context(|| format!("failed to read session snapshot {}", path.display())),
     }?;
     snapshot.workspace.fuzzer.migrate_attack_record_to_id();
-    if let Err(error) = validate_workspace_serialized_size(&snapshot.workspace) {
+    if let Err(error) = validate_workspace_state(&snapshot.workspace) {
         warn!(
             ?error,
             path = %path.display(),
@@ -2340,6 +2341,80 @@ mod tests {
         assert_eq!(loaded.transactions.len(), 1);
         assert_eq!(loaded.transactions[0].id, transaction_id);
         assert!(loaded.workspace.replay.tabs.is_empty());
+        assert!(super::snapshot_path(&storage_dir).exists());
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn load_session_snapshot_discards_semantically_invalid_workspace_only() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "sniper-load-invalid-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let request = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "Host".to_string(),
+                value: "example.test".to_string(),
+            }],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let transaction = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "example.test".to_string(),
+            "/kept".to_string(),
+            Some(200),
+            1,
+            request,
+            None,
+            Vec::new(),
+            None,
+            None,
+        );
+        let transaction_id = transaction.id;
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![transaction],
+            workspace: WorkspaceStateSnapshot {
+                replay: ReplayWorkspaceState {
+                    active_tab_id: Some("bad-tab".to_string()),
+                    tabs: vec![ReplayTabState {
+                        id: "bad-tab".to_string(),
+                        sequence: 1,
+                        base_request: Some(EditableRequest {
+                            scheme: "https".to_string(),
+                            host: " bad.example".to_string(),
+                            method: "GET".to_string(),
+                            path: "/".to_string(),
+                            headers: Vec::new(),
+                            body: String::new(),
+                            body_encoding: BodyEncoding::Utf8,
+                            preview_truncated: false,
+                        }),
+                        ..ReplayTabState::default()
+                    }],
+                    ..ReplayWorkspaceState::default()
+                },
+                ..WorkspaceStateSnapshot::default()
+            },
+            ..super::StoredSessionSnapshot::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let loaded = super::load_session_snapshot(&storage_dir, 100).unwrap();
+
+        assert_eq!(loaded.transactions.len(), 1);
+        assert_eq!(loaded.transactions[0].id, transaction_id);
+        assert!(loaded.workspace.replay.tabs.is_empty());
+        assert!(loaded.workspace.replay.active_tab_id.is_none());
         assert!(super::snapshot_path(&storage_dir).exists());
 
         let _ = std::fs::remove_dir_all(storage_dir);
@@ -3702,7 +3777,7 @@ mod tests {
                             ..Default::default()
                         },
                         ReplayTabState {
-                            id: "ws-tab-1".to_string(),
+                            id: "11111111-1111-4111-8111-111111111111".to_string(),
                             tab_type: "websocket".to_string(),
                             sequence: 2,
                             custom_label: "Chat socket".to_string(),
@@ -3817,7 +3892,7 @@ mod tests {
             .replay
             .tabs
             .iter()
-            .find(|tab| tab.id == "ws-tab-1")
+            .find(|tab| tab.id == "11111111-1111-4111-8111-111111111111")
             .expect("websocket replay tab should persist");
         assert_eq!(ws_tab.tab_type, "websocket");
         assert_eq!(ws_tab.ws_editor_text, "{\"type\":\"ping\"}");

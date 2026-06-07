@@ -994,7 +994,9 @@ fn validate_fuzzer_target_request_authority(
     Ok(())
 }
 
-fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::Result<(), String> {
+pub(crate) fn validate_workspace_state(
+    snapshot: &WorkspaceStateSnapshot,
+) -> std::result::Result<(), String> {
     validate_workspace_serialized_size(snapshot)?;
     let mut tab_ids = HashSet::new();
     let mut ws_frame_total = 0usize;

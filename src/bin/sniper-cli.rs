@@ -866,7 +866,14 @@ struct ResponseInterceptForwardPayload {
 #[serde(untagged)]
 enum AutoReplaceInput {
     Rules(Vec<MatchReplaceRule>),
-    Payload(MatchReplaceRulesPayload),
+    Payload(AutoReplaceRulesInput),
+}
+
+#[derive(Deserialize)]
+struct AutoReplaceRulesInput {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    rules: Vec<MatchReplaceRule>,
 }
 
 #[derive(Deserialize)]
@@ -1539,6 +1546,22 @@ fn sequence_write_session_id(
     ))
 }
 
+fn auto_replace_write_session_id(
+    cli_session_id: Option<Uuid>,
+    input_session_id: Option<Uuid>,
+) -> Result<Option<Uuid>> {
+    if let Some(input_session_id) = input_session_id {
+        let Some(cli_session_id) = cli_session_id else {
+            bail!("auto-replace JSON session_id requires matching --session-id");
+        };
+        if cli_session_id != input_session_id {
+            bail!("auto-replace JSON session_id conflicts with --session-id");
+        }
+        return Ok(Some(cli_session_id));
+    }
+    Ok(session_id_for_write_payload(cli_session_id))
+}
+
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
         HistoryCommand::List(args) => {
@@ -2161,11 +2184,17 @@ async fn handle_auto_replace(api: ApiClient, command: AutoReplaceCommand) -> Res
             let parsed: AutoReplaceInput = serde_json::from_str(&raw).context(
                 "failed to parse auto-replace JSON; expected either an array of rules or {\"rules\": [...]}",
             )?;
-            let payload = match parsed {
-                AutoReplaceInput::Rules(rules) => MatchReplaceRulesPayload { rules },
-                AutoReplaceInput::Payload(payload) => payload,
+            let (payload, input_session_id) = match parsed {
+                AutoReplaceInput::Rules(rules) => (MatchReplaceRulesPayload { rules }, None),
+                AutoReplaceInput::Payload(payload) => (
+                    MatchReplaceRulesPayload {
+                        rules: payload.rules,
+                    },
+                    payload.session_id,
+                ),
             };
-            let path = write_session_query_path("/api/match-replace", args.session_id);
+            let session_id = auto_replace_write_session_id(args.session_id, input_session_id)?;
+            let path = session_query_path("/api/match-replace", session_id);
             let rules: Vec<MatchReplaceRule> = api.post_json(&path, &payload).await?;
             print_json(&rules)
         }
@@ -2352,9 +2381,8 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             print_json(&run)
         }
         SequenceCommand::Delete(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path =
-                write_session_query_path(&format!("/api/sequences/{}", args.id), args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let path = session_query_path(&format!("/api/sequences/{}", args.id), session_id);
             api.delete_status(&path).await?;
             print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
         }
@@ -4562,7 +4590,7 @@ fn parse_response_status_line(status_line: &str) -> Result<u16> {
 mod tests {
     use super::{
         active_session_id_from_summaries, api_failure_detail, api_url, attach_workspace_save_error,
-        build_annotations_payload, build_editable_raw_request,
+        auto_replace_write_session_id, build_annotations_payload, build_editable_raw_request,
         build_editable_raw_request_with_version, build_oast_configure_update, cli_data_dir,
         data_dir_strings_match, default_cli_data_dir, default_editable_request,
         discover_api_base_url, discover_api_base_url_from_data_dir, explicit_or_active_session_id,
@@ -4932,6 +4960,35 @@ mod tests {
         assert!(error
             .to_string()
             .contains("sequence JSON session_id conflicts with --session-id"));
+    }
+
+    #[test]
+    fn auto_replace_write_session_id_rejects_json_only_or_conflicting_session_id() {
+        let cli_session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let input_session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        assert_eq!(auto_replace_write_session_id(None, None).unwrap(), None);
+        assert_eq!(
+            auto_replace_write_session_id(Some(cli_session_id), None).unwrap(),
+            Some(cli_session_id)
+        );
+
+        let error = auto_replace_write_session_id(None, Some(input_session_id))
+            .expect_err("auto-replace JSON session_id without --session-id should fail");
+        assert!(error
+            .to_string()
+            .contains("auto-replace JSON session_id requires matching --session-id"));
+
+        assert_eq!(
+            auto_replace_write_session_id(Some(input_session_id), Some(input_session_id)).unwrap(),
+            Some(input_session_id)
+        );
+
+        let error = auto_replace_write_session_id(Some(cli_session_id), Some(input_session_id))
+            .expect_err("conflicting explicit auto-replace session ids should fail");
+        assert!(error
+            .to_string()
+            .contains("auto-replace JSON session_id conflicts with --session-id"));
     }
 
     #[test]

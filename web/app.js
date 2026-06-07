@@ -1180,6 +1180,7 @@ function bindEvents() {
     state.websocketQuery = els.websocketSearchInput.value.trim();
     scheduleUiSettingsSave();
     clearWebsocketQueryBackfill();
+    clearWebsocketSelectionPreview({ render: true });
     if (_websocketSearchReloadTimer) {
       window.clearTimeout(_websocketSearchReloadTimer);
     }
@@ -1261,12 +1262,14 @@ function bindEvents() {
     state.websocketInScopeOnly = e.currentTarget.classList.toggle("active");
     scheduleUiSettingsSave();
     clearWebsocketQueryBackfill();
+    clearWebsocketSelectionPreview({ render: true });
     loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
   });
   document.getElementById("wsHideClosed")?.addEventListener("click", (e) => {
     state.websocketLiveOnly = e.currentTarget.classList.toggle("active");
     scheduleUiSettingsSave();
     clearWebsocketQueryBackfill();
+    clearWebsocketSelectionPreview({ render: true });
     loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
   });
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
@@ -4259,6 +4262,8 @@ async function loadTransactionDetail(id) {
         await selectHistoryTransaction(nextSelectedId, { scroll: true });
       }
     } else if (state.selectedId === id) {
+      state.selectedId = null;
+      updateHistorySelection(null);
       renderEmptyDetail();
     }
     return null;
@@ -4902,6 +4907,18 @@ function clearWebsocketSearchReload() {
   if (_websocketSearchReloadTimer) {
     window.clearTimeout(_websocketSearchReloadTimer);
     _websocketSearchReloadTimer = 0;
+  }
+}
+
+function clearWebsocketSelectionPreview(options = {}) {
+  state.selectedWebsocketId = null;
+  state.selectedFrameIdx = null;
+  state.selectedWebsocketRecord = null;
+  state.selectedWebsocketDetailError = "";
+  hideFrameDetail();
+  resetWebsocketFrameScroll();
+  if (options.render) {
+    renderWebsocketSessions();
   }
 }
 
@@ -9518,6 +9535,8 @@ function renderWebsocketSessions(options = {}) {
         }</td>
       </tr>
     `;
+    updateWsHandshakeLineNumbers();
+    updateWsHandshakeSearch();
     return;
   }
 
@@ -18143,6 +18162,7 @@ async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
         });
         if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
         if (resp.ok) {
+          await refreshWsReplayFramesOnce(tab, { lifecycleToken });
           item.sent = true;
           renderWsSetupQueue();
           scheduleWorkspaceStateSave();
@@ -18197,6 +18217,7 @@ async function wsSend() {
   if (!tab || tab.type !== "websocket" || tab.wsStatus !== "connected") return;
 
   const body = els.wsMessageEditor.value;
+  const lifecycleToken = tab.wsLifecycleToken;
 
   tab.wsMessageType = normalizeWsMessageType(els.wsMessageType.value);
   const binary = tab.wsMessageType !== "text";
@@ -18212,6 +18233,8 @@ async function wsSend() {
     if (!resp.ok) {
       const text = await resp.text().catch(() => "Send failed");
       showToast(text, "error");
+    } else {
+      await refreshWsReplayFramesOnce(tab, { lifecycleToken });
     }
   } catch (e) {
     showToast(`Send failed: ${e.message}`, "error");
@@ -18643,6 +18666,7 @@ function renderWsSetupQueue() {
           showToast(text, "error");
           return;
         }
+        await refreshWsReplayFramesOnce(tab, { lifecycleToken });
         item.sent = true;
         renderWsSetupQueue();
         scheduleWorkspaceStateSave();
