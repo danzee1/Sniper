@@ -414,6 +414,7 @@ impl SessionContext {
     }
 
     pub async fn open_websocket_capture(&self, record: WebSocketSessionRecord) -> Result<()> {
+        let _persist_guard = self.persist_lock.lock().await;
         self.append_websocket_journal_entry(&WebSocketJournalEntry::Open {
             record: record.clone(),
         })
@@ -427,6 +428,7 @@ impl SessionContext {
         id: Uuid,
         frame: WebSocketFrameRecord,
     ) -> Result<bool> {
+        let _persist_guard = self.persist_lock.lock().await;
         self.append_websocket_journal_entry(&WebSocketJournalEntry::Frame {
             id,
             frame: frame.clone(),
@@ -442,6 +444,7 @@ impl SessionContext {
         duration_ms: u64,
         note: Option<String>,
     ) -> Result<bool> {
+        let _persist_guard = self.persist_lock.lock().await;
         self.append_websocket_journal_entry(&WebSocketJournalEntry::Close {
             id,
             closed_at,
@@ -2114,6 +2117,13 @@ fn apply_websocket_journal_entry(
             };
             if record
                 .frames
+                .last()
+                .is_some_and(|latest| frame.index <= latest.index)
+            {
+                return;
+            }
+            if record
+                .frames
                 .iter()
                 .any(|existing| existing.index == frame.index)
             {
@@ -3292,6 +3302,94 @@ mod tests {
         assert_eq!(
             summary.retained_frame_count,
             super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_journal_replay_keeps_capped_snapshot_tail_order() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-websocket-journal-tail-order-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 2_000).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let websocket_id = Uuid::new_v4();
+        let total_frames = super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION + 507;
+        let frames = (0..total_frames)
+            .map(|index| WebSocketFrameRecord {
+                index,
+                captured_at: Utc::now(),
+                direction: WebSocketFrameDirection::ClientToServer,
+                kind: WebSocketFrameKind::Binary,
+                body_preview: "AAECAwQFBgcICQ==".to_string(),
+                body_encoding: BodyEncoding::Base64,
+                body_size: 10,
+                preview_truncated: false,
+            })
+            .collect::<Vec<_>>();
+        let tail_start = total_frames - super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION;
+        let snapshot_record = WebSocketSessionRecord {
+            id: websocket_id,
+            started_at: Utc::now(),
+            closed_at: Some(Utc::now()),
+            duration_ms: Some(1),
+            scheme: "wss".to_string(),
+            host: "socket.example.test".to_string(),
+            path: "/stream".to_string(),
+            status: Some(101),
+            request: MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 1024),
+            response: None,
+            frames: frames[tail_start..].to_vec(),
+            notes: Vec::new(),
+        };
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &super::StoredSessionSnapshot {
+                websockets: vec![snapshot_record.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut journal =
+            super::encode_websocket_journal_line(&super::WebSocketJournalEntry::Open {
+                record: WebSocketSessionRecord {
+                    frames: Vec::new(),
+                    ..snapshot_record
+                },
+            })
+            .unwrap();
+        for frame in frames {
+            journal.extend(
+                super::encode_websocket_journal_line(&super::WebSocketJournalEntry::Frame {
+                    id: websocket_id,
+                    frame,
+                })
+                .unwrap(),
+            );
+        }
+        std::fs::write(super::websocket_journal_path(&storage_dir), journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.websockets.get(websocket_id).await.unwrap();
+
+        assert_eq!(
+            restored.frames.len(),
+            super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION
+        );
+        assert_eq!(restored.frames[0].index, tail_start);
+        assert_eq!(restored.frames.last().unwrap().index, total_frames - 1);
+        assert!(restored
+            .frames
+            .windows(2)
+            .all(|frames| frames[0].index < frames[1].index));
+        assert_eq!(
+            std::fs::metadata(super::websocket_journal_path(&storage_dir))
+                .unwrap()
+                .len(),
+            0
         );
 
         let _ = std::fs::remove_dir_all(data_dir);

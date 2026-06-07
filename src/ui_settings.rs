@@ -465,13 +465,12 @@ impl AppUiSettingsStore {
     ) -> Result<AppUiSettingsSnapshot> {
         let next = snapshot.sanitized();
         let mut current = self.inner.write().await;
-        if next.server_revision < current.server_revision {
-            return Ok(current.clone());
-        }
-        if !next.client_id.is_empty()
-            && next.client_id == current.client_id
-            && next.client_version <= current.client_version
-        {
+        let same_client = !next.client_id.is_empty() && next.client_id == current.client_id;
+        if same_client {
+            if next.client_version <= current.client_version {
+                return Ok(current.clone());
+            }
+        } else if next.server_revision < current.server_revision {
             return Ok(current.clone());
         }
         let mut next = next;
@@ -833,6 +832,47 @@ mod tests {
         assert_eq!(accepted.client_id, "browser-a");
         assert_eq!(accepted.server_revision, 2);
         assert_eq!(accepted.active_tool, "tools");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn ui_settings_store_accepts_newer_same_client_with_stale_revision() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-ui-settings-{}", uuid::Uuid::new_v4()));
+        let store = AppUiSettingsStore::load_or_create(&data_dir).expect("store should load");
+
+        let initial = AppUiSettingsSnapshot {
+            client_id: "browser-client".to_string(),
+            client_version: 1,
+            server_revision: 0,
+            active_tool: "proxy".to_string(),
+            ..AppUiSettingsSnapshot::default()
+        };
+        let saved_initial = store
+            .replace_snapshot(initial)
+            .await
+            .expect("initial snapshot should persist");
+        assert_eq!(saved_initial.server_revision, 1);
+
+        let newer_during_unload = AppUiSettingsSnapshot {
+            client_id: "browser-client".to_string(),
+            client_version: 2,
+            server_revision: 0,
+            active_tool: "replay".to_string(),
+            websocket_live_only: true,
+            ..AppUiSettingsSnapshot::default()
+        };
+        let accepted = store
+            .replace_snapshot(newer_during_unload)
+            .await
+            .expect("newer same-client snapshot should persist despite stale revision");
+
+        assert_eq!(accepted.client_id, "browser-client");
+        assert_eq!(accepted.client_version, 2);
+        assert_eq!(accepted.server_revision, 2);
+        assert_eq!(accepted.active_tool, "replay");
+        assert!(accepted.websocket_live_only);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

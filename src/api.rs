@@ -612,7 +612,7 @@ fn validate_transaction_cursor_sort(query: &TransactionQuery) -> std::result::Re
         return Ok(());
     }
 
-    if query.offset.is_some_and(|offset| offset != 0) {
+    if query.offset.is_some() {
         return Err("before_sequence cannot be combined with offset".to_string());
     }
 
@@ -6902,6 +6902,7 @@ mod tests {
         for path in [
             "/api/transactions-page?before_sequence=42&sort_key=host&sort_direction=asc",
             "/api/transactions-page?before_sequence=42&sort_key=index&sort_direction=asc",
+            "/api/transactions-page?before_sequence=42&offset=0",
             "/api/transactions-page?before_sequence=42&offset=1",
         ] {
             let (status, body) =

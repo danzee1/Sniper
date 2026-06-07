@@ -353,6 +353,7 @@ function createWebsocketPagingState() {
     hasMore: false,
     capReached: false,
     loading: false,
+    summaryMutationGeneration: 0,
   };
 }
 
@@ -5095,6 +5096,19 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     }
     const pageItems = jsonArray(page.items);
     const pageOffset = Math.max(0, Number(page.offset ?? requestedOffset) || 0);
+    if (
+      append
+      && !websocketCursorPagingEnabled(queryState)
+      && summaryMutationGeneration !== _websocketSummaryMutationGeneration
+    ) {
+      state.websocketPaging = {
+        ...(state.websocketPaging || createWebsocketPagingState()),
+        querySignature,
+        loading: false,
+      };
+      await loadWebsocketsPageRefresh(preserveSelection);
+      return;
+    }
     const loadedOffset = Math.max(
       append ? Number(state.websocketPaging?.loadedOffset ?? 0) || 0 : 0,
       pageOffset + pageItems.length,
@@ -5132,6 +5146,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
       hasMore: serverHasMore && !capReached,
       capReached,
       loading: false,
+      summaryMutationGeneration: _websocketSummaryMutationGeneration,
     };
     state.websocketListError = "";
     state.websocketHistoryDirty = false;
@@ -5185,6 +5200,13 @@ async function loadMoreWebsockets() {
   const previousCount = (state.websocketSessions || []).length;
   const nextOffset = Math.max(0, Number(paging.loadedOffset ?? paging.limit ?? state.websocketSessions.length) || 0);
   const queryState = createWebsocketQueryState();
+  if (
+    !websocketCursorPagingEnabled(queryState)
+    && Number(paging.summaryMutationGeneration ?? 0) !== _websocketSummaryMutationGeneration
+  ) {
+    await loadWebsocketsPageRefresh(true);
+    return 0;
+  }
   const nextAfterId = websocketCursorPagingEnabled(queryState) ? websocketAppendAfterId() : null;
   if (nextOffset >= WEBSOCKET_MAX_LOADED_SESSIONS) {
     state.websocketPaging = { ...paging, hasMore: false, capReached: true };
@@ -5799,6 +5821,14 @@ function websocketSummarySignature(summary) {
   ].join("|");
 }
 
+function noteWebsocketSummaryMutation(id) {
+  _websocketSummaryMutationGeneration += 1;
+  if (id) {
+    _websocketSummaryMutationById.set(id, _websocketSummaryMutationGeneration);
+  }
+  pruneWebsocketSummaryMutationCache();
+}
+
 function websocketServerOrderCanAcceptSummaryEvents() {
   return (state.websocketSortKey || "started_at") === "started_at"
     && (state.websocketSortDirection || "desc") === "desc";
@@ -5839,6 +5869,7 @@ function applyWebsocketSummary(summary) {
   if (!summary?.id) return;
   if (!websocketServerOrderCanAcceptSummaryEvents()) {
     const selectedChanged = applySelectedWebsocketSummary(summary);
+    noteWebsocketSummaryMutation(summary.id);
     if (selectedChanged && isWebsocketHistoryVisible()) {
       scheduleVisibleWebsocketSelectionSync({ deferStaleDetail: true });
     }
@@ -5919,9 +5950,7 @@ function applyWebsocketSummary(summary) {
   if (removedVisibleCount) {
     adjustWebsocketPagingAfterLocalRemoval(removedVisibleCount);
   }
-  _websocketSummaryMutationGeneration += 1;
-  _websocketSummaryMutationById.set(summary.id, _websocketSummaryMutationGeneration);
-  pruneWebsocketSummaryMutationCache();
+  noteWebsocketSummaryMutation(summary.id);
 
   const selectedChanged = applySelectedWebsocketSummary(summary);
 
