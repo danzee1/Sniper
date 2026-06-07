@@ -82,11 +82,12 @@ pub struct SiteMapRecord {
 pub struct TransactionStore {
     inner: RwLock<StoreInner>,
     insert_lock: AsyncMutex<()>,
-    events: broadcast::Sender<TransactionSummary>,
+    events: broadcast::Sender<TransactionEvent>,
     retention_events: broadcast::Sender<()>,
     journal_tx: Option<mpsc::Sender<TransactionJournalCommand>>,
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
+    next_event_sequence: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -114,11 +115,20 @@ pub struct AnnotationUpdate {
     pub applied_user_note: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TransactionEvent {
+    pub event_sequence: u64,
+    pub summary: TransactionSummary,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum TransactionJournalEntry {
     Insert {
+        record: TransactionRecord,
+    },
+    Update {
         record: TransactionRecord,
     },
     Annotation {
@@ -334,6 +344,7 @@ impl TransactionStore {
             journal_tx: None,
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
+            next_event_sequence: AtomicU64::new(max_seq + 1),
         }
     }
 
@@ -380,7 +391,7 @@ impl TransactionStore {
             retention_trimmed = inner.trim_to_max_entries(max_entries);
         }
         drop(inner);
-        let _ = self.events.send(summary);
+        self.publish_transaction_event(summary);
         if retention_trimmed {
             let _ = self.retention_events.send(());
         }
@@ -661,16 +672,86 @@ impl TransactionStore {
         id: Uuid,
         update: impl FnOnce(&mut TransactionRecord),
     ) -> Option<TransactionSummary> {
+        match self
+            .update_record_with_journal_mode(id, update, false)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "failed to append transaction update journal entry before storing"
+                );
+                None
+            }
+        }
+    }
+
+    pub async fn update_record_durable(
+        &self,
+        id: Uuid,
+        update: impl FnOnce(&mut TransactionRecord),
+    ) -> io::Result<Option<TransactionSummary>> {
+        self.update_record_with_journal_mode(id, update, true).await
+    }
+
+    async fn update_record_with_journal_mode(
+        &self,
+        id: Uuid,
+        update: impl FnOnce(&mut TransactionRecord),
+        require_journal_append: bool,
+    ) -> io::Result<Option<TransactionSummary>> {
         let _mutation_guard = self.insert_lock.lock().await;
+        let mut updated_record = {
+            let inner = self.inner.read().await;
+            let Some(index) = inner.by_id.get(&id).copied() else {
+                return Ok(None);
+            };
+            let Some(record) = inner.entries.get(index) else {
+                return Ok(None);
+            };
+            record.clone()
+        };
+        update(&mut updated_record);
+        updated_record.id = id;
+        if let Some(tx) = &self.journal_tx {
+            if let Some(line) = encode_transaction_journal_line(&TransactionJournalEntry::Update {
+                record: updated_record.clone(),
+            }) {
+                if let Err(error) = append_transaction_journal(tx, line).await {
+                    if require_journal_append {
+                        return Err(error);
+                    }
+                    warn!(
+                        ?error,
+                        "failed to append transaction update journal entry before storing"
+                    );
+                }
+            } else if require_journal_append {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "failed to encode transaction update journal entry",
+                ));
+            }
+        } else if require_journal_append {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "transaction journal writer is not available",
+            ));
+        }
+        let summary = updated_record.summary();
         let mut inner = self.inner.write().await;
-        let index = inner.by_id.get(&id).copied()?;
-        let record = inner.entries.get_mut(index)?;
-        update(record);
-        let summary = record.summary();
+        let Some(index) = inner.by_id.get(&id).copied() else {
+            return Ok(None);
+        };
+        if index >= inner.entries.len() {
+            return Ok(None);
+        }
+        inner.entries[index] = updated_record;
         inner.summaries[index] = CachedSummary::new(summary.clone());
         drop(inner);
-        let _ = self.events.send(summary.clone());
-        Some(summary)
+        self.publish_transaction_event(summary.clone());
+        Ok(Some(summary))
     }
 
     pub async fn update_annotations_durable(
@@ -826,7 +907,7 @@ impl TransactionStore {
         inner.summaries[index] = CachedSummary::new(summary.clone());
         drop(inner);
         if has_annotation_patch {
-            let _ = self.events.send(summary.clone());
+            self.publish_transaction_event(summary.clone());
         }
         Ok(Some(AnnotationUpdate {
             summary,
@@ -913,9 +994,11 @@ impl TransactionStore {
         let max_seq = inner.entries.iter().map(|r| r.sequence).max().unwrap_or(0);
         *self.inner.write().await = inner;
         self.next_sequence.store(max_seq + 1, Ordering::Relaxed);
+        self.next_event_sequence
+            .store(max_seq + 1, Ordering::Relaxed);
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<TransactionSummary> {
+    pub fn subscribe(&self) -> broadcast::Receiver<TransactionEvent> {
         self.events.subscribe()
     }
 
@@ -925,6 +1008,20 @@ impl TransactionStore {
 
     pub fn latest_sequence(&self) -> u64 {
         self.next_sequence.load(Ordering::Relaxed).saturating_sub(1)
+    }
+
+    pub fn latest_event_sequence(&self) -> u64 {
+        self.next_event_sequence
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
+    }
+
+    fn publish_transaction_event(&self, summary: TransactionSummary) {
+        let event = TransactionEvent {
+            event_sequence: self.next_event_sequence.fetch_add(1, Ordering::Relaxed),
+            summary,
+        };
+        let _ = self.events.send(event);
     }
 }
 
@@ -1896,8 +1993,9 @@ mod tests {
 
         store.insert(record).await;
         let inserted = receiver.recv().await.unwrap();
-        assert_eq!(inserted.id, record_id);
-        assert_eq!(inserted.duration_ms, 0);
+        assert_eq!(inserted.event_sequence, 1);
+        assert_eq!(inserted.summary.id, record_id);
+        assert_eq!(inserted.summary.duration_ms, 0);
 
         let updated = store
             .update_record(record_id, |record| {
@@ -1910,11 +2008,54 @@ mod tests {
         assert_eq!(updated.duration_ms, 250);
         assert_eq!(updated.note_count, 1);
         let event = receiver.recv().await.unwrap();
-        assert_eq!(event.id, record_id);
-        assert_eq!(event.duration_ms, 250);
+        assert_eq!(event.event_sequence, 2);
+        assert_eq!(event.summary.id, record_id);
+        assert_eq!(event.summary.duration_ms, 250);
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed[0].duration_ms, 250);
         assert_eq!(listed[0].note_count, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_update_record_appends_update_journal_entry() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-store-record-update-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let journal_path = data_dir.join("transactions.journal");
+        let store =
+            TransactionStore::from_records_with_journal(Vec::new(), journal_path.clone(), None);
+        let record = test_record("streamed.example");
+        let record_id = record.id;
+
+        let outcome = store.insert(record).await;
+        assert!(!outcome.snapshot_fallback_needed());
+        let updated = store
+            .update_record_durable(record_id, |record| {
+                record.status = Some(200);
+                record.duration_ms = 125;
+                record.notes = vec!["stream complete".to_string()];
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.status, Some(200));
+        assert_eq!(updated.duration_ms, 125);
+        let lines = std::fs::read_to_string(&journal_path).unwrap();
+        let entries = lines
+            .lines()
+            .map(|line| serde_json::from_str::<TransactionJournalEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        let Some(TransactionJournalEntry::Update { record }) = entries.last() else {
+            panic!("expected durable record update journal entry");
+        };
+        assert_eq!(record.id, record_id);
+        assert_eq!(record.status, Some(200));
+        assert_eq!(record.duration_ms, 125);
+        assert_eq!(record.notes, vec!["stream complete".to_string()]);
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
@@ -1931,8 +2072,12 @@ mod tests {
             .expect("annotation should update");
 
         let event = receiver.recv().await.unwrap();
-        assert_eq!(event.id, record_id);
-        assert_eq!(event.color_tag.as_deref(), Some("yellow"));
+        assert_eq!(event.event_sequence, 2);
+        assert_eq!(event.summary.id, record_id);
+        assert_eq!(event.summary.sequence, 1);
+        assert_eq!(event.summary.color_tag.as_deref(), Some("yellow"));
+        assert_eq!(store.latest_sequence(), 1);
+        assert_eq!(store.latest_event_sequence(), 2);
     }
 
     #[tokio::test]

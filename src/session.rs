@@ -1836,6 +1836,16 @@ fn replay_transaction_journal_file(
                     );
                 }
             }
+            TransactionJournalEntry::Update { record } => {
+                let id = record.id;
+                if let Some(existing) = records.get_mut(&id) {
+                    *existing = record;
+                    annotation_mutated_record_ids.insert(id);
+                } else if let Some(existing) = backfill_records.get_mut(&id) {
+                    *existing = record;
+                    annotation_mutated_record_ids.insert(id);
+                }
+            }
             TransactionJournalEntry::Annotation {
                 id,
                 color_tag,
@@ -4728,6 +4738,97 @@ mod tests {
             .find(|summary| summary.id == active.id())
             .unwrap();
         assert_eq!(summary.request_count, 1);
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_replays_transaction_journal_update_after_insert() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-update-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let request = MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "host".to_string(),
+                value: "streamed.example".to_string(),
+            }],
+            body_preview: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 0,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: None,
+            content_decoded: false,
+        };
+        let provisional = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "streamed.example:443".to_string(),
+            "/events".to_string(),
+            None,
+            0,
+            request,
+            None,
+            vec!["Streaming response capture is still in progress.".to_string()],
+            None,
+            None,
+        );
+        let record_id = provisional.id;
+        let mut completed = provisional.clone();
+        completed.status = Some(200);
+        completed.duration_ms = 42;
+        completed.response = Some(MessageRecord {
+            headers: vec![HeaderRecord {
+                name: "content-type".to_string(),
+                value: "text/event-stream".to_string(),
+            }],
+            body_preview: "done".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+            body_size: 4,
+            decoded_body_size: None,
+            preview_truncated: false,
+            content_type: Some("text/event-stream".to_string()),
+            content_decoded: false,
+        });
+        completed.notes = vec!["stream complete".to_string()];
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let mut lines = Vec::new();
+        serde_json::to_writer(
+            &mut lines,
+            &TransactionJournalEntry::Insert {
+                record: provisional,
+            },
+        )
+        .unwrap();
+        lines.push(b'\n');
+        serde_json::to_writer(
+            &mut lines,
+            &TransactionJournalEntry::Update { record: completed },
+        )
+        .unwrap();
+        lines.push(b'\n');
+        std::fs::write(&journal_path, lines).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, record_id);
+        assert_eq!(restored[0].status, Some(200));
+        assert_eq!(restored[0].duration_ms, 42);
+        assert_eq!(restored[0].notes, vec!["stream complete".to_string()]);
+        assert_eq!(
+            restored[0]
+                .response
+                .as_ref()
+                .map(|response| response.body_preview.as_str()),
+            Some("done")
+        );
         assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
     }
 

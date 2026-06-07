@@ -5478,7 +5478,7 @@ async fn events(
     let mut finding_receiver = session.scanner.subscribe();
     let mut websocket_receiver = session.websockets.subscribe();
     let mut websocket_retention_receiver = session.websockets.subscribe_retention();
-    let latest_sequence = session.store.latest_sequence();
+    let latest_sequence = session.store.latest_event_sequence();
     let event_stream_started_for_active_session = state.sessions.active_session_id() == session_id;
 
     let stream = stream! {
@@ -5493,11 +5493,12 @@ async fn events(
             tokio::select! {
                 result = transaction_receiver.recv() => {
                     match result {
-                        Ok(summary) => {
+                        Ok(event) => {
+                            let summary = event.summary;
                             if let Ok(payload) = serde_json::to_string(&summary) {
                                 yield Ok(Event::default()
                                     .event("transaction")
-                                    .id(summary.sequence.to_string())
+                                    .id(event.event_sequence.to_string())
                                     .data(payload));
                             }
                         }

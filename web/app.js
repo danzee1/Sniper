@@ -3293,6 +3293,7 @@ async function drainWsReplayFramesBeforeHidden() {
 async function flushBeforeNativeClose() {
   await flushAllPendingAnnotations();
   await flushProxySettingsSaveBeforeClose();
+  await flushSequenceDraft({ preserveSelection: true });
   syncReplayDraftsBeforeWorkspaceClose();
   await flushWsReplayTabsBeforeClose();
   await flushWorkspaceState();
@@ -3309,6 +3310,7 @@ function flushWorkspaceStateBeforeHidden() {
   if (document.visibilityState !== "hidden") return;
   syncReplayDraftsBeforeWorkspaceClose();
   (async () => {
+    await flushSequenceDraft({ preserveSelection: true });
     await drainWsReplayFramesBeforeHidden();
     if (!hasPendingWorkspaceStateSave()) return;
     await flushWorkspaceState();
@@ -3333,6 +3335,9 @@ function flushWorkspaceStateOnUnload(event) {
   wsTranscriptFirstDirtyAt = 0;
   syncReplayDraftsBeforeWorkspaceClose();
   disconnectWsReplayTabsOnUnload();
+  if (state.sequenceDirty && state.editingSequence) {
+    requestWorkspaceUnloadPrompt(event);
+  }
   if (!state.activeSession || (!workspaceSaveDirty && !workspaceSaveTimer && !workspaceSaveInFlight && !hadTranscriptSaveTimer)) {
     return;
   }
@@ -14063,6 +14068,14 @@ function isRedirectCredentialHeader(header) {
   return name === "authorization" || name === "proxy-authorization";
 }
 
+function isRedirectRequestBodyHeader(header) {
+  const name = String(header?.name || "").trim().toLowerCase();
+  return name === "content-length"
+    || name === "transfer-encoding"
+    || name === "content-type"
+    || name === "content-encoding";
+}
+
 async function followRedirect() {
   const tab = getActiveReplayTab();
   if (!tab || !tab.responseRecord) return;
@@ -14169,6 +14182,7 @@ async function followRedirect() {
     .filter((h) => (
       !headerNameEquals(h, "cookie")
       && !headerNameEquals(h, "host")
+      && (!useGet || !isRedirectRequestBodyHeader(h))
       && (sameOriginRedirect || !isRedirectCredentialHeader(h))
     ))
     .map((h) => ({ name: h.name, value: h.value }));
@@ -14326,9 +14340,16 @@ function duplicateActiveReplayTab() {
   }
 
   if (tab.type === "websocket") {
+    let handshakeEdited = !!tab.wsHandshakeEdited;
+    let handshakeText = handshakeEdited ? (tab.wsHandshakeText || "") : "";
     if (state.activeReplayTabId === tab.id && els.wsHandshakeHeaders) {
-      tab.wsHandshakeText = els.wsHandshakeHeaders.value;
-      tab.wsHandshakeEdited = true;
+      const visibleHandshakeText = els.wsHandshakeHeaders.value;
+      handshakeEdited = handshakeEdited || visibleHandshakeText !== wsReplayDisplayHandshakeText(tab);
+      handshakeText = handshakeEdited ? visibleHandshakeText : "";
+      if (handshakeEdited) {
+        tab.wsHandshakeText = visibleHandshakeText;
+        tab.wsHandshakeEdited = true;
+      }
     }
     createWsReplayTab({
       scheme: tab.wsScheme,
@@ -14336,8 +14357,8 @@ function duplicateActiveReplayTab() {
       port: tab.wsPort,
       path: tab.wsPath,
       headers: normalizedHeaders(tab.wsHeaders),
-      handshakeText: tab.wsHandshakeText || "",
-      handshakeEdited: !!tab.wsHandshakeEdited,
+      handshakeText,
+      handshakeEdited,
       editorText: tab.wsEditorText || "",
       messageType: tab.wsMessageType || "text",
       editorBodyEncoded: !!tab.wsEditorBodyEncoded,

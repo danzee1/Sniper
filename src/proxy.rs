@@ -1966,17 +1966,17 @@ async fn serve_passthrough_tunnel(
         }
     };
 
-    if session
-        .store
-        .update_record(record_id, |record| {
+    let _ = update_transaction_record_quiet(
+        &state,
+        &session,
+        record_id,
+        "passthrough tunnel completion",
+        |record| {
             record.duration_ms = started.elapsed().as_millis() as u64;
-            record.notes = notes;
-        })
-        .await
-        .is_some()
-    {
-        persist_session_quiet(&state, &session).await;
-    }
+            record.notes = notes.clone();
+        },
+    )
+    .await;
 
     result.context("passthrough tunnel relay failed")?;
     Ok(())
@@ -2914,6 +2914,44 @@ async fn insert_transaction_quiet(
     session.store.insert(record).await
 }
 
+async fn update_transaction_record_quiet(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    record_id: Uuid,
+    context: &'static str,
+    update: impl Fn(&mut TransactionRecord),
+) -> bool {
+    match session
+        .store
+        .update_record_durable(record_id, |record| update(record))
+        .await
+    {
+        Ok(Some(_)) => {
+            persist_session_quiet(state, session).await;
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            warn!(
+                ?error,
+                context,
+                "failed to append durable transaction update journal entry; falling back to immediate snapshot persistence"
+            );
+            if session
+                .store
+                .update_record(record_id, |record| update(record))
+                .await
+                .is_some()
+            {
+                persist_session_immediate_quiet(state, session).await;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 async fn persist_transaction_insert_outcome(
     state: &Arc<AppState>,
     session: &Arc<SessionContext>,
@@ -3266,6 +3304,16 @@ async fn read_response_body_limited(response: reqwest::Response, limit: usize) -
     Ok(body.freeze())
 }
 
+fn apply_streamed_record_update(stored: &mut TransactionRecord, record: &TransactionRecord) {
+    stored.status = record.status;
+    stored.duration_ms = record.duration_ms;
+    stored.response = record.response.clone();
+    stored.notes = record.notes.clone();
+    stored.original_response = record.original_response.clone();
+    stored.http_version = record.http_version.clone();
+    stored.response_http_version = record.response_http_version.clone();
+}
+
 impl StreamedRecordContext {
     async fn insert_provisional_record(&mut self) {
         if self.record_id.is_some() {
@@ -3288,25 +3336,18 @@ impl StreamedRecordContext {
     async fn store_with_notes(self, preview: Vec<u8>, body_size: usize, notes: Vec<String>) {
         let record = self.build_record(preview, body_size, notes);
         if let Some(record_id) = self.record_id {
-            if self
-                .session
-                .store
-                .update_record(record_id, |stored| {
-                    stored.status = record.status;
-                    stored.duration_ms = record.duration_ms;
-                    stored.response = record.response.clone();
-                    stored.notes = record.notes.clone();
-                    stored.original_response = record.original_response.clone();
-                    stored.http_version = record.http_version.clone();
-                    stored.response_http_version = record.response_http_version.clone();
-                })
-                .await
-                .is_some()
+            if update_transaction_record_quiet(
+                &self.state,
+                &self.session,
+                record_id,
+                "streaming response completion",
+                |stored| apply_streamed_record_update(stored, &record),
+            )
+            .await
             {
                 let mut scan_record = record;
                 scan_record.id = record_id;
                 scan_record_for_session(&self.state, &self.session, scan_record);
-                persist_session_quiet(&self.state, &self.session).await;
                 forget_persist_context_if_clean(self.session.id(), self.persist_generation);
                 return;
             }
