@@ -320,12 +320,12 @@ impl WebSocketStore {
         let offset = sorted_summary_offset_after_id(&matched, filters.after_id)
             .unwrap_or_else(|| filters.offset.unwrap_or(0))
             .min(filtered_total);
-        let items = matched
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, summary)| summary)
-            .collect::<Vec<_>>();
+        let summaries = matched.into_iter().skip(offset).map(|(_, summary)| summary);
+        let items = if limit == 0 {
+            summaries.collect::<Vec<_>>()
+        } else {
+            summaries.take(limit).collect::<Vec<_>>()
+        };
         WebSocketListPage {
             items,
             total,
@@ -426,7 +426,7 @@ impl WebSocketStore {
     }
 }
 
-fn sessions_with_live_preserved(
+pub(crate) fn sessions_with_live_preserved(
     records: Vec<WebSocketSessionRecord>,
     max_entries: usize,
     max_frames_per_session: usize,
@@ -494,7 +494,10 @@ fn frame_window(
     }
 }
 
-fn trim_frame_overflow(frames: &mut Vec<WebSocketFrameRecord>, max_frames_per_session: usize) {
+pub(crate) fn trim_frame_overflow(
+    frames: &mut Vec<WebSocketFrameRecord>,
+    max_frames_per_session: usize,
+) {
     if frames.len() > max_frames_per_session {
         let overflow = frames.len() - max_frames_per_session;
         frames.drain(..overflow);
@@ -550,7 +553,7 @@ fn list_filtered_storage_order_page(
     if let Some(start_index) = storage_order_offset_after_id(inner, filters.after_id) {
         let mut matched_count = 0usize;
         let mut items = if limit == 0 {
-            Vec::new()
+            Vec::with_capacity(total.saturating_sub(start_index))
         } else {
             Vec::with_capacity(limit.min(total.saturating_sub(start_index)))
         };
@@ -563,7 +566,7 @@ fn list_filtered_storage_order_page(
                 continue;
             }
             matched_count += 1;
-            if limit != 0 && items.len() < limit {
+            if limit == 0 || items.len() < limit {
                 items.push(summary);
             }
             if limit != 0 && matched_count > limit {
@@ -643,13 +646,16 @@ fn list_unfiltered_storage_order_page(
     let offset = storage_order_offset_after_id(inner, filters.after_id)
         .unwrap_or(offset)
         .min(total);
-    let items = inner
+    let summaries = inner
         .order
         .iter()
         .skip(offset)
-        .take(limit)
-        .filter_map(|id| inner.sessions.get(id).map(WebSocketSessionEntry::summary))
-        .collect::<Vec<_>>();
+        .filter_map(|id| inner.sessions.get(id).map(WebSocketSessionEntry::summary));
+    let items = if limit == 0 {
+        summaries.collect::<Vec<_>>()
+    } else {
+        summaries.take(limit).collect::<Vec<_>>()
+    };
     Some(WebSocketListPage {
         items,
         total,
@@ -1039,6 +1045,22 @@ mod tests {
         assert_eq!(sorted_page.items.len(), 1);
         assert_eq!(sorted_page.items[0].host, "zeta.example.test");
         assert!(!sorted_page.has_more);
+
+        let unlimited_sorted_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(0),
+                offset: Some(1),
+                sort_key: Some("host".to_string()),
+                sort_direction: Some("asc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(unlimited_sorted_page.filtered_total, Some(2));
+        assert_eq!(unlimited_sorted_page.limit, 0);
+        assert_eq!(unlimited_sorted_page.items.len(), 1);
+        assert_eq!(unlimited_sorted_page.items[0].host, "zeta.example.test");
+        assert!(!unlimited_sorted_page.has_more);
     }
 
     #[tokio::test]
@@ -1583,6 +1605,65 @@ mod tests {
         assert!(page.has_more);
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].id, second_id);
+    }
+
+    #[tokio::test]
+    async fn list_page_limit_zero_returns_all_unfiltered_items_after_offset() {
+        let store = WebSocketStore::new(10, 10);
+        let first = session(Vec::new());
+        let first_id = first.id;
+        let second = session(Vec::new());
+        let second_id = second.id;
+        let third = session(Vec::new());
+
+        store.open(first).await;
+        store.open(second).await;
+        store.open(third).await;
+
+        let page = store.list_page(Some(0), Some(1)).await;
+
+        assert_eq!(page.total, 3);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.limit, 0);
+        assert!(!page.has_more);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].id, second_id);
+        assert_eq!(page.items[1].id, first_id);
+    }
+
+    #[tokio::test]
+    async fn list_page_limit_zero_returns_all_filtered_items_after_offset() {
+        let store = WebSocketStore::new(10, 10);
+        let mut first = session(Vec::new());
+        first.host = "first.example.test".to_string();
+        let first_id = first.id;
+        let mut second = session(Vec::new());
+        second.host = "second.example.test".to_string();
+        let second_id = second.id;
+        let mut third = session(Vec::new());
+        third.host = "third.example.test".to_string();
+
+        store.open(first).await;
+        store.open(second).await;
+        store.open(third).await;
+
+        let page = store
+            .list_page_filtered(&WebSocketListFilters {
+                query: Some("example.test".to_string()),
+                limit: Some(0),
+                offset: Some(1),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(page.total, 3);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.limit, 0);
+        assert_eq!(page.filtered_total, Some(3));
+        assert!(!page.has_more);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].id, second_id);
+        assert_eq!(page.items[1].id, first_id);
     }
 
     #[tokio::test]

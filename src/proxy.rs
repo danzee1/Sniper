@@ -683,6 +683,7 @@ fn build_replay_exchange_request(
     request: &EditableRequest,
     target: Option<&RequestTargetOverride>,
 ) -> Result<EditableRequest> {
+    crate::api::validate_runnable_editable_request(request).map_err(anyhow::Error::msg)?;
     validate_replay_header_records(&request.headers)?;
     let Some(target) = target else {
         return Ok(request.clone());
@@ -717,6 +718,7 @@ fn build_replay_exchange_request(
             .and_then(|authority| authority.port)
             .or(request_authority.port),
     )?;
+    crate::api::validate_runnable_editable_request(&rewritten).map_err(anyhow::Error::msg)?;
     Ok(rewritten)
 }
 
@@ -896,6 +898,21 @@ async fn handle_connect(
             .await;
         }
     };
+    if let Err(error) = validate_connect_host_header(request.headers(), &target) {
+        warn!(%peer_addr, ?error, target = %target, "invalid CONNECT Host header");
+        return record_connect_rejection(
+            &state,
+            &session,
+            request.uri(),
+            request.headers(),
+            started_at,
+            started,
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+            request_http_version,
+        )
+        .await;
+    }
     let request_capture = MessageRecord::from_headers_and_body(
         request.headers(),
         &[],
@@ -1285,6 +1302,9 @@ fn resolve_absolute_uri(
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
+    if path == "*" {
+        bail!("star-form request targets are not supported by proxy forwarding");
+    }
 
     Uri::builder()
         .scheme(default_scheme)
@@ -1466,6 +1486,35 @@ fn connect_target(uri: &Uri) -> Result<String> {
         .port_u16()
         .ok_or_else(|| anyhow!("CONNECT target authority must include a port: {target}"))?;
     Ok(authority.to_string())
+}
+
+fn validate_connect_host_header(headers: &HeaderMap, target: &str) -> Result<()> {
+    let mut host_headers = headers.get_all(HOST).iter();
+    let Some(host_header) = host_headers.next() else {
+        return Ok(());
+    };
+    if host_headers.next().is_some() {
+        bail!("multiple Host headers are not supported for CONNECT");
+    }
+
+    let host_header = host_header
+        .to_str()
+        .context("invalid CONNECT Host header")?;
+    let header_authority = parse_client_authority(host_header, "CONNECT Host header")?;
+    let target_authority = parse_client_authority(target, "CONNECT target authority")?;
+    let header_port = header_authority
+        .port_u16()
+        .ok_or_else(|| anyhow!("CONNECT Host header must include a port: {host_header}"))?;
+    let target_port = target_authority
+        .port_u16()
+        .ok_or_else(|| anyhow!("CONNECT target authority must include a port: {target}"))?;
+
+    if !authority_hosts_equivalent(header_authority.host(), target_authority.host())
+        || header_port != target_port
+    {
+        bail!("CONNECT Host header does not match CONNECT target authority");
+    }
+    Ok(())
 }
 
 fn rebuild_response(
@@ -2697,12 +2746,11 @@ async fn forward_websocket_request(
         )
         .await;
 
-    let captured_websocket_id = capture_enabled.then(Uuid::new_v4);
+    let mut captured_websocket_id = capture_enabled.then(Uuid::new_v4);
 
     if let Some(id) = captured_websocket_id {
-        session
-            .websockets
-            .open(WebSocketSessionRecord {
+        if let Err(error) = session
+            .open_websocket_capture(WebSocketSessionRecord {
                 id,
                 started_at,
                 closed_at: None,
@@ -2716,7 +2764,15 @@ async fn forward_websocket_request(
                 frames: Vec::new(),
                 notes: vec!["Live relay established.".to_string()],
             })
-            .await;
+            .await
+        {
+            warn!(
+                ?error,
+                websocket_id = %id,
+                "failed to journal captured WebSocket open"
+            );
+            captured_websocket_id = None;
+        }
     }
     persist_session_quiet(&state, &session).await;
 
@@ -4685,15 +4741,21 @@ async fn close_aborted_live_websocket_relay(
     if !claim_live_websocket_relay_close_persist(relay_id) {
         return;
     }
-    session
-        .websockets
-        .close(
+    if let Err(error) = session
+        .close_websocket_capture(
             websocket_id,
             Utc::now(),
             started.elapsed().as_millis() as u64,
             Some(note.to_string()),
         )
-        .await;
+        .await
+    {
+        warn!(
+            ?error,
+            websocket_id = %websocket_id,
+            "failed to journal captured WebSocket abort close"
+        );
+    }
     persist_session_quiet(state, session).await;
     forget_live_websocket_relay(relay_id);
 }
@@ -4870,16 +4932,22 @@ pub async fn close_live_websocket_relays(state: &AppState, note: &'static str) -
         relay.abort.abort();
         if let Some(websocket_id) = relay.captured_websocket_id {
             relay.close_persist_pending.store(true, Ordering::Release);
-            relay
+            if let Err(error) = relay
                 .session
-                .websockets
-                .close(
+                .close_websocket_capture(
                     websocket_id,
                     Utc::now(),
                     relay.started.elapsed().as_millis() as u64,
                     Some(note.to_string()),
                 )
-                .await;
+                .await
+            {
+                warn!(
+                    ?error,
+                    websocket_id = %websocket_id,
+                    "failed to journal captured WebSocket shutdown close"
+                );
+            }
             let session_id = relay.session.id();
             sessions_to_persist.insert(session_id, Arc::clone(&relay.session));
             relay_ids_by_session
@@ -5178,6 +5246,23 @@ fn clear_trailing_persist_if_generation(session_id: Uuid, generation: u64) -> bo
     true
 }
 
+async fn append_captured_websocket_frame(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    id: Uuid,
+    frame: WebSocketFrameRecord,
+) {
+    match session.append_websocket_capture_frame(id, frame).await {
+        Ok(true) => mark_session_persist_pending(state, session),
+        Ok(false) => {}
+        Err(error) => warn!(
+            ?error,
+            websocket_id = %id,
+            "failed to journal captured WebSocket frame"
+        ),
+    }
+}
+
 async fn relay_websocket_session(
     on_upgrade: hyper::upgrade::OnUpgrade,
     upstream_ws: UpstreamWebSocket,
@@ -5212,9 +5297,7 @@ async fn relay_websocket_session(
                                     &message,
                                     max_preview,
                                 ) {
-                                    if session.websockets.append_frame(id, frame).await {
-                                        mark_session_persist_pending(&state, &session);
-                                    }
+                                    append_captured_websocket_frame(&state, &session, id, frame).await;
                                     frame_index += 1;
                                 }
                             }
@@ -5231,9 +5314,7 @@ async fn relay_websocket_session(
                                         &reply,
                                         max_preview,
                                     ) {
-                                        if session.websockets.append_frame(id, frame).await {
-                                            mark_session_persist_pending(&state, &session);
-                                        }
+                                        append_captured_websocket_frame(&state, &session, id, frame).await;
                                         frame_index += 1;
                                     }
                                 }
@@ -5249,9 +5330,7 @@ async fn relay_websocket_session(
                                 &captured_message,
                                 max_preview,
                             ) {
-                                if session.websockets.append_frame(id, frame).await {
-                                    mark_session_persist_pending(&state, &session);
-                                }
+                                append_captured_websocket_frame(&state, &session, id, frame).await;
                                 frame_index += 1;
                             }
                         }
@@ -5288,9 +5367,7 @@ async fn relay_websocket_session(
                                     &message,
                                     max_preview,
                                 ) {
-                                    if session.websockets.append_frame(id, frame).await {
-                                        mark_session_persist_pending(&state, &session);
-                                    }
+                                    append_captured_websocket_frame(&state, &session, id, frame).await;
                                     frame_index += 1;
                                 }
                             }
@@ -5307,9 +5384,7 @@ async fn relay_websocket_session(
                                         &reply,
                                         max_preview,
                                     ) {
-                                        if session.websockets.append_frame(id, frame).await {
-                                            mark_session_persist_pending(&state, &session);
-                                        }
+                                        append_captured_websocket_frame(&state, &session, id, frame).await;
                                         frame_index += 1;
                                     }
                                 }
@@ -5325,9 +5400,7 @@ async fn relay_websocket_session(
                                 &captured_message,
                                 max_preview,
                             ) {
-                                if session.websockets.append_frame(id, frame).await {
-                                    mark_session_persist_pending(&state, &session);
-                                }
+                                append_captured_websocket_frame(&state, &session, id, frame).await;
                                 frame_index += 1;
                             }
                         }
@@ -5357,15 +5430,21 @@ async fn relay_websocket_session(
     };
 
     if let Some(id) = session_id {
-        session
-            .websockets
-            .close(
+        if let Err(error) = session
+            .close_websocket_capture(
                 id,
                 Utc::now(),
                 started.elapsed().as_millis() as u64,
                 close_note.clone(),
             )
-            .await;
+            .await
+        {
+            warn!(
+                ?error,
+                websocket_id = %id,
+                "failed to journal captured WebSocket close"
+            );
+        }
         session
             .event_log
             .push(
@@ -6788,6 +6867,26 @@ mod tests {
     }
 
     #[test]
+    fn connect_host_header_must_match_target_authority() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("attacker.example:443"));
+
+        let error = validate_connect_host_header(&headers, "127.0.0.1:443").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match CONNECT target authority"));
+    }
+
+    #[test]
+    fn connect_host_header_accepts_matching_ipv6_authority() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("[::1]:443"));
+
+        validate_connect_host_header(&headers, "[::1]:443").unwrap();
+    }
+
+    #[test]
     fn normalize_request_path_preserves_asterisk_form() {
         assert_eq!(normalize_request_path("*"), "*");
     }
@@ -6799,6 +6898,17 @@ mod tests {
         request.path = "*".to_string();
 
         let error = build_uri_from_request(&request, None).unwrap_err();
+
+        assert!(error.to_string().contains("star-form request targets"));
+    }
+
+    #[test]
+    fn proxy_uri_builder_rejects_asterisk_form_request_target() {
+        let uri: Uri = "*".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("example.com"));
+
+        let error = resolve_absolute_uri(&uri, &headers, "http", None).unwrap_err();
 
         assert!(error.to_string().contains("star-form request targets"));
     }
@@ -7203,6 +7313,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid request header value for X-Token"));
+    }
+
+    #[test]
+    fn replay_exchange_revalidates_request_authority_after_rewrite() {
+        let mut request = editable_request("origin.example:443");
+        request.host = "user@127.0.0.1:8080".to_string();
+
+        let error = build_replay_exchange_request(&request, None).unwrap_err();
+
+        assert!(error.to_string().contains("invalid request host"));
     }
 
     #[test]

@@ -3,13 +3,14 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{mpsc, Arc, RwLock},
+    thread,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -23,7 +24,8 @@ use crate::{
     intercept::{InterceptQueue, ResponseInterceptQueue},
     match_replace::{MatchReplaceRule, MatchReplaceStore},
     model::{
-        compact_annotation_client_versions_for_insert, TransactionRecord, WebSocketSessionRecord,
+        compact_annotation_client_versions_for_insert, TransactionRecord, WebSocketFrameRecord,
+        WebSocketSessionRecord,
     },
     runtime::{RuntimeSettings, RuntimeSettingsSnapshot},
     scanner::{scan_transaction, ScannerConfig, ScannerFinding, ScannerStore},
@@ -32,7 +34,7 @@ use crate::{
         normalize_storage_sequences, transaction_journal_checkpoint_path, NullableStringPatch,
         TransactionJournalEntry, TransactionStore,
     },
-    websocket::WebSocketStore,
+    websocket::{sessions_with_live_preserved, trim_frame_overflow, WebSocketStore},
     workspace::{validate_workspace_serialized_size, WorkspaceReplaceError},
     workspace::{WorkspaceStateSnapshot, WorkspaceStateStore},
 };
@@ -41,6 +43,7 @@ pub(crate) const SESSIONS_DIR: &str = "sessions";
 const REGISTRY_FILE: &str = "registry.json";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const TRANSACTION_JOURNAL_FILE: &str = "transactions.journal";
+const WEBSOCKET_JOURNAL_FILE: &str = "websockets.journal";
 const MAX_SESSION_NAME_BYTES: usize = 256;
 const MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION: usize = 1_000;
 
@@ -147,6 +150,8 @@ struct StoredSessionSnapshot {
     replayed_transaction_journal: bool,
     #[serde(skip)]
     replayed_transaction_ids: HashSet<Uuid>,
+    #[serde(skip)]
+    replayed_websocket_journal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +164,36 @@ struct TransactionJournalReplayResult {
     replayed_transaction_ids: HashSet<Uuid>,
     mutated_snapshot: bool,
     transaction_event_sequence: u64,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WebSocketJournalEntry {
+    Open {
+        record: WebSocketSessionRecord,
+    },
+    Frame {
+        id: Uuid,
+        frame: WebSocketFrameRecord,
+    },
+    Close {
+        id: Uuid,
+        closed_at: DateTime<Utc>,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+}
+
+enum WebSocketJournalCommand {
+    Append {
+        line: Vec<u8>,
+        ack: oneshot::Sender<io::Result<()>>,
+    },
+    Clear {
+        ack: mpsc::Sender<io::Result<()>>,
+    },
 }
 
 fn deserialize_workspace_state_lossy<'de, D>(
@@ -199,6 +234,7 @@ pub struct SessionContext {
     pub sequence: Arc<SequenceStore>,
     pub oast: Arc<crate::oast::OastStore>,
     pub workspace: Arc<WorkspaceStateStore>,
+    websocket_journal_tx: Option<mpsc::Sender<WebSocketJournalCommand>>,
     metadata: RwLock<SessionMetadata>,
     mutation_lock: AsyncMutex<()>,
     persist_lock: AsyncMutex<()>,
@@ -264,6 +300,9 @@ impl SessionContext {
         let transaction_event_sequence = snapshot.transaction_event_sequence;
         let mut websockets = snapshot.websockets;
         close_restored_open_websockets(&mut websockets);
+        let websocket_journal_tx = enable_journal
+            .then(|| start_websocket_journal_writer(websocket_journal_path(&storage_dir)))
+            .flatten();
         Self {
             id: metadata.id,
             storage_dir,
@@ -328,6 +367,7 @@ impl SessionContext {
                 store
             },
             workspace: Arc::new(WorkspaceStateStore::from_snapshot(snapshot.workspace)),
+            websocket_journal_tx,
             metadata: RwLock::new(metadata),
             mutation_lock: AsyncMutex::new(()),
             persist_lock: AsyncMutex::new(()),
@@ -371,6 +411,62 @@ impl SessionContext {
         let _persist_guard = self.persist_lock.lock().await;
         self.persist_with_workspace_snapshot_locked(self.workspace.snapshot().await)
             .await
+    }
+
+    pub async fn open_websocket_capture(&self, record: WebSocketSessionRecord) -> Result<()> {
+        self.append_websocket_journal_entry(&WebSocketJournalEntry::Open {
+            record: record.clone(),
+        })
+        .await?;
+        self.websockets.open(record).await;
+        Ok(())
+    }
+
+    pub async fn append_websocket_capture_frame(
+        &self,
+        id: Uuid,
+        frame: WebSocketFrameRecord,
+    ) -> Result<bool> {
+        self.append_websocket_journal_entry(&WebSocketJournalEntry::Frame {
+            id,
+            frame: frame.clone(),
+        })
+        .await?;
+        Ok(self.websockets.append_frame(id, frame).await)
+    }
+
+    pub async fn close_websocket_capture(
+        &self,
+        id: Uuid,
+        closed_at: DateTime<Utc>,
+        duration_ms: u64,
+        note: Option<String>,
+    ) -> Result<bool> {
+        self.append_websocket_journal_entry(&WebSocketJournalEntry::Close {
+            id,
+            closed_at,
+            duration_ms,
+            note: note.clone(),
+        })
+        .await?;
+        Ok(self
+            .websockets
+            .close(id, closed_at, duration_ms, note)
+            .await)
+    }
+
+    async fn append_websocket_journal_entry(&self, entry: &WebSocketJournalEntry) -> Result<()> {
+        let line = encode_websocket_journal_line(entry)?;
+        let tx = self
+            .websocket_journal_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("websocket journal writer is not available"))?;
+        append_websocket_journal(tx, line).await.with_context(|| {
+            format!(
+                "failed to append websocket journal for {}",
+                self.storage_dir.display()
+            )
+        })
     }
 
     pub async fn replace_workspace_snapshot_checked_and_persist(
@@ -507,6 +603,7 @@ impl SessionContext {
             workspace,
             replayed_transaction_journal: false,
             replayed_transaction_ids: HashSet::new(),
+            replayed_websocket_journal: false,
         };
 
         let mut metadata = self
@@ -534,6 +631,15 @@ impl SessionContext {
                 session_id = %self.id,
                 "failed to remove transaction journal checkpoint after writing session snapshot"
             );
+        }
+        if let Some(tx) = &self.websocket_journal_tx {
+            if let Err(error) = clear_websocket_journal(tx) {
+                warn!(
+                    %error,
+                    session_id = %self.id,
+                    "failed to clear websocket journal after writing session snapshot"
+                );
+            }
         }
 
         *self
@@ -902,7 +1008,8 @@ impl SessionRegistry {
                 self.max_entries,
             );
         }
-        if repaired_open_websockets || replayed_transaction_journal {
+        let replayed_websocket_journal = snapshot.replayed_websocket_journal;
+        if repaired_open_websockets || replayed_transaction_journal || replayed_websocket_journal {
             write_json(&snapshot_path(&storage_dir), &snapshot)?;
         }
         if replayed_transaction_journal {
@@ -911,6 +1018,15 @@ impl SessionRegistry {
                     %error,
                     session_id = %id,
                     "failed to compact replayed transaction journal after loading session"
+                );
+            }
+        }
+        if replayed_websocket_journal {
+            if let Err(error) = compact_replayed_websocket_journal(&storage_dir) {
+                warn!(
+                    %error,
+                    session_id = %id,
+                    "failed to compact replayed websocket journal after loading session"
                 );
             }
         }
@@ -1424,6 +1540,10 @@ fn transaction_journal_path(storage_dir: &Path) -> PathBuf {
     storage_dir.join(TRANSACTION_JOURNAL_FILE)
 }
 
+fn websocket_journal_path(storage_dir: &Path) -> PathBuf {
+    storage_dir.join(WEBSOCKET_JOURNAL_FILE)
+}
+
 fn session_storage_metadata(storage_dir: &Path) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(storage_dir) {
         Ok(metadata) => {
@@ -1507,6 +1627,22 @@ fn create_private_file(path: &Path) -> io::Result<fs::File> {
 #[cfg(not(unix))]
 fn create_private_file(path: &Path) -> io::Result<fs::File> {
     fs::File::create(path)
+}
+
+#[cfg(unix)]
+fn open_private_append_file(path: &Path) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    tighten_private_file(path)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_append_file(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 #[cfg(unix)]
@@ -1597,6 +1733,12 @@ fn load_session_snapshot_with_mode(
     snapshot.transaction_event_sequence = replay_result.transaction_event_sequence;
     snapshot.replayed_transaction_ids = replay_result.replayed_transaction_ids;
     snapshot.replayed_transaction_journal = replay_result.mutated_snapshot;
+    snapshot.replayed_websocket_journal = replay_websocket_journal(
+        storage_dir,
+        max_entries,
+        &mut snapshot,
+        mode == SessionSnapshotLoadMode::Writable,
+    )?;
     Ok(snapshot)
 }
 
@@ -1620,6 +1762,7 @@ fn replay_transaction_journal(
 ) -> Result<TransactionJournalReplayResult> {
     let journal_path = transaction_journal_path(storage_dir);
     let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
+    let checkpoint_consumed = checkpoint_path.exists();
 
     normalize_snapshot_transaction_sequences(&mut snapshot.transactions);
     let mut order = Vec::with_capacity(snapshot.transactions.len());
@@ -1710,7 +1853,8 @@ fn replay_transaction_journal(
         .map(|record| record.id)
         .collect();
     replayed_transaction_ids.retain(|id| retained_ids.contains(id));
-    let mutated_snapshot = !replayed_transaction_ids.is_empty()
+    let mutated_snapshot = checkpoint_consumed
+        || !replayed_transaction_ids.is_empty()
         || annotation_mutated_record_ids
             .iter()
             .any(|id| retained_ids.contains(id));
@@ -1719,6 +1863,366 @@ fn replay_transaction_journal(
         mutated_snapshot,
         transaction_event_sequence,
     })
+}
+
+fn start_websocket_journal_writer(
+    journal_path: PathBuf,
+) -> Option<mpsc::Sender<WebSocketJournalCommand>> {
+    let (tx, rx) = mpsc::channel::<WebSocketJournalCommand>();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<io::Result<()>>(1);
+    let spawn_result = thread::Builder::new()
+        .name("sniper-websocket-journal".to_string())
+        .spawn(move || {
+            if let Some(parent) = journal_path.parent() {
+                if let Err(error) = create_private_dir_all(parent) {
+                    warn!(?error, path = %parent.display(), "failed to create websocket journal directory");
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            }
+
+            let mut file = match open_private_append_file(&journal_path) {
+                Ok(file) => file,
+                Err(error) => {
+                    warn!(?error, path = %journal_path.display(), "failed to open websocket journal");
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Ok(()));
+
+            while let Ok(command) = rx.recv() {
+                match command {
+                    WebSocketJournalCommand::Append { line, ack } => {
+                        let result = file
+                            .write_all(&line)
+                            .and_then(|()| file.flush())
+                            .and_then(|()| file.sync_data());
+                        let failed = result.is_err();
+                        if let Err(error) = &result {
+                            warn!(?error, path = %journal_path.display(), "failed to append websocket journal entry");
+                        }
+                        let _ = ack.send(result);
+                        if failed {
+                            return;
+                        }
+                    }
+                    WebSocketJournalCommand::Clear { ack } => {
+                        let result = file.set_len(0).and_then(|()| file.sync_all());
+                        if let Err(error) = &result {
+                            warn!(?error, path = %journal_path.display(), "failed to clear websocket journal");
+                        }
+                        let failed = result.is_err();
+                        let _ = ack.send(result);
+                        if failed {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+    match spawn_result {
+        Ok(_) => match ready_rx.recv() {
+            Ok(Ok(())) => Some(tx),
+            Ok(Err(_)) => None,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "websocket journal writer stopped before startup completed"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            warn!(?error, "failed to spawn websocket journal writer");
+            None
+        }
+    }
+}
+
+async fn append_websocket_journal(
+    tx: &mpsc::Sender<WebSocketJournalCommand>,
+    line: Vec<u8>,
+) -> io::Result<()> {
+    let (ack, rx) = oneshot::channel();
+    tx.send(WebSocketJournalCommand::Append { line, ack })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "websocket journal writer stopped",
+            )
+        })?;
+    rx.await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "websocket journal writer stopped",
+        )
+    })?
+}
+
+fn clear_websocket_journal(tx: &mpsc::Sender<WebSocketJournalCommand>) -> io::Result<()> {
+    let (ack, rx) = mpsc::channel();
+    tx.send(WebSocketJournalCommand::Clear { ack })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "websocket journal writer stopped",
+            )
+        })?;
+    rx.recv().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "websocket journal writer stopped",
+        )
+    })?
+}
+
+fn encode_websocket_journal_line(entry: &WebSocketJournalEntry) -> Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(entry).context("failed to encode websocket journal entry")?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn replay_websocket_journal(
+    storage_dir: &Path,
+    max_entries: usize,
+    snapshot: &mut StoredSessionSnapshot,
+    repair_files: bool,
+) -> Result<bool> {
+    let journal_path = websocket_journal_path(storage_dir);
+    let file = match fs::File::open(&journal_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if journal_path.exists() => {
+            warn!(
+                ?error,
+                path = %journal_path.display(),
+                "discarding unreadable websocket journal"
+            );
+            if repair_files {
+                move_unreadable_websocket_journal_aside(&journal_path);
+            }
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read websocket journal {}",
+                    journal_path.display()
+                )
+            })
+        }
+    };
+    if file
+        .metadata()
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        warn!(
+            path = %journal_path.display(),
+            "discarding directory websocket journal"
+        );
+        if repair_files {
+            move_unreadable_websocket_journal_aside(&journal_path);
+        }
+        return Ok(false);
+    }
+
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut offset = 0u64;
+    let mut valid_prefix_len = 0u64;
+    let mut line_number = 0usize;
+    let mut replayed = false;
+    loop {
+        line.clear();
+        let bytes = reader.read_until(b'\n', &mut line).with_context(|| {
+            format!(
+                "failed to read websocket journal {}",
+                journal_path.display()
+            )
+        })?;
+        if bytes == 0 {
+            break;
+        }
+        let line_start_offset = offset;
+        offset = offset.saturating_add(bytes as u64);
+        line_number += 1;
+        let line_has_newline = line.ends_with(b"\n");
+        let trimmed = trim_ascii_whitespace(&line);
+        if trimmed.is_empty() {
+            if line_has_newline {
+                valid_prefix_len = offset;
+            }
+            continue;
+        }
+        if !line_has_newline {
+            warn!(
+                path = %journal_path.display(),
+                line = line_number,
+                "ignoring trailing partial websocket journal line"
+            );
+            if repair_files {
+                repair_corrupt_websocket_journal_tail(&journal_path, valid_prefix_len);
+            }
+            break;
+        }
+        let entry: WebSocketJournalEntry = match serde_json::from_slice(trimmed) {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    path = %journal_path.display(),
+                    line = line_number,
+                    "stopping websocket journal replay at corrupt line"
+                );
+                if repair_files {
+                    repair_corrupt_websocket_journal_tail(&journal_path, line_start_offset);
+                }
+                break;
+            }
+        };
+        apply_websocket_journal_entry(&mut snapshot.websockets, entry);
+        replayed = true;
+        valid_prefix_len = offset;
+    }
+    if replayed {
+        snapshot.websockets = sessions_with_live_preserved(
+            std::mem::take(&mut snapshot.websockets),
+            max_entries,
+            MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION,
+        );
+    }
+    Ok(replayed)
+}
+
+fn apply_websocket_journal_entry(
+    records: &mut Vec<WebSocketSessionRecord>,
+    entry: WebSocketJournalEntry,
+) {
+    match entry {
+        WebSocketJournalEntry::Open { record } => {
+            if records.iter().any(|existing| existing.id == record.id) {
+                return;
+            }
+            records.insert(0, record);
+        }
+        WebSocketJournalEntry::Frame { id, frame } => {
+            let Some(record) = records.iter_mut().find(|record| record.id == id) else {
+                return;
+            };
+            if record
+                .frames
+                .iter()
+                .any(|existing| existing.index == frame.index)
+            {
+                return;
+            }
+            record.frames.push(frame);
+            trim_frame_overflow(
+                &mut record.frames,
+                MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION,
+            );
+        }
+        WebSocketJournalEntry::Close {
+            id,
+            closed_at,
+            duration_ms,
+            note,
+        } => {
+            let Some(record) = records.iter_mut().find(|record| record.id == id) else {
+                return;
+            };
+            record.closed_at = Some(closed_at);
+            record.duration_ms = Some(duration_ms);
+            if let Some(note) = note {
+                if !record.notes.iter().any(|existing| existing == &note) {
+                    record.notes.push(note);
+                }
+            }
+        }
+    }
+}
+
+fn compact_replayed_websocket_journal(storage_dir: &Path) -> Result<()> {
+    let journal_path = websocket_journal_path(storage_dir);
+    match create_private_file(&journal_path) {
+        Ok(file) => {
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", journal_path.display()))?;
+            if let Some(parent) = journal_path.parent() {
+                sync_directory(parent, "websocket journal directory")?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to compact websocket journal {}",
+                journal_path.display()
+            )
+        }),
+    }
+}
+
+fn repair_corrupt_websocket_journal_tail(journal_path: &Path, valid_prefix_len: u64) {
+    preserve_corrupt_websocket_journal(journal_path);
+    match fs::OpenOptions::new().write(true).open(journal_path) {
+        Ok(file) => {
+            if let Err(error) = file.set_len(valid_prefix_len).and_then(|_| file.sync_all()) {
+                warn!(
+                    ?error,
+                    path = %journal_path.display(),
+                    valid_prefix_len,
+                    "failed to truncate corrupt websocket journal tail"
+                );
+                return;
+            }
+            if let Some(parent) = journal_path.parent() {
+                if let Err(error) = sync_directory(parent, "websocket journal directory") {
+                    warn!(
+                        ?error,
+                        path = %journal_path.display(),
+                        "failed to sync repaired websocket journal directory"
+                    );
+                }
+            }
+        }
+        Err(error) => warn!(
+            ?error,
+            path = %journal_path.display(),
+            "failed to open corrupt websocket journal for repair"
+        ),
+    }
+}
+
+fn preserve_corrupt_websocket_journal(journal_path: &Path) {
+    let Some(parent) = journal_path.parent() else {
+        return;
+    };
+    let corrupt_path = parent.join(format!(".websockets.journal.corrupt-{}", Uuid::new_v4()));
+    if let Err(error) = fs::copy(journal_path, &corrupt_path) {
+        warn!(
+            ?error,
+            path = %journal_path.display(),
+            corrupt_path = %corrupt_path.display(),
+            "failed to preserve corrupt websocket journal"
+        );
+    }
+}
+
+fn move_unreadable_websocket_journal_aside(journal_path: &Path) {
+    let parent = journal_path.parent().unwrap_or_else(|| Path::new("."));
+    let corrupt_path = parent.join(format!(".websockets.journal.corrupt-{}", Uuid::new_v4()));
+    if let Err(error) = fs::rename(journal_path, &corrupt_path) {
+        warn!(
+            ?error,
+            source = %journal_path.display(),
+            corrupt_path = %corrupt_path.display(),
+            "failed to move unreadable websocket journal aside"
+        );
+    }
 }
 
 fn normalize_snapshot_transaction_sequences(records: &mut [TransactionRecord]) {
@@ -2592,6 +3096,75 @@ mod tests {
         let reloaded = registry.load_context(active.id()).unwrap();
         let restored_again = reloaded.websockets.get(websocket_id).await.unwrap();
         assert_eq!(restored_again.notes.len(), 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn load_context_recovers_websocket_capture_from_journal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-websocket-journal-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let websocket_id = Uuid::new_v4();
+
+        active
+            .open_websocket_capture(WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now() - ChronoDuration::seconds(1),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "journal-ws.example.test".to_string(),
+                path: "/socket".to_string(),
+                status: Some(101),
+                request: MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        active
+            .append_websocket_capture_frame(
+                websocket_id,
+                WebSocketFrameRecord {
+                    index: 0,
+                    captured_at: Utc::now(),
+                    direction: WebSocketFrameDirection::ClientToServer,
+                    kind: WebSocketFrameKind::Text,
+                    body_preview: "hello".to_string(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 5,
+                    preview_truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let journal_path = super::websocket_journal_path(&storage_dir);
+        assert!(std::fs::metadata(&journal_path).unwrap().len() > 0);
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.websockets.get(websocket_id).await.unwrap();
+
+        assert_eq!(restored.host, "journal-ws.example.test");
+        assert_eq!(restored.frames.len(), 1);
+        assert_eq!(restored.frames[0].body_preview, "hello");
+        assert!(restored.closed_at.is_some());
+        assert!(restored
+            .notes
+            .iter()
+            .any(|note| note.contains("restarted before this WebSocket session was closed")));
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
+
+        let disk_snapshot: super::StoredSessionSnapshot =
+            serde_json::from_slice(&std::fs::read(super::snapshot_path(&storage_dir)).unwrap())
+                .unwrap();
+        assert_eq!(disk_snapshot.websockets.len(), 1);
+        assert_eq!(disk_snapshot.websockets[0].frames.len(), 1);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -5418,6 +5991,72 @@ mod tests {
         assert_eq!(restored[1].host, "checkpoint.example:443");
         assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
         assert!(!checkpoint_path.exists());
+    }
+
+    #[tokio::test]
+    async fn registry_compacts_duplicate_checkpoint_without_repeated_event_gap() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-duplicate-checkpoint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+
+        let mut record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "duplicate-checkpoint.example:443".to_string(),
+            "/snapshot".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        record.sequence = 1;
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &super::StoredSessionSnapshot {
+                transactions: vec![record.clone()],
+                transaction_event_sequence: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
+        let mut checkpoint = Vec::new();
+        serde_json::to_writer(&mut checkpoint, &TransactionJournalEntry::Insert { record })
+            .unwrap();
+        checkpoint.push(b'\n');
+        std::fs::write(&checkpoint_path, checkpoint).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].host, "duplicate-checkpoint.example:443");
+        assert_eq!(loaded.store.latest_event_sequence(), 2);
+        assert!(!checkpoint_path.exists());
+
+        let persisted: super::StoredSessionSnapshot =
+            serde_json::from_slice(&std::fs::read(super::snapshot_path(&storage_dir)).unwrap())
+                .unwrap();
+        assert_eq!(persisted.transaction_event_sequence, 2);
+        assert_eq!(persisted.transactions.len(), 1);
     }
 
     #[tokio::test]

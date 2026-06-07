@@ -299,6 +299,8 @@ pub struct AppUiSettingsSnapshot {
     pub client_id: String,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub client_version: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub server_revision: u64,
     pub display_settings: DisplaySettingsSnapshot,
     pub active_tool: String,
     pub active_proxy_tab: String,
@@ -331,6 +333,7 @@ impl Default for AppUiSettingsSnapshot {
         Self {
             client_id: String::new(),
             client_version: 0,
+            server_revision: 0,
             display_settings: DisplaySettingsSnapshot::default(),
             active_tool: "proxy".to_string(),
             active_proxy_tab: "http-history".to_string(),
@@ -364,6 +367,7 @@ impl AppUiSettingsSnapshot {
         sanitized.client_id =
             trim_to_char_limit(self.client_id.trim(), UI_SETTINGS_CLIENT_ID_MAX_CHARS);
         sanitized.client_version = self.client_version;
+        sanitized.server_revision = self.server_revision;
         sanitized.display_settings = self.display_settings.sanitized();
         sanitized.active_tool = sanitize_option(self.active_tool, "proxy", ACTIVE_TOOL_OPTIONS);
         sanitized.active_proxy_tab = sanitize_option(
@@ -461,12 +465,17 @@ impl AppUiSettingsStore {
     ) -> Result<AppUiSettingsSnapshot> {
         let next = snapshot.sanitized();
         let mut current = self.inner.write().await;
+        if next.server_revision < current.server_revision {
+            return Ok(current.clone());
+        }
         if !next.client_id.is_empty()
             && next.client_id == current.client_id
             && next.client_version <= current.client_version
         {
             return Ok(current.clone());
         }
+        let mut next = next;
+        next.server_revision = current.server_revision.saturating_add(1).max(1);
         persist_ui_settings(&self.path, &next)?;
         *current = next.clone();
         Ok(next)
@@ -692,6 +701,7 @@ mod tests {
         let reloaded = AppUiSettingsStore::load_or_create(&data_dir).expect("store should reload");
         let persisted = reloaded.snapshot().await;
 
+        assert_eq!(persisted.server_revision, 1);
         assert_eq!(persisted.display_settings.theme, "white");
         assert_eq!(persisted.display_settings.size_px, 15);
         assert_eq!(persisted.active_tool, "replay");
@@ -744,15 +754,15 @@ mod tests {
             active_tool: "proxy".to_string(),
             ..AppUiSettingsSnapshot::default()
         };
-        store
+        let saved_initial = store
             .replace_snapshot(initial.clone())
             .await
             .expect("initial snapshot should persist");
 
-        let mut newer = initial.clone();
+        let mut newer = saved_initial.clone();
         newer.client_version = 2;
         newer.active_tool = "replay".to_string();
-        store
+        let saved_newer = store
             .replace_snapshot(newer)
             .await
             .expect("newer snapshot should persist");
@@ -762,12 +772,67 @@ mod tests {
             .await
             .expect("stale snapshot should be ignored");
         assert_eq!(stale.client_version, 2);
+        assert_eq!(stale.server_revision, saved_newer.server_revision);
         assert_eq!(stale.active_tool, "replay");
 
         let reloaded = AppUiSettingsStore::load_or_create(&data_dir).expect("store should reload");
         let persisted = reloaded.snapshot().await;
         assert_eq!(persisted.client_version, 2);
+        assert_eq!(persisted.server_revision, saved_newer.server_revision);
         assert_eq!(persisted.active_tool, "replay");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn ui_settings_store_ignores_stale_different_client_snapshot() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-ui-settings-{}", uuid::Uuid::new_v4()));
+        let store = AppUiSettingsStore::load_or_create(&data_dir).expect("store should load");
+
+        let latest = AppUiSettingsSnapshot {
+            client_id: "browser-b".to_string(),
+            client_version: 1,
+            active_tool: "replay".to_string(),
+            websocket_live_only: true,
+            ..AppUiSettingsSnapshot::default()
+        };
+        let saved_latest = store
+            .replace_snapshot(latest)
+            .await
+            .expect("latest snapshot should persist");
+        assert_eq!(saved_latest.server_revision, 1);
+
+        let stale = AppUiSettingsSnapshot {
+            client_id: "browser-a".to_string(),
+            client_version: 1,
+            server_revision: 0,
+            active_tool: "tools".to_string(),
+            websocket_live_only: false,
+            ..AppUiSettingsSnapshot::default()
+        };
+        let returned = store
+            .replace_snapshot(stale)
+            .await
+            .expect("stale different-client snapshot should be ignored");
+
+        assert_eq!(returned.client_id, "browser-b");
+        assert_eq!(returned.server_revision, 1);
+        assert_eq!(returned.active_tool, "replay");
+        assert!(returned.websocket_live_only);
+
+        let mut current_client = returned.clone();
+        current_client.client_id = "browser-a".to_string();
+        current_client.client_version = 2;
+        current_client.active_tool = "tools".to_string();
+        let accepted = store
+            .replace_snapshot(current_client)
+            .await
+            .expect("different client with current revision should persist");
+
+        assert_eq!(accepted.client_id, "browser-a");
+        assert_eq!(accepted.server_revision, 2);
+        assert_eq!(accepted.active_tool, "tools");
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

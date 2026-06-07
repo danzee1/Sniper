@@ -865,6 +865,7 @@ let workspaceSaveConflictPending = false;
 let workspaceSaveConflictLatest = null;
 const uiSettingsClientId = createWorkspaceClientId();
 let uiSettingsSaveVersion = 0;
+let uiSettingsServerRevision = 0;
 const annotationClientId = createWorkspaceClientId();
 let annotationSaveVersion = 0;
 let uiSettingsSaveTimer = null;
@@ -15782,7 +15783,15 @@ async function loadUiSettings() {
   }
 }
 
+function updateUiSettingsServerRevision(snapshot) {
+  const revision = Number(snapshot?.server_revision);
+  if (Number.isFinite(revision) && revision >= 0) {
+    uiSettingsServerRevision = Math.max(0, Math.floor(revision));
+  }
+}
+
 function applyUiSettingsSnapshot(snapshot) {
+  updateUiSettingsServerRevision(snapshot);
   state.displaySettings = sanitizeDisplaySettings({
     sizePx: snapshot?.display_settings?.size_px,
     theme: snapshot?.display_settings?.theme,
@@ -15850,6 +15859,7 @@ function snapshotUiSettings() {
   return {
     client_id: uiSettingsClientId,
     client_version: uiSettingsSaveVersion,
+    server_revision: uiSettingsServerRevision,
     display_settings: {
       size_px: state.displaySettings.sizePx,
       theme: state.displaySettings.theme,
@@ -15880,9 +15890,13 @@ function snapshotUiSettings() {
   };
 }
 
-function nextUiSettingsPayload() {
+function nextUiSettingsSnapshot() {
   uiSettingsSaveVersion += 1;
-  return JSON.stringify(snapshotUiSettings());
+  return snapshotUiSettings();
+}
+
+function nextUiSettingsPayload() {
+  return JSON.stringify(nextUiSettingsSnapshot());
 }
 
 function scheduleUiSettingsSave(delay = 180) {
@@ -15903,7 +15917,8 @@ async function persistUiSettings() {
     try {
       while (uiSettingsDirty) {
         uiSettingsDirty = false;
-        const payload = nextUiSettingsPayload();
+        const payloadSnapshot = nextUiSettingsSnapshot();
+        const payload = JSON.stringify(payloadSnapshot);
         lastUiSettingsPayload = payload;
         const response = await fetch("/api/ui-settings", {
           method: "POST",
@@ -15916,6 +15931,15 @@ async function persistUiSettings() {
         if (!response.ok) {
           uiSettingsDirty = true;
           throw new Error(await response.text());
+        }
+        const savedSnapshot = await response.json().catch(() => null);
+        if (savedSnapshot && typeof savedSnapshot === "object") {
+          updateUiSettingsServerRevision(savedSnapshot);
+          const savedClientId = String(savedSnapshot.client_id || "");
+          const savedClientVersion = Math.max(0, Number(savedSnapshot.client_version || 0) || 0);
+          if (savedClientId !== payloadSnapshot.client_id || savedClientVersion !== payloadSnapshot.client_version) {
+            applyUiSettingsSnapshot(savedSnapshot);
+          }
         }
       }
     } finally {
