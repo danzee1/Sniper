@@ -1700,7 +1700,7 @@ function bindEvents() {
     state.targetScopeEditorSessionId = currentSessionId();
   });
   els.reloadTargetButton.addEventListener("click", () => {
-    loadTargetSiteMap(true).catch((error) => console.error(error));
+    reloadTargetSiteMapFromButton().catch((error) => console.error(error));
   });
   els.startFuzzerButton.addEventListener("click", () => {
     runFuzzerAttack().catch((error) => {
@@ -4156,6 +4156,9 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
     handleSequenceActionError(error);
     return;
   }
+  if (!(await flushTargetScopeDraft(staleSessionWriteOptions))) {
+    return;
+  }
   try {
     await flushAllPendingAnnotations(staleSessionWriteOptions);
   } catch (error) {
@@ -4183,6 +4186,9 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
 }
 
 async function createSession() {
+  if (!(await flushTargetScopeDraft())) {
+    return;
+  }
   if (!(await flushSequenceDraft())) {
     return;
   }
@@ -4205,6 +4211,9 @@ async function createSession() {
 }
 
 async function activateSessionById(id) {
+  if (!(await flushTargetScopeDraft())) {
+    return;
+  }
   if (!(await flushSequenceDraft())) {
     return;
   }
@@ -6176,6 +6185,30 @@ function syncTargetScopeDraft(force = false) {
       state.targetScopeEditorSessionId = null;
     }
   }
+}
+
+async function flushTargetScopeDraft(options = {}) {
+  if (!state.targetScopeDirty) {
+    return true;
+  }
+  try {
+    await saveTargetScope({
+      ...options,
+      skipReload: true,
+    });
+    return true;
+  } catch (error) {
+    console.error(error);
+    showToast(error?.message || "Failed to save scope", "error");
+    return false;
+  }
+}
+
+async function reloadTargetSiteMapFromButton() {
+  if (!(await flushTargetScopeDraft())) {
+    return;
+  }
+  await loadTargetSiteMap(true);
 }
 
 async function loadTargetSiteMap(forceScopeSync = false) {
@@ -11857,13 +11890,19 @@ async function deleteSelectedMatchReplaceRule() {
   showToast("Rule deleted");
 }
 
-async function saveTargetScope() {
-  const sessionId = currentSessionId();
+async function saveTargetScope(options = {}) {
+  const sessionId = options.sessionId || currentSessionId();
+  if (!sessionId) {
+    return;
+  }
   if (state.targetScopeEditorSessionId && state.targetScopeEditorSessionId !== sessionId) {
     await loadTargetSiteMap(true);
     throw new Error("Scope editor changed sessions. Review the scope and save again.");
   }
-  const scopePatterns = els.targetScopeEditor.value
+  const scopeText = state.targetScopeEditorSessionId === sessionId
+    ? els.targetScopeEditor.value
+    : state.targetScopeDraft;
+  const scopePatterns = String(scopeText || "")
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
@@ -11874,7 +11913,7 @@ async function saveTargetScope() {
     },
     body: JSON.stringify({
       session_id: sessionId,
-      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId, options),
       scope_patterns: scopePatterns,
     }),
   });
@@ -11883,6 +11922,11 @@ async function saveTargetScope() {
   }
   const runtime = await response.json();
   if (sessionId !== currentSessionId()) {
+    if (state.targetScopeEditorSessionId === sessionId) {
+      state.targetScopeDraft = formatScopePatternsText(runtime?.scope_patterns);
+      state.targetScopeDirty = false;
+      state.targetScopeEditorSessionId = null;
+    }
     return;
   }
   state.runtime = runtime;
@@ -11894,7 +11938,9 @@ async function saveTargetScope() {
   }
   renderInterceptStatus();
   renderProxySettings();
-  await loadTargetSiteMap();
+  if (!options.skipReload) {
+    await loadTargetSiteMap();
+  }
   invalidateVisibleEntriesCache();
   scheduleRefresh();
 }

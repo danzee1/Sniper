@@ -398,6 +398,9 @@ impl SessionContext {
         validate_workspace_serialized_size(&workspace)
             .map_err(anyhow::Error::msg)
             .with_context(|| "workspace snapshot is too large to persist")?;
+        validate_workspace_state(&workspace)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| "workspace snapshot is invalid")?;
         let path = snapshot_path(&self.storage_dir);
         let mut snapshot = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<StoredSessionSnapshot>(&bytes) {
@@ -460,6 +463,9 @@ impl SessionContext {
         validate_workspace_serialized_size(&workspace)
             .map_err(anyhow::Error::msg)
             .with_context(|| "workspace snapshot is too large to persist")?;
+        validate_workspace_state(&workspace)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| "workspace snapshot is invalid")?;
         let snapshot = StoredSessionSnapshot {
             runtime: self.runtime.snapshot().await,
             transactions: self

@@ -2159,7 +2159,7 @@ mod tests {
     use crate::match_replace::{MatchReplaceRule, MatchReplaceScope, MatchReplaceTarget};
     use crate::model::WebSocketSessionRecord;
     use crate::model::{BodyEncoding, EditableRequest, MessageRecord, TransactionRecord};
-    use crate::workspace::{ReplayTabState, ReplayWorkspaceState};
+    use crate::workspace::{ReplayTabState, ReplayWorkspaceState, WorkspaceReplaceError};
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
@@ -2727,6 +2727,59 @@ mod tests {
             .find(|summary| summary.id == session.id())
             .unwrap();
         assert_eq!(summary.request_count, 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_persist_rejects_invalid_snapshot_without_clobbering_current() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-workspace-invalid-persist-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let session = state.session().await;
+
+        let mut workspace = session.workspace.snapshot().await;
+        workspace.replay = ReplayWorkspaceState {
+            active_tab_id: Some("valid-tab".to_string()),
+            tabs: vec![ReplayTabState {
+                id: "valid-tab".to_string(),
+                sequence: 1,
+                ..ReplayTabState::default()
+            }],
+            ..ReplayWorkspaceState::default()
+        };
+        state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+
+        let mut invalid = session.workspace.snapshot().await;
+        invalid.replay.active_tab_id = Some("missing-tab".to_string());
+        let error = state
+            .replace_workspace_state_and_persist(&session, invalid)
+            .await
+            .unwrap_err();
+        match error {
+            WorkspaceReplaceError::Persist(message) => {
+                assert!(message.contains("workspace snapshot is invalid"));
+            }
+            WorkspaceReplaceError::Conflict(_) => panic!("invalid snapshot should fail validation"),
+        }
+
+        let current = session.workspace.snapshot().await;
+        assert_eq!(current.replay.active_tab_id.as_deref(), Some("valid-tab"));
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        let durable = reloaded.workspace.snapshot().await;
+        assert_eq!(durable.replay.active_tab_id.as_deref(), Some("valid-tab"));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -520,7 +520,7 @@ fn transaction_list_filters(query: TransactionQuery, scope_patterns: Vec<String>
         offset: query.offset,
         before_sequence: query.before_sequence,
         sort_key: query.sort_key,
-        sort_direction: query.sort_direction,
+        sort_direction: normalize_sort_direction(query.sort_direction.as_deref()),
         scope_patterns,
         in_scope_only: query.in_scope_only.unwrap_or(false),
         hide_connect: query.hide_connect.unwrap_or(false),
@@ -554,7 +554,7 @@ fn websocket_list_filters(
         offset: query.offset,
         after_id: query.after_id,
         sort_key: query.sort_key.clone(),
-        sort_direction: query.sort_direction.clone(),
+        sort_direction: normalize_sort_direction(query.sort_direction.as_deref()),
         scope_patterns,
         in_scope_only: query.in_scope_only.unwrap_or(false),
         live_only: query.live_only.unwrap_or(false),
@@ -563,6 +563,7 @@ fn websocket_list_filters(
 
 fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(), String> {
     validate_optional_limit(query.limit)?;
+    validate_sort_direction(query.sort_direction.as_deref())?;
 
     if let Some(value) = query.status_range.as_deref() {
         validate_status_range(value)
@@ -588,6 +589,28 @@ fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(
     }
 
     Ok(())
+}
+
+fn validate_websocket_query(query: &WebSocketQuery) -> std::result::Result<(), String> {
+    validate_optional_limit(query.limit)?;
+    validate_sort_direction(query.sort_direction.as_deref())
+}
+
+fn validate_sort_direction(direction: Option<&str>) -> std::result::Result<(), String> {
+    let Some(direction) = direction.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    match direction.to_ascii_lowercase().as_str() {
+        "asc" | "desc" => Ok(()),
+        _ => Err(format!("invalid sort_direction: {direction}")),
+    }
+}
+
+fn normalize_sort_direction(direction: Option<&str>) -> Option<String> {
+    direction
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 fn validate_status_code(status: u16) -> Option<()> {
@@ -4816,7 +4839,7 @@ async fn list_websockets(
 ) -> Response {
     const MAX_PAGE_LIMIT: usize = 10_000;
 
-    if let Err(error) = validate_optional_limit(query.limit) {
+    if let Err(error) = validate_websocket_query(&query) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
     if let Some(limit) = query.limit {
@@ -4838,7 +4861,7 @@ async fn list_websockets_page(
 ) -> Response {
     const MAX_PAGE_LIMIT: usize = 10_000;
 
-    if let Err(error) = validate_optional_limit(query.limit) {
+    if let Err(error) = validate_websocket_query(&query) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
     if let Some(limit) = query.limit {
@@ -6638,6 +6661,10 @@ mod tests {
         assert!(validate_since("1h").is_some());
         assert!(validate_since("-1h").is_none());
         assert!(validate_since("0m").is_none());
+        assert_eq!(
+            super::normalize_sort_direction(Some(" ASC ")).as_deref(),
+            Some("asc")
+        );
     }
 
     #[test]
@@ -6648,6 +6675,23 @@ mod tests {
         };
 
         assert!(validate_transaction_query(&query).is_err());
+    }
+
+    #[tokio::test]
+    async fn list_endpoints_reject_invalid_sort_direction() {
+        let (state, data_dir) = test_state("sniper-test-invalid-sort-direction");
+
+        for path in [
+            "/api/transactions-page?sort_key=host&sort_direction=up",
+            "/api/websockets-page?sort_key=host&sort_direction=up",
+        ] {
+            let (status, body) =
+                api_route_response(state.clone(), reqwest::Method::GET, path, None).await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            assert!(body.contains("invalid sort_direction"));
+        }
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
