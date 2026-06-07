@@ -748,9 +748,10 @@ fn sort_websocket_summaries(
     sort_key: Option<&str>,
     sort_direction: Option<&str>,
 ) {
-    let Some(sort_key) = sort_key.filter(|key| !key.trim().is_empty()) else {
-        return;
-    };
+    let sort_key = sort_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .unwrap_or("index");
     if sort_key == "index" {
         let descending = !matches!(sort_direction, Some("asc"));
         entries.sort_by(|left, right| {
@@ -969,6 +970,28 @@ mod tests {
         assert_eq!(page.items[1].host, "chat-1.example.test");
         assert_eq!(page.filtered_total, None);
         assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_honors_sort_direction_without_sort_key() {
+        let mut newest = session(vec![frame(1)]);
+        newest.host = "newest.example.test".to_string();
+        let newest_id = newest.id;
+        let mut older = session(vec![frame(1)]);
+        older.host = "older.example.test".to_string();
+        let older_id = older.id;
+        let store = WebSocketStore::from_sessions(10, 10, vec![newest, older]);
+
+        let page = store
+            .list_page_filtered(&WebSocketListFilters {
+                sort_direction: Some("asc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].id, older_id);
+        assert_eq!(page.items[1].id, newest_id);
     }
 
     #[tokio::test]

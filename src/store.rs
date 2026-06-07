@@ -83,6 +83,7 @@ pub struct TransactionStore {
     inner: RwLock<StoreInner>,
     insert_lock: AsyncMutex<()>,
     events: broadcast::Sender<TransactionSummary>,
+    retention_events: broadcast::Sender<()>,
     journal_tx: Option<mpsc::Sender<TransactionJournalCommand>>,
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
@@ -318,6 +319,7 @@ impl TransactionStore {
         max_entries: Option<usize>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
+        let (retention_events, _) = broadcast::channel(64);
         let mut inner = StoreInner::from_newest_first(records);
         if let Some(max_entries) = max_entries {
             inner.trim_to_max_entries(max_entries);
@@ -328,6 +330,7 @@ impl TransactionStore {
             inner: RwLock::new(inner),
             insert_lock: AsyncMutex::new(()),
             events,
+            retention_events,
             journal_tx: None,
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
@@ -378,6 +381,9 @@ impl TransactionStore {
         }
         drop(inner);
         let _ = self.events.send(summary);
+        if retention_trimmed {
+            let _ = self.retention_events.send(());
+        }
         TransactionInsertOutcome {
             journal_fallback_required,
             retention_trimmed,
@@ -818,6 +824,10 @@ impl TransactionStore {
         let applied_color_tag = record.color_tag.clone();
         let applied_user_note = record.user_note.clone();
         inner.summaries[index] = CachedSummary::new(summary.clone());
+        drop(inner);
+        if has_annotation_patch {
+            let _ = self.events.send(summary.clone());
+        }
         Ok(Some(AnnotationUpdate {
             summary,
             previous_color_tag,
@@ -907,6 +917,10 @@ impl TransactionStore {
 
     pub fn subscribe(&self) -> broadcast::Receiver<TransactionSummary> {
         self.events.subscribe()
+    }
+
+    pub fn subscribe_retention(&self) -> broadcast::Receiver<()> {
+        self.retention_events.subscribe()
     }
 
     pub fn latest_sequence(&self) -> u64 {
@@ -1901,6 +1915,40 @@ mod tests {
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed[0].duration_ms, 250);
         assert_eq!(listed[0].note_count, 1);
+    }
+
+    #[tokio::test]
+    async fn annotation_update_notifies_transaction_subscribers() {
+        let store = TransactionStore::new();
+        let record = test_record("annotated.example");
+        let record_id = record.id;
+        store.insert(record).await;
+        let mut receiver = store.subscribe();
+
+        store
+            .update_annotations(record_id, Some(Some("yellow".to_string())), None)
+            .await
+            .expect("annotation should update");
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.id, record_id);
+        assert_eq!(event.color_tag.as_deref(), Some("yellow"));
+    }
+
+    #[tokio::test]
+    async fn insert_notifies_retention_when_overflow_trims_history() {
+        let store = TransactionStore::from_records_with_max_entries(
+            vec![test_record("old.example")],
+            Some(1),
+        );
+        let mut retention_events = store.subscribe_retention();
+
+        store.insert(test_record("new.example")).await;
+
+        assert!(retention_events.try_recv().is_ok());
+        let listed = store.list(&ListFilters::default()).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].host, "new.example");
     }
 
     #[tokio::test]

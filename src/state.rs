@@ -319,6 +319,24 @@ impl AppState {
         Ok(session)
     }
 
+    pub async fn is_current_session_context(&self, session: &Arc<SessionContext>) -> bool {
+        let id = session.id();
+        let active = self.session().await;
+        if id == active.id() {
+            return Arc::ptr_eq(&active, session);
+        }
+        {
+            let contexts = self.session_contexts.lock().await;
+            if let Some(current) = contexts.get(&id) {
+                return Arc::ptr_eq(current, session);
+            }
+        }
+        let read_only_contexts = self.read_only_session_contexts.lock().await;
+        read_only_contexts
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+    }
+
     pub async fn session_context_for_id_operation_locked(
         &self,
         id: uuid::Uuid,
@@ -3026,6 +3044,7 @@ mod tests {
             .await
             .unwrap();
         assert!(std::sync::Arc::ptr_eq(&first_read, &second_read));
+        assert!(state.is_current_session_context(&first_read).await);
         assert!(state
             .read_only_session_contexts
             .lock()
@@ -3033,6 +3052,8 @@ mod tests {
             .contains_key(&original_id));
 
         let writable = state.session_context_for_id(original_id).await.unwrap();
+        assert!(!state.is_current_session_context(&first_read).await);
+        assert!(state.is_current_session_context(&writable).await);
         assert!(state
             .session_contexts
             .lock()

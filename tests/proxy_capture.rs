@@ -210,12 +210,11 @@ async fn proxy_streams_open_upstream_response_before_eof() {
         loop {
             let records = session.store.snapshot(Some(10)).await;
             if let Some(record) = records.iter().find(|record| record.path == "/stream") {
-                assert!(record
-                    .notes
-                    .iter()
-                    .any(|note| note
-                        .contains("Client disconnected before streamed response completed")));
-                return;
+                if record.notes.iter().any(|note| {
+                    note.contains("Client disconnected before streamed response completed")
+                }) {
+                    return;
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

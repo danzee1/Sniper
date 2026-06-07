@@ -3550,11 +3550,20 @@ function syncActiveWsReplayDraftFromDom() {
       }
     }
   }
-  if (els.wsHandshakeHeaders && tab.wsHandshakeText !== els.wsHandshakeHeaders.value) {
-    tab.wsHandshakeText = els.wsHandshakeHeaders.value;
-    tab.wsHandshakeEdited = true;
-    scheduleWorkspaceStateSave();
-    changed = true;
+  if (els.wsHandshakeHeaders) {
+    const handshakeText = els.wsHandshakeHeaders.value;
+    if (tab.wsHandshakeEdited) {
+      if (tab.wsHandshakeText !== handshakeText) {
+        tab.wsHandshakeText = handshakeText;
+        scheduleWorkspaceStateSave();
+        changed = true;
+      }
+    } else if (handshakeText !== wsReplayDisplayHandshakeText(tab)) {
+      tab.wsHandshakeText = handshakeText;
+      tab.wsHandshakeEdited = true;
+      scheduleWorkspaceStateSave();
+      changed = true;
+    }
   }
   const nextMessageType = normalizeWsMessageType(els.wsMessageType?.value || tab.wsMessageType);
   const nextEditorText = els.wsMessageHighlight
@@ -12814,33 +12823,27 @@ async function runCurrentSequence() {
   const sessionId = currentSequenceSessionId();
   const runGeneration = (state.sequenceRunGeneration || 0) + 1;
   state.sequenceRunGeneration = runGeneration;
-  syncSequenceStepFromDom();
-  const saved = await saveCurrentSequence();
-  if (!saved) {
-    if (state.sequenceRunGeneration === runGeneration) {
-      state.sequenceRunning = false;
-      renderSequencePanel();
-    }
-    return;
-  }
-  if (
-    state.sequenceRunGeneration !== runGeneration
-    || state.selectedSequenceId !== runSequenceId
-    || !isCurrentSequenceSession(sessionId)
-  ) {
-    if (state.sequenceRunGeneration === runGeneration) {
-      state.sequenceRunning = false;
-      renderSequencePanel();
-    }
-    return;
-  }
-  const runDraftVersion = state.sequenceDraftVersion || 0;
-
-  const runBtn = document.getElementById("runSequenceButton");
-  runBtn.disabled = true;
-  runBtn.textContent = "Running...";
+  let runDraftVersion = null;
 
   try {
+    syncSequenceStepFromDom();
+    const saved = await saveCurrentSequence();
+    if (!saved) {
+      return;
+    }
+    if (
+      state.sequenceRunGeneration !== runGeneration
+      || state.selectedSequenceId !== runSequenceId
+      || !isCurrentSequenceSession(sessionId)
+    ) {
+      return;
+    }
+    runDraftVersion = state.sequenceDraftVersion || 0;
+
+    const runBtn = document.getElementById("runSequenceButton");
+    runBtn.disabled = true;
+    runBtn.textContent = "Running...";
+
     const response = await fetch(`/api/sequences/${runSequenceId}/run`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -12868,7 +12871,12 @@ async function runCurrentSequence() {
     await loadSequences({ sessionId });
     scheduleRefresh();
   } catch (err) {
-    if (!isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion)) {
+    const currentRun = runDraftVersion == null
+      ? state.sequenceRunGeneration === runGeneration
+        && state.selectedSequenceId === runSequenceId
+        && isCurrentSequenceSession(sessionId)
+      : isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion);
+    if (!currentRun) {
       return;
     }
     showToast(`Sequence error: ${err.message}`, "error");
@@ -14027,6 +14035,34 @@ function applyReplaySentDraftIfUnchanged(tab, request, requestText, target) {
   tab.requestText = requestText;
 }
 
+function redirectTargetsSameOrigin(currentTarget, currentRequest, nextScheme, nextHost, nextPort) {
+  const currentScheme = String(currentTarget?.scheme || currentRequest?.scheme || "https").toLowerCase();
+  const normalizedNextScheme = String(nextScheme || "https").toLowerCase();
+  if (currentScheme !== normalizedNextScheme) {
+    return false;
+  }
+  const currentHost = stripIpv6Brackets(String(
+    currentTarget?.host || currentRequest?.host || "",
+  ).trim());
+  const currentPort = normalizePortValue(currentTarget?.port)
+    || defaultHttpPortForScheme(currentScheme);
+  const currentAuthority = joinAuthority(
+    currentHost,
+    isDefaultPortForScheme(currentScheme, currentPort) ? "" : currentPort,
+  );
+  const nextAuthority = joinAuthority(
+    nextHost,
+    isDefaultPortForScheme(normalizedNextScheme, nextPort) ? "" : nextPort,
+  );
+  return Boolean(currentAuthority && nextAuthority)
+    && httpRequestAuthoritiesEquivalent(currentAuthority, nextAuthority, currentScheme);
+}
+
+function isRedirectCredentialHeader(header) {
+  const name = String(header?.name || "").trim().toLowerCase();
+  return name === "authorization" || name === "proxy-authorization";
+}
+
 async function followRedirect() {
   const tab = getActiveReplayTab();
   if (!tab || !tab.responseRecord) return;
@@ -14057,8 +14093,9 @@ async function followRedirect() {
 
   const location = String(locationHeader.value || "").trim();
   let redirectUrl;
+  let currentTarget;
   try {
-    const currentTarget = getRepeaterTargetConfig(tab, currentRequest);
+    currentTarget = getRepeaterTargetConfig(tab, currentRequest);
     const currentUrl = buildUrlFromTarget(
       currentTarget.scheme || currentRequest.scheme || "https",
       currentTarget.host || currentRequest.host || "localhost",
@@ -14074,6 +14111,13 @@ async function followRedirect() {
   const newHost = stripIpv6Brackets(redirectUrl.hostname);
   const newPort = redirectUrl.port || (newScheme === "https" ? "443" : "80");
   const newPath = `${redirectUrl.pathname || "/"}${redirectUrl.search || ""}`;
+  const sameOriginRedirect = redirectTargetsSameOrigin(
+    currentTarget,
+    currentRequest,
+    newScheme,
+    newHost,
+    newPort,
+  );
 
   // 301/302/303 → GET (drop body), 307/308 → keep method
   const useGet = status === 301 || status === 302 || status === 303;
@@ -14098,7 +14142,9 @@ async function followRedirect() {
   // Merge with existing cookies
   let existingCookies = [];
   const currentHeaders = normalizedHeaders(currentRequest.headers);
-  const cookieHeader = currentHeaders.find((h) => headerNameEquals(h, "cookie"));
+  const cookieHeader = sameOriginRedirect
+    ? currentHeaders.find((h) => headerNameEquals(h, "cookie"))
+    : null;
   if (cookieHeader) {
     existingCookies = cookieHeader.value.split(";").map((c) => c.trim()).filter(Boolean);
   }
@@ -14110,15 +14156,21 @@ async function followRedirect() {
     const name = eqIdx > 0 ? c.substring(0, eqIdx) : c;
     cookieMap.set(name, c);
   }
-  for (const c of setCookies) {
-    const eqIdx = c.indexOf("=");
-    const name = eqIdx > 0 ? c.substring(0, eqIdx) : c;
-    cookieMap.set(name, c);
+  if (sameOriginRedirect) {
+    for (const c of setCookies) {
+      const eqIdx = c.indexOf("=");
+      const name = eqIdx > 0 ? c.substring(0, eqIdx) : c;
+      cookieMap.set(name, c);
+    }
   }
 
   // Build new headers
   const newHeaders = currentHeaders
-    .filter((h) => !headerNameEquals(h, "cookie") && !headerNameEquals(h, "host"))
+    .filter((h) => (
+      !headerNameEquals(h, "cookie")
+      && !headerNameEquals(h, "host")
+      && (sameOriginRedirect || !isRedirectCredentialHeader(h))
+    ))
     .map((h) => ({ name: h.name, value: h.value }));
 
   // Add updated host
@@ -19083,12 +19135,16 @@ function wsReplayDisplayHandshakeHeaders(tab) {
   return headers;
 }
 
-function refreshWsHandshakeHeadersForTarget(tab) {
-  if (!tab || tab.type !== "websocket" || tab.wsHandshakeEdited || !els.wsHandshakeHeaders) return;
+function wsReplayDisplayHandshakeText(tab) {
   const headers = wsReplayDisplayHandshakeHeaders(tab);
-  els.wsHandshakeHeaders.value = headers.length
+  return headers.length
     ? headers.map((h) => `${h.name}: ${h.value}`).join("\n")
     : "";
+}
+
+function refreshWsHandshakeHeadersForTarget(tab) {
+  if (!tab || tab.type !== "websocket" || tab.wsHandshakeEdited || !els.wsHandshakeHeaders) return;
+  els.wsHandshakeHeaders.value = wsReplayDisplayHandshakeText(tab);
   tab.wsHandshakeText = "";
 }
 
@@ -19490,12 +19546,7 @@ function renderWsReplay() {
     if (tab.wsHandshakeEdited) {
       els.wsHandshakeHeaders.value = tab.wsHandshakeText;
     } else {
-      const wsHeaders = wsReplayDisplayHandshakeHeaders(tab);
-      els.wsHandshakeHeaders.value = wsHeaders.length > 0
-        ? wsHeaders
-        .map(h => `${h.name}: ${h.value}`)
-        .join("\n")
-        : "";
+      els.wsHandshakeHeaders.value = wsReplayDisplayHandshakeText(tab);
     }
   }
 

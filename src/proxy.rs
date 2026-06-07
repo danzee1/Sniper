@@ -92,6 +92,7 @@ struct StreamedRecordContext {
     session: Arc<SessionContext>,
     _session_owner: ActiveProxySessionGuard,
     persist_generation: u64,
+    record_id: Option<Uuid>,
     started_at: chrono::DateTime<Utc>,
     started: Instant,
     method: String,
@@ -2879,25 +2880,30 @@ async fn store_record_and_scan(
 ) {
     let insert_outcome =
         insert_transaction_quiet(session, record.clone(), "captured transaction").await;
-    {
-        let scanner = session.scanner.clone();
-        let scan_generation = scanner.clear_generation();
-        let scan_record = record.clone();
-        let scan_state = Arc::clone(state);
-        let scan_session = Arc::clone(session);
-        spawn_tracked_proxy_task(session.id(), async move {
-            let config = scanner.get_config().await;
-            let findings = crate::scanner::scan_transaction(&scan_record, &config);
-            let mut accepted_findings = false;
-            for finding in findings {
-                accepted_findings |= scanner.push_if_generation(finding, scan_generation).await;
-            }
-            if accepted_findings {
-                persist_session_quiet(&scan_state, &scan_session).await;
-            }
-        });
-    }
+    scan_record_for_session(state, session, record);
     persist_transaction_insert_outcome(state, session, insert_outcome).await;
+}
+
+fn scan_record_for_session(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    record: TransactionRecord,
+) {
+    let scanner = session.scanner.clone();
+    let scan_generation = scanner.clear_generation();
+    let scan_state = Arc::clone(state);
+    let scan_session = Arc::clone(session);
+    spawn_tracked_proxy_task(session.id(), async move {
+        let config = scanner.get_config().await;
+        let findings = crate::scanner::scan_transaction(&record, &config);
+        let mut accepted_findings = false;
+        for finding in findings {
+            accepted_findings |= scanner.push_if_generation(finding, scan_generation).await;
+        }
+        if accepted_findings {
+            persist_session_quiet(&scan_state, &scan_session).await;
+        }
+    });
 }
 
 async fn insert_transaction_quiet(
@@ -3098,6 +3104,7 @@ async fn execute_streaming_http_exchange(
                 session: session.clone(),
                 _session_owner: remember_active_proxy_session_owner(session.id()),
                 persist_generation,
+                record_id: None,
                 started_at,
                 started,
                 method: method_text.clone(),
@@ -3124,6 +3131,8 @@ async fn execute_streaming_http_exchange(
                 );
             }
 
+            let mut context = context;
+            context.insert_provisional_record().await;
             let body = stream_upstream_response_body(response, context);
             rebuild_streaming_response(response_headers, status, body, &method_text)
         }
@@ -3258,12 +3267,60 @@ async fn read_response_body_limited(response: reqwest::Response, limit: usize) -
 }
 
 impl StreamedRecordContext {
+    async fn insert_provisional_record(&mut self) {
+        if self.record_id.is_some() {
+            return;
+        }
+        let mut notes = self.notes.clone();
+        notes.push("Streaming response capture is still in progress.".to_string());
+        let record = self.build_record(Vec::new(), 0, notes);
+        self.record_id = Some(record.id);
+        let insert_outcome =
+            insert_transaction_quiet(&self.session, record, "streaming response started").await;
+        persist_transaction_insert_outcome(&self.state, &self.session, insert_outcome).await;
+    }
+
     async fn store(self, preview: Vec<u8>, body_size: usize) {
         let notes = self.notes.clone();
         self.store_with_notes(preview, body_size, notes).await;
     }
 
-    async fn store_with_notes(mut self, preview: Vec<u8>, body_size: usize, notes: Vec<String>) {
+    async fn store_with_notes(self, preview: Vec<u8>, body_size: usize, notes: Vec<String>) {
+        let record = self.build_record(preview, body_size, notes);
+        if let Some(record_id) = self.record_id {
+            if self
+                .session
+                .store
+                .update_record(record_id, |stored| {
+                    stored.status = record.status;
+                    stored.duration_ms = record.duration_ms;
+                    stored.response = record.response.clone();
+                    stored.notes = record.notes.clone();
+                    stored.original_response = record.original_response.clone();
+                    stored.http_version = record.http_version.clone();
+                    stored.response_http_version = record.response_http_version.clone();
+                })
+                .await
+                .is_some()
+            {
+                let mut scan_record = record;
+                scan_record.id = record_id;
+                scan_record_for_session(&self.state, &self.session, scan_record);
+                persist_session_quiet(&self.state, &self.session).await;
+                forget_persist_context_if_clean(self.session.id(), self.persist_generation);
+                return;
+            }
+        }
+        store_record_and_scan(&self.state, &self.session, record).await;
+        forget_persist_context_if_clean(self.session.id(), self.persist_generation);
+    }
+
+    fn build_record(
+        &self,
+        preview: Vec<u8>,
+        body_size: usize,
+        notes: Vec<String>,
+    ) -> TransactionRecord {
         let mut response_capture = MessageRecord::from_headers_and_body(
             &self.response_headers,
             preview.as_ref(),
@@ -3277,27 +3334,24 @@ impl StreamedRecordContext {
                 response_capture.content_decoded = false;
             }
         }
-        self.notes = notes;
-        let record = with_record_http_versions(
+        with_record_http_versions(
             TransactionRecord::http(
                 self.started_at,
-                self.method,
-                self.scheme,
-                self.host,
-                self.path,
+                self.method.clone(),
+                self.scheme.clone(),
+                self.host.clone(),
+                self.path.clone(),
                 Some(self.status.as_u16()),
                 self.started.elapsed().as_millis() as u64,
-                self.request_capture,
+                self.request_capture.clone(),
                 Some(response_capture),
-                self.notes,
-                self.original_request_capture,
+                notes,
+                self.original_request_capture.clone(),
                 None,
             ),
             self.request_version,
             Some(self.response_version),
-        );
-        store_record_and_scan(&self.state, &self.session, record).await;
-        forget_persist_context_if_clean(self.session.id(), self.persist_generation);
+        )
     }
 }
 
@@ -5116,10 +5170,6 @@ async fn relay_websocket_session(
                         }
                         let should_close = message.is_close();
                         let captured_message = message.clone();
-                        upstream_sink
-                            .send(message)
-                            .await
-                            .context("failed to relay client websocket frame upstream")?;
                         if let Some(id) = session_id {
                             if let Some(frame) = capture_websocket_frame(
                                 frame_index,
@@ -5133,6 +5183,10 @@ async fn relay_websocket_session(
                                 frame_index += 1;
                             }
                         }
+                        upstream_sink
+                            .send(message)
+                            .await
+                            .context("failed to relay client websocket frame upstream")?;
                         if should_close {
                             if let Err(error) = client_sink.close().await {
                                 warn!(?error, "failed to flush client websocket close reply");
@@ -5192,10 +5246,6 @@ async fn relay_websocket_session(
                         }
                         let should_close = message.is_close();
                         let captured_message = message.clone();
-                        client_sink
-                            .send(message)
-                            .await
-                            .context("failed to relay upstream websocket frame to client")?;
                         if let Some(id) = session_id {
                             if let Some(frame) = capture_websocket_frame(
                                 frame_index,
@@ -5209,6 +5259,10 @@ async fn relay_websocket_session(
                                 frame_index += 1;
                             }
                         }
+                        client_sink
+                            .send(message)
+                            .await
+                            .context("failed to relay upstream websocket frame to client")?;
                         if should_close {
                             if let Err(error) = upstream_sink.close().await {
                                 warn!(?error, "failed to flush upstream websocket close reply");
@@ -5793,6 +5847,7 @@ mod tests {
             session: Arc::clone(&session),
             _session_owner: remember_active_proxy_session_owner(session_id),
             persist_generation,
+            record_id: None,
             started_at: Utc::now(),
             started: Instant::now(),
             method: "GET".to_string(),
@@ -5819,6 +5874,97 @@ mod tests {
             .await
             .unwrap();
         state.delete_session(session_id).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn streamed_capture_provisional_record_is_updated_in_place() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-proxy-streamed-capture-updates-in-place-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let mut scanner_config = session.scanner.get_config().await;
+        scanner_config.enabled = false;
+        session.scanner.update_config(scanner_config).await;
+
+        let request_capture = MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024);
+        let persist_generation = remember_persist_context(&session);
+        let mut context = StreamedRecordContext {
+            state: Arc::clone(&state),
+            session: Arc::clone(&session),
+            _session_owner: remember_active_proxy_session_owner(session_id),
+            persist_generation,
+            record_id: None,
+            started_at: Utc::now(),
+            started: Instant::now(),
+            method: "GET".to_string(),
+            scheme: "https".to_string(),
+            host: "streamed.example".to_string(),
+            path: "/stream".to_string(),
+            status: StatusCode::OK,
+            request_capture,
+            response_headers: HeaderMap::new(),
+            notes: Vec::new(),
+            original_request_capture: None,
+            request_version: Some(Version::HTTP_11),
+            response_version: Version::HTTP_11,
+            max_preview: 1024,
+        };
+
+        context.insert_provisional_record().await;
+        let record_id = context
+            .record_id
+            .expect("provisional id should be recorded");
+        let provisional = session
+            .store
+            .get(record_id)
+            .await
+            .expect("provisional record should be visible");
+        assert_eq!(provisional.response.as_ref().unwrap().body_size, 0);
+        assert!(provisional
+            .notes
+            .iter()
+            .any(|note| note.contains("still in progress")));
+
+        session
+            .store
+            .update_annotations(record_id, None, Some(Some("keep me".to_string())))
+            .await
+            .expect("annotation should update");
+
+        context
+            .store_with_notes(b"complete".to_vec(), 8, vec!["done".to_string()])
+            .await;
+
+        let listed = session
+            .store
+            .list(&crate::store::ListFilters::default())
+            .await;
+        assert_eq!(listed.len(), 1);
+        let final_record = session
+            .store
+            .get(record_id)
+            .await
+            .expect("final record should keep provisional id");
+        assert_eq!(final_record.response.as_ref().unwrap().body_size, 8);
+        assert_eq!(final_record.notes, vec!["done"]);
+        assert_eq!(final_record.user_note.as_deref(), Some("keep me"));
+        drain_proxy_connections(Duration::from_secs(1)).await;
+        flush_pending_session_persists(state.as_ref())
+            .await
+            .expect("pending persist should flush");
+        assert!(!session_has_pending_persist(session_id));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

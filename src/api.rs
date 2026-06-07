@@ -5473,6 +5473,7 @@ async fn events(
         .and_then(|value| value.parse::<u64>().ok());
     let session_id = session.id();
     let mut transaction_receiver = session.store.subscribe();
+    let mut transaction_retention_receiver = session.store.subscribe_retention();
     let mut log_receiver = session.event_log.subscribe();
     let mut finding_receiver = session.scanner.subscribe();
     let mut websocket_receiver = session.websockets.subscribe();
@@ -5499,6 +5500,22 @@ async fn events(
                                     .id(summary.sequence.to_string())
                                     .data(payload));
                             }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok(Event::default()
+                                .event("transactions_gap")
+                                .data("lagged"));
+                            continue;
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                result = transaction_retention_receiver.recv() => {
+                    match result {
+                        Ok(()) => {
+                            yield Ok(Event::default()
+                                .event("transactions_gap")
+                                .data("retention"));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             yield Ok(Event::default()
@@ -5577,6 +5594,12 @@ async fn events(
                     if !state.sessions.contains_session(session_id) {
                         yield Ok(Event::default()
                             .event("session_deleted")
+                            .data(session_id.to_string()));
+                        break;
+                    }
+                    if explicit_event_session && !state.is_current_session_context(&session).await {
+                        yield Ok(Event::default()
+                            .event("session_changed")
                             .data(session_id.to_string()));
                         break;
                     }
