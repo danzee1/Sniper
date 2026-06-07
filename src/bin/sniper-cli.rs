@@ -1537,10 +1537,6 @@ fn session_id_for_write_payload(explicit_session_id: Option<Uuid>) -> Option<Uui
     explicit_session_id
 }
 
-fn write_session_query_path(path: &str, explicit_session_id: Option<Uuid>) -> String {
-    session_query_path(path, session_id_for_write_payload(explicit_session_id))
-}
-
 fn sequence_write_session_id(
     cli_session_id: Option<Uuid>,
     input_session_id: Option<Uuid>,
@@ -1655,10 +1651,12 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
                 bail!("provide at least one of --color, --clear-color, --note, or --clear-note");
             }
             let payload = build_annotations_payload(color_tag, user_note);
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path = write_session_query_path(
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
+            let path = session_query_path_with_expected_active(
                 &format!("/api/transactions/{}/annotations", args.id),
-                args.session_id,
+                session_id,
+                expected_active_session_id,
             );
             let summary: TransactionSummary = api
                 .request_json(Method::PATCH, &path, Some(&payload))
@@ -2114,6 +2112,11 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
         }
         InterceptCommand::Forward(args) => {
             let read_session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let expected_active_session_id = if args.session_id.is_none() {
+                read_session_id
+            } else {
+                None
+            };
             let detail_path =
                 session_query_path(&format!("/api/intercepts/{}", args.id), read_session_id);
             let intercept: InterceptRecord = api.get_json(&detail_path).await?;
@@ -2125,9 +2128,10 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                 intercept.request
             };
             let session_id = read_session_id;
-            let action_path = write_session_query_path(
+            let action_path = session_query_path_with_expected_active(
                 &format!("/api/intercepts/{}/forward", args.id),
                 read_session_id,
+                expected_active_session_id,
             );
             api.post_status(&action_path, &InterceptForwardPayload { request })
                 .await?;
@@ -2139,10 +2143,12 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             })
         }
         InterceptCommand::Drop(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path = write_session_query_path(
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
+            let path = session_query_path_with_expected_active(
                 &format!("/api/intercepts/{}/drop", args.id),
-                args.session_id,
+                session_id,
+                expected_active_session_id,
             );
             api.post_status(&path, &json!({})).await?;
             print_json(&InterceptActionResult {
@@ -2153,8 +2159,13 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             })
         }
         InterceptCommand::ForwardAll(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path = write_session_query_path("/api/intercepts/forward-all", args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
+            let path = session_query_path_with_expected_active(
+                "/api/intercepts/forward-all",
+                session_id,
+                expected_active_session_id,
+            );
             let mut result: serde_json::Value = api
                 .post_json_or_no_content(&path, &json!({}))
                 .await?
@@ -2223,7 +2234,16 @@ async fn handle_auto_replace(api: ApiClient, command: AutoReplaceCommand) -> Res
                 ),
             };
             let session_id = auto_replace_write_session_id(args.session_id, input_session_id)?;
-            let path = session_query_path("/api/match-replace", session_id);
+            let expected_active_session_id = if session_id.is_none() {
+                active_session_id(&api).await?
+            } else {
+                None
+            };
+            let path = session_query_path_with_expected_active(
+                "/api/match-replace",
+                session_id.or(expected_active_session_id),
+                expected_active_session_id,
+            );
             let rules: Vec<MatchReplaceRule> = api.post_json(&path, &payload).await?;
             print_json(&rules)
         }
@@ -2250,6 +2270,11 @@ async fn handle_response_intercept(
         }
         ResponseInterceptCommand::Forward(args) => {
             let read_session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let expected_active_session_id = if args.session_id.is_none() {
+                read_session_id
+            } else {
+                None
+            };
             let detail_path = session_query_path(
                 &format!("/api/response-intercepts/{}", args.id),
                 read_session_id,
@@ -2261,9 +2286,10 @@ async fn handle_response_intercept(
                 item.response
             };
             let session_id = read_session_id;
-            let action_path = write_session_query_path(
+            let action_path = session_query_path_with_expected_active(
                 &format!("/api/response-intercepts/{}/forward", args.id),
                 read_session_id,
+                expected_active_session_id,
             );
             api.post_status(&action_path, &ResponseInterceptForwardPayload { response })
                 .await?;
@@ -2275,10 +2301,12 @@ async fn handle_response_intercept(
             })
         }
         ResponseInterceptCommand::Drop(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path = write_session_query_path(
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
+            let path = session_query_path_with_expected_active(
                 &format!("/api/response-intercepts/{}/drop", args.id),
-                args.session_id,
+                session_id,
+                expected_active_session_id,
             );
             api.post_status(&path, &json!({})).await?;
             print_json(&InterceptActionResult {
@@ -2289,9 +2317,13 @@ async fn handle_response_intercept(
             })
         }
         ResponseInterceptCommand::ForwardAll(args) => {
-            let session_id = session_id_for_write_payload(args.session_id);
-            let path =
-                write_session_query_path("/api/response-intercepts/forward-all", args.session_id);
+            let (session_id, expected_active_session_id) =
+                runtime_write_session_ids(&api, args.session_id).await?;
+            let path = session_query_path_with_expected_active(
+                "/api/response-intercepts/forward-all",
+                session_id,
+                expected_active_session_id,
+            );
             let mut result: serde_json::Value = api
                 .post_json_or_no_content(&path, &json!({}))
                 .await?
@@ -4688,13 +4720,13 @@ mod tests {
         replay_send_http_version, replay_send_target_for_tab, replay_tab_target_as_request,
         replay_tab_target_matches_request, replay_update_should_preserve_current_port,
         sequence_write_session_id, session_id_for_write_payload, session_query_path,
-        sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
-        sync_replay_tab_target_to_request, transaction_detail_path, validate_sniper_settings_probe,
-        websocket_detail_path, websocket_list_path, workspace_conflict_message,
-        workspace_state_conflict_detail, write_session_query_path, Cli, Command, HistoryCommand,
-        HistoryListArgs, HistoryListResponse, OastConfigureArgs, RuntimeUpdatePayload,
-        SequenceCommand, SequenceCreateInput, SessionCommand, SkillsInstallArgs,
-        SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
+        session_query_path_with_expected_active, sniper_settings_probe_matches, split_host_port,
+        split_payload_lines, strip_host_port, sync_replay_tab_target_to_request,
+        transaction_detail_path, validate_sniper_settings_probe, websocket_detail_path,
+        websocket_list_path, workspace_conflict_message, workspace_state_conflict_detail, Cli,
+        Command, HistoryCommand, HistoryListArgs, HistoryListResponse, OastConfigureArgs,
+        RuntimeUpdatePayload, SequenceCommand, SequenceCreateInput, SessionCommand,
+        SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
         CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES, SNIPER_API_PROBE_RETRY_DELAYS,
         SNIPER_DATA_DIR_ENV,
     };
@@ -5005,16 +5037,16 @@ mod tests {
     }
 
     #[test]
-    fn write_session_query_path_only_pins_explicit_session_id() {
+    fn session_query_path_with_expected_active_adds_write_guard() {
         let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 
         assert_eq!(
-            write_session_query_path("/api/match-replace", None),
-            "/api/match-replace"
-        );
-        assert_eq!(
-            write_session_query_path("/api/match-replace", Some(session_id)),
-            "/api/match-replace?session_id=22222222-2222-2222-2222-222222222222"
+            session_query_path_with_expected_active(
+                "/api/match-replace",
+                Some(session_id),
+                Some(session_id),
+            ),
+            "/api/match-replace?session_id=22222222-2222-2222-2222-222222222222&expected_active_session_id=22222222-2222-2222-2222-222222222222"
         );
     }
 

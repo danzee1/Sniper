@@ -2011,6 +2011,13 @@ struct SessionWriteQuery {
     expected_active_session_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TransactionWriteQuery {
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
+}
+
 fn reconcile_write_session_id(
     query_session_id: Option<Uuid>,
     body_session_id: Option<Uuid>,
@@ -2377,6 +2384,7 @@ async fn update_workspace_state(
     if !can_replace_snapshot(&snapshot, &current) {
         return (StatusCode::CONFLICT, Json(current)).into_response();
     }
+    merge_incomplete_workspace_update_ws_frames(&mut snapshot, &current);
     if let Err(error) = validate_workspace_state(&snapshot) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
@@ -2674,6 +2682,44 @@ fn merge_workspace_keepalive_ws_frames(
         truncated = true;
     }
     (frames, truncated)
+}
+
+fn merge_incomplete_workspace_update_ws_frames(
+    snapshot: &mut WorkspaceStateSnapshot,
+    current: &WorkspaceStateSnapshot,
+) {
+    let current_tabs = current
+        .replay
+        .tabs
+        .iter()
+        .filter(|tab| tab.tab_type == "websocket")
+        .map(|tab| (tab.id.as_str(), tab))
+        .collect::<IndexMap<_, _>>();
+    for tab in &mut snapshot.replay.tabs {
+        if tab.tab_type != "websocket" || tab.ws_frames_complete.unwrap_or(false) {
+            continue;
+        }
+        let Some(current_tab) = current_tabs.get(tab.id.as_str()) else {
+            tab.ws_frames_truncated = true;
+            continue;
+        };
+        let incoming_frames = std::mem::take(&mut tab.ws_frames);
+        let (merged_frames, merged_truncated) = merge_workspace_keepalive_ws_frames(
+            current_tab.ws_frames.clone(),
+            incoming_frames,
+            current_tab.ws_frames_truncated,
+            tab.ws_frames_truncated,
+        );
+        tab.ws_frames = merged_frames;
+        tab.ws_frames_truncated = merged_truncated;
+        if tab.ws_selected_frame_index.is_none() {
+            tab.ws_selected_frame_index = current_tab.ws_selected_frame_index;
+        }
+        if tab.ws_frame_window_start.is_none() {
+            tab.ws_frame_window_start = current_tab.ws_frame_window_start;
+        }
+        tab.ws_frames_complete = Some(true);
+    }
 }
 
 fn merge_workspace_keepalive_tab(
@@ -3426,7 +3472,7 @@ async fn get_scanner_config(
 
 async fn update_scanner_config(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     Json(payload): Json<ScannerConfigPayload>,
 ) -> Response {
     if let Err(error) = validate_scanner_config(&payload.config) {
@@ -3437,15 +3483,27 @@ async fn update_scanner_config(
             Ok(value) => value,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous = session.scanner.get_config().await;
     session.scanner.update_config(payload.config).await;
@@ -3509,7 +3567,7 @@ async fn list_match_replace_rules(
 
 async fn update_match_replace_rules(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     Json(payload): Json<MatchReplaceRulesPayload>,
 ) -> Response {
     if let Err(error) = validate_match_replace_rules(&payload.rules) {
@@ -3520,15 +3578,27 @@ async fn update_match_replace_rules(
             Ok(value) => value,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_rules = session.match_replace.snapshot().await;
     let previous_events = session
@@ -3695,7 +3765,7 @@ async fn get_transaction(
 async fn update_transaction_annotations(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<TransactionGetQuery>,
+    Query(query): Query<TransactionWriteQuery>,
     Json(payload): Json<AnnotationsPayload>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
@@ -3707,15 +3777,27 @@ async fn update_transaction_annotations(
             Ok(value) => value,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     if let Err(message) = validate_annotations_payload(&payload) {
         return (StatusCode::BAD_REQUEST, message).into_response();
     }
@@ -3777,7 +3859,7 @@ async fn get_intercept(
 async fn forward_intercept(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     Json(payload): Json<InterceptForwardPayload>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
@@ -3789,6 +3871,13 @@ async fn forward_intercept(
             Ok(value) => value,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
@@ -3801,11 +3890,16 @@ async fn forward_intercept(
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
 
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -3836,7 +3930,7 @@ async fn forward_intercept(
 async fn drop_intercept(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
@@ -3852,6 +3946,13 @@ async fn drop_intercept(
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
@@ -3860,11 +3961,16 @@ async fn drop_intercept(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -3894,7 +4000,7 @@ async fn drop_intercept(
 
 async fn forward_all_intercepts(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
     let (target_session_id, session_id_is_explicit) = match reconcile_write_session_id(
@@ -3906,15 +4012,27 @@ async fn forward_all_intercepts(
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -4082,7 +4200,7 @@ async fn get_response_intercept(
 async fn forward_response_intercept(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     Json(payload): Json<ResponseInterceptForwardPayload>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
@@ -4094,6 +4212,13 @@ async fn forward_response_intercept(
             Ok(value) => value,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
@@ -4106,11 +4231,16 @@ async fn forward_response_intercept(
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
 
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -4145,7 +4275,7 @@ async fn forward_response_intercept(
 async fn drop_response_intercept(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
     let id = match Uuid::parse_str(&id) {
@@ -4161,6 +4291,13 @@ async fn drop_response_intercept(
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
@@ -4169,11 +4306,16 @@ async fn drop_response_intercept(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -4203,7 +4345,7 @@ async fn drop_response_intercept(
 
 async fn forward_all_response_intercepts(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SessionScopedQuery>,
+    Query(query): Query<SessionWriteQuery>,
     payload: Option<Json<SessionActionPayload>>,
 ) -> Response {
     let (target_session_id, session_id_is_explicit) = match reconcile_write_session_id(
@@ -4215,15 +4357,27 @@ async fn forward_all_response_intercepts(
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
     let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard =
-        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
-            Ok(guard) => guard,
-            Err(response) => return response,
-        };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !session_id_is_explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let _mutation_guard = session.mutation_guard().await;
     let previous_events = session
         .event_log
@@ -7787,6 +7941,7 @@ mod tests {
                         test_ws_replay_frame(1, "old-one"),
                         test_ws_replay_frame(2, "old-two"),
                     ],
+                    ws_frames_complete: Some(true),
                     ws_selected_frame_index: Some(1),
                     ws_frame_window_start: Some(1),
                     ..ReplayTabState::default()
@@ -7820,6 +7975,84 @@ mod tests {
         );
 
         let tab = merged.replay.tabs.first().expect("merged tab");
+        let frames: Vec<_> = tab
+            .ws_frames
+            .iter()
+            .map(|frame| (frame.index, frame.body.as_str()))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![(1, "old-one"), (2, "new-two"), (3, "new-three")]
+        );
+        assert_eq!(tab.ws_selected_frame_index, Some(1));
+        assert_eq!(tab.ws_frame_window_start, Some(1));
+        assert!(!tab.ws_frames_truncated);
+    }
+
+    #[tokio::test]
+    async fn workspace_full_update_merges_incomplete_websocket_frames() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-full-save-ws-frame-merge")).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let tab_id = Uuid::new_v4().to_string();
+        let current = WorkspaceStateSnapshot {
+            session_id: Some(session_id),
+            client_id: Some("browser".to_string()),
+            client_version: 1,
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some(tab_id.clone()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: tab_id.clone(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_frames: vec![
+                        test_ws_replay_frame(1, "old-one"),
+                        test_ws_replay_frame(2, "old-two"),
+                    ],
+                    ws_frames_complete: Some(true),
+                    ws_selected_frame_index: Some(1),
+                    ws_frame_window_start: Some(1),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let current_response =
+            super::update_workspace_state(State(state.clone()), Json(current)).await;
+        assert_eq!(current_response.status(), StatusCode::OK);
+        let saved_current: WorkspaceStateSnapshot = response_json(current_response).await;
+
+        let incoming = WorkspaceStateSnapshot {
+            session_id: Some(session_id),
+            revision: saved_current.revision,
+            client_id: Some("browser".to_string()),
+            client_version: 2,
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some(tab_id.clone()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: tab_id,
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_frames: vec![
+                        test_ws_replay_frame(2, "new-two"),
+                        test_ws_replay_frame(3, "new-three"),
+                    ],
+                    ws_frames_complete: Some(false),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let update_response =
+            super::update_workspace_state(State(state.clone()), Json(incoming)).await;
+        assert_eq!(update_response.status(), StatusCode::OK);
+
+        let reloaded = state.sessions.load_context(session_id).unwrap();
+        let snapshot = reloaded.workspace.snapshot().await;
+        let tab = snapshot.replay.tabs.first().expect("ws tab should persist");
         let frames: Vec<_> = tab
             .ws_frames
             .iter()
@@ -8806,8 +9039,9 @@ mod tests {
         let conflict = super::forward_intercept(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(active_id),
+                expected_active_session_id: None,
             }),
             Json(super::InterceptForwardPayload {
                 session_id: Some(original_id),
@@ -8821,7 +9055,10 @@ mod tests {
         let response = super::forward_intercept(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::InterceptForwardPayload {
                 session_id: Some(original_id),
                 request: test_editable_request("/forwarded"),
@@ -8875,8 +9112,9 @@ mod tests {
         let conflict = super::forward_response_intercept(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(active_id),
+                expected_active_session_id: None,
             }),
             Json(super::ResponseInterceptForwardPayload {
                 session_id: Some(original_id),
@@ -8890,7 +9128,10 @@ mod tests {
         let response = super::forward_response_intercept(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::ResponseInterceptForwardPayload {
                 session_id: Some(original_id),
                 response: test_editable_response(204),
@@ -8939,7 +9180,10 @@ mod tests {
         let response = super::drop_intercept(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Some(Json(super::SessionActionPayload {
                 session_id: Some(original_id),
             })),
@@ -8987,7 +9231,10 @@ mod tests {
         let response = super::drop_response_intercept(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Some(Json(super::SessionActionPayload {
                 session_id: Some(original_id),
             })),
@@ -9036,7 +9283,10 @@ mod tests {
 
         let response = super::forward_all_intercepts(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Some(Json(super::SessionActionPayload {
                 session_id: Some(original_id),
             })),
@@ -9089,7 +9339,10 @@ mod tests {
 
         let response = super::forward_all_response_intercepts(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Some(Json(super::SessionActionPayload {
                 session_id: Some(original_id),
             })),
@@ -9110,6 +9363,9 @@ mod tests {
             Arc::new(AppState::new(test_app_config("sniper-stale-session-write-query")).unwrap());
         let original = state.session().await;
         let original_id = original.id();
+        let record = test_replay_response_record("/annotated", 200);
+        let record_id = record.id;
+        original.store.insert(record).await;
         state
             .create_session(Some("new active".to_string()))
             .await
@@ -9126,6 +9382,120 @@ mod tests {
         let findings_response =
             super::clear_findings(State(state.clone()), Query(stale_query.clone())).await;
         assert_eq!(findings_response.status(), StatusCode::CONFLICT);
+
+        let mut scanner_config = original.scanner.get_config().await;
+        scanner_config.enabled = false;
+        let scanner_response = super::update_scanner_config(
+            State(state.clone()),
+            Query(stale_query.clone()),
+            Json(super::ScannerConfigPayload::from(scanner_config)),
+        )
+        .await;
+        assert_eq!(scanner_response.status(), StatusCode::CONFLICT);
+        assert!(original.scanner.get_config().await.enabled);
+
+        let match_rule = MatchReplaceRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            description: "stale".to_string(),
+            scope: MatchReplaceScope::Request,
+            target: MatchReplaceTarget::Path,
+            search: "/old".to_string(),
+            replace: "/new".to_string(),
+            regex: false,
+            case_sensitive: true,
+        };
+        let match_response = super::update_match_replace_rules(
+            State(state.clone()),
+            Query(stale_query.clone()),
+            Json(MatchReplaceRulesPayload {
+                session_id: None,
+                rules: vec![match_rule],
+            }),
+        )
+        .await;
+        assert_eq!(match_response.status(), StatusCode::CONFLICT);
+        assert!(original.match_replace.snapshot().await.is_empty());
+
+        let annotation_response = super::update_transaction_annotations(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::TransactionWriteQuery {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+            }),
+            Json(super::AnnotationsPayload {
+                session_id: None,
+                color_tag: Some(Some("blue".to_string())),
+                user_note: None,
+                client_id: None,
+                client_version: None,
+            }),
+        )
+        .await;
+        assert_eq!(annotation_response.status(), StatusCode::CONFLICT);
+        assert!(original
+            .store
+            .get(record_id)
+            .await
+            .unwrap()
+            .color_tag
+            .is_none());
+
+        let request_forward_response = super::forward_intercept(
+            State(state.clone()),
+            Path(Uuid::new_v4().to_string()),
+            Query(stale_query.clone()),
+            Json(super::InterceptForwardPayload {
+                session_id: None,
+                request: test_editable_request("/stale"),
+            }),
+        )
+        .await;
+        assert_eq!(request_forward_response.status(), StatusCode::CONFLICT);
+
+        let request_drop_response = super::drop_intercept(
+            State(state.clone()),
+            Path(Uuid::new_v4().to_string()),
+            Query(stale_query.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(request_drop_response.status(), StatusCode::CONFLICT);
+
+        let request_forward_all_response =
+            super::forward_all_intercepts(State(state.clone()), Query(stale_query.clone()), None)
+                .await;
+        assert_eq!(request_forward_all_response.status(), StatusCode::CONFLICT);
+
+        let response_forward_response = super::forward_response_intercept(
+            State(state.clone()),
+            Path(Uuid::new_v4().to_string()),
+            Query(stale_query.clone()),
+            Json(super::ResponseInterceptForwardPayload {
+                session_id: None,
+                response: test_editable_response(200),
+            }),
+        )
+        .await;
+        assert_eq!(response_forward_response.status(), StatusCode::CONFLICT);
+
+        let response_drop_response = super::drop_response_intercept(
+            State(state.clone()),
+            Path(Uuid::new_v4().to_string()),
+            Query(stale_query.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(response_drop_response.status(), StatusCode::CONFLICT);
+
+        let response_forward_all_response = super::forward_all_response_intercepts(
+            State(state.clone()),
+            Query(stale_query.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(response_forward_all_response.status(), StatusCode::CONFLICT);
 
         let rule_response = super::delete_intercept_rule(
             State(state.clone()),
@@ -9195,7 +9565,10 @@ mod tests {
 
         let response = super::forward_all_intercepts(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             None,
         )
         .await;
@@ -9259,7 +9632,10 @@ mod tests {
 
         let response = super::forward_all_response_intercepts(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             None,
         )
         .await;
@@ -10496,8 +10872,9 @@ mod tests {
         };
         let response = super::update_match_replace_rules(
             State(state.clone()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(inactive_id),
+                expected_active_session_id: None,
             }),
             Json(MatchReplaceRulesPayload {
                 session_id: None,
@@ -10530,8 +10907,9 @@ mod tests {
         scanner_config.enabled = false;
         let response = super::update_scanner_config(
             State(state.clone()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(inactive_id),
+                expected_active_session_id: None,
             }),
             Json(super::ScannerConfigPayload::from(scanner_config.clone())),
         )
@@ -10677,7 +11055,10 @@ mod tests {
         };
         let response = super::update_match_replace_rules(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(MatchReplaceRulesPayload {
                 session_id: Some(inactive_id),
                 rules: vec![match_rule.clone()],
@@ -10700,8 +11081,9 @@ mod tests {
 
         let conflict_response = super::update_match_replace_rules(
             State(state.clone()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(active_id),
+                expected_active_session_id: None,
             }),
             Json(MatchReplaceRulesPayload {
                 session_id: Some(inactive_id),
@@ -10786,7 +11168,10 @@ mod tests {
         scanner_config.enabled = false;
         let response = super::update_scanner_config(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::ScannerConfigPayload {
                 session_id: Some(inactive_id),
                 config: scanner_config.clone(),
@@ -10809,8 +11194,9 @@ mod tests {
 
         let conflict_response = super::update_scanner_config(
             State(state.clone()),
-            Query(super::SessionScopedQuery {
+            Query(super::SessionWriteQuery {
                 session_id: Some(active_id),
+                expected_active_session_id: None,
             }),
             Json(super::ScannerConfigPayload {
                 session_id: Some(inactive_id),
@@ -10891,7 +11277,10 @@ mod tests {
         let response = super::update_transaction_annotations(
             State(state.clone()),
             Path(id.to_string()),
-            Query(super::TransactionGetQuery { session_id: None }),
+            Query(super::TransactionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::AnnotationsPayload {
                 session_id: None,
                 color_tag: Some(Some("blue".to_string())),
@@ -12901,7 +13290,10 @@ mod tests {
         let active_annotation_response = super::update_transaction_annotations(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::TransactionGetQuery { session_id: None }),
+            Query(super::TransactionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::AnnotationsPayload {
                 session_id: None,
                 color_tag: Some(Some("red".to_string())),
@@ -12919,7 +13311,10 @@ mod tests {
         let pinned_annotation_response = super::update_transaction_annotations(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::TransactionGetQuery { session_id: None }),
+            Query(super::TransactionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::AnnotationsPayload {
                 session_id: Some(original_id),
                 color_tag: Some(Some("blue".to_string())),
@@ -12938,8 +13333,9 @@ mod tests {
         let conflicting_annotation_response = super::update_transaction_annotations(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::TransactionGetQuery {
+            Query(super::TransactionWriteQuery {
                 session_id: Some(active_id),
+                expected_active_session_id: None,
             }),
             Json(super::AnnotationsPayload {
                 session_id: Some(original_id),
@@ -13659,7 +14055,10 @@ mod tests {
 
         let response = super::update_scanner_config(
             State(state),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::ScannerConfigPayload::from(next_config)),
         )
         .await;
@@ -13700,7 +14099,10 @@ mod tests {
 
         let response = super::update_scanner_config(
             State(state.clone()),
-            Query(super::SessionScopedQuery { session_id: None }),
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
             Json(super::ScannerConfigPayload::from(next_config)),
         )
         .await;

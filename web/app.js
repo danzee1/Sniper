@@ -141,6 +141,7 @@ const WORKSPACE_UNLOAD_HISTORY_ENTRIES_MAX_BYTES = 12 * 1024;
 const WORKSPACE_UNLOAD_RESPONSE_RECORD_MAX_BYTES = 12 * 1024;
 const WORKSPACE_UNLOAD_WS_SETUP_QUEUE_MAX_BYTES = 12 * 1024;
 const WORKSPACE_UNLOAD_WS_FRAMES_MAX_BYTES = 24 * 1024;
+const WORKSPACE_UNLOAD_UNSAVED_MESSAGE = "Large Replay edits have not finished saving.";
 const MAX_ANNOTATION_NOTE_BYTES = 32 * 1024;
 const WS_REPLAY_FINAL_POLL_INTERVAL_MS = 100;
 const WS_REPLAY_FINAL_POLL_TIMEOUT_MS = 2200;
@@ -2942,6 +2943,7 @@ function snapshotWorkspaceState(options = {}) {
           autoSend: !!item.autoSend,
         })),
         ws_frames: wsFrames,
+        ws_frames_complete: !wsFramesSnapshot.truncated,
         ws_frames_truncated: !!tab.wsFramesTruncated || wsFramesSnapshot.truncated,
         ws_selected_frame_index: snapshotWsReplaySelectedFrameIndex(tab, wsFrames),
         ws_frame_window_start: snapshotWsReplayFrameWindowStart(tab, wsFrames),
@@ -3262,7 +3264,15 @@ function flushWorkspaceStateBeforeHidden() {
   });
 }
 
-function flushWorkspaceStateOnUnload() {
+function requestWorkspaceUnloadPrompt(event) {
+  if (!event || event.type !== "beforeunload") {
+    return;
+  }
+  event.preventDefault();
+  event.returnValue = WORKSPACE_UNLOAD_UNSAVED_MESSAGE;
+}
+
+function flushWorkspaceStateOnUnload(event) {
   const hadTranscriptSaveTimer = !!wsTranscriptSaveTimer;
   window.clearTimeout(wsTranscriptSaveTimer);
   wsTranscriptSaveTimer = null;
@@ -3282,6 +3292,7 @@ function flushWorkspaceStateOnUnload() {
   const unloadPayload = workspaceUnloadPayload(snapshot);
   if (!unloadPayload) {
     workspaceSaveDirty = true;
+    requestWorkspaceUnloadPrompt(event);
     console.warn("Skipping unload workspace keepalive save because the full workspace snapshot is too large.");
     return;
   }
@@ -4149,6 +4160,20 @@ function sessionQueryPath(path, sessionId = currentSessionId()) {
   return `${path}${separator}session_id=${encodeURIComponent(sessionId)}`;
 }
 
+function sessionWritePath(path, sessionId = currentSessionId()) {
+  const params = new URLSearchParams();
+  if (sessionId) {
+    params.set("session_id", sessionId);
+  }
+  if (sessionId && sessionId === currentSessionId()) {
+    params.set("expected_active_session_id", sessionId);
+  }
+  const query = params.toString();
+  if (!query) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}${query}`;
+}
+
 function transactionPath(id, sessionId = currentSessionId()) {
   return sessionQueryPath(`/api/transactions/${encodeURIComponent(id)}`, sessionId);
 }
@@ -4734,7 +4759,7 @@ async function addInterceptRule() {
     path_pattern: "",
     method_filter: [],
   };
-  const response = await fetch(sessionQueryPath("/api/intercept-rules", sessionId), {
+  const response = await fetch(sessionWritePath("/api/intercept-rules", sessionId), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(rule),
@@ -4789,7 +4814,7 @@ async function saveInterceptRuleFromRow(ruleId) {
     path_pattern: pathInput?.value?.trim() || "",
     method_filter: (methodInput?.value || "").split(",").map((m) => m.trim().toUpperCase()).filter(Boolean),
   };
-  const response = await fetch(sessionQueryPath("/api/intercept-rules", sessionId), {
+  const response = await fetch(sessionWritePath("/api/intercept-rules", sessionId), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(updated),
@@ -4803,7 +4828,7 @@ async function saveInterceptRuleFromRow(ruleId) {
 
 async function deleteInterceptRule(ruleId) {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath(`/api/intercept-rules/${ruleId}`, sessionId), { method: "DELETE" });
+  const response = await fetch(sessionWritePath(`/api/intercept-rules/${ruleId}`, sessionId), { method: "DELETE" });
   await requireOkResponse(response, "Failed to delete intercept rule.");
   if (sessionId !== currentSessionId()) {
     return;
@@ -4816,7 +4841,7 @@ async function toggleInterceptRuleEnabled(ruleId, enabled) {
   const rule = (state.interceptRules || []).find((r) => r.id === ruleId);
   if (!rule) return;
   rule.enabled = enabled;
-  const response = await fetch(sessionQueryPath("/api/intercept-rules", sessionId), {
+  const response = await fetch(sessionWritePath("/api/intercept-rules", sessionId), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(rule),
@@ -5999,7 +6024,7 @@ function mergeEventLogEntries(primaryEntries, fallbackEntries) {
 
 async function clearEventLog() {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath("/api/event-log", sessionId), { method: "DELETE" });
+  const response = await fetch(sessionWritePath("/api/event-log", sessionId), { method: "DELETE" });
   await requireOkResponse(response, "Failed to clear event log.");
   if (sessionId !== currentSessionId()) {
     return;
@@ -6027,7 +6052,7 @@ async function loadMatchReplaceRules() {
 
 async function saveMatchReplaceRules() {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath("/api/match-replace", sessionId), {
+  const response = await fetch(sessionWritePath("/api/match-replace", sessionId), {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -8187,7 +8212,7 @@ async function saveScannerConfig(config, sessionId = currentSessionId(), options
     }
     config.enabled = latestConfig.enabled !== false;
   }
-  const res = await fetch(sessionQueryPath("/api/scanner-config", sessionId), {
+  const res = await fetch(sessionWritePath("/api/scanner-config", sessionId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(config),
@@ -8544,7 +8569,7 @@ async function generateOastPayload() {
 
 async function clearOastCallbacks() {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath("/api/oast/callbacks/clear", sessionId), { method: "POST" });
+  const response = await fetch(sessionWritePath("/api/oast/callbacks/clear", sessionId), { method: "POST" });
   await requireOkResponse(response, "Failed to clear OAST callbacks.");
   if (sessionId !== currentSessionId()) {
     return;
@@ -8622,7 +8647,7 @@ function bindFindingsEvents() {
     els.findingsClearButton.addEventListener("click", async () => {
       const sessionId = currentSessionId();
       try {
-        const response = await fetch(sessionQueryPath("/api/findings/clear", sessionId), { method: "POST" });
+        const response = await fetch(sessionWritePath("/api/findings/clear", sessionId), { method: "POST" });
         await requireOkResponse(response, "Failed to clear findings.");
         if (sessionId !== currentSessionId()) return;
         resetFindingsUiState();
@@ -12787,8 +12812,8 @@ async function toggleIntercept() {
 
   if (turningOff) {
     Promise.all([
-      fetch(sessionQueryPath("/api/intercepts/forward-all", sessionId), { method: "POST" }),
-      fetch(sessionQueryPath("/api/response-intercepts/forward-all", sessionId), { method: "POST" }),
+      fetch(sessionWritePath("/api/intercepts/forward-all", sessionId), { method: "POST" }),
+      fetch(sessionWritePath("/api/response-intercepts/forward-all", sessionId), { method: "POST" }),
     ]).then(async ([requestResponse, responseResponse]) => {
       await requireOkResponse(requestResponse, "Failed to forward queued requests.");
       await requireOkResponse(responseResponse, "Failed to forward queued responses.");
@@ -13044,7 +13069,7 @@ async function forwardSelectedIntercept() {
   updateInterceptQueueBadges();
 
   try {
-    const response = await fetch(sessionQueryPath(`/api/intercepts/${id}/forward`, sessionId), {
+    const response = await fetch(sessionWritePath(`/api/intercepts/${id}/forward`, sessionId), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ request }),
@@ -13082,7 +13107,7 @@ async function dropSelectedIntercept() {
   updateInterceptQueueBadges();
 
   try {
-    const response = await fetch(sessionQueryPath(`/api/intercepts/${id}/drop`, sessionId), { method: "POST" });
+    const response = await fetch(sessionWritePath(`/api/intercepts/${id}/drop`, sessionId), { method: "POST" });
     await requireOkResponse(response, "Failed to drop intercepted request.");
     if (sessionId !== currentSessionId()) {
       return;
@@ -13324,7 +13349,7 @@ async function forwardSelectedResponseIntercept() {
   updateInterceptQueueBadges();
 
   try {
-    const response = await fetch(sessionQueryPath(`/api/response-intercepts/${id}/forward`, sessionId), {
+    const response = await fetch(sessionWritePath(`/api/response-intercepts/${id}/forward`, sessionId), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ response: editedResponse }),
@@ -13360,7 +13385,7 @@ async function dropSelectedResponseIntercept() {
   updateInterceptQueueBadges();
 
   try {
-    const response = await fetch(sessionQueryPath(`/api/response-intercepts/${id}/drop`, sessionId), { method: "POST" });
+    const response = await fetch(sessionWritePath(`/api/response-intercepts/${id}/drop`, sessionId), { method: "POST" });
     await requireOkResponse(response, "Failed to drop intercepted response.");
     if (sessionId !== currentSessionId()) {
       return;
@@ -20016,7 +20041,7 @@ function flushAnnotationsOnUnload() {
     if (!entry?.sessionId || !entry.payload) continue;
     const body = JSON.stringify(entry.payload);
     if (utf8ByteLength(body) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
-    fetch(sessionQueryPath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, entry.sessionId), {
+    fetch(sessionWritePath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, entry.sessionId), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body,
@@ -20058,7 +20083,7 @@ async function flushPendingAnnotations(transactionId, options = {}) {
   let failureMessage = "";
   let saved = false;
   try {
-    const response = await fetch(sessionQueryPath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, sessionId), {
+    const response = await fetch(sessionWritePath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, sessionId), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
