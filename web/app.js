@@ -450,6 +450,7 @@ const state = {
   editingSequence: null,
   sequenceSelectionGeneration: 0,
   sequenceRunGeneration: 0,
+  sequenceRunning: false,
   sequenceDirty: false,
   sequenceDraftVersion: 0,
   sequenceRunResult: null,
@@ -3543,6 +3544,7 @@ function syncActiveWsReplayDraftFromDom() {
         tab.wsHost = nextHost;
         tab.wsPort = nextPort;
         tab.wsPath = nextPath;
+        refreshWsHandshakeHeadersForTarget(tab);
         scheduleWorkspaceStateSave();
         changed = true;
       }
@@ -4069,6 +4071,7 @@ function resetSessionScopedUiState() {
   state.selectedSequenceId = null;
   state.editingSequence = null;
   state.sequenceDirty = false;
+  state.sequenceRunning = false;
   state.sequenceRunResult = null;
   state.sequencePastRuns = [];
   clearCompareState();
@@ -10263,6 +10266,9 @@ function renderWebsocketSessions(options = {}) {
   if (els.wsHandshakeLines) {
     els.wsHandshakeLines.textContent = buildLineNumbers(hsLineCount);
   }
+  if (els.websocketHandshakeCM) {
+    updateWsHandshakeSearch();
+  }
   renderWebsocketFrameTable();
 }
 
@@ -12103,6 +12109,7 @@ async function sendRecordToSequence(record) {
     target: null,
     extractions: [],
   });
+  markSequenceDraftDirty();
   setActiveTool("sequence");
   if (!(await saveCurrentSequence())) {
     return;
@@ -12800,7 +12807,9 @@ async function deleteSequence(id) {
 }
 
 async function runCurrentSequence() {
-  if (!state.editingSequence) return;
+  if (!state.editingSequence || state.sequenceRunning) return;
+  state.sequenceRunning = true;
+  renderSequencePanel();
   const runSequenceId = state.editingSequence.id;
   const sessionId = currentSequenceSessionId();
   const runGeneration = (state.sequenceRunGeneration || 0) + 1;
@@ -12808,6 +12817,10 @@ async function runCurrentSequence() {
   syncSequenceStepFromDom();
   const saved = await saveCurrentSequence();
   if (!saved) {
+    if (state.sequenceRunGeneration === runGeneration) {
+      state.sequenceRunning = false;
+      renderSequencePanel();
+    }
     return;
   }
   if (
@@ -12815,6 +12828,10 @@ async function runCurrentSequence() {
     || state.selectedSequenceId !== runSequenceId
     || !isCurrentSequenceSession(sessionId)
   ) {
+    if (state.sequenceRunGeneration === runGeneration) {
+      state.sequenceRunning = false;
+      renderSequencePanel();
+    }
     return;
   }
   const runDraftVersion = state.sequenceDraftVersion || 0;
@@ -12861,8 +12878,7 @@ async function runCurrentSequence() {
       && state.selectedSequenceId === runSequenceId
       && isCurrentSequenceSession(sessionId)
     ) {
-      runBtn.disabled = false;
-      runBtn.textContent = "Run";
+      state.sequenceRunning = false;
       renderSequencePanel();
     }
   }
@@ -12904,9 +12920,11 @@ function renderSequencePanel() {
   // Editor
   const editing = state.editingSequence;
   const hasSequence = !!editing;
+  const sequenceRunning = Boolean(state.sequenceRunning);
   addStepBtn.disabled = !hasSequence;
   saveBtn.disabled = !hasSequence;
-  runBtn.disabled = !hasSequence || !editing?.steps?.length;
+  runBtn.disabled = sequenceRunning || !hasSequence || !editing?.steps?.length;
+  runBtn.textContent = sequenceRunning ? "Running..." : "Run";
   editorTitle.textContent = hasSequence ? editing.name : "No sequence selected";
 
   if (hasSequence) {
@@ -19035,13 +19053,43 @@ function parseWsHandshakeHeaders(tab) {
     return headers;
   }
   // Merge with any pre-set headers from seed
-  const merged = [...headers];
+  const merged = headers.filter((h) => !headerNameEquals(h, "host"));
   for (const h of normalizedHeaders(tab.wsHeaders)) {
-    if (!merged.some(m => headerNameEquals(m, h.name))) {
+    if (!headerNameEquals(h, "host") && !merged.some(m => headerNameEquals(m, h.name))) {
       merged.push(h);
     }
   }
+  const hostHeader = wsReplayHostHeaderValue(tab);
+  if (hostHeader) {
+    merged.unshift({ name: "Host", value: hostHeader });
+  }
   return merged;
+}
+
+function wsReplayHostHeaderValue(tab) {
+  if (!tab) return "";
+  const scheme = tab.wsScheme || "wss";
+  const port = normalizePortValue(tab.wsPort) || String(defaultWsPortForScheme(scheme));
+  return joinAuthority(tab.wsHost, isDefaultPortForScheme(scheme, port) ? "" : port);
+}
+
+function wsReplayDisplayHandshakeHeaders(tab) {
+  const headers = normalizedHeaders(tab?.wsHeaders)
+    .filter((h) => !headerNameEquals(h, "host"));
+  const hostHeader = wsReplayHostHeaderValue(tab);
+  if (hostHeader) {
+    headers.unshift({ name: "Host", value: hostHeader });
+  }
+  return headers;
+}
+
+function refreshWsHandshakeHeadersForTarget(tab) {
+  if (!tab || tab.type !== "websocket" || tab.wsHandshakeEdited || !els.wsHandshakeHeaders) return;
+  const headers = wsReplayDisplayHandshakeHeaders(tab);
+  els.wsHandshakeHeaders.value = headers.length
+    ? headers.map((h) => `${h.name}: ${h.value}`).join("\n")
+    : "";
+  tab.wsHandshakeText = "";
 }
 
 async function wsSend() {
@@ -19442,7 +19490,7 @@ function renderWsReplay() {
     if (tab.wsHandshakeEdited) {
       els.wsHandshakeHeaders.value = tab.wsHandshakeText;
     } else {
-      const wsHeaders = normalizedHeaders(tab.wsHeaders);
+      const wsHeaders = wsReplayDisplayHandshakeHeaders(tab);
       els.wsHandshakeHeaders.value = wsHeaders.length > 0
         ? wsHeaders
         .map(h => `${h.name}: ${h.value}`)
@@ -19906,17 +19954,18 @@ function syncWsReplayPortInput(options = {}) {
     rawPort,
   );
   let changed = false;
-  if (
-    tab.wsScheme !== normalizedTarget.scheme
-    || tab.wsHost !== normalizedTarget.host
-    || tab.wsPort !== normalizedTarget.port
-  ) {
-    tab.wsScheme = normalizedTarget.scheme;
-    tab.wsHost = normalizedTarget.host;
-    tab.wsPort = normalizedTarget.port;
-    scheduleWorkspaceStateSave();
-    changed = true;
-  }
+    if (
+      tab.wsScheme !== normalizedTarget.scheme
+      || tab.wsHost !== normalizedTarget.host
+      || tab.wsPort !== normalizedTarget.port
+    ) {
+      tab.wsScheme = normalizedTarget.scheme;
+      tab.wsHost = normalizedTarget.host;
+      tab.wsPort = normalizedTarget.port;
+      refreshWsHandshakeHeadersForTarget(tab);
+      scheduleWorkspaceStateSave();
+      changed = true;
+    }
   if (options.normalizeInput) {
     els.wsHostInput.value = normalizedTarget.host;
     els.wsPortInput.value = normalizedTarget.port;
@@ -19949,6 +19998,7 @@ function bindWsReplayEvents() {
         els.wsPortInput.value,
         els.wsPathInput.value,
       ));
+      refreshWsHandshakeHeadersForTarget(tab);
       renderReplayTabs();
       scheduleWorkspaceStateSave();
     }
@@ -19972,6 +20022,7 @@ function bindWsReplayEvents() {
         tab.wsScheme = normalizedTarget.scheme;
         tab.wsHost = normalizedTarget.host;
         tab.wsPort = normalizedTarget.port;
+        refreshWsHandshakeHeadersForTarget(tab);
       } else {
         tab.wsHost = els.wsHostInput.value.trim();
       }
@@ -20636,6 +20687,10 @@ function sendWsFrameToReplay(frameIdx) {
     if (session.id) {
       loadWebsocketDetail(session.id, { force: true }).catch((error) => console.error(error));
     }
+    return;
+  }
+  if (frame.direction !== "client_to_server") {
+    showToast("Only client-to-server WebSocket frames can be sent to Replay.", "error");
     return;
   }
   const firstLoadedFrameIndex = frames.length ? Number(frames[0]?.index) : 0;

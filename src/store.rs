@@ -88,6 +88,22 @@ pub struct TransactionStore {
     next_sequence: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransactionInsertOutcome {
+    journal_fallback_required: bool,
+    retention_trimmed: bool,
+}
+
+impl TransactionInsertOutcome {
+    pub fn snapshot_fallback_needed(self) -> bool {
+        self.journal_fallback_required || self.retention_trimmed
+    }
+
+    pub fn immediate_snapshot_required(self) -> bool {
+        self.journal_fallback_required
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AnnotationUpdate {
     pub summary: TransactionSummary,
@@ -328,10 +344,10 @@ impl TransactionStore {
         store
     }
 
-    pub async fn insert(&self, mut record: TransactionRecord) -> bool {
+    pub async fn insert(&self, mut record: TransactionRecord) -> TransactionInsertOutcome {
         let _insert_guard = self.insert_lock.lock().await;
         record.sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let needs_snapshot_fallback = match &self.journal_tx {
+        let journal_fallback_required = match &self.journal_tx {
             Some(tx) => match encode_transaction_insert_journal_line(&record) {
                 Some(line) => {
                     if let Err(error) = append_transaction_journal(tx, line).await {
@@ -362,7 +378,10 @@ impl TransactionStore {
         }
         drop(inner);
         let _ = self.events.send(summary);
-        needs_snapshot_fallback || retention_trimmed
+        TransactionInsertOutcome {
+            journal_fallback_required,
+            retention_trimmed,
+        }
     }
 
     pub async fn len(&self) -> usize {
@@ -629,6 +648,23 @@ impl TransactionStore {
                 None
             }
         }
+    }
+
+    pub async fn update_record(
+        &self,
+        id: Uuid,
+        update: impl FnOnce(&mut TransactionRecord),
+    ) -> Option<TransactionSummary> {
+        let _mutation_guard = self.insert_lock.lock().await;
+        let mut inner = self.inner.write().await;
+        let index = inner.by_id.get(&id).copied()?;
+        let record = inner.entries.get_mut(index)?;
+        update(record);
+        let summary = record.summary();
+        inner.summaries[index] = CachedSummary::new(summary.clone());
+        drop(inner);
+        let _ = self.events.send(summary.clone());
+        Some(summary)
     }
 
     pub async fn update_annotations_durable(
@@ -1809,8 +1845,9 @@ mod tests {
         store.journal_tx = Some(tx);
 
         let record = test_record("lost.example");
-        let needs_snapshot_fallback = store.insert(record).await;
-        assert!(needs_snapshot_fallback);
+        let outcome = store.insert(record).await;
+        assert!(outcome.snapshot_fallback_needed());
+        assert!(outcome.immediate_snapshot_required());
 
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed.len(), 1);
@@ -1825,12 +1862,45 @@ mod tests {
     async fn insert_requests_snapshot_fallback_without_journal_writer() {
         let store = TransactionStore::from_records_with_max_entries(Vec::new(), None);
 
-        let needs_snapshot_fallback = store.insert(test_record("snapshot.example")).await;
+        let outcome = store.insert(test_record("snapshot.example")).await;
 
-        assert!(needs_snapshot_fallback);
+        assert!(outcome.snapshot_fallback_needed());
+        assert!(outcome.immediate_snapshot_required());
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].host, "snapshot.example");
+    }
+
+    #[tokio::test]
+    async fn update_record_refreshes_summary_cache_and_notifies_watchers() {
+        let store = TransactionStore::new();
+        let mut record = test_record("passthrough.example:443");
+        record.duration_ms = 0;
+        record.notes = vec!["SSL passthrough tunnel established.".to_string()];
+        let record_id = record.id;
+        let mut receiver = store.subscribe();
+
+        store.insert(record).await;
+        let inserted = receiver.recv().await.unwrap();
+        assert_eq!(inserted.id, record_id);
+        assert_eq!(inserted.duration_ms, 0);
+
+        let updated = store
+            .update_record(record_id, |record| {
+                record.duration_ms = 250;
+                record.notes = vec!["SSL passthrough: 10 bytes sent, 20 bytes received".into()];
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(updated.duration_ms, 250);
+        assert_eq!(updated.note_count, 1);
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.id, record_id);
+        assert_eq!(event.duration_ms, 250);
+        let listed = store.list(&ListFilters::default()).await;
+        assert_eq!(listed[0].duration_ms, 250);
+        assert_eq!(listed[0].note_count, 1);
     }
 
     #[tokio::test]
@@ -1877,7 +1947,8 @@ mod tests {
             .expect_err("snapshot compaction should wait for pending journaled insert");
 
         ack.send(Ok(())).unwrap();
-        assert!(!insert_task.await.unwrap());
+        let insert_outcome = insert_task.await.unwrap();
+        assert!(!insert_outcome.snapshot_fallback_needed());
 
         let listed = store.list(&ListFilters::default()).await;
         assert_eq!(listed.len(), 2);

@@ -945,11 +945,13 @@ async fn handle_connect(
                     Some(request_http_version),
                     Some(Version::HTTP_11),
                 );
-                if insert_transaction_quiet(&session, record, "passthrough tunnel connect failure")
-                    .await
-                {
-                    persist_session_quiet(&state, &session).await;
-                }
+                let insert_outcome = insert_transaction_quiet(
+                    &session,
+                    record,
+                    "passthrough tunnel connect failure",
+                )
+                .await;
+                persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
                 return text_response(
                     StatusCode::BAD_GATEWAY,
                     "passthrough tunnel upstream connect failed",
@@ -1687,9 +1689,8 @@ async fn record_http_rejection(
         request_http_version,
         Some(Version::HTTP_11),
     );
-    if insert_transaction_quiet(session, record, context).await {
-        persist_session_quiet(state, session).await;
-    }
+    let insert_outcome = insert_transaction_quiet(session, record, context).await;
+    persist_transaction_insert_outcome(state, session, insert_outcome).await;
     response
 }
 
@@ -1725,9 +1726,8 @@ async fn record_connect_rejection(
         Some(request_http_version),
         Some(Version::HTTP_11),
     );
-    if insert_transaction_quiet(session, record, "invalid connect target").await {
-        persist_session_quiet(state, session).await;
-    }
+    let insert_outcome = insert_transaction_quiet(session, record, "invalid connect target").await;
+    persist_transaction_insert_outcome(state, session, insert_outcome).await;
     response
 }
 
@@ -1754,9 +1754,9 @@ async fn record_connect_post_ok_tunnel_failure(
         Some(request_http_version),
         Some(Version::HTTP_11),
     );
-    if insert_transaction_quiet(session, record, "connect post-ok tunnel failure").await {
-        persist_session_quiet(state, session).await;
-    }
+    let insert_outcome =
+        insert_transaction_quiet(session, record, "connect post-ok tunnel failure").await;
+    persist_transaction_insert_outcome(state, session, insert_outcome).await;
 }
 
 trait EmptyStringExt {
@@ -1869,9 +1869,8 @@ async fn serve_special_host_tls(
         Some(request_http_version),
         Some(Version::HTTP_11),
     );
-    if insert_transaction_quiet(&session, record, "special-host tunnel").await {
-        persist_session_quiet(&state, &session).await;
-    }
+    let insert_outcome = insert_transaction_quiet(&session, record, "special-host tunnel").await;
+    persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
 
     let io = TokioIo::new(tls_stream);
     let special_host_authority = request_authority.clone();
@@ -1935,6 +1934,22 @@ async fn serve_passthrough_tunnel(
     };
     let mut client_stream = TokioIo::new(upgraded);
 
+    let record = with_record_http_versions(
+        TransactionRecord::tunnel(
+            started_at,
+            target,
+            Some(StatusCode::OK.as_u16()),
+            0,
+            request_capture,
+            vec!["SSL passthrough tunnel established.".to_string()],
+        ),
+        Some(request_http_version),
+        Some(Version::HTTP_11),
+    );
+    let record_id = record.id;
+    let insert_outcome = insert_transaction_quiet(&session, record, "passthrough tunnel").await;
+    persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
+
     let result = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
 
     let notes = match &result {
@@ -1950,19 +1965,15 @@ async fn serve_passthrough_tunnel(
         }
     };
 
-    let record = with_record_http_versions(
-        TransactionRecord::tunnel(
-            started_at,
-            target,
-            Some(StatusCode::OK.as_u16()),
-            started.elapsed().as_millis() as u64,
-            request_capture,
-            notes,
-        ),
-        Some(request_http_version),
-        Some(Version::HTTP_11),
-    );
-    if insert_transaction_quiet(&session, record, "passthrough tunnel").await {
+    if session
+        .store
+        .update_record(record_id, |record| {
+            record.duration_ms = started.elapsed().as_millis() as u64;
+            record.notes = notes;
+        })
+        .await
+        .is_some()
+    {
         persist_session_quiet(&state, &session).await;
     }
 
@@ -2012,9 +2023,8 @@ async fn serve_https_mitm(
         Some(request_http_version),
         Some(Version::HTTP_11),
     );
-    if insert_transaction_quiet(&session, record, "https mitm tunnel").await {
-        persist_session_quiet(&state, &session).await;
-    }
+    let insert_outcome = insert_transaction_quiet(&session, record, "https mitm tunnel").await;
+    persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
 
     let io = TokioIo::new(tls_stream);
     let connect_authority = authority.to_string();
@@ -2069,7 +2079,7 @@ async fn handle_special_host_request(
             );
             let (response, response_capture) =
                 synthetic_error_response(error.status(), &message, &state);
-            if insert_transaction_quiet(
+            let insert_outcome = insert_transaction_quiet(
                 &session,
                 with_record_http_versions(
                     TransactionRecord::http(
@@ -2091,10 +2101,8 @@ async fn handle_special_host_request(
                 ),
                 "special host body collection failed",
             )
-            .await
-            {
-                persist_session_quiet(&state, &session).await;
-            }
+            .await;
+            persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
             return Ok(response);
         }
     };
@@ -2111,7 +2119,7 @@ async fn handle_special_host_request(
         state.config.body_preview_bytes,
     );
 
-    if insert_transaction_quiet(
+    let insert_outcome = insert_transaction_quiet(
         &session,
         with_record_http_versions(
             TransactionRecord::http(
@@ -2133,10 +2141,8 @@ async fn handle_special_host_request(
         ),
         "special-host request",
     )
-    .await
-    {
-        persist_session_quiet(&state, &session).await;
-    }
+    .await;
+    persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
 
     Ok(build_local_response(
         response.status,
@@ -2196,9 +2202,9 @@ async fn forward_http_request(
                 "Request dropped in intercept.",
                 Some(request_http_version),
             );
-            if insert_transaction_quiet(&session, dropped.record, "dropped request").await {
-                persist_session_quiet(&state, &session).await;
-            }
+            let insert_outcome =
+                insert_transaction_quiet(&session, dropped.record, "dropped request").await;
+            persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
             return dropped.response;
         }
     };
@@ -2333,10 +2339,10 @@ async fn forward_websocket_request(
                 "WebSocket upgrade dropped in intercept.",
                 Some(request_http_version),
             );
-            if insert_transaction_quiet(&session, dropped.record, "dropped websocket upgrade").await
-            {
-                persist_session_quiet(&state, &session).await;
-            }
+            let insert_outcome =
+                insert_transaction_quiet(&session, dropped.record, "dropped websocket upgrade")
+                    .await;
+            persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
             return dropped.response;
         }
     };
@@ -2413,9 +2419,9 @@ async fn forward_websocket_request(
             Some(request_http_version),
             Some(Version::HTTP_11),
         );
-        if insert_transaction_quiet(&session, record, "invalid edited websocket upgrade").await {
-            persist_session_quiet(&state, &session).await;
-        }
+        let insert_outcome =
+            insert_transaction_quiet(&session, record, "invalid edited websocket upgrade").await;
+        persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
         return client_response;
     }
 
@@ -2443,9 +2449,9 @@ async fn forward_websocket_request(
         )
         .await;
         let record = exchange.record.clone();
-        if insert_transaction_quiet(&session, record, "special-host websocket request").await {
-            persist_session_quiet(&state, &session).await;
-        }
+        let insert_outcome =
+            insert_transaction_quiet(&session, record, "special-host websocket request").await;
+        persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
         return match exchange.response {
             Ok(response) => rebuild_response(
                 response.headers,
@@ -2497,10 +2503,10 @@ async fn forward_websocket_request(
                 Some(request_http_version),
                 Some(Version::HTTP_11),
             );
-            if insert_transaction_quiet(&session, record, "websocket upstream http response").await
-            {
-                persist_session_quiet(&state, &session).await;
-            }
+            let insert_outcome =
+                insert_transaction_quiet(&session, record, "websocket upstream http response")
+                    .await;
+            persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
             return rebuild_response(headers, status, body, &forwarded_request.method);
         }
         Err(UpstreamWebSocketConnectError::Other(error)) => {
@@ -2525,9 +2531,9 @@ async fn forward_websocket_request(
                 Some(request_http_version),
                 Some(Version::HTTP_11),
             );
-            if insert_transaction_quiet(&session, record, "websocket connect failure").await {
-                persist_session_quiet(&state, &session).await;
-            }
+            let insert_outcome =
+                insert_transaction_quiet(&session, record, "websocket connect failure").await;
+            persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
             return client_response;
         }
     };
@@ -2559,9 +2565,9 @@ async fn forward_websocket_request(
                 Some(request_http_version),
                 Some(Version::HTTP_11),
             );
-            if insert_transaction_quiet(&session, record, "invalid websocket handshake").await {
-                persist_session_quiet(&state, &session).await;
-            }
+            let insert_outcome =
+                insert_transaction_quiet(&session, record, "invalid websocket handshake").await;
+            persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
             return client_response;
         }
     };
@@ -2616,9 +2622,9 @@ async fn forward_websocket_request(
             Some(request_http_version),
             Some(Version::HTTP_11),
         );
-        if insert_transaction_quiet(&session, record, "invalid websocket response").await {
-            persist_session_quiet(&state, &session).await;
-        }
+        let insert_outcome =
+            insert_transaction_quiet(&session, record, "invalid websocket response").await;
+        persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
         return client_response;
     }
 
@@ -2650,7 +2656,9 @@ async fn forward_websocket_request(
         Some(request_http_version),
         Some(Version::HTTP_11),
     );
-    insert_transaction_quiet(&session, http_record, "websocket upgrade transaction").await;
+    let insert_outcome =
+        insert_transaction_quiet(&session, http_record, "websocket upgrade transaction").await;
+    persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
     session
         .event_log
         .push(
@@ -2869,7 +2877,7 @@ async fn store_record_and_scan(
     session: &Arc<SessionContext>,
     record: TransactionRecord,
 ) {
-    let needs_snapshot_fallback =
+    let insert_outcome =
         insert_transaction_quiet(session, record.clone(), "captured transaction").await;
     {
         let scanner = session.scanner.clone();
@@ -2889,17 +2897,27 @@ async fn store_record_and_scan(
             }
         });
     }
-    if needs_snapshot_fallback {
-        persist_session_quiet(state, session).await;
-    }
+    persist_transaction_insert_outcome(state, session, insert_outcome).await;
 }
 
 async fn insert_transaction_quiet(
     session: &Arc<SessionContext>,
     record: TransactionRecord,
     _context: &'static str,
-) -> bool {
+) -> crate::store::TransactionInsertOutcome {
     session.store.insert(record).await
+}
+
+async fn persist_transaction_insert_outcome(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    outcome: crate::store::TransactionInsertOutcome,
+) {
+    if outcome.immediate_snapshot_required() {
+        persist_session_immediate_quiet(state, session).await;
+    } else if outcome.snapshot_fallback_needed() {
+        persist_session_quiet(state, session).await;
+    }
 }
 
 async fn should_stream_upstream_response(
@@ -4258,6 +4276,25 @@ async fn persist_session_quiet(state: &Arc<AppState>, session: &Arc<SessionConte
     }
 
     spawn_persist_task(Arc::clone(state), Arc::clone(session), generation);
+}
+
+async fn persist_session_immediate_quiet(state: &Arc<AppState>, session: &Arc<SessionContext>) {
+    let generation = remember_persist_context(session);
+    {
+        let mut last = LAST_PERSIST.lock().unwrap_or_else(|e| e.into_inner());
+        *last = Some(Instant::now());
+    }
+    if let Err(error) = state.persist_session_context(session).await {
+        warn!(
+            ?error,
+            session_id = %session.id(),
+            "failed to immediately persist session snapshot"
+        );
+        mark_persist_dirty_generation(session.id(), generation);
+        schedule_delayed_persist(state, session, PERSIST_DEBOUNCE, generation);
+        return;
+    }
+    forget_persist_state_if_generation(session.id(), generation);
 }
 
 fn persist_debounce_remaining() -> Option<Duration> {
@@ -5634,6 +5671,44 @@ mod tests {
         assert!(session.store.get(record_id).await.is_some());
         assert!(pending_session_context(session_id).is_none());
         assert!(!session_has_pending_persist(session_id));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn journal_fallback_capture_is_persisted_before_returning() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-proxy-journal-fallback-immediate-persist-{}",
+            Uuid::new_v4()
+        ));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let inactive_metadata = state
+            .sessions
+            .create_session(Some("read-only inactive".to_string()))
+            .unwrap();
+        let session = state
+            .read_session_context_for_id(inactive_metadata.id)
+            .await
+            .unwrap();
+        let mut scanner_config = session.scanner.get_config().await;
+        scanner_config.enabled = false;
+        session.scanner.update_config(scanner_config).await;
+
+        let record = captured_transaction("journal-fallback.example");
+        let record_id = record.id;
+        store_record_and_scan(&state, &session, record).await;
+
+        assert!(pending_session_context(session.id()).is_none());
+        assert!(!session_has_pending_persist(session.id()));
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        assert!(reloaded.store.get(record_id).await.is_some());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

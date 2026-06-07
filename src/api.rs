@@ -66,6 +66,9 @@ const MAX_WORKSPACE_FUZZER_PAYLOAD_LINES: usize = 5_000;
 const MAX_WORKSPACE_WS_HEADERS: usize = 200;
 const MAX_WORKSPACE_WS_HEADER_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_WS_HEADERS_BYTES: usize = 256 * 1024;
+const MAX_WS_REPLAY_SCHEME_BYTES: usize = 16;
+const MAX_WS_REPLAY_HOST_BYTES: usize = 1024;
+const MAX_WS_REPLAY_PATH_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_WS_SETUP_QUEUE_ITEMS: usize = 250;
 const MAX_WORKSPACE_WS_SETUP_ITEM_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_EDITABLE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -564,6 +567,8 @@ fn websocket_list_filters(
 fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(), String> {
     validate_optional_limit(query.limit)?;
     validate_sort_direction(query.sort_direction.as_deref())?;
+    validate_transaction_sort_key(query.sort_key.as_deref())?;
+    validate_transaction_cursor_sort(query)?;
 
     if let Some(value) = query.status_range.as_deref() {
         validate_status_range(value)
@@ -591,9 +596,57 @@ fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(
     Ok(())
 }
 
+fn validate_transaction_sort_key(sort_key: Option<&str>) -> std::result::Result<(), String> {
+    let Some(sort_key) = sort_key.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    match sort_key {
+        "index" | "host" | "method" | "path" | "status" | "length" | "mime" | "notes" | "tls"
+        | "started_at" => Ok(()),
+        _ => Err(format!("invalid transaction sort_key: {sort_key}")),
+    }
+}
+
+fn validate_transaction_cursor_sort(query: &TransactionQuery) -> std::result::Result<(), String> {
+    if query.before_sequence.is_none() {
+        return Ok(());
+    }
+
+    if query.offset.is_some_and(|offset| offset != 0) {
+        return Err("before_sequence cannot be combined with offset".to_string());
+    }
+
+    let sort_key = query
+        .sort_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("index");
+    let sort_direction = normalize_sort_direction(query.sort_direction.as_deref())
+        .unwrap_or_else(|| "desc".to_string());
+    if sort_key != "index" || sort_direction != "desc" {
+        return Err("before_sequence requires sort_key=index and sort_direction=desc".to_string());
+    }
+
+    Ok(())
+}
+
 fn validate_websocket_query(query: &WebSocketQuery) -> std::result::Result<(), String> {
     validate_optional_limit(query.limit)?;
-    validate_sort_direction(query.sort_direction.as_deref())
+    validate_sort_direction(query.sort_direction.as_deref())?;
+    validate_websocket_sort_key(query.sort_key.as_deref())
+}
+
+fn validate_websocket_sort_key(sort_key: Option<&str>) -> std::result::Result<(), String> {
+    let Some(sort_key) = sort_key.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    match sort_key {
+        "index" | "host" | "path" | "status" | "frame_count" | "duration_ms" | "started_at" => {
+            Ok(())
+        }
+        _ => Err(format!("invalid websocket sort_key: {sort_key}")),
+    }
 }
 
 fn validate_sort_direction(direction: Option<&str>) -> std::result::Result<(), String> {
@@ -3601,9 +3654,6 @@ async fn update_match_replace_rules(
     Query(query): Query<SessionWriteQuery>,
     Json(payload): Json<MatchReplaceRulesPayload>,
 ) -> Response {
-    if let Err(error) = validate_match_replace_rules(&payload.rules) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
-    }
     let (target_session_id, session_id_is_explicit) =
         match reconcile_write_session_id(query.session_id, payload.session_id) {
             Ok(value) => value,
@@ -3620,6 +3670,9 @@ async fn update_match_replace_rules(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if let Err(error) = validate_match_replace_rules(&payload.rules) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
     let _operation_guard = match guard_session_write_operation(
         &state,
         &session,
@@ -4961,6 +5014,9 @@ async fn ws_replay_connect(
             return ws_replay_connection_owner_conflict_response(owner_session_id);
         }
     }
+    if let Err(error) = validate_ws_replay_connect_payload(&payload) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
     let url = match build_ws_replay_url(&payload.scheme, &payload.host, payload.port, &payload.path)
     {
         Ok(url) => url,
@@ -4993,9 +5049,59 @@ async fn ws_replay_connect(
     }
 }
 
+fn validate_ws_replay_connect_payload(
+    payload: &WsReplayConnectPayload,
+) -> std::result::Result<(), String> {
+    validate_text_field(
+        "WebSocket replay scheme",
+        &payload.scheme,
+        MAX_WS_REPLAY_SCHEME_BYTES,
+    )?;
+    validate_text_field(
+        "WebSocket replay host",
+        &payload.host,
+        MAX_WS_REPLAY_HOST_BYTES,
+    )?;
+    validate_text_field(
+        "WebSocket replay path",
+        &payload.path,
+        MAX_WS_REPLAY_PATH_BYTES,
+    )?;
+    validate_ws_replay_header_limits(&payload.headers)
+}
+
+fn validate_ws_replay_header_limits(
+    headers: &[crate::model::HeaderRecord],
+) -> std::result::Result<(), String> {
+    if headers.len() > MAX_WORKSPACE_WS_HEADERS {
+        return Err(format!(
+            "WebSocket replay cannot include more than {MAX_WORKSPACE_WS_HEADERS} headers"
+        ));
+    }
+    let mut headers_bytes_total = 0usize;
+    for header in headers {
+        let header_bytes = serde_json::to_vec(header)
+            .map_err(|error| format!("failed to measure WebSocket replay header: {error}"))?
+            .len();
+        if header_bytes > MAX_WORKSPACE_WS_HEADER_BYTES {
+            return Err(format!(
+                "WebSocket replay header cannot exceed {MAX_WORKSPACE_WS_HEADER_BYTES} stored bytes"
+            ));
+        }
+        headers_bytes_total = headers_bytes_total.saturating_add(header_bytes);
+        if headers_bytes_total > MAX_WORKSPACE_WS_HEADERS_BYTES {
+            return Err(format!(
+                "WebSocket replay headers cannot exceed {MAX_WORKSPACE_WS_HEADERS_BYTES} stored bytes"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_ws_replay_headers(
     headers: &[crate::model::HeaderRecord],
 ) -> std::result::Result<Vec<(String, String)>, String> {
+    validate_ws_replay_header_limits(headers)?;
     for header in headers {
         let name = header.name.trim();
         if name != header.name {
@@ -5474,12 +5580,16 @@ async fn events(
                             .data(session_id.to_string()));
                         break;
                     }
-                    if state.sessions.active_session_id() != session_id
-                        && (!explicit_event_session || event_stream_started_for_active_session)
-                    {
+                    let active_session_id = state.sessions.active_session_id();
+                    if should_reconnect_event_stream(
+                        explicit_event_session,
+                        event_stream_started_for_active_session,
+                        session_id,
+                        active_session_id,
+                    ) {
                         yield Ok(Event::default()
                             .event("session_changed")
-                            .data(state.sessions.active_session_id().to_string()));
+                            .data(active_session_id.to_string()));
                         break;
                     }
                 }
@@ -5494,6 +5604,18 @@ async fn events(
                 .text("keepalive"),
         )
         .into_response()
+}
+
+fn should_reconnect_event_stream(
+    explicit_event_session: bool,
+    event_stream_started_for_active_session: bool,
+    watched_session_id: Uuid,
+    active_session_id: Uuid,
+) -> bool {
+    if active_session_id == watched_session_id {
+        return explicit_event_session && !event_stream_started_for_active_session;
+    }
+    !explicit_event_session || event_stream_started_for_active_session
 }
 
 async fn index() -> Response {
@@ -6677,6 +6799,25 @@ mod tests {
         assert!(validate_transaction_query(&query).is_err());
     }
 
+    #[test]
+    fn event_stream_reconnects_when_explicit_inactive_session_becomes_active() {
+        let watched = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        assert!(!super::should_reconnect_event_stream(
+            true, false, watched, other
+        ));
+        assert!(super::should_reconnect_event_stream(
+            true, false, watched, watched
+        ));
+        assert!(super::should_reconnect_event_stream(
+            true, true, watched, other
+        ));
+        assert!(super::should_reconnect_event_stream(
+            false, true, watched, other
+        ));
+    }
+
     #[tokio::test]
     async fn list_endpoints_reject_invalid_sort_direction() {
         let (state, data_dir) = test_state("sniper-test-invalid-sort-direction");
@@ -6689,6 +6830,63 @@ mod tests {
                 api_route_response(state.clone(), reqwest::Method::GET, path, None).await;
             assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
             assert!(body.contains("invalid sort_direction"));
+        }
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_page_rejects_invalid_sort_key() {
+        let (state, data_dir) = test_state("sniper-test-invalid-websocket-sort-key");
+
+        let (status, body) = api_route_response(
+            state,
+            reqwest::Method::GET,
+            "/api/websockets-page?sort_key=hst",
+            None,
+        )
+        .await;
+
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid websocket sort_key"));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn transaction_page_rejects_invalid_sort_key() {
+        let (state, data_dir) = test_state("sniper-test-invalid-transaction-sort-key");
+
+        let (status, body) = api_route_response(
+            state,
+            reqwest::Method::GET,
+            "/api/transactions-page?sort_key=hst",
+            None,
+        )
+        .await;
+
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid transaction sort_key"));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn transaction_page_rejects_incompatible_before_sequence_sort() {
+        let (state, data_dir) = test_state("sniper-test-invalid-before-sequence-sort");
+
+        for path in [
+            "/api/transactions-page?before_sequence=42&sort_key=host&sort_direction=asc",
+            "/api/transactions-page?before_sequence=42&sort_key=index&sort_direction=asc",
+            "/api/transactions-page?before_sequence=42&offset=1",
+        ] {
+            let (status, body) =
+                api_route_response(state.clone(), reqwest::Method::GET, path, None).await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            assert!(
+                body.contains("before_sequence"),
+                "response body should explain before_sequence validation: {body}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(data_dir);
@@ -6979,6 +7177,53 @@ mod tests {
         assert!(validate_match_replace_rules(&rules)
             .unwrap_err()
             .contains("more than"));
+    }
+
+    #[tokio::test]
+    async fn match_replace_update_rejects_unknown_session_before_rule_validation() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-match-replace-unknown-session-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 32,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let active = state.session().await;
+
+        let response = super::update_match_replace_rules(
+            State(state.clone()),
+            Query(super::SessionWriteQuery {
+                session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
+            }),
+            Json(MatchReplaceRulesPayload {
+                session_id: None,
+                rules: vec![MatchReplaceRule {
+                    id: Uuid::new_v4(),
+                    enabled: true,
+                    description: "invalid regex".to_string(),
+                    scope: MatchReplaceScope::Request,
+                    target: MatchReplaceTarget::Path,
+                    search: "(".to_string(),
+                    replace: "x".to_string(),
+                    regex: true,
+                    case_sensitive: true,
+                }],
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(active.match_replace.snapshot().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
@@ -13328,6 +13573,97 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), super::StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn ws_replay_connect_rejects_oversized_handshake_payloads() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-connect-caps-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let mut cases = Vec::new();
+
+        cases.push(super::WsReplayConnectPayload {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+            id: Uuid::new_v4(),
+            scheme: "wss".to_string(),
+            host: "h".repeat(super::MAX_WS_REPLAY_HOST_BYTES + 1),
+            port: 443,
+            path: "/socket".to_string(),
+            headers: Vec::new(),
+        });
+        cases.push(super::WsReplayConnectPayload {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+            id: Uuid::new_v4(),
+            scheme: "wss".to_string(),
+            host: "example.test".to_string(),
+            port: 443,
+            path: format!("/{}", "p".repeat(super::MAX_WS_REPLAY_PATH_BYTES + 1)),
+            headers: Vec::new(),
+        });
+        cases.push(super::WsReplayConnectPayload {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+            id: Uuid::new_v4(),
+            scheme: "wss".to_string(),
+            host: "example.test".to_string(),
+            port: 443,
+            path: "/socket".to_string(),
+            headers: (0..=super::MAX_WORKSPACE_WS_HEADERS)
+                .map(|index| HeaderRecord {
+                    name: format!("x-test-{index}"),
+                    value: "ok".to_string(),
+                })
+                .collect(),
+        });
+        cases.push(super::WsReplayConnectPayload {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+            id: Uuid::new_v4(),
+            scheme: "wss".to_string(),
+            host: "example.test".to_string(),
+            port: 443,
+            path: "/socket".to_string(),
+            headers: vec![HeaderRecord {
+                name: "x-large".to_string(),
+                value: "x".repeat(super::MAX_WORKSPACE_WS_HEADER_BYTES + 1),
+            }],
+        });
+        cases.push(super::WsReplayConnectPayload {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+            id: Uuid::new_v4(),
+            scheme: "wss".to_string(),
+            host: "example.test".to_string(),
+            port: 443,
+            path: "/socket".to_string(),
+            headers: (0..5)
+                .map(|index| HeaderRecord {
+                    name: format!("x-total-{index}"),
+                    value: "x".repeat(60 * 1024),
+                })
+                .collect(),
+        });
+
+        for payload in cases {
+            let connection_id = payload.id;
+            let response = super::ws_replay_connect(State(state.clone()), Json(payload)).await;
+            assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
+            assert!(state.ws_replay.snapshot(connection_id).await.is_none());
+        }
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

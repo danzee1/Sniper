@@ -212,8 +212,11 @@ struct HistoryListArgs {
     #[arg(long, value_parser = parse_nonzero_usize)]
     limit: Option<usize>,
     /// Return rows after this zero-based offset. Uses the paged history API.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "before_sequence")]
     offset: Option<usize>,
+    /// Return rows older than this capture sequence. Uses stable cursor paging.
+    #[arg(long, conflicts_with = "offset")]
+    before_sequence: Option<u64>,
     /// Include pagination metadata instead of the legacy array-only output.
     #[arg(long)]
     page: bool,
@@ -233,7 +236,7 @@ struct HistoryListArgs {
     #[arg(long)]
     mime: Option<String>,
     /// Sort key for paged history output, e.g. index, host, method, path, status, length, mime, notes, tls, started_at.
-    #[arg(long)]
+    #[arg(long, value_parser = ["index", "host", "method", "path", "status", "length", "mime", "notes", "tls", "started_at"])]
     sort_key: Option<String>,
     /// Sort direction for paged history output.
     #[arg(long, value_parser = ["asc", "desc"])]
@@ -630,7 +633,7 @@ struct WebSocketListArgs {
     limit: Option<usize>,
     #[arg(long)]
     offset: Option<usize>,
-    #[arg(long)]
+    #[arg(long, value_parser = ["index", "host", "path", "status", "frame_count", "duration_ms", "started_at"])]
     sort_key: Option<String>,
     #[arg(long, value_parser = ["asc", "desc"])]
     sort_direction: Option<String>,
@@ -2824,6 +2827,9 @@ fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> String
     if let Some(offset) = args.offset {
         params.push(("offset".to_string(), offset.to_string()));
     }
+    if let Some(before_sequence) = args.before_sequence {
+        params.push(("before_sequence".to_string(), before_sequence.to_string()));
+    }
     if let Some(host) = args
         .host
         .as_deref()
@@ -2875,12 +2881,16 @@ fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> String
     if let Some(sort_direction) = sort_direction {
         params.push(("sort_direction".to_string(), sort_direction.to_string()));
     }
-    let endpoint =
-        if args.page || args.offset.is_some() || sort_key.is_some() || sort_direction.is_some() {
-            "/api/transactions-page"
-        } else {
-            "/api/transactions"
-        };
+    let endpoint = if args.page
+        || args.offset.is_some()
+        || args.before_sequence.is_some()
+        || sort_key.is_some()
+        || sort_direction.is_some()
+    {
+        "/api/transactions-page"
+    } else {
+        "/api/transactions"
+    };
     let query = encode_query(params);
     if query.is_empty() {
         endpoint.to_string()
@@ -4850,6 +4860,16 @@ mod tests {
             history_list_path(Some(session_id), &legacy_args),
             "/api/transactions?session_id=22222222-2222-2222-2222-222222222222&limit=1"
         );
+
+        let cursor_args = HistoryListArgs {
+            limit: Some(50),
+            before_sequence: Some(1234),
+            ..HistoryListArgs::default()
+        };
+        assert_eq!(
+            history_list_path(Some(session_id), &cursor_args),
+            "/api/transactions-page?session_id=22222222-2222-2222-2222-222222222222&limit=50&before_sequence=1234"
+        );
     }
 
     #[test]
@@ -6601,6 +6621,25 @@ mod tests {
         assert_eq!(args.sort_key.as_deref(), Some("host"));
         assert_eq!(args.sort_direction.as_deref(), Some("asc"));
         assert!(args.page);
+
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "history",
+            "list",
+            "--limit",
+            "50",
+            "--before-sequence",
+            "99",
+        ])
+        .unwrap();
+        let Command::History {
+            command: HistoryCommand::List(args),
+        } = parsed.command
+        else {
+            panic!("expected history list");
+        };
+        assert_eq!(args.before_sequence, Some(99));
+        assert!(args.offset.is_none());
     }
 
     fn parse_sequence_command(args: &[&str]) -> SequenceCommand {
@@ -6831,6 +6870,19 @@ mod tests {
             Cli::try_parse_from(["sniper-cli", "history", "list", "--sort-direction", "up",])
                 .is_err()
         );
+        assert!(
+            Cli::try_parse_from(["sniper-cli", "history", "list", "--sort-key", "hst",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "history",
+            "list",
+            "--offset",
+            "1",
+            "--before-sequence",
+            "99",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from(["sniper-cli", "fuzzer", "list", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from([
             "sniper-cli",
@@ -6839,6 +6891,15 @@ mod tests {
             "list",
             "--limit",
             "0",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "websocket",
+            "list",
+            "--sort-key",
+            "hst",
         ])
         .is_err());
         assert!(
