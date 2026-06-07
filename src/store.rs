@@ -1010,19 +1010,48 @@ fn rotate_transaction_journal_file(file: &mut fs::File, journal_path: &Path) -> 
 
     if !active.is_empty() {
         let checkpoint_path = transaction_journal_checkpoint_path(journal_path);
-        if let Some(parent) = checkpoint_path.parent() {
-            create_private_dir_all(parent)?;
-        }
-        let mut checkpoint = open_private_truncate_file(&checkpoint_path)?;
-        checkpoint.write_all(&active)?;
-        checkpoint.sync_all()?;
-        if let Some(parent) = checkpoint_path.parent() {
-            sync_directory(parent)?;
-        }
+        merge_transaction_journal_checkpoint(&checkpoint_path, &active)?;
     }
 
     file.set_len(0)?;
     file.sync_all()
+}
+
+fn merge_transaction_journal_checkpoint(checkpoint_path: &Path, active: &[u8]) -> io::Result<()> {
+    if let Some(parent) = checkpoint_path.parent() {
+        create_private_dir_all(parent)?;
+    }
+
+    let mut checkpoint = match fs::read(checkpoint_path) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    if !checkpoint.is_empty() && !checkpoint.ends_with(b"\n") {
+        checkpoint.push(b'\n');
+    }
+    checkpoint.extend_from_slice(active);
+
+    let file_name = checkpoint_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("transactions.journal.checkpoint");
+    let tmp_path = checkpoint_path.with_file_name(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+    let write_result = (|| -> io::Result<()> {
+        let mut tmp = open_private_truncate_file(&tmp_path)?;
+        tmp.write_all(&checkpoint)?;
+        tmp.sync_all()?;
+        fs::rename(&tmp_path, checkpoint_path)?;
+        tighten_private_file(checkpoint_path)?;
+        if let Some(parent) = checkpoint_path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {

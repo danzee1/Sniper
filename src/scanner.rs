@@ -850,7 +850,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         // ── Cloud provider keys ──
         (r"AKIA[0-9A-Z]{16}", "AWS Access Key ID", Severity::High),
         (
-            r"(?i)(aws_secret_access_key|aws_secret)\s*[=:]\s*[A-Za-z0-9/+=]{40}",
+            r#"(?i)\b(aws_secret_access_key|aws_secret)\b["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}"#,
             "AWS Secret Access Key",
             Severity::High,
         ),
@@ -976,7 +976,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         ),
         // ── Generic secrets ──
         (
-            r#"(?i)(api[_-]?key|apikey|api[_-]?secret)\s*[=:"']\s*[A-Za-z0-9_\-]{20,}"#,
+            r#"(?i)\b(api[_-]?key|apikey|api[_-]?secret)\b["']?\s*[:=]\s*["']?[A-Za-z0-9_\-]{20,}"#,
             "API Key/Secret pattern",
             Severity::Medium,
         ),
@@ -991,7 +991,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::High,
         ),
         (
-            r#"(?i)(secret[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token)\s*[=:"']\s*[A-Za-z0-9_\-/+=]{16,}"#,
+            r#"(?i)\b(secret[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token)\b["']?\s*[:=]\s*["']?[A-Za-z0-9_\-/+=]{16,}"#,
             "Secret/Token pattern",
             Severity::Medium,
         ),
@@ -1165,6 +1165,9 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                 {
                     continue;
                 }
+                if is_card_number_label(label) && !luhn_valid(m.as_str()) {
+                    continue;
+                }
                 // Skip matches embedded inside base64 strings (false positives from
                 // base64-encoded ad payloads, tracking pixels, etc. in JSON responses)
                 if is_embedded_in_base64(body, &m) {
@@ -1236,6 +1239,39 @@ fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool 
         collapsed.as_str(),
         "password required" | "confirm password" | "password confirmation"
     )
+}
+
+fn is_card_number_label(label: &str) -> bool {
+    matches!(
+        label,
+        "Possible Visa card number" | "Possible Mastercard number"
+    )
+}
+
+fn luhn_valid(candidate: &str) -> bool {
+    let digits: Vec<u32> = candidate
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .filter_map(|ch| ch.to_digit(10))
+        .collect();
+    if digits.len() < 12 {
+        return false;
+    }
+
+    let mut sum = 0u32;
+    let mut double = false;
+    for digit in digits.iter().rev() {
+        let mut value = *digit;
+        if double {
+            value *= 2;
+            if value > 9 {
+                value -= 9;
+            }
+        }
+        sum += value;
+        double = !double;
+    }
+    sum % 10 == 0
 }
 
 // ── Rule 5: CORS ──
@@ -1662,9 +1698,8 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
 
     // Access-Control-Allow-Methods with dangerous methods
     if let Some(methods) = header_value("access-control-allow-methods") {
-        let m_lower = methods.to_ascii_lowercase();
         for dangerous in &["put", "delete", "patch"] {
-            if m_lower.contains(dangerous) {
+            if cors_allows_method(&methods, dangerous) {
                 findings.push(make_finding(
                     record,
                     Severity::Info,
@@ -1677,6 +1712,13 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
             }
         }
     }
+}
+
+fn cors_allows_method(methods: &str, method: &str) -> bool {
+    methods
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate.eq_ignore_ascii_case(method))
 }
 
 // ── Rule 9: Information Disclosure ──
@@ -1795,23 +1837,21 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
         let ct_lower = ct.to_ascii_lowercase();
         // Only flag in non-email contexts (HTML/JSON)
         if ct_lower.contains("html") || ct_lower.contains("json") {
-            if let Some(m) = email_re.find(body) {
+            for m in email_re.find_iter(body) {
                 // Skip obvious false positives
                 let email = m.as_str();
-                if !email.ends_with("example.com")
-                    && !email.ends_with("example.org")
-                    && !email.contains("schema.org")
-                    && !email.contains("w3.org")
-                {
-                    findings.push(make_finding(
-                        record,
-                        Severity::Info,
-                        "info",
-                        "Email address in response",
-                        "Email addresses found in response body. These could be used for phishing or social engineering.",
-                        truncate_evidence(email, 80),
-                    ));
+                if should_ignore_disclosed_email(email) {
+                    continue;
                 }
+                findings.push(make_finding(
+                    record,
+                    Severity::Info,
+                    "info",
+                    "Email address in response",
+                    "Email addresses found in response body. These could be used for phishing or social engineering.",
+                    truncate_evidence(email, 80),
+                ));
+                break;
             }
         }
     }
@@ -1990,6 +2030,19 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
             }
         }
     }
+}
+
+fn should_ignore_disclosed_email(email: &str) -> bool {
+    let Some((_, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    matches!(domain.as_str(), "example.com" | "example.org")
+        || domain.ends_with(".example.com")
+        || domain.ends_with(".example.org")
+        || matches!(domain.as_str(), "schema.org" | "w3.org")
+        || domain.ends_with(".schema.org")
+        || domain.ends_with(".w3.org")
 }
 
 fn is_external_redirect_location(location: &str, request_scheme: &str, request_host: &str) -> bool {
@@ -2838,6 +2891,35 @@ mod tests {
     }
 
     #[test]
+    fn cors_allowed_methods_match_exact_method_tokens() {
+        let record = make_record(
+            vec![],
+            vec![("access-control-allow-methods", "GET, OPTIONS, COMPUTE")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|f| f.title == "CORS allows PUT"),
+            "method names embedded in other tokens should not count as allowed CORS methods"
+        );
+    }
+
+    #[test]
+    fn cors_allowed_methods_still_report_patch_token() {
+        let record = make_record(
+            vec![],
+            vec![("access-control-allow-methods", "GET, PATCH")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings.iter().any(|f| f.title == "CORS allows PATCH"));
+    }
+
+    #[test]
     fn test_server_disclosure() {
         let record = make_record(vec![], vec![("server", "Apache/2.4.51")], "", 200);
         let config = ScannerConfig::default();
@@ -3063,6 +3145,84 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_scanner_detects_json_api_key() {
+        let fake_key = "A".repeat(24);
+        let body = format!(r#"{{"api_key":"{fake_key}"}}"#);
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            &body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|f| f.title.contains("API Key/Secret pattern")));
+    }
+
+    #[test]
+    fn sensitive_scanner_detects_quoted_secret_token_assignment() {
+        let fake_token = "b".repeat(24);
+        let body = format!(r#"const auth_token = "{fake_token}";"#);
+        let record = make_record(vec![], vec![("content-type", "text/html")], &body, 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|f| f.title.contains("Secret/Token pattern")));
+    }
+
+    #[test]
+    fn sensitive_scanner_detects_json_aws_secret_access_key() {
+        let fake_secret = "c".repeat(40);
+        let body = format!(r#"{{"aws_secret_access_key":"{fake_secret}"}}"#);
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            &body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|f| f.title.contains("AWS Secret Access Key")));
+    }
+
+    #[test]
+    fn sensitive_scanner_rejects_invalid_luhn_card_number() {
+        let invalid_card = format!("{}{}", "411111111111111", "2");
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            &invalid_card,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(!findings
+            .iter()
+            .any(|f| f.title.contains("Possible Visa card number")));
+    }
+
+    #[test]
+    fn sensitive_scanner_detects_luhn_valid_visa_card_number() {
+        let valid_card = format!("{}{}", "411111111111111", "1");
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            &valid_card,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|f| f.title.contains("Possible Visa card number")));
+    }
+
+    #[test]
     fn test_html_comment_sensitive() {
         let record = make_record(
             vec![],
@@ -3096,5 +3256,35 @@ mod tests {
                 .any(|f| f.category == "info" && f.title.contains("Swagger")),
             "Should detect Swagger/OpenAPI spec exposure"
         );
+    }
+
+    #[test]
+    fn email_disclosure_ignores_example_domains_case_insensitively() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            "<html>Contact ADMIN@EXAMPLE.COM for docs.</html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(!findings
+            .iter()
+            .any(|f| f.title == "Email address in response"));
+    }
+
+    #[test]
+    fn email_disclosure_does_not_ignore_suffix_lookalike_domains() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            "<html>Contact security@notexample.com for help.</html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "Email address in response"));
     }
 }

@@ -84,8 +84,10 @@ impl WebSocketSessionEntry {
             status: self.status,
             frame_count: self
                 .frames
-                .back()
-                .map(|frame| frame.index.max(self.frames.len()))
+                .iter()
+                .map(|frame| frame.index)
+                .max()
+                .map(|last_index| last_index.saturating_add(1).max(self.frames.len()))
                 .unwrap_or(0),
             retained_frame_count: self.frames.len(),
             last_frame_index: self.frames.back().map(|frame| frame.index),
@@ -1121,7 +1123,7 @@ mod tests {
         let store = WebSocketStore::new(10, 2);
 
         store
-            .open(session(vec![frame(1), frame(2), frame(3)]))
+            .open(session(vec![frame(0), frame(1), frame(2)]))
             .await;
 
         let restored = store.snapshot(None).await;
@@ -1131,17 +1133,17 @@ mod tests {
                 .iter()
                 .map(|frame| frame.index)
                 .collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![1, 2]
         );
         let page = store.list_page(Some(10), None).await;
         assert_eq!(page.items[0].frame_count, 3);
         assert_eq!(page.items[0].retained_frame_count, 2);
-        assert_eq!(page.items[0].last_frame_index, Some(3));
+        assert_eq!(page.items[0].last_frame_index, Some(2));
     }
 
     #[tokio::test]
     async fn get_windowed_returns_only_requested_tail_frames() {
-        let record = session(vec![frame(1), frame(2), frame(3), frame(4)]);
+        let record = session(vec![frame(0), frame(1), frame(2), frame(3)]);
         let record_id = record.id;
         let store = WebSocketStore::from_sessions(10, 10, vec![record]);
 
@@ -1153,23 +1155,23 @@ mod tests {
                 .iter()
                 .map(|frame| frame.index)
                 .collect::<Vec<_>>(),
-            vec![3, 4]
+            vec![2, 3]
         );
     }
 
     #[tokio::test]
     async fn summary_tracks_last_retained_frame_index_after_frame_cap() {
-        let record = session(vec![frame(1), frame(2)]);
+        let record = session(vec![frame(0), frame(1)]);
         let record_id = record.id;
         let store = WebSocketStore::from_sessions(10, 2, vec![record]);
 
-        assert!(store.append_frame(record_id, frame(3)).await);
+        assert!(store.append_frame(record_id, frame(2)).await);
 
         let page = store.list_page(Some(10), None).await;
         let summary = &page.items[0];
         assert_eq!(summary.frame_count, 3);
         assert_eq!(summary.retained_frame_count, 2);
-        assert_eq!(summary.last_frame_index, Some(3));
+        assert_eq!(summary.last_frame_index, Some(2));
     }
 
     #[tokio::test]
@@ -1178,7 +1180,7 @@ mod tests {
         let record_id = record.id;
         let store = WebSocketStore::from_sessions(10, 3, vec![record]);
 
-        for index in 1..=10 {
+        for index in 0..10 {
             assert!(store.append_frame(record_id, frame(index)).await);
         }
 
@@ -1189,12 +1191,12 @@ mod tests {
                 .iter()
                 .map(|frame| frame.index)
                 .collect::<Vec<_>>(),
-            vec![8, 9, 10]
+            vec![7, 8, 9]
         );
         let summary = &store.list_page(Some(10), None).await.items[0];
         assert_eq!(summary.frame_count, 10);
         assert_eq!(summary.retained_frame_count, 3);
-        assert_eq!(summary.last_frame_index, Some(10));
+        assert_eq!(summary.last_frame_index, Some(9));
     }
 
     #[tokio::test]

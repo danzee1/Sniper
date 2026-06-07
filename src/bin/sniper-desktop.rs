@@ -21,11 +21,13 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
-use wry::WebViewBuilder;
+use wry::{WebView, WebViewBuilder};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DesktopUserEvent {
     ShutdownSignal,
+    WebviewCloseFlushFinished { generation: u64, ok: bool },
+    WebviewCloseFlushTimedOut { generation: u64 },
 }
 
 const APP_BUNDLE_IDENTIFIER: &str = "com.sm1ee.sniper";
@@ -33,6 +35,9 @@ const OPEN_PATH: &str = "/usr/bin/open";
 const INSTALL_SKILLS_ENV: &str = "SNIPER_INSTALL_AGENT_SKILLS";
 const INSTALL_CLI_PATH_ENV: &str = "SNIPER_INSTALL_CLI_PATH";
 const SNIPER_DATA_DIR_ENV: &str = "SNIPER_DATA_DIR";
+const DESKTOP_CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const DESKTOP_CLOSE_FLUSH_OK_PREFIX: &str = "sniper:native-close-flush-ok:";
+const DESKTOP_CLOSE_FLUSH_ERROR_PREFIX: &str = "sniper:native-close-flush-error:";
 
 fn desktop_data_dir_from_env() -> PathBuf {
     env::var_os(SNIPER_DATA_DIR_ENV)
@@ -213,6 +218,7 @@ fn main() -> Result<()> {
         .context("failed to create desktop window")?;
     let ui_url = format!("http://{}/", config.ui_addr);
     let ui_origin = format!("http://{}", config.ui_addr);
+    let ipc_event_proxy = event_loop.create_proxy();
     let ui_task = runtime.spawn(async move {
         if let Err(error) = api::serve_api(ui_listener, ui_state).await {
             error!(?error, "ui task stopped");
@@ -228,6 +234,14 @@ fn main() -> Result<()> {
         .with_new_window_req_handler({
             let ui_origin = ui_origin.clone();
             move |url| handle_new_window_request(&url, &ui_origin)
+        })
+        .with_ipc_handler(move |request| {
+            let Some(event) = desktop_user_event_from_ipc(request.body()) else {
+                return;
+            };
+            if let Err(error) = ipc_event_proxy.send_event(event) {
+                warn!(?error, "failed to forward desktop webview IPC event");
+            }
         })
         .with_url(&ui_url);
     let webview = match webview_builder.build() {
@@ -274,6 +288,9 @@ fn main() -> Result<()> {
     let mut ui_task = Some(ui_task);
     let mut oast_task = Some(oast_task);
     let mut signal_task = Some(signal_task);
+    let close_flush_event_proxy = event_loop.create_proxy();
+    let mut close_flush_in_progress = false;
+    let mut close_flush_generation = 0u64;
     event_loop.run(move |event, _, control_flow| {
         let _keep_runtime = &runtime;
         let _keep_window = &window;
@@ -349,19 +366,47 @@ fn main() -> Result<()> {
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
-                match persist_desktop_session_state(&runtime, close_state.as_ref()) {
-                    Ok(()) => {
-                        teardown_once(true);
-                        *control_flow = ControlFlow::Exit;
-                    }
-                    Err(error) => {
-                        *control_flow = block_desktop_shutdown(error);
-                    }
+                if close_flush_in_progress {
+                    return;
+                }
+                if let Err(error) = begin_webview_flush_before_desktop_close(
+                    &webview,
+                    close_flush_event_proxy.clone(),
+                    &mut close_flush_in_progress,
+                    &mut close_flush_generation,
+                ) {
+                    *control_flow = block_desktop_shutdown(error);
                 }
             }
             Event::UserEvent(DesktopUserEvent::ShutdownSignal) => {
                 if shutdown_done.load(Ordering::Acquire) {
                     *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                if close_flush_in_progress {
+                    return;
+                }
+                if let Err(error) = begin_webview_flush_before_desktop_close(
+                    &webview,
+                    close_flush_event_proxy.clone(),
+                    &mut close_flush_in_progress,
+                    &mut close_flush_generation,
+                ) {
+                    *control_flow = block_desktop_shutdown(error);
+                }
+            }
+            Event::UserEvent(DesktopUserEvent::WebviewCloseFlushFinished {
+                generation,
+                ok,
+            }) => {
+                if !close_flush_in_progress || generation != close_flush_generation {
+                    return;
+                }
+                close_flush_in_progress = false;
+                if !ok {
+                    *control_flow = block_desktop_shutdown(anyhow::anyhow!(
+                        "failed to flush webview state before desktop shutdown"
+                    ));
                     return;
                 }
                 match persist_desktop_session_state(&runtime, close_state.as_ref()) {
@@ -373,6 +418,15 @@ fn main() -> Result<()> {
                         *control_flow = block_desktop_shutdown(error);
                     }
                 }
+            }
+            Event::UserEvent(DesktopUserEvent::WebviewCloseFlushTimedOut { generation }) => {
+                if !close_flush_in_progress || generation != close_flush_generation {
+                    return;
+                }
+                close_flush_in_progress = false;
+                *control_flow = block_desktop_shutdown(anyhow::anyhow!(
+                    "timed out flushing webview state before desktop shutdown"
+                ));
             }
             Event::LoopDestroyed => {
                 let session_persisted = if shutdown_done.load(Ordering::Acquire) {
@@ -399,6 +453,82 @@ fn main() -> Result<()> {
             _ => {}
         }
     })
+}
+
+fn desktop_user_event_from_ipc(message: &str) -> Option<DesktopUserEvent> {
+    if let Some(generation) = message.strip_prefix(DESKTOP_CLOSE_FLUSH_OK_PREFIX) {
+        return generation.parse::<u64>().ok().map(|generation| {
+            DesktopUserEvent::WebviewCloseFlushFinished {
+                generation,
+                ok: true,
+            }
+        });
+    }
+    if let Some(rest) = message.strip_prefix(DESKTOP_CLOSE_FLUSH_ERROR_PREFIX) {
+        let generation = rest
+            .split_once(':')
+            .map(|(generation, _)| generation)
+            .unwrap_or(rest);
+        return generation.parse::<u64>().ok().map(|generation| {
+            DesktopUserEvent::WebviewCloseFlushFinished {
+                generation,
+                ok: false,
+            }
+        });
+    }
+    None
+}
+
+fn begin_webview_flush_before_desktop_close(
+    webview: &WebView,
+    event_proxy: EventLoopProxy<DesktopUserEvent>,
+    close_flush_in_progress: &mut bool,
+    close_flush_generation: &mut u64,
+) -> Result<()> {
+    if *close_flush_in_progress {
+        return Ok(());
+    }
+    *close_flush_generation = close_flush_generation.wrapping_add(1);
+    let generation = *close_flush_generation;
+    let script = desktop_close_flush_script(generation);
+    webview
+        .evaluate_script(&script)
+        .context("failed to request webview state flush before desktop shutdown")?;
+    *close_flush_in_progress = true;
+    schedule_webview_flush_timeout(event_proxy, generation);
+    Ok(())
+}
+
+fn schedule_webview_flush_timeout(event_proxy: EventLoopProxy<DesktopUserEvent>, generation: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(DESKTOP_CLOSE_FLUSH_TIMEOUT);
+        if let Err(error) =
+            event_proxy.send_event(DesktopUserEvent::WebviewCloseFlushTimedOut { generation })
+        {
+            warn!(?error, "failed to forward desktop webview flush timeout");
+        }
+    });
+}
+
+fn desktop_close_flush_script(generation: u64) -> String {
+    format!(
+        r#"(async () => {{
+  const post = (message) => {{
+    if (window.ipc && typeof window.ipc.postMessage === "function") {{
+      window.ipc.postMessage(message);
+    }}
+  }};
+  try {{
+    if (typeof window.__sniperFlushBeforeNativeClose === "function") {{
+      await window.__sniperFlushBeforeNativeClose();
+    }}
+    post("{DESKTOP_CLOSE_FLUSH_OK_PREFIX}{generation}");
+  }} catch (error) {{
+    const detail = error && error.message ? error.message : String(error);
+    post("{DESKTOP_CLOSE_FLUSH_ERROR_PREFIX}{generation}:" + detail.slice(0, 200));
+  }}
+}})();"#
+    )
 }
 
 fn desktop_devtools_enabled() -> bool {
@@ -916,12 +1046,13 @@ fn is_same_origin(url: &str, expected_origin: &str) -> bool {
 mod tests {
     use super::{
         begin_desktop_teardown, block_desktop_shutdown, combine_desktop_persist_results,
-        complete_desktop_shutdown, finish_desktop_teardown, handle_navigation_request,
-        handle_new_window_request, is_blocked_desktop_navigation_scheme, is_same_origin,
-        load_shell_rc_contents, normalize_empty_data_dir_env, persist_desktop_session_state,
-        shell_single_quote, should_install_cli_path, should_install_cli_path_on_launch,
+        complete_desktop_shutdown, desktop_close_flush_script, desktop_user_event_from_ipc,
+        finish_desktop_teardown, handle_navigation_request, handle_new_window_request,
+        is_blocked_desktop_navigation_scheme, is_same_origin, load_shell_rc_contents,
+        normalize_empty_data_dir_env, persist_desktop_session_state, shell_single_quote,
+        should_install_cli_path, should_install_cli_path_on_launch,
         should_install_skills_on_launch, upsert_managed_path_line, write_shell_rc_atomically,
-        AppConfig, AppState, SNIPER_DATA_DIR_ENV,
+        AppConfig, AppState, DesktopUserEvent, SNIPER_DATA_DIR_ENV,
     };
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -979,6 +1110,34 @@ mod tests {
         normalize_empty_data_dir_env();
 
         assert!(std::env::var_os(SNIPER_DATA_DIR_ENV).is_none());
+    }
+
+    #[test]
+    fn desktop_close_flush_ipc_messages_parse_to_user_events() {
+        assert_eq!(
+            desktop_user_event_from_ipc("sniper:native-close-flush-ok:7"),
+            Some(DesktopUserEvent::WebviewCloseFlushFinished {
+                generation: 7,
+                ok: true,
+            })
+        );
+        assert_eq!(
+            desktop_user_event_from_ipc("sniper:native-close-flush-error:8:conflict"),
+            Some(DesktopUserEvent::WebviewCloseFlushFinished {
+                generation: 8,
+                ok: false,
+            })
+        );
+        assert_eq!(desktop_user_event_from_ipc("sniper:unrelated"), None);
+    }
+
+    #[test]
+    fn desktop_close_flush_script_posts_generation_scoped_ipc_messages() {
+        let script = desktop_close_flush_script(42);
+
+        assert!(script.contains("window.__sniperFlushBeforeNativeClose"));
+        assert!(script.contains("sniper:native-close-flush-ok:42"));
+        assert!(script.contains("sniper:native-close-flush-error:42:"));
     }
 
     #[test]

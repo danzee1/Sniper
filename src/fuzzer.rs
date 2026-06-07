@@ -404,15 +404,24 @@ async fn rollback_failed_fuzzer_persist(
 }
 
 fn count_request_markers(request: &EditableRequest) -> usize {
-    let mut count = count_markers(&request.host)
-        + count_markers(&request.method)
+    let mut count = count_markers(&request.method)
         + count_markers(&request.path)
         + count_markers(&request.body);
+    if !has_literal_host_header(request) {
+        count += count_markers(&request.host);
+    }
     for header in &request.headers {
         count += count_markers(&header.name);
         count += count_markers(&header.value);
     }
     count
+}
+
+fn has_literal_host_header(request: &EditableRequest) -> bool {
+    request
+        .headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("host"))
 }
 
 fn validate_marker_count(marker_count: usize) -> Result<()> {
@@ -498,8 +507,13 @@ where
 }
 
 fn expanded_request_size(template: &EditableRequest, payload_len: usize) -> usize {
+    let host_bytes = if has_literal_host_header(template) {
+        template.host.len()
+    } else {
+        expanded_value_len(&template.host, payload_len)
+    };
     let mut bytes = expanded_value_len(&template.scheme, payload_len)
-        .saturating_add(expanded_value_len(&template.host, payload_len))
+        .saturating_add(host_bytes)
         .saturating_add(expanded_value_len(&template.method, payload_len))
         .saturating_add(expanded_value_len(&template.path, payload_len))
         .saturating_add(expanded_value_len(&template.body, payload_len));
@@ -522,7 +536,9 @@ fn expanded_value_len(value: &str, payload_len: usize) -> usize {
 
 fn apply_payload_to_request(template: &EditableRequest, payload: &str) -> Result<EditableRequest> {
     let mut request = template.clone();
-    request.host = replace_markers(&request.host, payload)?;
+    if !has_literal_host_header(&request) {
+        request.host = replace_markers(&request.host, payload)?;
+    }
     request.method = replace_markers(&request.method, payload)?;
     request.path = replace_markers(&request.path, payload)?;
     request.body = replace_markers(&request.body, payload)?;
@@ -743,11 +759,58 @@ mod tests {
             preview_truncated: false,
         };
 
-        assert_eq!(count_request_markers(&request), 2);
+        assert_eq!(count_request_markers(&request), 1);
         let applied = apply_payload_to_request(&request, "demo").unwrap();
 
         assert_eq!(applied.headers[0].value, "header-demo.example.com");
         assert_eq!(applied.host, "header-demo.example.com");
+    }
+
+    #[test]
+    fn fixed_host_header_rejects_authority_only_payload_marker() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: "authority-$payload$.example.com".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: vec![HeaderRecord {
+                name: "Host".to_string(),
+                value: "fixed.example.com".to_string(),
+            }],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+
+        assert_eq!(count_request_markers(&request), 0);
+        let error = validate_expanded_requests(&request, &["demo".to_string()], |_| Ok(()))
+            .expect_err("authority-only marker should be ignored by the fixed Host header");
+
+        assert!(error.to_string().contains("missing $payload$ markers"));
+    }
+
+    #[test]
+    fn host_header_override_excludes_authority_markers_from_expansion_budget() {
+        let request = EditableRequest {
+            scheme: "https".to_string(),
+            host: FUZZER_PAYLOAD_MARKER.repeat(MAX_FUZZER_MARKERS_PER_REQUEST),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: vec![HeaderRecord {
+                name: "Host".to_string(),
+                value: "header-$payload$.example.com".to_string(),
+            }],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+
+        let payload = "d".repeat(MAX_FUZZER_PAYLOAD_BYTES);
+        validate_expanded_requests(&request, std::slice::from_ref(&payload), |_| Ok(())).unwrap();
+        let applied = apply_payload_to_request(&request, &payload).unwrap();
+
+        assert!(applied.host.starts_with("header-dddd"));
+        assert!(applied.host.ends_with(".example.com"));
     }
 
     #[tokio::test]

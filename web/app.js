@@ -3057,6 +3057,17 @@ async function flushWorkspaceState() {
   }
 }
 
+async function flushBeforeNativeClose() {
+  await flushWorkspaceState();
+  window.clearTimeout(uiSettingsSaveTimer);
+  uiSettingsSaveTimer = null;
+  if (uiSettingsDirty || uiSettingsInFlight) {
+    await persistUiSettings();
+  }
+}
+
+window.__sniperFlushBeforeNativeClose = flushBeforeNativeClose;
+
 function flushWorkspaceStateBeforeHidden() {
   if (document.visibilityState !== "hidden") return;
   if (!hasPendingWorkspaceStateSave()) return;
@@ -3337,7 +3348,7 @@ function disconnectWsReplayTabsOnUnload() {
     if (!tab || tab.type !== "websocket") continue;
     if (tab.wsStatus !== "connected" && tab.wsStatus !== "connecting") continue;
     const sessionId = tab.wsSessionId || activeSessionId;
-    const payload = JSON.stringify({ session_id: sessionId, id: tab.id, remove: false });
+    const payload = JSON.stringify({ session_id: sessionId, id: tab.id, remove: true });
     if (utf8ByteLength(payload) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
     fetch("/api/replay/ws-disconnect", {
       method: "POST",
@@ -12899,6 +12910,7 @@ function duplicateActiveReplayTab() {
       setupQueue: Array.isArray(tab.wsSetupQueue)
         ? tab.wsSetupQueue.map((item) => ({ ...item }))
         : [],
+      setupQueueNotice: tab.wsSetupNotice || "",
       capturedFrames: getWsReplayFrames(tab),
       selectedFrameIndex: tab.wsSelectedFrameIndex,
       frameWindowStart: tab.wsFrameWindowStart,
@@ -17767,6 +17779,11 @@ function trimWsReplayFrames(tab) {
   const overflow = tab.wsFrames.length - WS_REPLAY_MAX_LOADED_FRAMES;
   if (overflow <= 0) return;
   const removedFrames = tab.wsFrames.splice(0, overflow);
+  tab.wsFramesTruncated = true;
+  const firstAvailable = Number(tab.wsFrames[0]?.index);
+  tab.wsError = Number.isFinite(firstAvailable)
+    ? `WebSocket replay transcript is missing frames before #${firstAvailable + 1}.`
+    : "WebSocket replay transcript is missing earlier frames.";
   for (let index = 0; index < removedFrames.length; index += 1) {
     forgetWsReplayFrameIndex(tab, removedFrames[index], index);
   }
@@ -17781,6 +17798,10 @@ function trimWsReplayFrames(tab) {
     && !tab.wsFrames.some((frame) => frame.index === tab.wsSelectedFrameIndex)
   ) {
     tab.wsSelectedFrameIndex = -1;
+  }
+  scheduleWorkspaceStateSave();
+  if (state.activeReplayTabId === tab.id) {
+    renderWsStatus();
   }
 }
 

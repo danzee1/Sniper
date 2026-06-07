@@ -621,8 +621,10 @@ pub struct WebSocketSessionSummary {
 
 pub fn websocket_total_frame_count(frames: &[WebSocketFrameRecord]) -> usize {
     frames
-        .last()
-        .map(|frame| frame.index.max(frames.len()))
+        .iter()
+        .map(|frame| frame.index)
+        .max()
+        .map(|last_index| last_index.saturating_add(1).max(frames.len()))
         .unwrap_or(0)
 }
 
@@ -1001,6 +1003,39 @@ mod tests {
         assert_eq!(frame.body_encoding, BodyEncoding::Utf8);
         assert_eq!(frame.body_size, 0);
         assert!(!frame.preview_truncated);
+    }
+
+    #[test]
+    fn websocket_summary_counts_zero_based_retained_tail_frames() {
+        let mut record: WebSocketSessionRecord = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-00000000f002",
+            "started_at": "2026-01-01T00:00:00Z",
+            "scheme": "wss",
+            "host": "socket.example.com",
+            "path": "/stream",
+            "request": { "headers": [] },
+            "frames": []
+        }))
+        .expect("websocket session should deserialize");
+        record.frames = [7usize, 8, 9]
+            .into_iter()
+            .map(|index| WebSocketFrameRecord {
+                index,
+                captured_at: Utc::now(),
+                direction: WebSocketFrameDirection::ServerToClient,
+                kind: WebSocketFrameKind::Text,
+                body_preview: format!("frame-{index}"),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                preview_truncated: false,
+            })
+            .collect();
+
+        let summary = record.summary();
+
+        assert_eq!(summary.frame_count, 10);
+        assert_eq!(summary.retained_frame_count, 3);
+        assert_eq!(summary.last_frame_index, Some(9));
     }
 
     #[test]

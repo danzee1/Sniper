@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error as StdError,
     fmt,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use anyhow::{anyhow, Result};
@@ -23,6 +23,9 @@ use crate::{
 const MAX_SEQUENCE_EXPANDED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SEQUENCE_VARIABLE_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_SEQUENCE_VARIABLES_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+static SEQUENCE_VARIABLE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{([^{}]+)\}\}").expect("valid sequence variable regex"));
 
 #[derive(Debug)]
 pub struct SequencePersistenceError {
@@ -290,11 +293,14 @@ fn bound_sequence_definitions(
 }
 
 fn substitute_variables(text: &str, variables: &HashMap<String, String>) -> String {
-    let mut result = text.to_string();
-    for (name, value) in variables {
-        result = result.replace(&format!("{{{{{name}}}}}"), value);
-    }
-    result
+    SEQUENCE_VARIABLE_REGEX
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            variables
+                .get(&captures[1])
+                .cloned()
+                .unwrap_or_else(|| captures[0].to_string())
+        })
+        .into_owned()
 }
 
 fn apply_variables_to_request(
@@ -924,6 +930,18 @@ mod tests {
             applied.headers.first().map(|header| header.value.as_str()),
             Some("new.example")
         );
+    }
+
+    #[test]
+    fn sequence_variable_substitution_does_not_recursively_expand_values() {
+        let variables = HashMap::from([
+            ("token".to_string(), "{{secret}}".to_string()),
+            ("secret".to_string(), "leaked".to_string()),
+        ]);
+
+        let substituted = substitute_variables("Bearer {{token}} / {{secret}}", &variables);
+
+        assert_eq!(substituted, "Bearer {{secret}} / leaked");
     }
 
     #[test]

@@ -11024,7 +11024,7 @@ mod tests {
             status: Some(101),
             request: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
             response: None,
-            frames: (1..=1002)
+            frames: (0..1002)
                 .map(|index| WebSocketFrameRecord {
                     index,
                     captured_at: Utc::now(),
@@ -11061,7 +11061,7 @@ mod tests {
                 .iter()
                 .map(|frame| frame.index)
                 .collect::<Vec<_>>(),
-            vec![1001, 1002]
+            vec![1000, 1001]
         );
 
         let empty_detail_response = super::get_websocket(
@@ -11095,8 +11095,8 @@ mod tests {
         assert_eq!(default_detail_response.status(), super::StatusCode::OK);
         let default_detail: WebSocketSessionRecord = response_json(default_detail_response).await;
         assert_eq!(default_detail.frames.len(), 1000);
-        assert_eq!(default_detail.frames[0].index, 3);
-        assert_eq!(default_detail.frames[999].index, 1002);
+        assert_eq!(default_detail.frames[0].index, 2);
+        assert_eq!(default_detail.frames[999].index, 1001);
 
         let oversized_detail_response = super::get_websocket(
             State(state.clone()),
@@ -11114,7 +11114,7 @@ mod tests {
         let oversized_detail: WebSocketSessionRecord =
             response_json(oversized_detail_response).await;
         assert_eq!(oversized_detail.frames.len(), 1000);
-        assert_eq!(oversized_detail.frames[0].index, 3);
+        assert_eq!(oversized_detail.frames[0].index, 2);
 
         let legacy_list_response = super::list_websockets(
             State(state.clone()),
@@ -11130,7 +11130,7 @@ mod tests {
         let legacy_list: Vec<WebSocketSessionSummary> = response_json(legacy_list_response).await;
         assert_eq!(legacy_list[0].frame_count, 1002);
         assert_eq!(legacy_list[0].retained_frame_count, 1002);
-        assert_eq!(legacy_list[0].last_frame_index, Some(1002));
+        assert_eq!(legacy_list[0].last_frame_index, Some(1001));
 
         let list_response = super::list_websockets_page(
             State(state),
@@ -11146,7 +11146,7 @@ mod tests {
         let page: super::WebSocketPageResponse = response_json(list_response).await;
         assert_eq!(page.items[0].frame_count, 1002);
         assert_eq!(page.items[0].retained_frame_count, 1002);
-        assert_eq!(page.items[0].last_frame_index, Some(1002));
+        assert_eq!(page.items[0].last_frame_index, Some(1001));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

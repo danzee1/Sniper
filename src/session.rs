@@ -4768,6 +4768,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_keeps_replayed_checkpoint_entries_when_journal_rotates_before_snapshot() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-merge-checkpoint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+
+        let old_record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "checkpoint.example:443".to_string(),
+            "/checkpoint".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        let new_record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "active.example:443".to_string(),
+            "/active".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let journal_path = super::transaction_journal_path(&storage_dir);
+        let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
+        let mut checkpoint = Vec::new();
+        serde_json::to_writer(
+            &mut checkpoint,
+            &TransactionJournalEntry::Insert { record: old_record },
+        )
+        .unwrap();
+        checkpoint.push(b'\n');
+        std::fs::write(&checkpoint_path, checkpoint).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        loaded.store.insert(new_record).await;
+        loaded
+            .store
+            .snapshot_for_persistence(Some(32))
+            .await
+            .unwrap();
+
+        let reloaded = registry.load_context(active.id()).unwrap();
+        let restored = reloaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(restored.len(), 2);
+        assert!(restored
+            .iter()
+            .any(|record| record.host == "active.example:443"));
+        assert!(restored
+            .iter()
+            .any(|record| record.host == "checkpoint.example:443"));
+    }
+
+    #[tokio::test]
     async fn registry_checkpoint_annotations_do_not_overwrite_snapshot_records() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-session-journal-checkpoint-annotation-test-{}",
