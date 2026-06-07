@@ -96,6 +96,25 @@ pub struct AppState {
     pub runtime_instance_id: uuid::Uuid,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LiveSessionCounts {
+    request_count: usize,
+    websocket_count: usize,
+    event_count: usize,
+    fuzzer_count: usize,
+    rule_count: usize,
+}
+
+async fn session_live_counts(session: &Arc<SessionContext>) -> LiveSessionCounts {
+    LiveSessionCounts {
+        request_count: session.store.len().await,
+        websocket_count: session.websockets.len().await,
+        event_count: session.event_log.len().await,
+        fuzzer_count: session.fuzzer.len().await,
+        rule_count: session.match_replace.len().await,
+    }
+}
+
 impl AppState {
     pub fn new(config: AppConfig) -> Result<Self> {
         let certificates = Arc::new(CertificateAuthority::load_or_create(&config.data_dir)?);
@@ -317,7 +336,7 @@ impl AppState {
         let mut live_counts = HashMap::new();
 
         let active = self.session().await;
-        live_counts.insert(active.id(), active.store.len().await);
+        live_counts.insert(active.id(), session_live_counts(&active).await);
 
         let writable_contexts: Vec<_> = {
             let contexts = self.session_contexts.lock().await;
@@ -325,7 +344,7 @@ impl AppState {
         };
         for session in writable_contexts {
             if self.sessions.contains_session(session.id()) {
-                live_counts.insert(session.id(), session.store.len().await);
+                live_counts.insert(session.id(), session_live_counts(&session).await);
             }
         }
 
@@ -335,13 +354,17 @@ impl AppState {
         };
         for session in read_only_contexts {
             if self.sessions.contains_session(session.id()) {
-                live_counts.insert(session.id(), session.store.len().await);
+                live_counts.insert(session.id(), session_live_counts(&session).await);
             }
         }
 
         for summary in &mut summaries {
-            if let Some(count) = live_counts.get(&summary.id) {
-                summary.request_count = *count;
+            if let Some(counts) = live_counts.get(&summary.id) {
+                summary.request_count = counts.request_count;
+                summary.websocket_count = counts.websocket_count;
+                summary.event_count = counts.event_count;
+                summary.fuzzer_count = counts.fuzzer_count;
+                summary.rule_count = counts.rule_count;
             }
         }
         summaries
@@ -2107,7 +2130,11 @@ mod tests {
         EXPECTED_APP_EXECUTABLE, HDIUTIL_PATH, LIPO_PATH, PLIST_BUDDY_PATH, SH_PATH, SPCTL_PATH,
     };
     use crate::config::AppConfig;
-    use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
+    use crate::event_log::EventLevel;
+    use crate::fuzzer::{FuzzerAttackRecord, FuzzerAttackStatus};
+    use crate::match_replace::{MatchReplaceRule, MatchReplaceScope, MatchReplaceTarget};
+    use crate::model::WebSocketSessionRecord;
+    use crate::model::{BodyEncoding, EditableRequest, MessageRecord, TransactionRecord};
     use crate::workspace::{ReplayTabState, ReplayWorkspaceState};
     use std::fs;
     use std::path::Path;
@@ -2661,7 +2688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_list_uses_live_retained_request_count() {
+    async fn session_list_uses_live_retained_counts() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-session-list-live-count-{}",
             uuid::Uuid::new_v4()
@@ -2704,6 +2731,78 @@ mod tests {
                 ))
                 .await;
         }
+        session
+            .websockets
+            .open(WebSocketSessionRecord {
+                id: uuid::Uuid::new_v4(),
+                started_at: chrono::Utc::now(),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "live-count.example".to_string(),
+                path: "/ws".to_string(),
+                status: Some(101),
+                request: MessageRecord {
+                    headers: Vec::new(),
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        session
+            .event_log
+            .push(
+                EventLevel::Info,
+                "test",
+                "Live event",
+                "Event count should be live",
+            )
+            .await;
+        session
+            .fuzzer
+            .insert(FuzzerAttackRecord {
+                id: uuid::Uuid::new_v4(),
+                started_at: chrono::Utc::now(),
+                completed_at: chrono::Utc::now(),
+                status: FuzzerAttackStatus::Completed,
+                template: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "live-count.example".to_string(),
+                    method: "GET".to_string(),
+                    path: "/FUZZ".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                payload_count: 1,
+                marker_count: 1,
+                results: Vec::new(),
+                notes: Vec::new(),
+            })
+            .await;
+        session
+            .match_replace
+            .replace_all(vec![MatchReplaceRule {
+                id: uuid::Uuid::new_v4(),
+                enabled: true,
+                description: "count me".to_string(),
+                scope: MatchReplaceScope::Request,
+                target: MatchReplaceTarget::Path,
+                search: "/old".to_string(),
+                replace: "/new".to_string(),
+                regex: false,
+                case_sensitive: false,
+            }])
+            .await;
 
         let summary = state
             .list_sessions()
@@ -2712,6 +2811,10 @@ mod tests {
             .find(|summary| summary.id == session.id())
             .unwrap();
         assert_eq!(summary.request_count, 2);
+        assert_eq!(summary.websocket_count, 1);
+        assert_eq!(summary.event_count, 1);
+        assert_eq!(summary.fuzzer_count, 1);
+        assert_eq!(summary.rule_count, 1);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

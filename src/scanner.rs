@@ -578,10 +578,9 @@ fn is_non_empty_base64url(value: &str) -> bool {
 }
 
 fn extract_jwt_from_text(text: &str) -> Vec<String> {
-    // Simple pattern: eyJ followed by base64url(. or %2E)base64url(. or %2E)base64url
-    let re =
-        Regex::new(r"eyJ[A-Za-z0-9_-]+(?:\.|%2[eE])eyJ[A-Za-z0-9_-]+(?:\.|%2[eE])[A-Za-z0-9_-]*")
-            .unwrap();
+    // Simple pattern: JWT-looking base64url segments with a JSON-looking header.
+    let re = Regex::new(r"eyJ[A-Za-z0-9_-]*(?:\.|%2[eE])[A-Za-z0-9_-]+(?:\.|%2[eE])[A-Za-z0-9_-]*")
+        .unwrap();
     re.find_iter(text)
         .map(|m| normalize_jwt_token_candidate(m.as_str()))
         .filter(|token| looks_like_jwt(token))
@@ -713,7 +712,7 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
             .map(|h| h.value.as_str())
     };
 
-    if !header_value("content-security-policy").is_some_and(|value| !value.trim().is_empty()) {
+    if header_value("content-security-policy").is_none_or(|value| value.trim().is_empty()) {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -1321,7 +1320,7 @@ fn luhn_valid(candidate: &str) -> bool {
         sum += value;
         double = !double;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 // ── Rule 5: CORS ──
@@ -2184,7 +2183,8 @@ fn is_external_redirect_location(location: &str, request_scheme: &str, request_h
     let Some(redirect_host) = redirect.host_str() else {
         return false;
     };
-    !base_host.eq_ignore_ascii_case(redirect_host)
+    !base.scheme().eq_ignore_ascii_case(redirect.scheme())
+        || !base_host.eq_ignore_ascii_case(redirect_host)
         || base.port_or_known_default() != redirect.port_or_known_default()
 }
 
@@ -2737,6 +2737,26 @@ mod tests {
     }
 
     #[test]
+    fn open_redirect_detection_treats_scheme_downgrade_as_external() {
+        let mut record = make_record(
+            vec![],
+            vec![("location", "http://example.com:8443/callback")],
+            "",
+            302,
+        );
+        record.host = "example.com:8443".to_string();
+        record.path = "/login?next=http%3A%2F%2Fexample.com%3A8443%2Fcallback".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Possible open redirect"),
+            "same host and port with a different scheme is still a cross-origin redirect"
+        );
+    }
+
+    #[test]
     fn jwt_algorithm_checks_only_use_alg_claim() {
         let token = jwt_token(
             serde_json::json!({ "alg": "RS256", "kid": "none", "hint": "HS256" }),
@@ -2895,6 +2915,25 @@ mod tests {
                 .any(|finding| finding.title == "JWT without expiration"),
             "percent-encoded JWTs in response bodies should still be analyzed"
         );
+    }
+
+    #[test]
+    fn jwt_detection_accepts_non_object_payload_prefix_in_body_tokens() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "none", "typ": "JWT" }),
+            serde_json::json!({}),
+        );
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            &format!(r#"{{"token":"{token}"}}"#),
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "JWT with alg:none"));
     }
 
     #[test]
@@ -3512,7 +3551,7 @@ mod tests {
 
     #[test]
     fn sensitive_scanner_detects_huggingface_token_with_digits() {
-        let body = format!("token={}", format!("hf_{}", "a1".repeat(17)));
+        let body = format!("token=hf_{}", "a1".repeat(17));
         let record = make_record(vec![], vec![("content-type", "text/html")], &body, 200);
         let findings = scan_transaction(&record, &ScannerConfig::default());
 

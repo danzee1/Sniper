@@ -4715,6 +4715,7 @@ async fn events(
     let mut log_receiver = session.event_log.subscribe();
     let mut finding_receiver = session.scanner.subscribe();
     let mut websocket_receiver = session.websockets.subscribe();
+    let mut websocket_retention_receiver = session.websockets.subscribe_retention();
     let latest_sequence = session.store.latest_sequence();
     let event_stream_started_for_active_session = state.sessions.active_session_id() == session_id;
 
@@ -4785,6 +4786,22 @@ async fn events(
                             if let Ok(payload) = serde_json::to_string(&summary) {
                                 yield Ok(Event::default().event("websocket").data(payload));
                             }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok(Event::default()
+                                .event("websockets_gap")
+                                .data("lagged"));
+                            continue;
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                result = websocket_retention_receiver.recv() => {
+                    match result {
+                        Ok(()) => {
+                            yield Ok(Event::default()
+                                .event("websockets_gap")
+                                .data("retention"));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             yield Ok(Event::default()

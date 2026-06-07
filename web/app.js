@@ -8903,8 +8903,14 @@ function renderIntercepts() {
 
   Array.from(els.interceptTableBody.querySelectorAll(".history-row")).forEach((row) => {
     row.addEventListener("click", () => {
-      state.selectedInterceptId = row.dataset.id;
-      loadInterceptDetail(row.dataset.id).catch((error) => console.error(error));
+      const id = row.dataset.id;
+      if (state.selectedInterceptId !== id) {
+        state.selectedInterceptId = id;
+        state.selectedInterceptRecord = null;
+        state.interceptEditorSeedId = null;
+        renderIntercepts();
+      }
+      loadInterceptDetail(id).catch((error) => console.error(error));
     });
   });
 
@@ -10360,16 +10366,7 @@ function renderFuzzer() {
   }
   if (!attackRecord) {
     els.fuzzerMeta.textContent = state.fuzzerNotice || "No fuzz run has been started yet.";
-    els.fuzzerResultsBody.innerHTML = `
-      <tr class="empty-row">
-        <td colspan="6">${escapeHtml(state.fuzzerNotice || "Use $payload$ markers in the request template, then click Start.")}</td>
-      </tr>
-    `;
-    // Hide detail panel and its resizer when no attack record
-    if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.add("hidden");
-    const _dr = document.getElementById("fuzzerDetailResizer");
-    if (_dr) _dr.classList.add("hidden");
-    state._fuzzerDetailRecord = null;
+    renderEmptyFuzzerResults(state.fuzzerNotice || "Use $payload$ markers in the request template, then click Start.");
     return;
   }
 
@@ -10406,9 +10403,29 @@ function fuzzerResultsShell() {
   return els.fuzzerResultsBody?.closest(".history-table-shell") || null;
 }
 
+function renderEmptyFuzzerResults(message) {
+  if (els.fuzzerResultsBody) {
+    els.fuzzerResultsBody.innerHTML = `
+      <tr class="empty-row">
+        <td colspan="6">${escapeHtml(message || "No fuzzer results.")}</td>
+      </tr>
+    `;
+  }
+  const shell = fuzzerResultsShell();
+  if (shell) {
+    shell.scrollTop = 0;
+  }
+  state._selectedFuzzerResultKey = null;
+  hideFuzzerDetailPanel();
+}
+
 function renderFuzzerResultsVirtual() {
   const results = jsonArray(state.fuzzerAttackRecord?.results);
-  if (!els.fuzzerResultsBody || !results.length) {
+  if (!els.fuzzerResultsBody) {
+    return;
+  }
+  if (!results.length) {
+    renderEmptyFuzzerResults("No fuzzer results are available for this run.");
     return;
   }
   const shell = fuzzerResultsShell();
@@ -11946,7 +11963,7 @@ async function requireOkResponse(response, fallbackMessage) {
 }
 
 async function forwardSelectedIntercept() {
-  if (!state.selectedInterceptRecord) {
+  if (!state.selectedInterceptRecord || state.selectedInterceptRecord.id !== state.selectedInterceptId) {
     return;
   }
 
@@ -11995,7 +12012,7 @@ async function forwardSelectedIntercept() {
 }
 
 async function dropSelectedIntercept() {
-  if (!state.selectedInterceptRecord) {
+  if (!state.selectedInterceptRecord || state.selectedInterceptRecord.id !== state.selectedInterceptId) {
     return;
   }
 
@@ -12170,8 +12187,14 @@ function renderResponseIntercepts() {
 
   Array.from(els.responseInterceptTableBody.querySelectorAll(".history-row")).forEach((row) => {
     row.addEventListener("click", () => {
-      state.selectedResponseInterceptId = row.dataset.id;
-      loadResponseInterceptDetail(row.dataset.id).catch((error) => console.error(error));
+      const id = row.dataset.id;
+      if (state.selectedResponseInterceptId !== id) {
+        state.selectedResponseInterceptId = id;
+        state.selectedResponseInterceptRecord = null;
+        state.responseInterceptEditorSeedId = null;
+        renderResponseIntercepts();
+      }
+      loadResponseInterceptDetail(id).catch((error) => console.error(error));
     });
   });
 
@@ -12226,7 +12249,7 @@ function renderResponseIntercepts() {
 }
 
 async function forwardSelectedResponseIntercept() {
-  if (!state.selectedResponseInterceptRecord) return;
+  if (!state.selectedResponseInterceptRecord || state.selectedResponseInterceptRecord.id !== state.selectedResponseInterceptId) return;
 
   const sessionId = currentSessionId();
   const id = state.selectedResponseInterceptRecord.id;
@@ -12269,7 +12292,7 @@ async function forwardSelectedResponseIntercept() {
 }
 
 async function dropSelectedResponseIntercept() {
-  if (!state.selectedResponseInterceptRecord) return;
+  if (!state.selectedResponseInterceptRecord || state.selectedResponseInterceptRecord.id !== state.selectedResponseInterceptId) return;
 
   const sessionId = currentSessionId();
   const id = state.selectedResponseInterceptRecord.id;
@@ -19320,8 +19343,7 @@ function copyResponseContentForRecord(record, format) {
   if (!record?.response) return;
   let text = "";
   if (format === "response-headers") {
-    text = `HTTP/1.1 ${record.status || 200}\r\n`;
-    for (const h of normalizedHeaders(record.response.headers)) text += `${h.name}: ${h.value}\r\n`;
+    text = `${buildRawResponseHead(record).replace(/\n/g, "\r\n")}\r\n`;
   } else if (format === "response-body") {
     text = record.response.body_encoding === "base64"
       ? safeDecodeBase64(record.response.body_preview || "")

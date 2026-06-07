@@ -75,6 +75,14 @@ impl MatchReplaceStore {
         self.rules.read().await.clone()
     }
 
+    pub async fn len(&self) -> usize {
+        self.rules.read().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.rules.read().await.is_empty()
+    }
+
     pub async fn replace_all(&self, rules: Vec<MatchReplaceRule>) -> Vec<MatchReplaceRule> {
         let mut current = self.rules.write().await;
         *current = rules;

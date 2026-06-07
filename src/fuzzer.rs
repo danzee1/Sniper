@@ -172,6 +172,14 @@ impl FuzzerStore {
             .collect()
     }
 
+    pub async fn len(&self) -> usize {
+        self.attacks.read().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.attacks.read().await.is_empty()
+    }
+
     pub async fn replace_all(&self, records: Vec<FuzzerAttackRecord>) {
         let mut attacks = self.attacks.write().await;
         attacks.clear();

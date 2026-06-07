@@ -358,6 +358,10 @@ impl TransactionStore {
         self.inner.read().await.entries.len()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.entries.is_empty()
+    }
+
     pub async fn list(&self, filters: &ListFilters) -> Vec<TransactionSummary> {
         self.list_page(filters).await.items
     }

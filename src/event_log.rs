@@ -117,6 +117,14 @@ impl EventLogStore {
         self.list(limit).await
     }
 
+    pub async fn len(&self) -> usize {
+        self.entries.read().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.entries.read().await.is_empty()
+    }
+
     pub async fn replace_all(&self, records: Vec<EventLogEntry>) {
         let mut entries = self.entries.write().await;
         entries.clear();

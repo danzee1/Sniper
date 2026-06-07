@@ -1401,6 +1401,7 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
             }
 
             // Dispatch poll to correct backend
+            let clear_generation = store.clear_generation();
             let callbacks = match config.provider {
                 OastProvider::Interactsh => {
                     poll_interactsh_from_store(&store, &config, &client).await
@@ -1413,7 +1414,7 @@ pub fn start_oast_poller(store: Arc<OastStore>) -> tokio::task::JoinHandle<()> {
                 info!(count = callbacks.len(), provider = %config.provider, "OAST callbacks received");
                 let mut inserted = 0usize;
                 for cb in callbacks {
-                    if store.push(cb).await {
+                    if store.push_if_generation(cb, clear_generation).await {
                         inserted += 1;
                     }
                 }

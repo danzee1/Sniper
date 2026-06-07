@@ -18,6 +18,7 @@ pub struct WebSocketStore {
     max_frames_per_session: usize,
     inner: RwLock<WebSocketStoreInner>,
     events: broadcast::Sender<WebSocketSessionSummary>,
+    retention_events: broadcast::Sender<()>,
 }
 
 struct WebSocketStoreInner {
@@ -154,6 +155,8 @@ impl WebSocketStore {
     ) -> Self {
         let (events, _) =
             broadcast::channel(max_entries.clamp(32, MAX_WEBSOCKET_BROADCAST_CAPACITY));
+        let (retention_events, _) =
+            broadcast::channel(max_entries.clamp(32, MAX_WEBSOCKET_BROADCAST_CAPACITY));
         let records = sessions_with_live_preserved(records, max_entries, max_frames_per_session);
         let inner = inner_from_records(records, max_entries);
         Self {
@@ -161,6 +164,7 @@ impl WebSocketStore {
             max_frames_per_session,
             inner: RwLock::new(inner),
             events,
+            retention_events,
         }
     }
 
@@ -187,6 +191,9 @@ impl WebSocketStore {
             inner.started_at_desc_ordered = compute_storage_order_matches_started_at_desc(&inner);
         }
         let _ = self.events.send(summary);
+        if removed_any {
+            let _ = self.retention_events.send(());
+        }
     }
 
     pub async fn append_frame(&self, id: Uuid, frame: WebSocketFrameRecord) -> bool {
@@ -216,11 +223,16 @@ impl WebSocketStore {
                 session.notes.push(note);
             }
             let summary = session.summary();
-            let _ = self.events.send(summary);
             let removed_any = trim_overflow(&mut inner, self.max_entries);
+            if inner.sessions.contains_key(&id) {
+                let _ = self.events.send(summary);
+            }
             if removed_any && !inner.started_at_desc_ordered {
                 inner.started_at_desc_ordered =
                     compute_storage_order_matches_started_at_desc(&inner);
+            }
+            if removed_any {
+                let _ = self.retention_events.send(());
             }
             true
         } else {
@@ -330,6 +342,14 @@ impl WebSocketStore {
             .map(|session| session.to_record_with_frame_window(frame_limit))
     }
 
+    pub async fn len(&self) -> usize {
+        self.inner.read().await.order.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.order.is_empty()
+    }
+
     pub async fn snapshot(&self, limit: Option<usize>) -> Vec<WebSocketSessionRecord> {
         self.snapshot_with_frame_limit(limit, None).await
     }
@@ -382,6 +402,10 @@ impl WebSocketStore {
 
     pub fn subscribe(&self) -> broadcast::Receiver<WebSocketSessionSummary> {
         self.events.subscribe()
+    }
+
+    pub fn subscribe_retention(&self) -> broadcast::Receiver<()> {
+        self.retention_events.subscribe()
     }
 }
 
@@ -1372,5 +1396,22 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         assert!(!snapshot.iter().any(|session| session.id == closed_id));
         assert!(snapshot.iter().any(|session| session.id == live_id));
+    }
+
+    #[tokio::test]
+    async fn open_notifies_retention_when_overflow_removes_session() {
+        let store = WebSocketStore::new(1, 10);
+        let closed = closed_session(Vec::new());
+        let closed_id = closed.id;
+        store.open(closed).await;
+        let mut retention_events = store.subscribe_retention();
+
+        let live = session(Vec::new());
+        let live_id = live.id;
+        store.open(live).await;
+
+        assert!(retention_events.try_recv().is_ok());
+        assert!(store.get(closed_id).await.is_none());
+        assert!(store.get(live_id).await.is_some());
     }
 }

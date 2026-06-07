@@ -676,6 +676,7 @@ struct SkillsInstallArgs {
     ArgGroup::new("rules_source")
         .args(["file", "stdin"])
         .multiple(false)
+        .required(true)
 ))]
 struct AutoReplaceSetArgs {
     #[arg(long)]
@@ -761,7 +762,7 @@ struct InterceptRuleCreateArgs {
     #[arg(long, default_value = "both", value_parser = ["request", "response", "both"])]
     scope: String,
     /// Create a rule that matches all traffic. Required when no matcher is supplied.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["host_pattern", "path_pattern", "method_filter"])]
     all: bool,
     #[arg(long)]
     host_pattern: Option<String>,
@@ -812,6 +813,7 @@ struct SequenceGetArgs {
     ArgGroup::new("sequence_source")
         .args(["file", "stdin"])
         .multiple(false)
+        .required(true)
 ))]
 struct SequenceCreateArgs {
     #[arg(long)]
@@ -6187,6 +6189,7 @@ mod tests {
             "sniper-cli",
             "sequence",
             "create",
+            "--stdin",
             "--session-id",
             session_id,
         ]) {
@@ -6294,6 +6297,8 @@ mod tests {
             "--stdin",
         ])
         .is_err());
+        assert!(Cli::try_parse_from(["sniper-cli", "auto-replace", "set"]).is_err());
+        assert!(Cli::try_parse_from(["sniper-cli", "sequence", "create"]).is_err());
     }
 
     #[test]
@@ -6332,6 +6337,16 @@ mod tests {
             "--all",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "intercept-rule",
+            "create",
+            "--all",
+            "--host-pattern",
+            "*.example.com",
+        ])
+        .is_err());
     }
 
     #[test]
