@@ -131,8 +131,10 @@ const WS_REPLAY_MAX_PERSISTED_FRAMES = 1000;
 const WS_REPLAY_MAX_PERSISTED_FRAME_BODY_BYTES = 16 * 1024;
 const WS_REPLAY_MAX_PERSISTED_TOTAL_FRAMES = 2000;
 const WS_REPLAY_MAX_PERSISTED_TOTAL_BODY_BYTES = 12 * 1024 * 1024;
+const WS_REPLAY_MAX_SETUP_QUEUE_ITEMS = 250;
 const WS_REPLAY_TRANSCRIPT_SAVE_DELAY_MS = 2000;
 const WS_REPLAY_TRANSCRIPT_SAVE_MAX_WAIT_MS = 5000;
+const WEBSOCKET_SORTED_SUMMARY_REFRESH_MIN_MS = 2000;
 const WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES = 60 * 1024;
 const WORKSPACE_UNLOAD_HISTORY_ENTRIES_MAX_BYTES = 12 * 1024;
 const WORKSPACE_UNLOAD_RESPONSE_RECORD_MAX_BYTES = 12 * 1024;
@@ -496,9 +498,11 @@ let _websocketVisibleSyncDeferStaleDetail = false;
 let _websocketQueryBackfillTimer = 0;
 let _websocketQueryBackfillGeneration = 0;
 let _websocketFilteredReloadTimer = 0;
+let _websocketFilteredReloadDueAt = 0;
 let _websocketSearchReloadTimer = 0;
 let _lastHttpHistoryFallbackPoll = Date.now();
 let _lastWebsocketFallbackPoll = Date.now();
+let _lastWebsocketPageRefreshAt = 0;
 let _interceptToggleRequestSeq = 0;
 
 const els = {
@@ -2875,6 +2879,11 @@ function snapshotWorkspaceState(options = {}) {
         if (tab.type === "websocket") {
           const wsFramesSnapshot = snapshotWsReplayFrames(tab, wsFrameBudget);
           const wsFrames = wsFramesSnapshot.frames;
+          const wsSetupQueueSnapshot = limitWsSetupQueueItems(
+            Array.isArray(tab.wsSetupQueue)
+              ? tab.wsSetupQueue.map((item) => normalizeWsSetupItem(item))
+              : [],
+          );
           return {
             id: tab.id,
             type: "websocket",
@@ -2891,8 +2900,8 @@ function snapshotWorkspaceState(options = {}) {
             ws_editor_text: tab.wsEditorText || "",
             ws_message_type: normalizeWsMessageType(tab.wsMessageType),
             ws_editor_body_encoded: !!tab.wsEditorBodyEncoded,
-            ws_setup_notice: tab.wsSetupNotice || "",
-            ws_setup_queue: (Array.isArray(tab.wsSetupQueue) ? tab.wsSetupQueue : []).map((item) => ({
+            ws_setup_notice: appendWsSetupNotice(tab.wsSetupNotice || "", wsSetupQueueSnapshot.notice),
+            ws_setup_queue: wsSetupQueueSnapshot.items.map((item) => ({
               label: item.label || "",
               body: item.body || "",
               kind: normalizeWsMessageType(item.kind),
@@ -3822,6 +3831,7 @@ function resetSessionScopedUiState() {
   }
   _websocketSummaryEventBuffer.clear();
   _lastWebsocketFallbackPoll = Date.now();
+  _lastWebsocketPageRefreshAt = 0;
   state.eventLog = [];
   state.matchReplaceRules = [];
   state.selectedMatchReplaceRuleId = null;
@@ -4961,6 +4971,7 @@ function clearFilteredWebsocketReload() {
     window.clearTimeout(_websocketFilteredReloadTimer);
     _websocketFilteredReloadTimer = 0;
   }
+  _websocketFilteredReloadDueAt = 0;
 }
 
 function clearWebsocketSearchReload() {
@@ -4995,15 +5006,29 @@ function resetWebsocketHistoryScroll() {
   }
 }
 
-function scheduleWebsocketPageRefresh() {
+function scheduleWebsocketPageRefresh(options = {}) {
   state.websocketHistoryDirty = true;
-  if (_websocketFilteredReloadTimer) return;
+  const minDelayMs = Math.max(0, Number(options.minDelayMs) || 0);
+  const refreshDelay = minDelayMs
+    ? Math.max(0, minDelayMs - (Date.now() - _lastWebsocketPageRefreshAt))
+    : 250;
+  const dueAt = Date.now() + refreshDelay;
+  if (_websocketFilteredReloadTimer) {
+    if (minDelayMs || _websocketFilteredReloadDueAt <= dueAt) {
+      return;
+    }
+    window.clearTimeout(_websocketFilteredReloadTimer);
+    _websocketFilteredReloadTimer = 0;
+  }
+  _websocketFilteredReloadDueAt = dueAt;
   _websocketFilteredReloadTimer = window.setTimeout(() => {
     _websocketFilteredReloadTimer = 0;
+    _websocketFilteredReloadDueAt = 0;
     if (isWebsocketHistoryVisible()) {
+      _lastWebsocketPageRefreshAt = Date.now();
       loadWebsocketsPageRefresh(true).catch((error) => console.error(error));
     }
-  }, 250);
+  }, refreshDelay);
 }
 
 function scheduleFilteredWebsocketReload() {
@@ -5386,7 +5411,11 @@ function queueWebsocketSummaryEvent(event) {
 function applyWebsocketSummary(summary) {
   if (!summary?.id) return;
   if (!websocketServerOrderCanAcceptSummaryEvents()) {
-    scheduleWebsocketPageRefresh();
+    const selectedChanged = applySelectedWebsocketSummary(summary);
+    if (selectedChanged && isWebsocketHistoryVisible()) {
+      scheduleVisibleWebsocketSelectionSync({ deferStaleDetail: true });
+    }
+    scheduleWebsocketPageRefresh({ minDelayMs: WEBSOCKET_SORTED_SUMMARY_REFRESH_MIN_MS });
     return;
   }
 
@@ -18054,6 +18083,30 @@ function normalizeWsSetupItem(item = {}) {
   };
 }
 
+function appendWsSetupNotice(existingNotice, notice) {
+  const existing = String(existingNotice || "").trim();
+  const next = String(notice || "").trim();
+  if (!next || existing.includes(next)) return existing;
+  return existing ? `${existing} ${next}` : next;
+}
+
+function limitWsSetupQueueItems(items, options = {}) {
+  const setupItems = Array.isArray(items) ? items : [];
+  if (setupItems.length <= WS_REPLAY_MAX_SETUP_QUEUE_ITEMS) {
+    return { items: setupItems, notice: "" };
+  }
+  if (options.disableWhenOverflow) {
+    return {
+      items: [],
+      notice: `Auto-send setup was disabled because ${setupItems.length} earlier client messages exceed the ${WS_REPLAY_MAX_SETUP_QUEUE_ITEMS}-message saved setup limit.`,
+    };
+  }
+  return {
+    items: setupItems.slice(0, WS_REPLAY_MAX_SETUP_QUEUE_ITEMS),
+    notice: `Setup queue was limited to the first ${WS_REPLAY_MAX_SETUP_QUEUE_ITEMS} messages so the replay tab can be saved.`,
+  };
+}
+
 function wsSetupItemFromCapturedFrame(frame) {
   if (!isWsFrameReplayable(frame)) {
     return null;
@@ -18078,6 +18131,18 @@ function createWsReplayTab(seed = {}) {
   state.replayTabSequence += 1;
   const selectedFrameIndex = Number(seed.selectedFrameIndex);
   const seedFrames = normalizeWebsocketFrames(seed.capturedFrames);
+  const seedHasSetupQueue = Array.isArray(seed.setupQueue);
+  const setupQueueSource = seedHasSetupQueue
+    ? seed.setupQueue.map((item) => normalizeWsSetupItem(item))
+    : seedFrames
+      .filter((f) => f.direction === "client_to_server")
+      .filter((f) => !Number.isFinite(selectedFrameIndex) || f.index < selectedFrameIndex)
+      .filter((f) => !f.preview_truncated)
+      .map((f) => wsSetupItemFromCapturedFrame(f))
+      .filter(Boolean);
+  const limitedSetupQueue = limitWsSetupQueueItems(setupQueueSource, {
+    disableWhenOverflow: !seedHasSetupQueue,
+  });
   const tab = {
     id: crypto.randomUUID(),
     type: "websocket",
@@ -18107,15 +18172,8 @@ function createWsReplayTab(seed = {}) {
     wsLifecycleToken: 0,
     wsSetupPending: false,
     wsSetupRunning: false,
-    wsSetupNotice: seed.setupQueueNotice || "",
-    wsSetupQueue: Array.isArray(seed.setupQueue)
-      ? seed.setupQueue.map((item) => normalizeWsSetupItem(item))
-      : seedFrames
-        .filter((f) => f.direction === "client_to_server")
-        .filter((f) => !Number.isFinite(selectedFrameIndex) || f.index < selectedFrameIndex)
-        .filter((f) => !f.preview_truncated)
-        .map((f) => wsSetupItemFromCapturedFrame(f))
-        .filter(Boolean),
+    wsSetupNotice: appendWsSetupNotice(seed.setupQueueNotice || "", limitedSetupQueue.notice),
+    wsSetupQueue: limitedSetupQueue.items,
   };
   rebuildWsReplayFrameTracking(tab);
   state.replayTabs.push(tab);
@@ -19898,7 +19956,7 @@ function sendWsFrameToReplay(frameIdx) {
 
   const target = authorityToTargetState(session.host || "", wsScheme === "ws" ? "http" : "https");
   const port = normalizePortValue(target.port) || defaultWsPortForScheme(wsScheme);
-  createWsReplayTab({
+  const replayTab = createWsReplayTab({
     scheme: wsScheme,
     host: target.host,
     port,
@@ -19916,6 +19974,8 @@ function sendWsFrameToReplay(frameIdx) {
   });
   if (setupQueueMayBeIncomplete) {
     showToast("WebSocket history is truncated. Replay setup auto-send was disabled.", "warning");
+  } else if (replayTab.wsSetupNotice) {
+    showToast("WebSocket replay setup auto-send was disabled because there are too many earlier client messages.", "warning");
   }
   setActiveTool("replay");
   renderToolPanels();

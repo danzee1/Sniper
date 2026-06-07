@@ -2035,11 +2035,15 @@ impl From<crate::intercept::InterceptRule> for InterceptRulePayload {
 
 #[derive(Debug, Deserialize)]
 struct InterceptForwardPayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
     request: EditableRequest,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponseInterceptForwardPayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
     response: EditableResponse,
 }
 
@@ -2095,6 +2099,8 @@ struct CreateSessionPayload {
 
 #[derive(Debug, Deserialize)]
 struct AnnotationsPayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     color_tag: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
@@ -2590,22 +2596,35 @@ fn keepalive_replay_tab_membership_ids(
 }
 
 fn keepalive_new_replay_tab(
-    tab: ReplayTabState,
+    mut tab: ReplayTabState,
     keepalive: &WorkspaceKeepaliveMetadata,
 ) -> Option<ReplayTabState> {
     if tab.tab_type == "websocket" {
         if !keepalive.ws_text_complete() {
             return None;
         }
-        if tab.ws_setup_queue_complete != Some(true) || tab.ws_frames_complete != Some(true) {
+        if tab.ws_setup_queue_complete.is_none() || tab.ws_frames_complete.is_none() {
             return None;
+        }
+        if tab.ws_setup_queue_complete == Some(false) {
+            tab.ws_setup_queue.clear();
+        }
+        if tab.ws_frames_complete == Some(false) {
+            tab.ws_frames_truncated = true;
         }
         return Some(tab);
     }
-    (keepalive.text_complete()
-        && tab.history_entries_complete.unwrap_or(true)
-        && tab.response_record_complete.unwrap_or(true))
-    .then_some(tab)
+    if !keepalive.text_complete() {
+        return None;
+    }
+    if tab.history_entries_complete == Some(false) {
+        tab.history_entries.clear();
+        tab.history_index = None;
+    }
+    if tab.response_record_complete == Some(false) {
+        tab.response_record = None;
+    }
+    Some(tab)
 }
 
 fn complete_workspace_keepalive_fuzzer(
@@ -3617,12 +3636,17 @@ async fn update_transaction_annotations(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -3694,7 +3718,12 @@ async fn forward_intercept(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3707,7 +3736,7 @@ async fn forward_intercept(
     };
 
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -3950,7 +3979,12 @@ async fn forward_response_intercept(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+    let (target_session_id, session_id_is_explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let session = match resolve_session_for_optional_id(&state, target_session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -3963,7 +3997,7 @@ async fn forward_response_intercept(
     };
 
     let _operation_guard =
-        match guard_session_write_operation(&state, &session, query.session_id.is_none()).await {
+        match guard_session_write_operation(&state, &session, !session_id_is_explicit).await {
             Ok(guard) => guard,
             Err(response) => return response,
         };
@@ -6537,6 +6571,7 @@ mod tests {
     #[test]
     fn annotation_validation_limits_color_and_note_size() {
         assert!(validate_annotations_payload(&AnnotationsPayload {
+            session_id: None,
             color_tag: Some(Some("blue".to_string())),
             user_note: Some(Some("short note".to_string())),
             client_id: Some("browser-client".to_string()),
@@ -6544,6 +6579,7 @@ mod tests {
         })
         .is_ok());
         assert!(validate_annotations_payload(&AnnotationsPayload {
+            session_id: None,
             color_tag: Some(None),
             user_note: Some(None),
             client_id: None,
@@ -6553,6 +6589,7 @@ mod tests {
 
         assert_eq!(
             validate_annotations_payload(&AnnotationsPayload {
+                session_id: None,
                 color_tag: Some(Some("chartreuse".to_string())),
                 user_note: None,
                 client_id: None,
@@ -6562,6 +6599,7 @@ mod tests {
             "unsupported color tag"
         );
         assert!(validate_annotations_payload(&AnnotationsPayload {
+            session_id: None,
             color_tag: None,
             user_note: Some(Some("x".repeat(super::MAX_ANNOTATION_NOTE_BYTES + 1))),
             client_id: None,
@@ -6570,6 +6608,7 @@ mod tests {
         .unwrap_err()
         .contains("user note"));
         assert!(validate_annotations_payload(&AnnotationsPayload {
+            session_id: None,
             color_tag: None,
             user_note: None,
             client_id: Some("x".repeat(super::MAX_WORKSPACE_CLIENT_ID_BYTES + 1)),
@@ -6579,6 +6618,7 @@ mod tests {
         .contains("annotation client id"));
         assert_eq!(
             validate_annotations_payload(&AnnotationsPayload {
+                session_id: None,
                 color_tag: None,
                 user_note: None,
                 client_id: Some("browser-client".to_string()),
@@ -8087,6 +8127,69 @@ mod tests {
     }
 
     #[test]
+    fn workspace_keepalive_creates_missing_http_tab_shell_when_children_are_compact() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("existing".to_string()),
+                tabs: vec![ReplayTabState {
+                    id: "existing".to_string(),
+                    sequence: 1,
+                    ..ReplayTabState::default()
+                }],
+                ..ReplayWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("new-http".to_string()),
+                tab_sequence: 2,
+                tabs: vec![ReplayTabState {
+                    id: "new-http".to_string(),
+                    sequence: 2,
+                    custom_label: "Replay HTTP".to_string(),
+                    base_request: Some(test_editable_request("/compact")),
+                    request_text: "GET /compact HTTP/1.1\r\nHost: example.test\r\n\r\n".to_string(),
+                    target_scheme: "https".to_string(),
+                    target_host: "example.test".to_string(),
+                    target_port: "443".to_string(),
+                    response_record: None,
+                    response_record_complete: Some(false),
+                    history_entries: Vec::new(),
+                    history_entries_complete: Some(false),
+                    history_index: Some(7),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        assert_eq!(merged.replay.tabs.len(), 2);
+        assert_eq!(merged.replay.active_tab_id.as_deref(), Some("new-http"));
+        let tab = merged
+            .replay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "new-http")
+            .expect("new HTTP replay tab shell should be kept");
+        assert_eq!(tab.custom_label, "Replay HTTP");
+        assert_eq!(tab.target_host, "example.test");
+        assert_eq!(
+            tab.request_text,
+            "GET /compact HTTP/1.1\r\nHost: example.test\r\n\r\n"
+        );
+        assert!(tab.response_record.is_none());
+        assert!(tab.history_entries.is_empty());
+        assert!(tab.history_index.is_none());
+    }
+
+    #[test]
     fn workspace_keepalive_skips_missing_websocket_tab_when_text_is_partial() {
         let current = WorkspaceStateSnapshot::default();
         let incoming = WorkspaceStateSnapshot {
@@ -8121,7 +8224,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_keepalive_skips_missing_websocket_tab_when_arrays_are_compact() {
+    fn workspace_keepalive_creates_missing_websocket_tab_shell_when_arrays_are_compact() {
         let current = WorkspaceStateSnapshot {
             replay: ReplayWorkspaceState {
                 active_tab_id: Some("existing".to_string()),
@@ -8150,6 +8253,7 @@ mod tests {
                         .to_string(),
                     ws_editor_text: "hello".to_string(),
                     ws_setup_queue_complete: Some(false),
+                    ws_frames: vec![test_ws_replay_frame(42, "tail")],
                     ws_frames_complete: Some(false),
                     ..ReplayTabState::default()
                 }],
@@ -8163,10 +8267,23 @@ mod tests {
             super::WorkspaceKeepaliveMetadata::default(),
         );
 
-        assert_eq!(merged.replay.tabs.len(), 1);
-        assert_eq!(merged.replay.active_tab_id.as_deref(), Some("existing"));
-        let tab = &merged.replay.tabs[0];
-        assert_eq!(tab.id, "existing");
+        assert_eq!(merged.replay.tabs.len(), 2);
+        assert_eq!(merged.replay.active_tab_id.as_deref(), Some("ws-new"));
+        let tab = merged
+            .replay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "ws-new")
+            .expect("new websocket tab shell should be kept");
+        assert_eq!(tab.tab_type, "websocket");
+        assert_eq!(tab.custom_label, "Replay WS");
+        assert_eq!(tab.ws_host, "example.test");
+        assert_eq!(tab.ws_path, "/socket");
+        assert_eq!(tab.ws_editor_text, "hello");
+        assert!(tab.ws_setup_queue.is_empty());
+        assert_eq!(tab.ws_frames.len(), 1);
+        assert_eq!(tab.ws_frames[0].index, 42);
+        assert!(tab.ws_frames_truncated);
     }
 
     #[test]
@@ -8444,6 +8561,141 @@ mod tests {
         let error = super::validate_workspace_state(&snapshot).unwrap_err();
 
         assert!(error.contains("must match fuzzer base request"));
+    }
+
+    #[tokio::test]
+    async fn request_intercept_forward_body_session_id_targets_inactive_session() {
+        let state = Arc::new(
+            AppState::new(test_app_config("sniper-forward-request-body-session")).unwrap(),
+        );
+        let original = state.session().await;
+        let original_id = original.id();
+        let active_id = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap()
+            .id;
+        let record = InterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            peer_addr: "127.0.0.1:12345".to_string(),
+            request: test_editable_request("/queued"),
+            is_websocket: false,
+        };
+        let record_id = record.id;
+        let queue = original.intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(record).await }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+
+        let conflict = super::forward_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(active_id),
+            }),
+            Json(super::InterceptForwardPayload {
+                session_id: Some(original_id),
+                request: test_editable_request("/conflict"),
+            }),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(queue.list().await.len(), 1);
+
+        let response = super::forward_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Json(super::InterceptForwardPayload {
+                session_id: Some(original_id),
+                request: test_editable_request("/forwarded"),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(queue.list().await.is_empty());
+        match task.await.unwrap() {
+            InterceptResolution::Forward(request) => assert_eq!(request.path, "/forwarded"),
+            other => panic!("expected forward resolution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_intercept_forward_body_session_id_targets_inactive_session() {
+        let state = Arc::new(
+            AppState::new(test_app_config("sniper-forward-response-body-session")).unwrap(),
+        );
+        let original = state.session().await;
+        let original_id = original.id();
+        let active_id = state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap()
+            .id;
+        let record = ResponseInterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "GET".to_string(),
+            path: "/queued".to_string(),
+            status: 200,
+            response: test_editable_response(200),
+        };
+        let record_id = record.id;
+        let queue = original.response_intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(record).await }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+
+        let conflict = super::forward_response_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(active_id),
+            }),
+            Json(super::ResponseInterceptForwardPayload {
+                session_id: Some(original_id),
+                response: test_editable_response(409),
+            }),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(queue.list().await.len(), 1);
+
+        let response = super::forward_response_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionScopedQuery { session_id: None }),
+            Json(super::ResponseInterceptForwardPayload {
+                session_id: Some(original_id),
+                response: test_editable_response(204),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(queue.list().await.is_empty());
+        match task.await.unwrap() {
+            ResponseInterceptResolution::Forward(response) => assert_eq!(response.status, 204),
+            other => panic!("expected forward resolution, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -10085,6 +10337,7 @@ mod tests {
             Path(id.to_string()),
             Query(super::TransactionGetQuery { session_id: None }),
             Json(super::AnnotationsPayload {
+                session_id: None,
                 color_tag: Some(Some("blue".to_string())),
                 user_note: Some(Some("durable snapshot".to_string())),
                 client_id: None,
@@ -11937,10 +12190,11 @@ mod tests {
         let record_id = record.id;
         original.store.insert(record).await;
         state.persist_session_context(&original).await.unwrap();
-        state
+        let active_id = state
             .create_session(Some("new active".to_string()))
             .await
-            .unwrap();
+            .unwrap()
+            .id;
 
         let active_response = super::get_transaction(
             State(state.clone()),
@@ -12005,6 +12259,7 @@ mod tests {
             Path(record_id.to_string()),
             Query(super::TransactionGetQuery { session_id: None }),
             Json(super::AnnotationsPayload {
+                session_id: None,
                 color_tag: Some(Some("red".to_string())),
                 user_note: None,
                 client_id: None,
@@ -12020,10 +12275,9 @@ mod tests {
         let pinned_annotation_response = super::update_transaction_annotations(
             State(state.clone()),
             Path(record_id.to_string()),
-            Query(super::TransactionGetQuery {
-                session_id: Some(original_id),
-            }),
+            Query(super::TransactionGetQuery { session_id: None }),
             Json(super::AnnotationsPayload {
+                session_id: Some(original_id),
                 color_tag: Some(Some("blue".to_string())),
                 user_note: Some(Some("inactive note".to_string())),
                 client_id: None,
@@ -12036,6 +12290,28 @@ mod tests {
         let annotated = annotated_session.store.get(record_id).await.unwrap();
         assert_eq!(annotated.color_tag.as_deref(), Some("blue"));
         assert_eq!(annotated.user_note.as_deref(), Some("inactive note"));
+
+        let conflicting_annotation_response = super::update_transaction_annotations(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::TransactionGetQuery {
+                session_id: Some(active_id),
+            }),
+            Json(super::AnnotationsPayload {
+                session_id: Some(original_id),
+                color_tag: Some(Some("green".to_string())),
+                user_note: None,
+                client_id: None,
+                client_version: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            conflicting_annotation_response.status(),
+            super::StatusCode::BAD_REQUEST
+        );
+        let annotated_after_conflict = annotated_session.store.get(record_id).await.unwrap();
+        assert_eq!(annotated_after_conflict.color_tag.as_deref(), Some("blue"));
 
         let pinned_page_response = super::list_transactions_page(
             State(state.clone()),
