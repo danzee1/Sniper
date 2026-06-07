@@ -60,6 +60,7 @@ const WEBSOCKET_SORT_KEY_OPTIONS: &[&str] = &[
     "duration_ms",
     "started_at",
 ];
+const UI_SETTINGS_CLIENT_ID_MAX_CHARS: usize = 128;
 const WEBSOCKET_QUERY_MAX_CHARS: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,6 +130,10 @@ impl WorkbenchPaneWidthsSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppUiSettingsSnapshot {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub client_version: u64,
     pub display_settings: DisplaySettingsSnapshot,
     pub active_tool: String,
     pub active_proxy_tab: String,
@@ -154,6 +159,8 @@ pub struct AppUiSettingsSnapshot {
 impl Default for AppUiSettingsSnapshot {
     fn default() -> Self {
         Self {
+            client_id: String::new(),
+            client_version: 0,
             display_settings: DisplaySettingsSnapshot::default(),
             active_tool: "proxy".to_string(),
             active_proxy_tab: "http-history".to_string(),
@@ -179,6 +186,9 @@ impl AppUiSettingsSnapshot {
     fn sanitized(self) -> Self {
         let mut sanitized = Self::default();
 
+        sanitized.client_id =
+            trim_to_char_limit(self.client_id.trim(), UI_SETTINGS_CLIENT_ID_MAX_CHARS);
+        sanitized.client_version = self.client_version;
         sanitized.display_settings = self.display_settings.sanitized();
         sanitized.active_tool = sanitize_option(self.active_tool, "proxy", ACTIVE_TOOL_OPTIONS);
         sanitized.active_proxy_tab = sanitize_option(
@@ -265,6 +275,12 @@ impl AppUiSettingsStore {
     ) -> Result<AppUiSettingsSnapshot> {
         let next = snapshot.sanitized();
         let mut current = self.inner.write().await;
+        if !next.client_id.is_empty()
+            && next.client_id == current.client_id
+            && next.client_version <= current.client_version
+        {
+            return Ok(current.clone());
+        }
         persist_ui_settings(&self.path, &next)?;
         *current = next.clone();
         Ok(next)
@@ -398,6 +414,10 @@ fn sanitize_option(value: String, fallback: &str, allowed: &[&str]) -> String {
     }
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 fn trim_to_char_limit(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -490,6 +510,46 @@ mod tests {
         assert_eq!(persisted.websocket_stack_height, Some(345));
         assert_eq!(persisted.ws_replay_left_width, Some(555));
         assert_eq!(persisted.ws_replay_frame_detail_height, Some(222));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn ui_settings_store_ignores_stale_same_client_snapshot() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-ui-settings-{}", uuid::Uuid::new_v4()));
+        let store = AppUiSettingsStore::load_or_create(&data_dir).expect("store should load");
+
+        let initial = AppUiSettingsSnapshot {
+            client_id: "browser-client".to_string(),
+            client_version: 1,
+            active_tool: "proxy".to_string(),
+            ..AppUiSettingsSnapshot::default()
+        };
+        store
+            .replace_snapshot(initial.clone())
+            .await
+            .expect("initial snapshot should persist");
+
+        let mut newer = initial.clone();
+        newer.client_version = 2;
+        newer.active_tool = "replay".to_string();
+        store
+            .replace_snapshot(newer)
+            .await
+            .expect("newer snapshot should persist");
+
+        let stale = store
+            .replace_snapshot(initial)
+            .await
+            .expect("stale snapshot should be ignored");
+        assert_eq!(stale.client_version, 2);
+        assert_eq!(stale.active_tool, "replay");
+
+        let reloaded = AppUiSettingsStore::load_or_create(&data_dir).expect("store should reload");
+        let persisted = reloaded.snapshot().await;
+        assert_eq!(persisted.client_version, 2);
+        assert_eq!(persisted.active_tool, "replay");
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

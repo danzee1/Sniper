@@ -1474,6 +1474,19 @@ fn write_session_query_path(path: &str, explicit_session_id: Option<Uuid>) -> St
     session_query_path(path, session_id_for_write_payload(explicit_session_id))
 }
 
+fn sequence_write_session_id(
+    cli_session_id: Option<Uuid>,
+    input_session_id: Option<Uuid>,
+) -> Result<Option<Uuid>> {
+    if cli_session_id.is_some() && input_session_id.is_some() && cli_session_id != input_session_id
+    {
+        bail!("sequence JSON session_id conflicts with --session-id");
+    }
+    Ok(session_id_for_write_payload(
+        cli_session_id.or(input_session_id),
+    ))
+}
+
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
         HistoryCommand::List(args) => {
@@ -2220,12 +2233,7 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             let raw = read_text_input(file, stdin)?;
             let input: SequenceCreateInput =
                 serde_json::from_str(&raw).context("failed to parse sequence JSON")?;
-            if session_id.is_some() && input.session_id.is_some() && session_id != input.session_id
-            {
-                bail!("sequence JSON session_id conflicts with --session-id");
-            }
-            let target_session_id = session_id.or(input.session_id);
-            let session_id = resolve_session_id_arg(&api, target_session_id).await?;
+            let session_id = sequence_write_session_id(session_id, input.session_id)?;
             let def = input.definition;
             api.post_status(
                 "/api/sequences",
@@ -2238,7 +2246,7 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             print_json_with_session(&def, session_id)
         }
         SequenceCommand::Run(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let session_id = session_id_for_write_payload(args.session_id);
             let mut result: serde_json::Value = api
                 .post_json_long(
                     &format!("/api/sequences/{}/run", args.id),
@@ -2257,8 +2265,9 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             print_json(&run)
         }
         SequenceCommand::Delete(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path(&format!("/api/sequences/{}", args.id), session_id);
+            let session_id = session_id_for_write_payload(args.session_id);
+            let path =
+                write_session_query_path(&format!("/api/sequences/{}", args.id), args.session_id);
             api.delete_status(&path).await?;
             print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
         }
@@ -4480,13 +4489,14 @@ mod tests {
         read_payloads_input, read_raw_request_input, read_raw_response_input, read_text_input,
         replay_send_http_version, replay_send_target_for_tab, replay_tab_target_as_request,
         replay_tab_target_matches_request, replay_update_should_preserve_current_port,
-        session_id_for_write_payload, session_query_path, sniper_settings_probe_matches,
-        split_host_port, split_payload_lines, strip_host_port, sync_replay_tab_target_to_request,
-        transaction_detail_path, validate_sniper_settings_probe, websocket_detail_path,
-        websocket_list_path, workspace_conflict_message, write_session_query_path, Cli, Command,
-        HistoryCommand, HistoryListArgs, HistoryListResponse, OastConfigureArgs, SequenceCommand,
-        SequenceCreateInput, SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation,
-        WebSocketListArgs, WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
+        sequence_write_session_id, session_id_for_write_payload, session_query_path,
+        sniper_settings_probe_matches, split_host_port, split_payload_lines, strip_host_port,
+        sync_replay_tab_target_to_request, transaction_detail_path, validate_sniper_settings_probe,
+        websocket_detail_path, websocket_list_path, workspace_conflict_message,
+        write_session_query_path, Cli, Command, HistoryCommand, HistoryListArgs,
+        HistoryListResponse, OastConfigureArgs, SequenceCommand, SequenceCreateInput,
+        SessionCommand, SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs,
+        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, MAX_CLI_INPUT_BYTES,
         SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
@@ -4803,6 +4813,28 @@ mod tests {
             write_session_query_path("/api/match-replace", Some(session_id)),
             "/api/match-replace?session_id=22222222-2222-2222-2222-222222222222"
         );
+    }
+
+    #[test]
+    fn sequence_write_session_id_only_uses_explicit_sources() {
+        let cli_session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let input_session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        assert_eq!(sequence_write_session_id(None, None).unwrap(), None);
+        assert_eq!(
+            sequence_write_session_id(Some(cli_session_id), None).unwrap(),
+            Some(cli_session_id)
+        );
+        assert_eq!(
+            sequence_write_session_id(None, Some(input_session_id)).unwrap(),
+            Some(input_session_id)
+        );
+
+        let error = sequence_write_session_id(Some(cli_session_id), Some(input_session_id))
+            .expect_err("conflicting explicit sequence session ids should fail");
+        assert!(error
+            .to_string()
+            .contains("sequence JSON session_id conflicts with --session-id"));
     }
 
     #[test]

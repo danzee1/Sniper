@@ -2448,15 +2448,15 @@ fn keepalive_replay_tab_membership_ids(
 }
 
 fn keepalive_new_replay_tab(
-    mut tab: ReplayTabState,
+    tab: ReplayTabState,
     keepalive: &WorkspaceKeepaliveMetadata,
 ) -> Option<ReplayTabState> {
     if tab.tab_type == "websocket" {
         if !keepalive.ws_text_complete() {
             return None;
         }
-        if !tab.ws_frames_complete.unwrap_or(true) {
-            tab.ws_frames_truncated = true;
+        if tab.ws_setup_queue_complete != Some(true) || tab.ws_frames_complete != Some(true) {
+            return None;
         }
         return Some(tab);
     }
@@ -7859,17 +7859,28 @@ mod tests {
     }
 
     #[test]
-    fn workspace_keepalive_creates_missing_websocket_tab_when_arrays_are_compact() {
-        let current = WorkspaceStateSnapshot::default();
+    fn workspace_keepalive_skips_missing_websocket_tab_when_arrays_are_compact() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("existing".to_string()),
+                tabs: vec![ReplayTabState {
+                    id: "existing".to_string(),
+                    sequence: 1,
+                    ..ReplayTabState::default()
+                }],
+                ..ReplayWorkspaceState::default()
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
         let incoming = WorkspaceStateSnapshot {
             replay: ReplayWorkspaceState {
                 active_tab_id: Some("ws-new".to_string()),
-                tab_sequence: 1,
+                tab_sequence: 2,
                 tabs: vec![ReplayTabState {
                     id: "ws-new".to_string(),
                     tab_type: "websocket".to_string(),
                     custom_label: "Replay WS".to_string(),
-                    sequence: 1,
+                    sequence: 2,
                     ws_scheme: "wss".to_string(),
                     ws_host: "example.test".to_string(),
                     ws_path: "/socket".to_string(),
@@ -7891,13 +7902,84 @@ mod tests {
         );
 
         assert_eq!(merged.replay.tabs.len(), 1);
+        assert_eq!(merged.replay.active_tab_id.as_deref(), Some("existing"));
+        let tab = &merged.replay.tabs[0];
+        assert_eq!(tab.id, "existing");
+    }
+
+    #[test]
+    fn workspace_keepalive_creates_missing_websocket_tab_when_arrays_are_complete_empty() {
+        let current = WorkspaceStateSnapshot::default();
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws-new".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws-new".to_string(),
+                    tab_type: "websocket".to_string(),
+                    custom_label: "Replay WS".to_string(),
+                    sequence: 1,
+                    ws_scheme: "wss".to_string(),
+                    ws_host: "example.test".to_string(),
+                    ws_path: "/socket".to_string(),
+                    ws_handshake_text: "GET /socket HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                        .to_string(),
+                    ws_editor_text: "hello".to_string(),
+                    ws_setup_queue_complete: Some(true),
+                    ws_frames_complete: Some(true),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        assert_eq!(merged.replay.tabs.len(), 1);
         assert_eq!(merged.replay.active_tab_id.as_deref(), Some("ws-new"));
         let tab = &merged.replay.tabs[0];
         assert_eq!(tab.tab_type, "websocket");
         assert_eq!(tab.ws_host, "example.test");
         assert!(tab.ws_setup_queue.is_empty());
         assert!(tab.ws_frames.is_empty());
-        assert!(tab.ws_frames_truncated);
+        assert!(!tab.ws_frames_truncated);
+    }
+
+    #[test]
+    fn workspace_keepalive_skips_missing_websocket_tab_when_array_flags_are_missing() {
+        let current = WorkspaceStateSnapshot::default();
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("ws-new".to_string()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: "ws-new".to_string(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_scheme: "wss".to_string(),
+                    ws_host: "example.test".to_string(),
+                    ws_path: "/socket".to_string(),
+                    ws_handshake_text: "GET /socket HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                        .to_string(),
+                    ws_editor_text: "hello".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata::default(),
+        );
+
+        assert!(merged.replay.tabs.is_empty());
+        assert!(merged.replay.active_tab_id.is_none());
     }
 
     #[test]

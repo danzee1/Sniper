@@ -839,6 +839,8 @@ let workspaceSaveLastSnapshot = null;
 const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
+const uiSettingsClientId = createWorkspaceClientId();
+let uiSettingsSaveVersion = 0;
 let uiSettingsSaveTimer = null;
 let uiSettingsDirty = false;
 let uiSettingsInFlight = false;
@@ -14392,6 +14394,8 @@ function applyUiSettingsSnapshot(snapshot) {
 
 function snapshotUiSettings() {
   return {
+    client_id: uiSettingsClientId,
+    client_version: uiSettingsSaveVersion,
     display_settings: {
       size_px: state.displaySettings.sizePx,
       theme: state.displaySettings.theme,
@@ -14417,6 +14421,11 @@ function snapshotUiSettings() {
   };
 }
 
+function nextUiSettingsPayload() {
+  uiSettingsSaveVersion += 1;
+  return JSON.stringify(snapshotUiSettings());
+}
+
 function scheduleUiSettingsSave(delay = 180) {
   uiSettingsDirty = true;
   window.clearTimeout(uiSettingsSaveTimer);
@@ -14434,7 +14443,7 @@ async function persistUiSettings() {
   try {
     while (uiSettingsDirty) {
       uiSettingsDirty = false;
-      const payload = JSON.stringify(snapshotUiSettings());
+      const payload = nextUiSettingsPayload();
       lastUiSettingsPayload = payload;
       const response = await fetch("/api/ui-settings", {
         method: "POST",
@@ -14460,7 +14469,7 @@ function flushUiSettingsOnUnload() {
   }
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = null;
-  const payload = uiSettingsDirty ? JSON.stringify(snapshotUiSettings()) : lastUiSettingsPayload;
+  const payload = uiSettingsDirty ? nextUiSettingsPayload() : lastUiSettingsPayload;
   if (!payload) {
     return;
   }
