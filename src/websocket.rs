@@ -281,6 +281,15 @@ impl WebSocketStore {
         ) {
             return page;
         }
+        if let Some(page) = list_filtered_storage_order_page(
+            &inner,
+            total,
+            limit,
+            filters,
+            normalized_query.as_deref(),
+        ) {
+            return page;
+        }
         let mut matched: Vec<(usize, WebSocketSessionSummary)> = inner
             .order
             .iter()
@@ -511,6 +520,84 @@ fn websocket_summary_matches_filters(
         }
     }
     true
+}
+
+fn list_filtered_storage_order_page(
+    inner: &WebSocketStoreInner,
+    total: usize,
+    limit: usize,
+    filters: &WebSocketListFilters,
+    normalized_query: Option<&str>,
+) -> Option<WebSocketListPage> {
+    if !storage_order_satisfies_websocket_sort(inner, filters) {
+        return None;
+    }
+
+    let offset = filtered_storage_order_offset_after_id(inner, filters, normalized_query)
+        .unwrap_or_else(|| filters.offset.unwrap_or(0));
+    let mut matched_count = 0usize;
+    let mut exhausted = true;
+    let mut items = if limit == 0 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(limit.min(total.saturating_sub(offset)))
+    };
+    let stop_after = if limit == 0 {
+        None
+    } else {
+        Some(offset.saturating_add(limit).saturating_add(1))
+    };
+
+    for id in inner.order.iter() {
+        let Some(summary) = inner.sessions.get(id).map(WebSocketSessionEntry::summary) else {
+            continue;
+        };
+        if !websocket_summary_matches_filters(&summary, filters, normalized_query) {
+            continue;
+        }
+
+        let matched_index = matched_count;
+        matched_count += 1;
+        if matched_index >= offset && (limit == 0 || items.len() < limit) {
+            items.push(summary);
+        }
+        if stop_after.is_some_and(|threshold| matched_count >= threshold) {
+            exhausted = false;
+            break;
+        }
+    }
+
+    let has_more = limit != 0 && matched_count > offset.saturating_add(items.len());
+    Some(WebSocketListPage {
+        items,
+        total,
+        filtered_total: exhausted.then_some(matched_count),
+        offset,
+        limit,
+        has_more,
+    })
+}
+
+fn filtered_storage_order_offset_after_id(
+    inner: &WebSocketStoreInner,
+    filters: &WebSocketListFilters,
+    normalized_query: Option<&str>,
+) -> Option<usize> {
+    let after_id = filters.after_id?;
+    let mut filtered_index = 0usize;
+    for id in inner.order.iter() {
+        let Some(summary) = inner.sessions.get(id).map(WebSocketSessionEntry::summary) else {
+            continue;
+        };
+        if !websocket_summary_matches_filters(&summary, filters, normalized_query) {
+            continue;
+        }
+        if summary.id == after_id {
+            return Some(filtered_index.saturating_add(1));
+        }
+        filtered_index += 1;
+    }
+    None
 }
 
 fn list_unfiltered_storage_order_page(
@@ -826,6 +913,36 @@ mod tests {
 
         assert_eq!(page.items.len(), DEFAULT_WEBSOCKET_LIST_LIMIT);
         assert_eq!(page.limit, DEFAULT_WEBSOCKET_LIST_LIMIT);
+        assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_streams_storage_order_without_full_count() {
+        let now = Utc::now();
+        let records = (0..25)
+            .map(|idx| {
+                let mut record = session(vec![frame(1)]);
+                record.host = format!("chat-{idx}.example.test");
+                record.started_at = now - chrono::Duration::milliseconds(idx as i64);
+                record
+            })
+            .collect::<Vec<_>>();
+        let store = WebSocketStore::from_sessions(100, 10, records);
+
+        let page = store
+            .list_page_filtered(&WebSocketListFilters {
+                query: Some("example.test".to_string()),
+                limit: Some(2),
+                sort_key: Some("started_at".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].host, "chat-0.example.test");
+        assert_eq!(page.items[1].host, "chat-1.example.test");
+        assert_eq!(page.filtered_total, None);
         assert!(page.has_more);
     }
 

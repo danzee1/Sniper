@@ -1466,10 +1466,6 @@ fn explicit_or_active_session_id(
     explicit_session_id.or(active_session_id)
 }
 
-fn optional_session_write_id(explicit_session_id: Option<Uuid>) -> Option<Uuid> {
-    explicit_session_id
-}
-
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
         HistoryCommand::List(args) => {
@@ -1548,7 +1544,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
                 bail!("provide at least one of --color, --clear-color, --note, or --clear-note");
             }
             let payload = build_annotations_payload(color_tag, user_note);
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path(
                 &format!("/api/transactions/{}/annotations", args.id),
                 session_id,
@@ -1607,7 +1603,7 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             })
         }
         TargetCommand::SetScope(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let scope_patterns = if args.clear {
                 Vec::new()
             } else {
@@ -1952,7 +1948,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
 async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<()> {
     match command {
         InterceptCommand::On(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
@@ -1967,7 +1963,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             print_json_with_session(&runtime, session_id)
         }
         InterceptCommand::Off(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let runtime: RuntimeSettingsSnapshot = api
                 .post_json(
                     "/api/runtime",
@@ -1988,7 +1984,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             print_json(&intercepts)
         }
         InterceptCommand::Forward(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let detail_path =
                 session_query_path(&format!("/api/intercepts/{}", args.id), session_id);
             let intercept: InterceptRecord = api.get_json(&detail_path).await?;
@@ -2011,7 +2007,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             })
         }
         InterceptCommand::Drop(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path(&format!("/api/intercepts/{}/drop", args.id), session_id);
             api.post_status(&path, &json!({})).await?;
             print_json(&InterceptActionResult {
@@ -2022,7 +2018,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             })
         }
         InterceptCommand::ForwardAll(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/intercepts/forward-all", session_id);
             let mut result: serde_json::Value = api
                 .post_json_or_no_content(&path, &json!({}))
@@ -2070,7 +2066,7 @@ async fn handle_auto_replace(api: ApiClient, command: AutoReplaceCommand) -> Res
             print_json(&rules)
         }
         AutoReplaceCommand::Set(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let raw = read_text_input(args.file, args.stdin)?;
             let parsed: AutoReplaceInput = serde_json::from_str(&raw).context(
                 "failed to parse auto-replace JSON; expected either an array of rules or {\"rules\": [...]}",
@@ -2105,7 +2101,7 @@ async fn handle_response_intercept(
             print_json(&item)
         }
         ResponseInterceptCommand::Forward(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let detail_path =
                 session_query_path(&format!("/api/response-intercepts/{}", args.id), session_id);
             let item: ResponseInterceptRecord = api.get_json(&detail_path).await?;
@@ -2128,7 +2124,7 @@ async fn handle_response_intercept(
             })
         }
         ResponseInterceptCommand::Drop(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path(
                 &format!("/api/response-intercepts/{}/drop", args.id),
                 session_id,
@@ -2142,7 +2138,7 @@ async fn handle_response_intercept(
             })
         }
         ResponseInterceptCommand::ForwardAll(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/response-intercepts/forward-all", session_id);
             let mut result: serde_json::Value = api
                 .post_json_or_no_content(&path, &json!({}))
@@ -2168,7 +2164,7 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
             print_json(&rules)
         }
         InterceptRuleCommand::Create(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let _explicit_all = args.all;
             let rule = json!({
                 "id": Uuid::new_v4(),
@@ -2183,7 +2179,7 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
             print_json_with_session(&rule, session_id)
         }
         InterceptRuleCommand::Delete(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path(&format!("/api/intercept-rules/{}", args.id), session_id);
             api.delete_status(&path).await?;
             print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
@@ -2316,13 +2312,13 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
             print_json(&result)
         }
         OastCommand::Clear(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/oast/callbacks/clear", session_id);
             api.post_status(&path, &serde_json::json!({})).await?;
             print_json(&serde_json::json!({"status": "cleared", "session_id": session_id}))
         }
         OastCommand::Configure(args) => {
-            let session_id = optional_session_write_id(args.session_id);
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             if args.provider.as_deref() == Some("boast") && args.token.is_some() {
                 bail!("BOAST provider does not use an OAST token");
             }
@@ -4466,13 +4462,12 @@ mod tests {
         failed_record_output, fuzzer_active_target_for_request,
         fuzzer_target_request_authority_for_request, history_list_path, install_skills,
         next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
-        normalize_target_inputs, oast_fields_for_output, optional_session_write_id,
-        parse_editable_raw_request, parse_editable_raw_request_bytes_with_version,
-        parse_editable_raw_request_with_version, parse_editable_raw_response,
-        parse_editable_raw_response_bytes, prepare_cli_workspace_save, process_path_strings_match,
-        push_replay_history_entry, read_limited_to_end, read_payloads_input,
-        read_raw_request_input, read_raw_response_input, read_text_input, replay_send_http_version,
-        replay_send_target_for_tab, replay_tab_target_as_request,
+        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
+        parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
+        parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
+        process_path_strings_match, push_replay_history_entry, read_limited_to_end,
+        read_payloads_input, read_raw_request_input, read_raw_response_input, read_text_input,
+        replay_send_http_version, replay_send_target_for_tab, replay_tab_target_as_request,
         replay_tab_target_matches_request, replay_update_should_preserve_current_port,
         session_query_path, sniper_settings_probe_matches, split_host_port, split_payload_lines,
         strip_host_port, sync_replay_tab_target_to_request, transaction_detail_path,
@@ -4771,14 +4766,6 @@ mod tests {
             Some(active)
         );
         assert_eq!(explicit_or_active_session_id(None, None), None);
-    }
-
-    #[test]
-    fn optional_session_writes_do_not_resolve_implicit_active_session() {
-        let explicit = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-
-        assert_eq!(optional_session_write_id(Some(explicit)), Some(explicit));
-        assert_eq!(optional_session_write_id(None), None);
     }
 
     #[test]
