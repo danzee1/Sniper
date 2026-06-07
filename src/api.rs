@@ -3506,9 +3506,6 @@ async fn update_scanner_config(
     Query(query): Query<SessionWriteQuery>,
     Json(payload): Json<ScannerConfigPayload>,
 ) -> Response {
-    if let Err(error) = validate_scanner_config(&payload.config) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
-    }
     let (target_session_id, session_id_is_explicit) =
         match reconcile_write_session_id(query.session_id, payload.session_id) {
             Ok(value) => value,
@@ -3525,6 +3522,9 @@ async fn update_scanner_config(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if let Err(error) = validate_scanner_config(&payload.config) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
     let _operation_guard = match guard_session_write_operation(
         &state,
         &session,
@@ -7431,6 +7431,52 @@ mod tests {
         assert!(super::validate_scanner_config(&config)
             .unwrap_err()
             .contains("duplicated"));
+    }
+
+    #[tokio::test]
+    async fn scanner_config_update_rejects_unknown_session_before_config_validation() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-scanner-config-unknown-session-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 32,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let active = state.session().await;
+        let mut invalid_config = active.scanner.get_config().await;
+        invalid_config.custom_rules.push(CustomRule {
+            id: "invalid".to_string(),
+            name: "Invalid".to_string(),
+            enabled: true,
+            target: "response_body".to_string(),
+            header_name: String::new(),
+            pattern: "   ".to_string(),
+            severity: Severity::Info,
+            category: "custom".to_string(),
+            description: String::new(),
+        });
+
+        let response = super::update_scanner_config(
+            State(state.clone()),
+            Query(super::SessionWriteQuery {
+                session_id: Some(Uuid::new_v4()),
+                expected_active_session_id: None,
+            }),
+            Json(super::ScannerConfigPayload::from(invalid_config)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(active.scanner.get_config().await.custom_rules.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

@@ -440,6 +440,8 @@ const state = {
   eventLog: [],
   matchReplaceRules: [],
   selectedMatchReplaceRuleId: null,
+  matchReplaceDirty: false,
+  matchReplaceEditorSessionId: null,
   targetSiteMap: [],
   oastCallbacks: [],
   selectedOastId: null,
@@ -506,6 +508,7 @@ let _lastHttpHistoryFallbackPoll = Date.now();
 let _lastWebsocketFallbackPoll = Date.now();
 let _lastWebsocketPageRefreshAt = 0;
 let _interceptToggleRequestSeq = 0;
+let _interceptToggleInFlight = false;
 
 const els = {
   dashboardShell: document.getElementById("dashboardShell"),
@@ -1057,7 +1060,12 @@ function bindEvents() {
         loadRuntimeSettings().catch((error) => console.error(error));
       }
       if (state.activeProxyTab === "replace") {
-        loadMatchReplaceRules().catch((error) => console.error(error));
+        flushMatchReplaceDraft()
+          .then((ok) => {
+            if (ok) return loadMatchReplaceRules();
+            return null;
+          })
+          .catch((error) => console.error(error));
       }
       if (state.activeProxyTab === "oast") {
         loadOastCallbacks().catch((error) => console.error(error));
@@ -4027,6 +4035,8 @@ function resetSessionScopedUiState() {
   state.eventLog = [];
   state.matchReplaceRules = [];
   state.selectedMatchReplaceRuleId = null;
+  state.matchReplaceDirty = false;
+  state.matchReplaceEditorSessionId = null;
   state.targetSiteMap = [];
   resetOastUiState();
   state.targetScopeDraft = "";
@@ -4159,6 +4169,9 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
   if (!(await flushTargetScopeDraft(staleSessionWriteOptions))) {
     return;
   }
+  if (!(await flushMatchReplaceDraft(staleSessionWriteOptions))) {
+    return;
+  }
   try {
     await flushAllPendingAnnotations(staleSessionWriteOptions);
   } catch (error) {
@@ -4189,6 +4202,9 @@ async function createSession() {
   if (!(await flushTargetScopeDraft())) {
     return;
   }
+  if (!(await flushMatchReplaceDraft())) {
+    return;
+  }
   if (!(await flushSequenceDraft())) {
     return;
   }
@@ -4212,6 +4228,9 @@ async function createSession() {
 
 async function activateSessionById(id) {
   if (!(await flushTargetScopeDraft())) {
+    return;
+  }
+  if (!(await flushMatchReplaceDraft())) {
     return;
   }
   if (!(await flushSequenceDraft())) {
@@ -6138,38 +6157,76 @@ async function clearEventLog() {
 
 async function loadMatchReplaceRules() {
   const sessionId = currentSessionId();
+  if (state.matchReplaceDirty && state.matchReplaceEditorSessionId === sessionId) {
+    return;
+  }
   const response = await fetch(sessionQueryPath("/api/match-replace", sessionId));
   await requireOkResponse(response, "Failed to load match-replace rules.");
   const rules = jsonArray(await response.json());
   if (sessionId !== currentSessionId()) {
     return;
   }
-  state.matchReplaceRules = rules;
-  if (!state.matchReplaceRules.some((rule) => rule.id === state.selectedMatchReplaceRuleId)) {
-    state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
-  }
-  renderMatchReplaceRules();
-}
-
-async function saveMatchReplaceRules() {
-  const sessionId = currentSessionId();
-  const response = await fetch(sessionWritePath("/api/match-replace", sessionId), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ rules: state.matchReplaceRules }),
-  });
-  await requireOkResponse(response, "Failed to save match-replace rules.");
-  const rules = jsonArray(await response.json());
-  if (sessionId !== currentSessionId()) {
+  if (state.matchReplaceDirty && state.matchReplaceEditorSessionId === sessionId) {
     return;
   }
   state.matchReplaceRules = rules;
   if (!state.matchReplaceRules.some((rule) => rule.id === state.selectedMatchReplaceRuleId)) {
     state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
   }
+  state.matchReplaceDirty = false;
+  state.matchReplaceEditorSessionId = sessionId;
   renderMatchReplaceRules();
+}
+
+async function saveMatchReplaceRules(options = {}) {
+  const sessionId = options.sessionId || currentSessionId();
+  if (!sessionId) {
+    return;
+  }
+  if (
+    state.matchReplaceDirty
+    && state.matchReplaceEditorSessionId
+    && state.matchReplaceEditorSessionId !== sessionId
+  ) {
+    throw new Error("Match/Replace editor changed sessions. Review the rule and save again.");
+  }
+  const response = await fetch(sessionWritePath("/api/match-replace", sessionId, options), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ session_id: sessionId, rules: state.matchReplaceRules }),
+  });
+  await requireOkResponse(response, "Failed to save match-replace rules.");
+  const rules = jsonArray(await response.json());
+  if (sessionId !== currentSessionId()) {
+    if (state.matchReplaceEditorSessionId === sessionId) {
+      state.matchReplaceDirty = false;
+      state.matchReplaceEditorSessionId = null;
+    }
+    return;
+  }
+  state.matchReplaceRules = rules;
+  if (!state.matchReplaceRules.some((rule) => rule.id === state.selectedMatchReplaceRuleId)) {
+    state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
+  }
+  state.matchReplaceDirty = false;
+  state.matchReplaceEditorSessionId = sessionId;
+  renderMatchReplaceRules();
+}
+
+async function flushMatchReplaceDraft(options = {}) {
+  if (!state.matchReplaceDirty) {
+    return true;
+  }
+  try {
+    await saveMatchReplaceRules(options);
+    return true;
+  } catch (error) {
+    console.error(error);
+    showToast(error?.message || "Failed to save match-replace rule", "error");
+    return false;
+  }
 }
 
 function formatScopePatternsText(patterns) {
@@ -11869,13 +11926,27 @@ function syncMatchReplaceEditor() {
     return;
   }
 
-  rule.description = "";
-  rule.scope = els.matchReplaceScope.value;
-  rule.target = els.matchReplaceTarget.value;
-  rule.search = els.matchReplaceSearch.value;
-  rule.replace = els.matchReplaceReplace.value;
-  rule.regex = els.matchReplaceRegex.checked;
-  rule.case_sensitive = els.matchReplaceCaseSensitive.checked;
+  const next = {
+    description: "",
+    scope: els.matchReplaceScope.value,
+    target: els.matchReplaceTarget.value,
+    search: els.matchReplaceSearch.value,
+    replace: els.matchReplaceReplace.value,
+    regex: els.matchReplaceRegex.checked,
+    case_sensitive: els.matchReplaceCaseSensitive.checked,
+  };
+  const changed = rule.description !== next.description
+    || rule.scope !== next.scope
+    || rule.target !== next.target
+    || rule.search !== next.search
+    || rule.replace !== next.replace
+    || Boolean(rule.regex) !== next.regex
+    || Boolean(rule.case_sensitive) !== next.case_sensitive;
+  Object.assign(rule, next);
+  if (changed) {
+    state.matchReplaceDirty = true;
+    state.matchReplaceEditorSessionId = currentSessionId();
+  }
 }
 
 async function deleteSelectedMatchReplaceRule() {
@@ -12946,70 +13017,76 @@ function normalizeSequenceRunResult(run) {
 }
 
 async function toggleIntercept() {
-  if (!state.runtime) {
+  if (!state.runtime || _interceptToggleInFlight) {
     return;
   }
 
   const sessionId = currentSessionId();
   const turningOff = state.runtime.intercept_enabled;
+  const previousInterceptEnabled = Boolean(state.runtime.intercept_enabled);
   // Optimistic UI update — render immediately, sync in background
   state.runtime.intercept_enabled = !state.runtime.intercept_enabled;
   const desiredInterceptEnabled = state.runtime.intercept_enabled;
   const requestSeq = ++_interceptToggleRequestSeq;
+  _interceptToggleInFlight = true;
+  els.interceptStatus.disabled = true;
   renderInterceptStatus();
 
-  fetch("/api/runtime", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      session_id: sessionId,
-      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
-      intercept_enabled: desiredInterceptEnabled,
-    }),
-  }).then(async (r) => {
-    await requireOkResponse(r, "Failed to update intercept mode.");
-    return r.json();
-  }).then((rt) => {
-    if (requestSeq === _interceptToggleRequestSeq && sessionId === currentSessionId()) {
-      state.runtime = rt;
-      renderInterceptStatus();
+  try {
+    const runtimeResponse = await fetch("/api/runtime", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+        intercept_enabled: desiredInterceptEnabled,
+      }),
+    });
+    await requireOkResponse(runtimeResponse, "Failed to update intercept mode.");
+    const runtime = await runtimeResponse.json();
+    if (requestSeq !== _interceptToggleRequestSeq || sessionId !== currentSessionId()) {
+      return;
     }
-  })
-    .catch((error) => {
+    state.runtime = runtime;
+    renderInterceptStatus();
+
+    if (turningOff && state.runtime?.intercept_enabled === false) {
+      const [requestResponse, responseResponse] = await Promise.all([
+        fetch(sessionWritePath("/api/intercepts/forward-all", sessionId), { method: "POST" }),
+        fetch(sessionWritePath("/api/response-intercepts/forward-all", sessionId), { method: "POST" }),
+      ]);
+      await requireOkResponse(requestResponse, "Failed to forward queued requests.");
+      await requireOkResponse(responseResponse, "Failed to forward queued responses.");
       if (requestSeq !== _interceptToggleRequestSeq || sessionId !== currentSessionId()) {
         return;
       }
-      console.error(error);
-      showToast(error?.message || "Failed to update intercept mode.", "error");
-      loadRuntimeSettings().then(renderInterceptStatus).catch(console.error);
-    });
-
-  if (turningOff) {
-    Promise.all([
-      fetch(sessionWritePath("/api/intercepts/forward-all", sessionId), { method: "POST" }),
-      fetch(sessionWritePath("/api/response-intercepts/forward-all", sessionId), { method: "POST" }),
-    ]).then(async ([requestResponse, responseResponse]) => {
-      await requireOkResponse(requestResponse, "Failed to forward queued requests.");
-      await requireOkResponse(responseResponse, "Failed to forward queued responses.");
-    }).then(() => {
-      if (sessionId !== currentSessionId()) {
-        return null;
+      await Promise.all([loadIntercepts(false), loadResponseIntercepts(false)]);
+      if (sessionId === currentSessionId()) {
+        scheduleRefresh();
       }
-      return Promise.all([loadIntercepts(false), loadResponseIntercepts(false)]);
-    })
-      .then(() => {
-        if (sessionId === currentSessionId()) {
-          scheduleRefresh();
-        }
-      })
-      .catch((error) => {
-        if (sessionId !== currentSessionId()) {
-          return;
-        }
-        console.error(error);
-        showToast(error?.message || "Failed to forward queued intercepts.", "error");
-        Promise.all([loadIntercepts(false), loadResponseIntercepts(false)]).catch(console.error);
-      });
+    }
+  } catch (error) {
+    if (requestSeq !== _interceptToggleRequestSeq || sessionId !== currentSessionId()) {
+      return;
+    }
+    console.error(error);
+    showToast(error?.message || "Failed to update intercept mode.", "error");
+    if (state.runtime) {
+      state.runtime.intercept_enabled = previousInterceptEnabled;
+      renderInterceptStatus();
+    }
+    loadRuntimeSettings().catch(console.error);
+    if (turningOff) {
+      Promise.all([loadIntercepts(false), loadResponseIntercepts(false)]).catch(console.error);
+    }
+  } finally {
+    if (requestSeq === _interceptToggleRequestSeq) {
+      _interceptToggleInFlight = false;
+      els.interceptStatus.disabled = false;
+      if (sessionId === currentSessionId()) {
+        renderInterceptStatus();
+      }
+    }
   }
 }
 

@@ -1404,6 +1404,11 @@ code {
   color: #50c878;
 }
 
+.toggle-pill:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .traffic-region {
   grid-row: 3;
   min-height: 0;

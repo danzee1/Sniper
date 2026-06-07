@@ -1031,6 +1031,7 @@ impl AppState {
         .await
         .context("failed to persist closed live WebSocket relays before self-update restart");
         self.abort_proxy_task().await;
+        self.set_proxy_online(false);
         crate::proxy::drain_proxy_connections(Duration::from_secs(1)).await;
         crate::proxy::flush_pending_session_persists(self)
             .await
@@ -2620,6 +2621,51 @@ mod tests {
 
         assert!(state.begin_self_update().is_err());
 
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn self_update_prepare_failure_restore_restarts_proxy_listener() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-update-restore-proxy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = std::sync::Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 100,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+
+        crate::proxy::rebind_proxy(
+            std::sync::Arc::clone(&state),
+            state.get_active_proxy_addr().await,
+        )
+        .await
+        .unwrap();
+        let proxy_addr = state.get_active_proxy_addr().await;
+        assert!(state.is_proxy_online());
+
+        state.prepare_for_self_update_shutdown().await.unwrap();
+        assert!(!state.is_proxy_online());
+
+        state
+            .restore_proxy_after_self_update_prepare_failure()
+            .await;
+        assert!(state.is_proxy_online());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(proxy_addr),
+        )
+        .await
+        .expect("proxy listener should accept connections after restore")
+        .expect("proxy listener should be reachable after restore");
+
+        state.abort_proxy_task().await;
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
