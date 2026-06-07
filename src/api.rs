@@ -2149,6 +2149,8 @@ struct ReplaySendPayload {
     session_id: Option<Uuid>,
     #[serde(default)]
     expected_active_session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_workspace_revision: Option<u64>,
     request: EditableRequest,
     target: Option<RequestTargetOverride>,
     source_transaction_id: Option<Uuid>,
@@ -4725,6 +4727,13 @@ async fn send_replay(
         Some(session.id()),
     ) {
         return response;
+    }
+    if let Some(expected_revision) = payload.expected_workspace_revision {
+        let mut current = session.workspace.snapshot().await;
+        if current.revision != expected_revision {
+            current.session_id = Some(session.id());
+            return (StatusCode::CONFLICT, Json(current)).into_response();
+        }
     }
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
         Ok(value) => value,
@@ -12300,6 +12309,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -12344,6 +12354,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: None,
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -12393,6 +12404,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: Some(original_id),
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -12451,6 +12463,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: Some(inactive.id),
                 expected_active_session_id: Some(active_id),
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -12507,6 +12520,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -12558,6 +12572,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -12582,6 +12597,69 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .contains("preview is truncated"));
+        assert!(session.store.snapshot(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_send_rejects_stale_workspace_revision_before_sending() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-replay-send-workspace-revision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let stale_revision = session.workspace.snapshot().await.revision;
+        session
+            .workspace
+            .replace_snapshot(WorkspaceStateSnapshot::default())
+            .await;
+        let current_revision = session.workspace.snapshot().await.revision;
+        assert!(current_revision > stale_revision);
+
+        let response = super::send_replay(
+            State(state.clone()),
+            Json(super::ReplaySendPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(stale_revision),
+                request: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                target: None,
+                source_transaction_id: None,
+                http_version: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("revision"),
+            Some(&serde_json::json!(current_revision))
+        );
+        let session_id_string = session_id.to_string();
+        assert_eq!(
+            body.get("session_id").and_then(serde_json::Value::as_str),
+            Some(session_id_string.as_str())
+        );
         assert!(session.store.snapshot(Some(10)).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);
@@ -12625,6 +12703,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: Some(session_id),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "http".to_string(),
                     host: addr.to_string(),
@@ -12683,6 +12762,7 @@ mod tests {
             Json(super::ReplaySendPayload {
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 request: EditableRequest {
                     scheme: "ftp".to_string(),
                     host: String::new(),

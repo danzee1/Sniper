@@ -10338,8 +10338,6 @@ function renderWebsocketFrameTable() {
     state.selectedFrameIdx = null;
     hideFrameDetail();
   }
-  const frameWindow = websocketRenderedFrameWindow(frames);
-  const renderedFrames = frameWindow.renderedFrames;
   const fullFrameCount = Number.isFinite(Number(session.frame_count))
     ? Number(session.frame_count)
     : frames.length;
@@ -10359,6 +10357,13 @@ function renderWebsocketFrameTable() {
       ? `${WEBSOCKET_MAX_LOADED_FRAMES}-frame browser cache active`
       : "",
   ].filter(Boolean).join(", ");
+  const hasFrameWindowNotice = (session.frames_truncated || olderFrameCount > 0) && olderFrameCount > 0;
+  const frameWindow = websocketRenderedFrameWindow(frames, {
+    leadingHeight: hasFrameWindowNotice
+      ? (measuredWebsocketFrameRowHeight || WEBSOCKET_FRAME_ROW_HEIGHT)
+      : 0,
+  });
+  const renderedFrames = frameWindow.renderedFrames;
   const framePositions = new Map(frames.map((frame, index) => {
     const frameIndex = Number(frame.index);
     return [
@@ -10366,7 +10371,7 @@ function renderWebsocketFrameTable() {
       Number.isFinite(frameIndex) ? frameIndex + 1 : olderFrameCount + index + 1,
     ];
   }));
-  const frameWindowNotice = (session.frames_truncated || olderFrameCount > 0) && olderFrameCount > 0
+  const frameWindowNotice = hasFrameWindowNotice
     ? `
           <tr class="ws-frame-window-row">
             <td colspan="5">
@@ -10532,7 +10537,9 @@ function ensureWebsocketFramePositionInView(position, options = {}) {
     return false;
   }
   const rowHeight = measuredWebsocketFrameRowHeight || WEBSOCKET_FRAME_ROW_HEIGHT;
-  const rowTop = position * rowHeight;
+  const noticeRow = els.websocketFramesBody?.querySelector(".ws-frame-window-row") || null;
+  const leadingHeight = noticeRow?.getBoundingClientRect().height || 0;
+  const rowTop = leadingHeight + position * rowHeight;
   const rowBottom = rowTop + rowHeight;
   const viewTop = shell.scrollTop;
   const viewBottom = viewTop + shell.clientHeight;
@@ -10551,7 +10558,7 @@ function ensureWebsocketFramePositionInView(position, options = {}) {
   return true;
 }
 
-function websocketRenderedFrameWindow(frames) {
+function websocketRenderedFrameWindow(frames, options = {}) {
   if (!Array.isArray(frames) || !frames.length) {
     return {
       renderedFrames: [],
@@ -10563,6 +10570,7 @@ function websocketRenderedFrameWindow(frames) {
   }
   const shell = websocketFramesShell();
   const rowHeight = measuredWebsocketFrameRowHeight || WEBSOCKET_FRAME_ROW_HEIGHT;
+  const leadingHeight = Math.max(0, Number(options.leadingHeight || 0) || 0);
   if (!shell || frames.length <= WEBSOCKET_MAX_RENDERED_FRAME_ROWS) {
     return {
       renderedFrames: frames,
@@ -10573,15 +10581,16 @@ function websocketRenderedFrameWindow(frames) {
     };
   }
   const viewportHeight = shell.clientHeight || rowHeight * WEBSOCKET_MAX_RENDERED_FRAME_ROWS;
-  const maxScrollTop = Math.max(0, frames.length * rowHeight - viewportHeight);
+  const maxScrollTop = Math.max(0, leadingHeight + frames.length * rowHeight - viewportHeight);
   const scrollTop = Math.min(shell.scrollTop, maxScrollTop);
   if (shell.scrollTop !== scrollTop) {
     shell.scrollTop = scrollTop;
   }
-  const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - WEBSOCKET_FRAME_BUFFER_ROWS);
+  const frameScrollTop = Math.max(0, scrollTop - leadingHeight);
+  const startIdx = Math.max(0, Math.floor(frameScrollTop / rowHeight) - WEBSOCKET_FRAME_BUFFER_ROWS);
   let endIdx = Math.min(
     frames.length,
-    Math.ceil((scrollTop + viewportHeight) / rowHeight) + WEBSOCKET_FRAME_BUFFER_ROWS,
+    Math.ceil((frameScrollTop + viewportHeight) / rowHeight) + WEBSOCKET_FRAME_BUFFER_ROWS,
   );
   if (endIdx - startIdx > WEBSOCKET_MAX_RENDERED_FRAME_ROWS) {
     endIdx = startIdx + WEBSOCKET_MAX_RENDERED_FRAME_ROWS;
@@ -13927,6 +13936,7 @@ async function sendReplay() {
       body: JSON.stringify({
         session_id: sendingSessionId,
         expected_active_session_id: expectedActiveSessionIdForWrite(sendingSessionId),
+        expected_workspace_revision: state.workspaceRevision || 0,
         request,
         target: targetPayload,
         source_transaction_id: tab.sourceTransactionId,
@@ -14286,6 +14296,7 @@ async function followRedirect() {
       body: JSON.stringify({
         session_id: followingSessionId,
         expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
+        expected_workspace_revision: state.workspaceRevision || 0,
         request: newRequest,
         target,
         source_transaction_id: null,
@@ -15937,6 +15948,16 @@ function scheduleUiSettingsSave(delay = 180) {
   }, delay);
 }
 
+function scheduleUiSettingsRetry(delay = 1000) {
+  if (uiSettingsSaveTimer) {
+    return;
+  }
+  uiSettingsSaveTimer = window.setTimeout(() => {
+    uiSettingsSaveTimer = null;
+    persistUiSettings().catch((error) => console.error(error));
+  }, delay);
+}
+
 async function persistUiSettings() {
   if (uiSettingsSavePromise) {
     return uiSettingsSavePromise;
@@ -15949,16 +15970,24 @@ async function persistUiSettings() {
         const payloadSnapshot = nextUiSettingsSnapshot();
         const payload = JSON.stringify(payloadSnapshot);
         lastUiSettingsPayload = payload;
-        const response = await fetch("/api/ui-settings", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-          },
-          body: payload,
-        });
+        let response;
+        try {
+          response = await fetch("/api/ui-settings", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: payload,
+          });
+        } catch (error) {
+          uiSettingsDirty = true;
+          scheduleUiSettingsRetry();
+          throw error;
+        }
 
         if (!response.ok) {
           uiSettingsDirty = true;
+          scheduleUiSettingsRetry();
           throw new Error(await response.text());
         }
         const savedSnapshot = await response.json().catch(() => null);

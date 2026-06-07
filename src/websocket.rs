@@ -215,6 +215,10 @@ impl WebSocketStore {
         }
     }
 
+    pub async fn contains(&self, id: Uuid) -> bool {
+        self.inner.read().await.sessions.contains_key(&id)
+    }
+
     pub async fn close(
         &self,
         id: Uuid,

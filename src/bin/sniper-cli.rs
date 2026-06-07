@@ -1125,6 +1125,10 @@ impl ApiClient {
             }
             bail!("request to {} failed ({}): {}", path, status, body.error);
         }
+        if status == StatusCode::CONFLICT {
+            let message = response.text().await.unwrap_or_else(|_| String::new());
+            bail!("{}", workspace_state_conflict_detail(path, status, message));
+        }
         let message = response.text().await.unwrap_or_else(|_| String::new());
         let detail = api_failure_detail(status, message);
         bail!("request to {} failed ({}): {}", path, status, detail);
@@ -1363,6 +1367,7 @@ struct CreateSessionPayload {
 struct ReplaySendPayload {
     session_id: Option<Uuid>,
     expected_active_session_id: Option<Uuid>,
+    expected_workspace_revision: Option<u64>,
     request: EditableRequest,
     target: Option<RequestTargetOverride>,
     source_transaction_id: Option<Uuid>,
@@ -1857,6 +1862,7 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                         &workspace,
                         args.session_id,
                     ),
+                    expected_workspace_revision: Some(workspace.revision),
                     request: request.clone(),
                     target: target.clone(),
                     source_transaction_id: tab.source_transaction_id,
@@ -1915,12 +1921,11 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 print_json(&output)?;
                 bail!("replay failed after storing transaction record: {error}");
             } else {
-                let mut output = json_value_with_session(&record, workspace.session_id)?;
-                if let Some(save_error) = workspace_save_error {
-                    attach_workspace_save_error(&mut output, &save_error);
-                    print_json(&output)?;
-                    bail!("replay was sent, but workspace state was not saved: {save_error}");
-                }
+                let output = json_value_with_session_and_workspace_save_error(
+                    &record,
+                    workspace.session_id,
+                    workspace_save_error.as_ref(),
+                )?;
                 print_json(&output)?;
                 Ok(())
             }
@@ -2020,19 +2025,22 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 }
                 bail!("fuzzer attack failed");
             }
-            let mut record_output = json_value_with_session(&record, workspace.session_id)?;
-            if let Some(save_error) = workspace_save_error {
-                attach_workspace_save_error(&mut record_output, &save_error);
-                print_json(&record_output)?;
-                bail!("fuzzer attack completed, but workspace state was not saved: {save_error}");
-            }
+            let record_output = json_value_with_session_and_workspace_save_error(
+                &record,
+                workspace.session_id,
+                workspace_save_error.as_ref(),
+            )?;
             if args.r#async {
-                print_json(&json!({
+                let mut async_output = json!({
                     "async_requested": true,
                     "session_id": workspace.session_id,
                     "message": "Fuzzer attack completed. The current Sniper API creates attacks synchronously, so the CLI waits until the server returns the attack record.",
                     "attack": record,
-                }))?;
+                });
+                if let Some(save_error) = workspace_save_error.as_ref() {
+                    attach_workspace_save_error(&mut async_output, save_error);
+                }
+                print_json(&async_output)?;
             } else {
                 print_json(&record_output)?;
             }
@@ -4434,6 +4442,18 @@ fn json_value_with_session<T: Serialize>(value: &T, session_id: Option<Uuid>) ->
     Ok(output)
 }
 
+fn json_value_with_session_and_workspace_save_error<T: Serialize>(
+    value: &T,
+    session_id: Option<Uuid>,
+    workspace_save_error: Option<&anyhow::Error>,
+) -> Result<Value> {
+    let mut output = json_value_with_session(value, session_id)?;
+    if let Some(error) = workspace_save_error {
+        attach_workspace_save_error(&mut output, error);
+    }
+    Ok(output)
+}
+
 fn attach_session_id(output: &mut Value, session_id: Option<Uuid>) {
     if let Some(session_id) = session_id {
         if let Value::Object(map) = output {
@@ -4733,8 +4753,9 @@ mod tests {
         default_editable_request, discover_api_base_url, discover_api_base_url_from_data_dir,
         explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
         fuzzer_target_request_authority_for_request, history_list_path, install_skills,
-        next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
-        normalize_target_inputs, oast_fields_for_output, parse_editable_raw_request,
+        json_value_with_session_and_workspace_save_error, next_replay_tab_sequence,
+        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
+        oast_fields_for_output, parse_editable_raw_request,
         parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
         parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
         process_path_strings_match, push_replay_history_entry, read_limited_to_end,
@@ -5395,6 +5416,16 @@ mod tests {
 
         attach_workspace_save_error(&mut output, &anyhow::anyhow!("workspace conflict"));
         assert_eq!(output["workspace_save_error"], "workspace conflict");
+
+        let replay_output = json_value_with_session_and_workspace_save_error(
+            &serde_json::json!({ "status": "sent" }),
+            Some(session_id),
+            Some(&anyhow::anyhow!("workspace conflict")),
+        )
+        .unwrap();
+        assert_eq!(replay_output["status"], "sent");
+        assert_eq!(replay_output["session_id"], serde_json::json!(session_id));
+        assert_eq!(replay_output["workspace_save_error"], "workspace conflict");
     }
 
     #[test]

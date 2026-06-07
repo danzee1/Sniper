@@ -152,6 +152,10 @@ struct StoredSessionSnapshot {
     replayed_transaction_ids: HashSet<Uuid>,
     #[serde(skip)]
     replayed_websocket_journal: bool,
+    #[serde(skip)]
+    compactable_websocket_journal: bool,
+    #[serde(skip)]
+    unresolved_websocket_journal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +168,20 @@ struct TransactionJournalReplayResult {
     replayed_transaction_ids: HashSet<Uuid>,
     mutated_snapshot: bool,
     transaction_event_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WebSocketJournalReplayResult {
+    mutated_snapshot: bool,
+    can_compact: bool,
+    has_unresolved_delta: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebSocketJournalApplyResult {
+    Mutated,
+    Noop,
+    MissingParent,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -429,6 +447,9 @@ impl SessionContext {
         frame: WebSocketFrameRecord,
     ) -> Result<bool> {
         let _persist_guard = self.persist_lock.lock().await;
+        if !self.websockets.contains(id).await {
+            return Ok(false);
+        }
         self.append_websocket_journal_entry(&WebSocketJournalEntry::Frame {
             id,
             frame: frame.clone(),
@@ -445,6 +466,9 @@ impl SessionContext {
         note: Option<String>,
     ) -> Result<bool> {
         let _persist_guard = self.persist_lock.lock().await;
+        if !self.websockets.contains(id).await {
+            return Ok(false);
+        }
         self.append_websocket_journal_entry(&WebSocketJournalEntry::Close {
             id,
             closed_at,
@@ -607,6 +631,8 @@ impl SessionContext {
             replayed_transaction_journal: false,
             replayed_transaction_ids: HashSet::new(),
             replayed_websocket_journal: false,
+            compactable_websocket_journal: false,
+            unresolved_websocket_journal: false,
         };
 
         let mut metadata = self
@@ -1012,6 +1038,8 @@ impl SessionRegistry {
             );
         }
         let replayed_websocket_journal = snapshot.replayed_websocket_journal;
+        let compactable_websocket_journal = snapshot.compactable_websocket_journal;
+        let unresolved_websocket_journal = snapshot.unresolved_websocket_journal;
         if repaired_open_websockets || replayed_transaction_journal || replayed_websocket_journal {
             write_json(&snapshot_path(&storage_dir), &snapshot)?;
         }
@@ -1024,7 +1052,7 @@ impl SessionRegistry {
                 );
             }
         }
-        if replayed_websocket_journal {
+        if compactable_websocket_journal && !unresolved_websocket_journal {
             if let Err(error) = compact_replayed_websocket_journal(&storage_dir) {
                 warn!(
                     %error,
@@ -1032,8 +1060,15 @@ impl SessionRegistry {
                     "failed to compact replayed websocket journal after loading session"
                 );
             }
+        } else if unresolved_websocket_journal {
+            warn!(
+                session_id = %id,
+                "preserving websocket journal because it contains frame or close deltas without a parent session"
+            );
         }
-        if update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries) {
+        if !unresolved_websocket_journal
+            && update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries)
+        {
             if let Err(error) = self.update_metadata(metadata.clone()) {
                 warn!(
                     ?error,
@@ -1736,12 +1771,15 @@ fn load_session_snapshot_with_mode(
     snapshot.transaction_event_sequence = replay_result.transaction_event_sequence;
     snapshot.replayed_transaction_ids = replay_result.replayed_transaction_ids;
     snapshot.replayed_transaction_journal = replay_result.mutated_snapshot;
-    snapshot.replayed_websocket_journal = replay_websocket_journal(
+    let websocket_replay_result = replay_websocket_journal(
         storage_dir,
         max_entries,
         &mut snapshot,
         mode == SessionSnapshotLoadMode::Writable,
     )?;
+    snapshot.replayed_websocket_journal = websocket_replay_result.mutated_snapshot;
+    snapshot.compactable_websocket_journal = websocket_replay_result.can_compact;
+    snapshot.unresolved_websocket_journal = websocket_replay_result.has_unresolved_delta;
     Ok(snapshot)
 }
 
@@ -1992,11 +2030,13 @@ fn replay_websocket_journal(
     max_entries: usize,
     snapshot: &mut StoredSessionSnapshot,
     repair_files: bool,
-) -> Result<bool> {
+) -> Result<WebSocketJournalReplayResult> {
     let journal_path = websocket_journal_path(storage_dir);
     let file = match fs::File::open(&journal_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WebSocketJournalReplayResult::default());
+        }
         Err(error) if journal_path.exists() => {
             warn!(
                 ?error,
@@ -2006,7 +2046,7 @@ fn replay_websocket_journal(
             if repair_files {
                 move_unreadable_websocket_journal_aside(&journal_path);
             }
-            return Ok(false);
+            return Ok(WebSocketJournalReplayResult::default());
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -2029,7 +2069,7 @@ fn replay_websocket_journal(
         if repair_files {
             move_unreadable_websocket_journal_aside(&journal_path);
         }
-        return Ok(false);
+        return Ok(WebSocketJournalReplayResult::default());
     }
 
     let mut reader = BufReader::new(file);
@@ -2037,7 +2077,7 @@ fn replay_websocket_journal(
     let mut offset = 0u64;
     let mut valid_prefix_len = 0u64;
     let mut line_number = 0usize;
-    let mut replayed = false;
+    let mut replay_result = WebSocketJournalReplayResult::default();
     loop {
         line.clear();
         let bytes = reader.read_until(b'\n', &mut line).with_context(|| {
@@ -2086,54 +2126,69 @@ fn replay_websocket_journal(
                 break;
             }
         };
-        apply_websocket_journal_entry(&mut snapshot.websockets, entry);
-        replayed = true;
+        match apply_websocket_journal_entry(&mut snapshot.websockets, entry) {
+            WebSocketJournalApplyResult::Mutated => {
+                replay_result.mutated_snapshot = true;
+            }
+            WebSocketJournalApplyResult::Noop => {}
+            WebSocketJournalApplyResult::MissingParent => {
+                replay_result.has_unresolved_delta = true;
+                warn!(
+                    path = %journal_path.display(),
+                    line = line_number,
+                    "preserving websocket journal line with missing parent session"
+                );
+            }
+        }
         valid_prefix_len = offset;
     }
-    if replayed {
+    replay_result.can_compact = valid_prefix_len > 0 && !replay_result.has_unresolved_delta;
+    if replay_result.mutated_snapshot {
         snapshot.websockets = sessions_with_live_preserved(
             std::mem::take(&mut snapshot.websockets),
             max_entries,
             MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION,
         );
     }
-    Ok(replayed)
+    Ok(replay_result)
 }
 
 fn apply_websocket_journal_entry(
     records: &mut Vec<WebSocketSessionRecord>,
     entry: WebSocketJournalEntry,
-) {
+) -> WebSocketJournalApplyResult {
     match entry {
         WebSocketJournalEntry::Open { record } => {
             if records.iter().any(|existing| existing.id == record.id) {
-                return;
+                return WebSocketJournalApplyResult::Noop;
             }
             records.insert(0, record);
+            WebSocketJournalApplyResult::Mutated
         }
         WebSocketJournalEntry::Frame { id, frame } => {
             let Some(record) = records.iter_mut().find(|record| record.id == id) else {
-                return;
+                return WebSocketJournalApplyResult::MissingParent;
             };
             if record
                 .frames
                 .last()
                 .is_some_and(|latest| frame.index <= latest.index)
             {
-                return;
+                return WebSocketJournalApplyResult::Noop;
             }
             if record
                 .frames
                 .iter()
                 .any(|existing| existing.index == frame.index)
             {
-                return;
+                return WebSocketJournalApplyResult::Noop;
             }
             record.frames.push(frame);
             trim_frame_overflow(
                 &mut record.frames,
                 MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION,
             );
+            WebSocketJournalApplyResult::Mutated
         }
         WebSocketJournalEntry::Close {
             id,
@@ -2142,14 +2197,22 @@ fn apply_websocket_journal_entry(
             note,
         } => {
             let Some(record) = records.iter_mut().find(|record| record.id == id) else {
-                return;
+                return WebSocketJournalApplyResult::MissingParent;
             };
+            let mut mutated =
+                record.closed_at != Some(closed_at) || record.duration_ms != Some(duration_ms);
             record.closed_at = Some(closed_at);
             record.duration_ms = Some(duration_ms);
             if let Some(note) = note {
                 if !record.notes.iter().any(|existing| existing == &note) {
                     record.notes.push(note);
+                    mutated = true;
                 }
+            }
+            if mutated {
+                WebSocketJournalApplyResult::Mutated
+            } else {
+                WebSocketJournalApplyResult::Noop
             }
         }
     }
@@ -3175,6 +3238,82 @@ mod tests {
                 .unwrap();
         assert_eq!(disk_snapshot.websockets.len(), 1);
         assert_eq!(disk_snapshot.websockets[0].frames.len(), 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_capture_does_not_journal_missing_parent_deltas() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-websocket-orphan-write-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let websocket_id = Uuid::new_v4();
+
+        let appended = active
+            .append_websocket_capture_frame(
+                websocket_id,
+                WebSocketFrameRecord {
+                    index: 0,
+                    captured_at: Utc::now(),
+                    direction: WebSocketFrameDirection::ClientToServer,
+                    kind: WebSocketFrameKind::Text,
+                    body_preview: "late".to_string(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 4,
+                    preview_truncated: false,
+                },
+            )
+            .await
+            .unwrap();
+        let closed = active
+            .close_websocket_capture(websocket_id, Utc::now(), 1, Some("late close".to_string()))
+            .await
+            .unwrap();
+
+        assert!(!appended);
+        assert!(!closed);
+        let journal_path = super::websocket_journal_path(&storage_dir);
+        let journal_len = std::fs::metadata(&journal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        assert_eq!(journal_len, 0);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn load_context_preserves_websocket_journal_with_missing_parent_delta() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-websocket-orphan-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let websocket_id = Uuid::new_v4();
+        let journal = super::encode_websocket_journal_line(&super::WebSocketJournalEntry::Frame {
+            id: websocket_id,
+            frame: WebSocketFrameRecord {
+                index: 0,
+                captured_at: Utc::now(),
+                direction: WebSocketFrameDirection::ServerToClient,
+                kind: WebSocketFrameKind::Text,
+                body_preview: "orphan".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 6,
+                preview_truncated: false,
+            },
+        })
+        .unwrap();
+        let journal_path = super::websocket_journal_path(&storage_dir);
+        std::fs::write(&journal_path, &journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+
+        assert!(loaded.websockets.get(websocket_id).await.is_none());
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
