@@ -48,6 +48,7 @@ if [[ "$ALLOW_ADHOC_RELEASE" != "1" ]] && git rev-parse --is-inside-work-tree >/
   TRACKED_RELEASE_STATUS="$(git status --porcelain --untracked-files=no)"
   UNTRACKED_RELEASE_INPUTS="$(git ls-files --others --exclude-standard -- \
     Cargo.toml Cargo.lock README.md \
+    build.rs .cargo rust-toolchain rust-toolchain.toml \
     src web packaging tests 2>/dev/null || true)"
   if [[ -n "$TRACKED_RELEASE_STATUS" || -n "$UNTRACKED_RELEASE_INPUTS" ]]; then
     echo "Release artifacts require a clean worktree." >&2

@@ -146,6 +146,7 @@ const WS_COLUMN_RULES = {
   duration_ms: { default: 90,  min: 60,  max: 180 },
   started_at:  { default: 150, min: 110, max: 260 },
 };
+const WEBSOCKET_SORT_KEYS = new Set(Object.keys(WS_COLUMN_RULES));
 
 const FINDINGS_COL_RULES = {
   severity: { default: 88, min: 60, max: 150 },
@@ -409,6 +410,9 @@ const state = {
   websocketQuery: "",
   websocketSortKey: "started_at",
   websocketSortDirection: "desc",
+  websocketInScopeOnly: false,
+  websocketLiveOnly: false,
+  websocketStackHeight: null,
   selectedWebsocketId: null,
   selectedWebsocketRecord: null,
   selectedWebsocketDetailError: "",
@@ -1163,6 +1167,7 @@ function bindEvents() {
 
   els.websocketSearchInput.addEventListener("input", () => {
     state.websocketQuery = els.websocketSearchInput.value.trim();
+    scheduleUiSettingsSave();
     clearWebsocketQueryBackfill();
     if (_websocketSearchReloadTimer) {
       window.clearTimeout(_websocketSearchReloadTimer);
@@ -1242,12 +1247,14 @@ function bindEvents() {
     }
   });
   document.getElementById("wsInScopeOnly")?.addEventListener("click", (e) => {
-    e.currentTarget.classList.toggle("active");
+    state.websocketInScopeOnly = e.currentTarget.classList.toggle("active");
+    scheduleUiSettingsSave();
     clearWebsocketQueryBackfill();
     loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
   });
   document.getElementById("wsHideClosed")?.addEventListener("click", (e) => {
-    e.currentTarget.classList.toggle("active");
+    state.websocketLiveOnly = e.currentTarget.classList.toggle("active");
+    scheduleUiSettingsSave();
     clearWebsocketQueryBackfill();
     loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
   });
@@ -4294,8 +4301,8 @@ function createWebsocketQueryState() {
     q: String(state.websocketQuery || "").trim(),
     sortKey: state.websocketSortKey || "started_at",
     sortDirection: state.websocketSortDirection === "asc" ? "asc" : "desc",
-    inScopeOnly: document.getElementById("wsInScopeOnly")?.classList.contains("active") ?? false,
-    liveOnly: document.getElementById("wsHideClosed")?.classList.contains("active") ?? false,
+    inScopeOnly: Boolean(state.websocketInScopeOnly),
+    liveOnly: Boolean(state.websocketLiveOnly),
   };
 }
 
@@ -4511,8 +4518,8 @@ function websocketQueryBackfillVisibleTarget() {
 
 function websocketFilterIsActive() {
   return Boolean(String(state.websocketQuery || "").trim())
-    || Boolean(document.getElementById("wsInScopeOnly")?.classList.contains("active"))
-    || Boolean(document.getElementById("wsHideClosed")?.classList.contains("active"));
+    || Boolean(state.websocketInScopeOnly)
+    || Boolean(state.websocketLiveOnly);
 }
 
 function websocketSummaryMatchesCurrentQuery(summary) {
@@ -9229,8 +9236,8 @@ function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, t
     : `${visibleCount} session(s) visible`;
   const parts = [visibleLabel];
   const filters = [];
-  if (document.getElementById("wsInScopeOnly")?.classList.contains("active")) filters.push("in scope");
-  if (document.getElementById("wsHideClosed")?.classList.contains("active")) filters.push("live only");
+  if (state.websocketInScopeOnly) filters.push("in scope");
+  if (state.websocketLiveOnly) filters.push("live only");
   if (query) filters.push(query);
   if (filters.length) parts.push(`filter: ${filters.join(", ")}`);
   if (isKnownCount(filteredCount)) {
@@ -9400,12 +9407,14 @@ function defaultWebsocketSortDirection(key) {
 }
 
 function toggleWebsocketSort(key) {
-  if (state.websocketSortKey === key) {
+  const sortKey = sanitizeWebsocketSortKey(key);
+  if (state.websocketSortKey === sortKey) {
     state.websocketSortDirection = state.websocketSortDirection === "asc" ? "desc" : "asc";
   } else {
-    state.websocketSortKey = key;
-    state.websocketSortDirection = defaultWebsocketSortDirection(key);
+    state.websocketSortKey = sortKey;
+    state.websocketSortDirection = defaultWebsocketSortDirection(sortKey);
   }
+  scheduleUiSettingsSave();
   clearWebsocketQueryBackfill();
   loadWebsocketsPageRefresh(true, { resetWindow: true }).catch((error) => console.error(error));
 }
@@ -11878,8 +11887,9 @@ async function saveProxySettings() {
   if (!isValidIpLiteral(bindHost)) {
     throw new Error("Proxy bind host must be an IPv4 or IPv6 address.");
   }
+  const normalizedBindHost = normalizeIpLiteralForSettings(bindHost);
   const startupUpdate = {
-    proxy_bind_host: bindHost,
+    proxy_bind_host: normalizedBindHost,
     proxy_port: proxyPort,
   };
   const oastTokenValue = document.getElementById("proxySettingOastToken")?.value?.trim() || "";
@@ -11983,6 +11993,14 @@ function isValidIpLiteral(value) {
     const value = Number(octet);
     return value >= 0 && value <= 255 && String(value) === octet;
   });
+}
+
+function normalizeIpLiteralForSettings(value) {
+  const host = String(value || "").trim();
+  if (host.startsWith("[") && host.endsWith("]")) {
+    return host.slice(1, -1);
+  }
+  return host;
 }
 
 async function requireOkResponse(response, fallbackMessage) {
@@ -13974,6 +13992,19 @@ function sanitizeActiveProxyTab(value) {
   return IMPLEMENTED_PROXY_TABS.has(proxyTab) ? proxyTab : "http-history";
 }
 
+function sanitizeWebsocketQuery(value) {
+  return String(value || "").trim().slice(0, 512);
+}
+
+function sanitizeWebsocketSortKey(value) {
+  const sortKey = String(value || "").trim();
+  return WEBSOCKET_SORT_KEYS.has(sortKey) ? sortKey : "started_at";
+}
+
+function sanitizeWebsocketSortDirection(value) {
+  return String(value || "").trim() === "asc" ? "asc" : "desc";
+}
+
 function loadHistoryColumnWidths() {
   state.historyColumnWidths = createDefaultHistoryColumnWidths();
   state.historyColumnOrder = [...DEFAULT_HISTORY_COLUMN_ORDER];
@@ -14246,14 +14277,27 @@ function applyUiSettingsSnapshot(snapshot) {
   state.workbenchHeight = sanitizeWorkbenchHeight(snapshot?.workbench_height);
   state.workbenchPaneWidths = sanitizeWorkbenchPaneWidths(snapshot?.workbench_pane_widths);
   state.websocketPaneWidth = sanitizeWebsocketPaneWidth(snapshot?.websocket_pane_width);
+  state.websocketQuery = sanitizeWebsocketQuery(snapshot?.websocket_query);
+  state.websocketSortKey = sanitizeWebsocketSortKey(snapshot?.websocket_sort_key);
+  state.websocketSortDirection = sanitizeWebsocketSortDirection(snapshot?.websocket_sort_direction);
+  state.websocketInScopeOnly = Boolean(snapshot?.websocket_in_scope_only);
+  state.websocketLiveOnly = Boolean(snapshot?.websocket_live_only);
+  state.websocketStackHeight = sanitizeWebsocketStackHeight(snapshot?.websocket_stack_height);
   state.wsReplayLeftWidth = sanitizeWsReplayLeftWidth(snapshot?.ws_replay_left_width);
   state.wsReplayFrameDetailHeight = sanitizeWsReplayFrameDetailHeight(snapshot?.ws_replay_frame_detail_height);
+  if (els.websocketSearchInput) {
+    els.websocketSearchInput.value = state.websocketQuery;
+  }
+  document.getElementById("wsInScopeOnly")?.classList.toggle("active", state.websocketInScopeOnly);
+  document.getElementById("wsHideClosed")?.classList.toggle("active", state.websocketLiveOnly);
   applyDisplaySettingsState();
   renderHistoryHeader();
   applyHistoryColumnWidths();
   applyWsColumnWidths();
+  updateWebsocketSortIndicators();
   applySavedWorkbenchPaneWidths();
   applySavedWebsocketPaneWidth();
+  applySavedWebsocketStackHeight();
   applySavedWsReplayLayout();
 
   if (state.workbenchHeight) {
@@ -14279,6 +14323,12 @@ function snapshotUiSettings() {
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,
+    websocket_query: sanitizeWebsocketQuery(state.websocketQuery),
+    websocket_sort_key: sanitizeWebsocketSortKey(state.websocketSortKey),
+    websocket_sort_direction: sanitizeWebsocketSortDirection(state.websocketSortDirection),
+    websocket_in_scope_only: Boolean(state.websocketInScopeOnly),
+    websocket_live_only: Boolean(state.websocketLiveOnly),
+    websocket_stack_height: state.websocketStackHeight > 0 ? state.websocketStackHeight : null,
     ws_replay_left_width: state.wsReplayLeftWidth > 0 ? state.wsReplayLeftWidth : null,
     ws_replay_frame_detail_height: state.wsReplayFrameDetailHeight > 0 ? state.wsReplayFrameDetailHeight : null,
   };
@@ -15874,6 +15924,49 @@ function resetWebsocketPaneWidth(clearState = true) {
   }
 }
 
+function sanitizeWebsocketStackHeight(height) {
+  const value = Number(height);
+  return Number.isFinite(value) && value > 0
+    ? Math.round(clamp(value, WEBSOCKET_STACK_MIN_HEIGHTS.sessions, 4096))
+    : null;
+}
+
+function websocketSessionsCard() {
+  return els.websocketPanel?.querySelector(".ws-sessions-card");
+}
+
+function applyWebsocketStackHeight(height, options = {}) {
+  const sanitized = sanitizeWebsocketStackHeight(height);
+  const sessionsCard = websocketSessionsCard();
+  if (!sanitized || !sessionsCard) {
+    return;
+  }
+  sessionsCard.style.flex = "none";
+  sessionsCard.style.height = `${sanitized}px`;
+  if (options.updateState !== false) {
+    state.websocketStackHeight = sanitized;
+  }
+}
+
+function resetWebsocketStackHeight(clearState = true) {
+  const sessionsCard = websocketSessionsCard();
+  if (sessionsCard) {
+    sessionsCard.style.removeProperty("flex");
+    sessionsCard.style.removeProperty("height");
+  }
+  if (clearState) {
+    state.websocketStackHeight = null;
+  }
+}
+
+function applySavedWebsocketStackHeight() {
+  if (state.websocketStackHeight) {
+    applyWebsocketStackHeight(state.websocketStackHeight, { updateState: false });
+  } else {
+    resetWebsocketStackHeight(false);
+  }
+}
+
 function sanitizeWsReplayLeftWidth(width) {
   const value = Number(width);
   return Number.isFinite(value) && value > 0
@@ -15949,10 +16042,8 @@ function bindWebsocketStackResizer(handle) {
   const sessionsCard = stackPanel.querySelector(".panel-card-top");
 
   handle.addEventListener("dblclick", () => {
-    if (sessionsCard) {
-      sessionsCard.style.flex = "";
-      sessionsCard.style.height = "";
-    }
+    resetWebsocketStackHeight();
+    scheduleUiSettingsSave();
   });
 
   handle.addEventListener("mousedown", (event) => {
@@ -15963,6 +16054,8 @@ function bindWebsocketStackResizer(handle) {
     const startY = event.clientY;
     const startSessions = sessionsCard.getBoundingClientRect().height;
     const combinedHeight = startSessions + workbench.getBoundingClientRect().height;
+    let nextSessionsHeight = Math.round(startSessions);
+    let moved = false;
 
     document.body.classList.add("pane-resizing-y");
     handle.classList.add("active");
@@ -15974,8 +16067,9 @@ function bindWebsocketStackResizer(handle) {
         WEBSOCKET_STACK_MIN_HEIGHTS.sessions,
         combinedHeight - WEBSOCKET_STACK_MIN_HEIGHTS.workbench,
       );
-      sessionsCard.style.flex = "none";
-      sessionsCard.style.height = `${Math.round(nextSessions)}px`;
+      nextSessionsHeight = Math.round(nextSessions);
+      moved = true;
+      applyWebsocketStackHeight(nextSessionsHeight, { updateState: false });
     };
 
     const onUp = () => {
@@ -15983,6 +16077,10 @@ function bindWebsocketStackResizer(handle) {
       handle.classList.remove("active");
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+      if (moved) {
+        state.websocketStackHeight = sanitizeWebsocketStackHeight(nextSessionsHeight);
+        scheduleUiSettingsSave();
+      }
     };
 
     document.addEventListener("mousemove", onMove);

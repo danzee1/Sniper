@@ -51,6 +51,16 @@ const ACTIVE_PROXY_TAB_OPTIONS: &[&str] = &[
     "oast",
     "proxy-settings",
 ];
+const WEBSOCKET_SORT_KEY_OPTIONS: &[&str] = &[
+    "index",
+    "host",
+    "path",
+    "status",
+    "frame_count",
+    "duration_ms",
+    "started_at",
+];
+const WEBSOCKET_QUERY_MAX_CHARS: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -131,6 +141,12 @@ pub struct AppUiSettingsSnapshot {
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
     pub websocket_pane_width: Option<u16>,
+    pub websocket_query: String,
+    pub websocket_sort_key: String,
+    pub websocket_sort_direction: String,
+    pub websocket_in_scope_only: bool,
+    pub websocket_live_only: bool,
+    pub websocket_stack_height: Option<u16>,
     pub ws_replay_left_width: Option<u16>,
     pub ws_replay_frame_detail_height: Option<u16>,
 }
@@ -147,6 +163,12 @@ impl Default for AppUiSettingsSnapshot {
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
+            websocket_query: String::new(),
+            websocket_sort_key: "started_at".to_string(),
+            websocket_sort_direction: "desc".to_string(),
+            websocket_in_scope_only: false,
+            websocket_live_only: false,
+            websocket_stack_height: None,
             ws_replay_left_width: None,
             ws_replay_frame_detail_height: None,
         }
@@ -173,6 +195,21 @@ impl AppUiSettingsSnapshot {
             .websocket_pane_width
             .filter(|width| *width > 0)
             .map(|width| width.clamp(300, 4_096));
+        sanitized.websocket_query =
+            trim_to_char_limit(self.websocket_query.trim(), WEBSOCKET_QUERY_MAX_CHARS);
+        sanitized.websocket_sort_key = sanitize_option(
+            self.websocket_sort_key,
+            "started_at",
+            WEBSOCKET_SORT_KEY_OPTIONS,
+        );
+        sanitized.websocket_sort_direction =
+            sanitize_option(self.websocket_sort_direction, "desc", &["asc", "desc"]);
+        sanitized.websocket_in_scope_only = self.websocket_in_scope_only;
+        sanitized.websocket_live_only = self.websocket_live_only;
+        sanitized.websocket_stack_height = self
+            .websocket_stack_height
+            .filter(|height| *height > 0)
+            .map(|height| height.clamp(160, 4_096));
         sanitized.ws_replay_left_width = self
             .ws_replay_left_width
             .filter(|width| *width > 0)
@@ -361,6 +398,10 @@ fn sanitize_option(value: String, fallback: &str, allowed: &[&str]) -> String {
     }
 }
 
+fn trim_to_char_limit(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
 fn default_history_column_widths() -> BTreeMap<String, u16> {
     BTreeMap::from([
         ("host".to_string(), 320),
@@ -413,6 +454,12 @@ mod tests {
         snapshot.workbench_pane_widths.response_percent = Some(41);
         snapshot.workbench_pane_widths.inspector_width = Some(390);
         snapshot.websocket_pane_width = Some(444);
+        snapshot.websocket_query = "chat.example".to_string();
+        snapshot.websocket_sort_key = "host".to_string();
+        snapshot.websocket_sort_direction = "asc".to_string();
+        snapshot.websocket_in_scope_only = true;
+        snapshot.websocket_live_only = true;
+        snapshot.websocket_stack_height = Some(345);
         snapshot.ws_replay_left_width = Some(555);
         snapshot.ws_replay_frame_detail_height = Some(222);
 
@@ -435,6 +482,12 @@ mod tests {
         assert_eq!(persisted.workbench_pane_widths.response_percent, Some(41));
         assert_eq!(persisted.workbench_pane_widths.inspector_width, Some(390));
         assert_eq!(persisted.websocket_pane_width, Some(444));
+        assert_eq!(persisted.websocket_query, "chat.example");
+        assert_eq!(persisted.websocket_sort_key, "host");
+        assert_eq!(persisted.websocket_sort_direction, "asc");
+        assert!(persisted.websocket_in_scope_only);
+        assert!(persisted.websocket_live_only);
+        assert_eq!(persisted.websocket_stack_height, Some(345));
         assert_eq!(persisted.ws_replay_left_width, Some(555));
         assert_eq!(persisted.ws_replay_frame_detail_height, Some(222));
 
@@ -453,6 +506,10 @@ mod tests {
         snapshot.display_settings.mono_font = "fantasy".to_string();
         snapshot.active_tool = "missing-tool".to_string();
         snapshot.active_proxy_tab = "missing-tab".to_string();
+        snapshot.websocket_query =
+            format!("  {}  ", "x".repeat(super::WEBSOCKET_QUERY_MAX_CHARS + 8));
+        snapshot.websocket_sort_key = "missing-sort".to_string();
+        snapshot.websocket_sort_direction = "sideways".to_string();
 
         store
             .replace_snapshot(snapshot)
@@ -467,6 +524,12 @@ mod tests {
         assert_eq!(persisted.display_settings.mono_font, "jetbrains");
         assert_eq!(persisted.active_tool, "proxy");
         assert_eq!(persisted.active_proxy_tab, "http-history");
+        assert_eq!(
+            persisted.websocket_query.chars().count(),
+            super::WEBSOCKET_QUERY_MAX_CHARS
+        );
+        assert_eq!(persisted.websocket_sort_key, "started_at");
+        assert_eq!(persisted.websocket_sort_direction, "desc");
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
