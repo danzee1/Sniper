@@ -1403,10 +1403,37 @@ fn validate_authority_for_client_input(authority: &Authority, label: &str) -> Re
     if authority.as_str().contains('@') {
         bail!("{label} must not include URI userinfo");
     }
+    let host = authority.host();
+    if host.is_empty() || host == "[]" {
+        bail!("{label} must include a host");
+    }
+    if authority_has_invalid_explicit_port(authority) {
+        bail!("{label} includes an invalid port: {authority}");
+    }
     if authority.port().is_some() && authority.port_u16().is_none() {
         bail!("{label} includes an invalid port: {authority}");
     }
     Ok(())
+}
+
+fn authority_has_invalid_explicit_port(authority: &Authority) -> bool {
+    if authority.port_u16().is_some() {
+        return false;
+    }
+    let raw = authority.as_str();
+    if raw.ends_with(']') {
+        return false;
+    }
+    let Some((host_part, port_part)) = raw.rsplit_once(':') else {
+        return false;
+    };
+    if port_part.is_empty() {
+        return true;
+    }
+    if host_part.starts_with('[') || !host_part.contains(':') {
+        return true;
+    }
+    false
 }
 
 fn authority_hosts_equivalent(left: &str, right: &str) -> bool {
@@ -3918,10 +3945,14 @@ fn build_uri_from_request(
     request: &EditableRequest,
     authority_override: Option<&str>,
 ) -> Result<Uri> {
+    let path = normalize_request_path(&request.path);
+    if path == "*" {
+        bail!("star-form request targets are not supported by replay send");
+    }
     Uri::builder()
         .scheme(request.scheme.as_str())
         .authority(authority_override.unwrap_or(request.host.as_str()))
-        .path_and_query(normalize_request_path(&request.path))
+        .path_and_query(path)
         .build()
         .map_err(|error| anyhow!("failed to build upstream URI: {error}"))
 }
@@ -6762,6 +6793,17 @@ mod tests {
     }
 
     #[test]
+    fn replay_uri_builder_rejects_asterisk_form_request_target() {
+        let mut request = editable_request("example.com");
+        request.method = "OPTIONS".to_string();
+        request.path = "*".to_string();
+
+        let error = build_uri_from_request(&request, None).unwrap_err();
+
+        assert!(error.to_string().contains("star-form request targets"));
+    }
+
+    #[test]
     fn connect_target_requires_explicit_port() {
         let uri: Uri = "http://example.com".parse().unwrap();
         let error = connect_target(&uri).unwrap_err();
@@ -6769,6 +6811,32 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must be authority-form host:port"));
+    }
+
+    #[test]
+    fn connect_target_rejects_empty_host_authority_before_upgrade() {
+        let uri: Uri = ":80".parse().unwrap();
+        let error = connect_target(&uri).unwrap_err();
+
+        assert!(error.to_string().contains("must include a host"));
+    }
+
+    #[test]
+    fn client_authority_rejects_empty_and_invalid_hosts() {
+        for authority in [":80", "[]:443"] {
+            let error = parse_client_authority(authority, "test authority").unwrap_err();
+            assert!(
+                error.to_string().contains("must include a host"),
+                "{authority} should be rejected as empty host"
+            );
+        }
+
+        for authority in ["example.com:", "example.com:70000"] {
+            assert!(
+                parse_client_authority(authority, "test authority").is_err(),
+                "{authority} should be rejected as invalid authority"
+            );
+        }
     }
 
     #[test]

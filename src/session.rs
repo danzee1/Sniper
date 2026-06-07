@@ -118,6 +118,8 @@ impl StoredSessionRegistrySnapshot {
 struct StoredSessionSnapshot {
     runtime: RuntimeSettingsSnapshot,
     transactions: Vec<TransactionRecord>,
+    #[serde(default)]
+    transaction_event_sequence: u64,
     websockets: Vec<WebSocketSessionRecord>,
     event_log: Vec<EventLogEntry>,
     match_replace_rules: Vec<MatchReplaceRule>,
@@ -156,6 +158,7 @@ enum SessionSnapshotLoadMode {
 struct TransactionJournalReplayResult {
     replayed_transaction_ids: HashSet<Uuid>,
     mutated_snapshot: bool,
+    transaction_event_sequence: u64,
 }
 
 fn deserialize_workspace_state_lossy<'de, D>(
@@ -258,6 +261,7 @@ impl SessionContext {
         } else {
             snapshot.scanner_findings
         };
+        let transaction_event_sequence = snapshot.transaction_event_sequence;
         let mut websockets = snapshot.websockets;
         close_restored_open_websockets(&mut websockets);
         Self {
@@ -265,15 +269,17 @@ impl SessionContext {
             storage_dir,
             max_entries,
             store: Arc::new(if enable_journal {
-                TransactionStore::from_records_with_journal(
+                TransactionStore::from_records_with_journal_and_event_sequence(
                     snapshot.transactions,
                     journal_path,
                     Some(max_entries),
+                    transaction_event_sequence,
                 )
             } else {
-                TransactionStore::from_records_with_max_entries(
+                TransactionStore::from_records_with_max_entries_and_event_sequence(
                     snapshot.transactions,
                     Some(max_entries),
+                    transaction_event_sequence,
                 )
             }),
             runtime: Arc::new(RuntimeSettings::from_snapshot(runtime_snapshot.clone())),
@@ -466,18 +472,20 @@ impl SessionContext {
         validate_workspace_state(&workspace)
             .map_err(anyhow::Error::msg)
             .with_context(|| "workspace snapshot is invalid")?;
+        let transactions = self
+            .store
+            .snapshot_for_persistence(Some(self.max_entries))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to rotate transaction journal for {}",
+                    self.storage_dir.display()
+                )
+            })?;
         let snapshot = StoredSessionSnapshot {
             runtime: self.runtime.snapshot().await,
-            transactions: self
-                .store
-                .snapshot_for_persistence(Some(self.max_entries))
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to rotate transaction journal for {}",
-                        self.storage_dir.display()
-                    )
-                })?,
+            transactions,
+            transaction_event_sequence: self.store.latest_event_sequence(),
             websockets: self
                 .websockets
                 .snapshot_with_frame_limit(
@@ -1586,6 +1594,7 @@ fn load_session_snapshot_with_mode(
         &mut snapshot,
         mode == SessionSnapshotLoadMode::Writable,
     )?;
+    snapshot.transaction_event_sequence = replay_result.transaction_event_sequence;
     snapshot.replayed_transaction_ids = replay_result.replayed_transaction_ids;
     snapshot.replayed_transaction_journal = replay_result.mutated_snapshot;
     Ok(snapshot)
@@ -1643,6 +1652,13 @@ fn replay_transaction_journal(
                 .max()
                 .unwrap_or(0)
         });
+    let mut transaction_event_sequence = snapshot.transaction_event_sequence.max(
+        records
+            .values()
+            .map(|record| record.sequence)
+            .max()
+            .unwrap_or(0),
+    );
 
     let mut annotation_mutated_record_ids = HashSet::new();
     annotation_mutated_record_ids.extend(replay_transaction_journal_file(
@@ -1657,6 +1673,7 @@ fn replay_transaction_journal(
         Some(&snapshot_record_ids),
         max_entries,
         repair_files,
+        &mut transaction_event_sequence,
     )?);
     annotation_mutated_record_ids.extend(replay_transaction_journal_file(
         &journal_path,
@@ -1670,6 +1687,7 @@ fn replay_transaction_journal(
         None,
         max_entries,
         repair_files,
+        &mut transaction_event_sequence,
     )?);
     apply_transaction_journal_backfill(
         max_entries,
@@ -1699,6 +1717,7 @@ fn replay_transaction_journal(
     Ok(TransactionJournalReplayResult {
         replayed_transaction_ids,
         mutated_snapshot,
+        transaction_event_sequence,
     })
 }
 
@@ -1720,6 +1739,7 @@ fn replay_transaction_journal_file(
     skip_annotations_for: Option<&HashSet<Uuid>>,
     max_entries: usize,
     repair_files: bool,
+    transaction_event_sequence: &mut u64,
 ) -> Result<HashSet<Uuid>> {
     let file = match fs::File::open(journal_path) {
         Ok(file) => file,
@@ -1814,6 +1834,7 @@ fn replay_transaction_journal_file(
                 break;
             }
         };
+        *transaction_event_sequence = transaction_event_sequence.saturating_add(1);
         match entry {
             TransactionJournalEntry::Insert { record } => {
                 if insert_after_sequence.is_some_and(|sequence| record.sequence <= sequence) {
@@ -3832,6 +3853,7 @@ mod tests {
         let mut replayed = HashSet::new();
         let mut backfill_order = VecDeque::new();
         let mut backfill_records = HashMap::new();
+        let mut transaction_event_sequence = 0;
         super::replay_transaction_journal_file(
             &journal_path,
             None,
@@ -3844,10 +3866,12 @@ mod tests {
             None,
             100,
             true,
+            &mut transaction_event_sequence,
         )
         .expect("directory journal should be moved aside");
 
         assert!(order.is_empty());
+        assert_eq!(transaction_event_sequence, 0);
         assert!(!journal_path.exists());
         let has_corrupt_backup = std::fs::read_dir(&storage_dir).unwrap().any(|entry| {
             entry
@@ -4830,6 +4854,80 @@ mod tests {
             Some("done")
         );
         assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_replay_advances_transaction_event_sequence_for_annotations() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-event-sequence-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+
+        let mut record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "event-sequence.example:443".to_string(),
+            "/snapshot".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        record.sequence = 1;
+        let record_id = record.id;
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &super::StoredSessionSnapshot {
+                transactions: vec![record],
+                transaction_event_sequence: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut journal = Vec::new();
+        serde_json::to_writer(
+            &mut journal,
+            &TransactionJournalEntry::Annotation {
+                id: record_id,
+                color_tag: Some(NullableStringPatch::Set("green".to_string())),
+                user_note: None,
+                annotation_revision: Some(1),
+                previous_annotation_revision: Some(0),
+                annotation_client_id: None,
+                annotation_client_version: None,
+                previous_color_tag: None,
+                previous_user_note: None,
+            },
+        )
+        .unwrap();
+        journal.push(b'\n');
+        std::fs::write(super::transaction_journal_path(&storage_dir), journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(loaded.store.latest_sequence(), 1);
+        assert_eq!(loaded.store.latest_event_sequence(), 2);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].color_tag.as_deref(), Some("green"));
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

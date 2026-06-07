@@ -60,8 +60,27 @@ const WEBSOCKET_SORT_KEY_OPTIONS: &[&str] = &[
     "duration_ms",
     "started_at",
 ];
+const HTTP_HISTORY_SORT_KEY_OPTIONS: &[&str] = &[
+    "index",
+    "host",
+    "method",
+    "path",
+    "status",
+    "length",
+    "mime",
+    "notes",
+    "tls",
+    "started_at",
+];
+const HTTP_HISTORY_METHOD_OPTIONS: &[&str] = &[
+    "", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+];
+const HTTP_COLOR_TAG_OPTIONS: &[&str] = &["red", "orange", "yellow", "green", "blue", "purple"];
 const UI_SETTINGS_CLIENT_ID_MAX_CHARS: usize = 128;
 const WEBSOCKET_QUERY_MAX_CHARS: usize = 512;
+const HTTP_QUERY_MAX_CHARS: usize = 512;
+const HTTP_FILTER_TEXT_MAX_CHARS: usize = 512;
+const HTTP_FILTER_COLOR_TAG_MAX_COUNT: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -129,6 +148,152 @@ impl WorkbenchPaneWidthsSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct HttpMimeFilterSnapshot {
+    pub html: bool,
+    pub script: bool,
+    pub json: bool,
+    pub css: bool,
+    pub image: bool,
+    pub websocket: bool,
+    pub other: bool,
+}
+
+impl Default for HttpMimeFilterSnapshot {
+    fn default() -> Self {
+        Self {
+            html: true,
+            script: true,
+            json: true,
+            css: true,
+            image: true,
+            websocket: true,
+            other: true,
+        }
+    }
+}
+
+impl HttpMimeFilterSnapshot {
+    fn sanitized(self) -> Self {
+        if self.html
+            || self.script
+            || self.json
+            || self.css
+            || self.image
+            || self.websocket
+            || self.other
+        {
+            self
+        } else {
+            Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpStatusFilterSnapshot {
+    pub success: bool,
+    pub redirect: bool,
+    pub client_error: bool,
+    pub server_error: bool,
+    pub other: bool,
+}
+
+impl Default for HttpStatusFilterSnapshot {
+    fn default() -> Self {
+        Self {
+            success: true,
+            redirect: true,
+            client_error: true,
+            server_error: true,
+            other: true,
+        }
+    }
+}
+
+impl HttpStatusFilterSnapshot {
+    fn sanitized(self) -> Self {
+        if self.success || self.redirect || self.client_error || self.server_error || self.other {
+            self
+        } else {
+            Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpFilterSettingsSnapshot {
+    pub in_scope_only: bool,
+    pub hide_without_responses: bool,
+    pub only_parameterized: bool,
+    pub only_notes: bool,
+    pub search_term: String,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub negative_search: bool,
+    pub mime: HttpMimeFilterSnapshot,
+    pub status: HttpStatusFilterSnapshot,
+    pub hidden_extensions: String,
+    pub port: String,
+    pub color_tags: Vec<String>,
+}
+
+impl Default for HttpFilterSettingsSnapshot {
+    fn default() -> Self {
+        Self {
+            in_scope_only: false,
+            hide_without_responses: false,
+            only_parameterized: false,
+            only_notes: false,
+            search_term: String::new(),
+            regex: false,
+            case_sensitive: false,
+            negative_search: false,
+            mime: HttpMimeFilterSnapshot::default(),
+            status: HttpStatusFilterSnapshot::default(),
+            hidden_extensions: "png,ico,css,woff,woff2,ttf,svg,jpg,jpeg,gif".to_string(),
+            port: String::new(),
+            color_tags: Vec::new(),
+        }
+    }
+}
+
+impl HttpFilterSettingsSnapshot {
+    fn sanitized(self) -> Self {
+        let mut seen = BTreeMap::new();
+        let color_tags = self
+            .color_tags
+            .into_iter()
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| HTTP_COLOR_TAG_OPTIONS.contains(&tag.as_str()))
+            .filter(|tag| seen.insert(tag.clone(), ()).is_none())
+            .take(HTTP_FILTER_COLOR_TAG_MAX_COUNT)
+            .collect();
+
+        Self {
+            in_scope_only: self.in_scope_only,
+            hide_without_responses: self.hide_without_responses,
+            only_parameterized: self.only_parameterized,
+            only_notes: self.only_notes,
+            search_term: trim_to_char_limit(self.search_term.trim(), HTTP_FILTER_TEXT_MAX_CHARS),
+            regex: self.regex,
+            case_sensitive: self.case_sensitive,
+            negative_search: self.negative_search,
+            mime: self.mime.sanitized(),
+            status: self.status.sanitized(),
+            hidden_extensions: trim_to_char_limit(
+                self.hidden_extensions.trim(),
+                HTTP_FILTER_TEXT_MAX_CHARS,
+            ),
+            port: trim_to_char_limit(self.port.trim(), HTTP_FILTER_TEXT_MAX_CHARS),
+            color_tags,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppUiSettingsSnapshot {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_id: String,
@@ -142,6 +307,11 @@ pub struct AppUiSettingsSnapshot {
     pub ws_column_widths: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history_column_order: Vec<String>,
+    pub http_query: String,
+    pub http_method: String,
+    pub http_sort_key: String,
+    pub http_sort_direction: String,
+    pub http_filter_settings: HttpFilterSettingsSnapshot,
     pub workbench_height: Option<u16>,
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
@@ -167,6 +337,11 @@ impl Default for AppUiSettingsSnapshot {
             history_column_widths: default_history_column_widths(),
             ws_column_widths: default_ws_column_widths(),
             history_column_order: Vec::new(),
+            http_query: String::new(),
+            http_method: String::new(),
+            http_sort_key: "index".to_string(),
+            http_sort_direction: "desc".to_string(),
+            http_filter_settings: HttpFilterSettingsSnapshot::default(),
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
@@ -196,6 +371,17 @@ impl AppUiSettingsSnapshot {
             "http-history",
             ACTIVE_PROXY_TAB_OPTIONS,
         );
+        sanitized.http_query = trim_to_char_limit(self.http_query.trim(), HTTP_QUERY_MAX_CHARS);
+        sanitized.http_method = sanitize_option(
+            self.http_method.trim().to_ascii_uppercase(),
+            "",
+            HTTP_HISTORY_METHOD_OPTIONS,
+        );
+        sanitized.http_sort_key =
+            sanitize_option(self.http_sort_key, "index", HTTP_HISTORY_SORT_KEY_OPTIONS);
+        sanitized.http_sort_direction =
+            sanitize_option(self.http_sort_direction, "desc", &["asc", "desc"]);
+        sanitized.http_filter_settings = self.http_filter_settings.sanitized();
         sanitized.workbench_height = self
             .workbench_height
             .filter(|height| *height > 0)
@@ -469,6 +655,21 @@ mod tests {
         snapshot
             .ws_column_widths
             .insert("frame_count".to_string(), 123);
+        snapshot.http_query = "login".to_string();
+        snapshot.http_method = "post".to_string();
+        snapshot.http_sort_key = "status".to_string();
+        snapshot.http_sort_direction = "asc".to_string();
+        snapshot.http_filter_settings.in_scope_only = true;
+        snapshot.http_filter_settings.hide_without_responses = true;
+        snapshot.http_filter_settings.search_term = "token".to_string();
+        snapshot.http_filter_settings.regex = true;
+        snapshot.http_filter_settings.case_sensitive = true;
+        snapshot.http_filter_settings.mime.image = false;
+        snapshot.http_filter_settings.status.redirect = false;
+        snapshot.http_filter_settings.hidden_extensions = "png,jpg".to_string();
+        snapshot.http_filter_settings.port = "443".to_string();
+        snapshot.http_filter_settings.color_tags =
+            vec!["red".to_string(), "blue".to_string(), "red".to_string()];
         snapshot.workbench_height = Some(333);
         snapshot.workbench_pane_widths.request_percent = Some(34);
         snapshot.workbench_pane_widths.response_percent = Some(41);
@@ -497,6 +698,23 @@ mod tests {
         assert_eq!(persisted.active_proxy_tab, "websockets-history");
         assert_eq!(persisted.history_column_widths.get("host"), Some(&444));
         assert_eq!(persisted.ws_column_widths.get("frame_count"), Some(&123));
+        assert_eq!(persisted.http_query, "login");
+        assert_eq!(persisted.http_method, "POST");
+        assert_eq!(persisted.http_sort_key, "status");
+        assert_eq!(persisted.http_sort_direction, "asc");
+        assert!(persisted.http_filter_settings.in_scope_only);
+        assert!(persisted.http_filter_settings.hide_without_responses);
+        assert_eq!(persisted.http_filter_settings.search_term, "token");
+        assert!(persisted.http_filter_settings.regex);
+        assert!(persisted.http_filter_settings.case_sensitive);
+        assert!(!persisted.http_filter_settings.mime.image);
+        assert!(!persisted.http_filter_settings.status.redirect);
+        assert_eq!(persisted.http_filter_settings.hidden_extensions, "png,jpg");
+        assert_eq!(persisted.http_filter_settings.port, "443");
+        assert_eq!(
+            persisted.http_filter_settings.color_tags,
+            vec!["red".to_string(), "blue".to_string()]
+        );
         assert_eq!(persisted.workbench_height, Some(333));
         assert_eq!(persisted.workbench_pane_widths.request_percent, Some(34));
         assert_eq!(persisted.workbench_pane_widths.response_percent, Some(41));
@@ -566,6 +784,34 @@ mod tests {
         snapshot.display_settings.mono_font = "fantasy".to_string();
         snapshot.active_tool = "missing-tool".to_string();
         snapshot.active_proxy_tab = "missing-tab".to_string();
+        snapshot.http_query = format!("  {}  ", "q".repeat(super::HTTP_QUERY_MAX_CHARS + 8));
+        snapshot.http_method = "TRACE".to_string();
+        snapshot.http_sort_key = "missing-sort".to_string();
+        snapshot.http_sort_direction = "sideways".to_string();
+        snapshot.http_filter_settings.search_term =
+            format!("  {}  ", "s".repeat(super::HTTP_FILTER_TEXT_MAX_CHARS + 8));
+        snapshot.http_filter_settings.mime = super::HttpMimeFilterSnapshot {
+            html: false,
+            script: false,
+            json: false,
+            css: false,
+            image: false,
+            websocket: false,
+            other: false,
+        };
+        snapshot.http_filter_settings.status = super::HttpStatusFilterSnapshot {
+            success: false,
+            redirect: false,
+            client_error: false,
+            server_error: false,
+            other: false,
+        };
+        snapshot.http_filter_settings.color_tags = vec![
+            "red".to_string(),
+            "missing".to_string(),
+            "purple".to_string(),
+            "red".to_string(),
+        ];
         snapshot.websocket_query =
             format!("  {}  ", "x".repeat(super::WEBSOCKET_QUERY_MAX_CHARS + 8));
         snapshot.websocket_sort_key = "missing-sort".to_string();
@@ -584,6 +830,23 @@ mod tests {
         assert_eq!(persisted.display_settings.mono_font, "jetbrains");
         assert_eq!(persisted.active_tool, "proxy");
         assert_eq!(persisted.active_proxy_tab, "http-history");
+        assert_eq!(
+            persisted.http_query.chars().count(),
+            super::HTTP_QUERY_MAX_CHARS
+        );
+        assert_eq!(persisted.http_method, "");
+        assert_eq!(persisted.http_sort_key, "index");
+        assert_eq!(persisted.http_sort_direction, "desc");
+        assert_eq!(
+            persisted.http_filter_settings.search_term.chars().count(),
+            super::HTTP_FILTER_TEXT_MAX_CHARS
+        );
+        assert!(persisted.http_filter_settings.mime.html);
+        assert!(persisted.http_filter_settings.status.success);
+        assert_eq!(
+            persisted.http_filter_settings.color_tags,
+            vec!["red".to_string(), "purple".to_string()]
+        );
         assert_eq!(
             persisted.websocket_query.chars().count(),
             super::WEBSOCKET_QUERY_MAX_CHARS

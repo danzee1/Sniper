@@ -100,6 +100,9 @@ const HISTORY_COLUMN_DEFS = {
   tls: { label: "TLS", cssClass: "col-tls", sortKey: "tls" },
   started_at: { label: "Time", cssClass: "col-time", sortKey: "started_at" },
 };
+const HTTP_HISTORY_SORT_KEYS = new Set(Object.keys(HISTORY_COLUMN_RULES));
+const HTTP_METHOD_FILTER_OPTIONS = new Set(["", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
+const HTTP_COLOR_TAG_OPTIONS = new Set(["red", "orange", "yellow", "green", "blue", "purple"]);
 const DEFAULT_HISTORY_COLUMN_ORDER = ["index", "host", "method", "path", "status", "length", "mime", "notes", "tls", "started_at"];
 const HISTORY_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
   month: "short",
@@ -1142,6 +1145,7 @@ function bindEvents() {
     clearTimeout(_searchDebounce);
     _searchDebounce = setTimeout(() => {
       state.query = els.searchInput.value.trim();
+      scheduleUiSettingsSave();
       clearHttpHistorySelectionPreview();
       scheduleRefresh({ resetScroll: true });
     }, 60);
@@ -1150,6 +1154,7 @@ function bindEvents() {
     if (event.key === "Enter") {
       clearTimeout(_searchDebounce);
       state.query = els.searchInput.value.trim();
+      scheduleUiSettingsSave();
       clearHttpHistorySelectionPreview();
       scheduleRefresh({ resetScroll: true });
     }
@@ -1158,6 +1163,7 @@ function bindEvents() {
     // Triggered when user clears the search field via the X button
     clearTimeout(_searchDebounce);
     state.query = els.searchInput.value.trim();
+    scheduleUiSettingsSave();
     clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
@@ -1302,6 +1308,7 @@ function bindEvents() {
   document.getElementById("httpInScopeToggle")?.addEventListener("click", (e) => {
     e.currentTarget.classList.toggle("active");
     state.filterSettings.inScopeOnly = e.currentTarget.classList.contains("active");
+    scheduleUiSettingsSave();
     clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
@@ -1350,6 +1357,7 @@ function bindEvents() {
 
   els.methodFilter.addEventListener("change", () => {
     state.method = els.methodFilter.value;
+    scheduleUiSettingsSave();
     clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
@@ -1365,6 +1373,7 @@ function bindEvents() {
       state.filterSettings.colorTags.add(color);
       btn.classList.add("active");
     }
+    scheduleUiSettingsSave();
     clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
@@ -1392,6 +1401,7 @@ function bindEvents() {
     state.filterSettings = createDefaultFilterSettings();
     hydrateFilterForm();
     syncHttpInScopePill();
+    scheduleUiSettingsSave();
     clearHttpHistorySelectionPreview();
     scheduleRefresh({ resetScroll: true });
   });
@@ -15413,6 +15423,101 @@ function sanitizeActiveProxyTab(value) {
   return IMPLEMENTED_PROXY_TABS.has(proxyTab) ? proxyTab : "http-history";
 }
 
+function sanitizeHttpQuery(value) {
+  return String(value || "").trim().slice(0, 512);
+}
+
+function sanitizeHttpMethod(value) {
+  const method = String(value || "").trim().toUpperCase();
+  return HTTP_METHOD_FILTER_OPTIONS.has(method) ? method : "";
+}
+
+function sanitizeHttpSortKey(value) {
+  const sortKey = String(value || "").trim();
+  return HTTP_HISTORY_SORT_KEYS.has(sortKey) ? sortKey : "index";
+}
+
+function sanitizeHttpSortDirection(value) {
+  return String(value || "").trim() === "asc" ? "asc" : "desc";
+}
+
+function sanitizeHttpBooleanMap(candidate, defaults) {
+  const next = { ...defaults };
+  if (candidate && typeof candidate === "object") {
+    Object.keys(defaults).forEach((key) => {
+      if (typeof candidate[key] === "boolean") {
+        next[key] = candidate[key];
+      }
+    });
+    if (Object.prototype.hasOwnProperty.call(defaults, "clientError") && typeof candidate.client_error === "boolean") {
+      next.clientError = candidate.client_error;
+    }
+    if (Object.prototype.hasOwnProperty.call(defaults, "serverError") && typeof candidate.server_error === "boolean") {
+      next.serverError = candidate.server_error;
+    }
+  }
+  return Object.values(next).some(Boolean) ? next : { ...defaults };
+}
+
+function sanitizeHttpColorTags(value) {
+  const values = Array.isArray(value)
+    ? value
+    : (value && typeof value[Symbol.iterator] === "function" ? [...value] : []);
+  const tags = new Set();
+  values.forEach((candidate) => {
+    const tag = String(candidate || "").trim();
+    if (HTTP_COLOR_TAG_OPTIONS.has(tag)) {
+      tags.add(tag);
+    }
+  });
+  return tags;
+}
+
+function sanitizeHttpFilterSettings(candidate) {
+  const defaults = createDefaultFilterSettings();
+  const filters = candidate && typeof candidate === "object" ? candidate : {};
+  return {
+    inScopeOnly: Boolean(filters.in_scope_only ?? filters.inScopeOnly ?? defaults.inScopeOnly),
+    hideWithoutResponses: Boolean(filters.hide_without_responses ?? filters.hideWithoutResponses ?? defaults.hideWithoutResponses),
+    onlyParameterized: Boolean(filters.only_parameterized ?? filters.onlyParameterized ?? defaults.onlyParameterized),
+    onlyNotes: Boolean(filters.only_notes ?? filters.onlyNotes ?? defaults.onlyNotes),
+    searchTerm: String(filters.search_term ?? filters.searchTerm ?? defaults.searchTerm).trim().slice(0, 512),
+    regex: Boolean(filters.regex ?? defaults.regex),
+    caseSensitive: Boolean(filters.case_sensitive ?? filters.caseSensitive ?? defaults.caseSensitive),
+    negativeSearch: Boolean(filters.negative_search ?? filters.negativeSearch ?? defaults.negativeSearch),
+    mime: sanitizeHttpBooleanMap(filters.mime, defaults.mime),
+    status: sanitizeHttpBooleanMap(filters.status, defaults.status),
+    hiddenExtensions: String(filters.hidden_extensions ?? filters.hiddenExtensions ?? defaults.hiddenExtensions).trim().slice(0, 512),
+    port: String(filters.port ?? defaults.port).trim().slice(0, 512),
+    colorTags: sanitizeHttpColorTags(filters.color_tags ?? filters.colorTags),
+  };
+}
+
+function serializeHttpFilterSettings() {
+  const filters = sanitizeHttpFilterSettings(state.filterSettings);
+  return {
+    in_scope_only: filters.inScopeOnly,
+    hide_without_responses: filters.hideWithoutResponses,
+    only_parameterized: filters.onlyParameterized,
+    only_notes: filters.onlyNotes,
+    search_term: filters.searchTerm,
+    regex: filters.regex,
+    case_sensitive: filters.caseSensitive,
+    negative_search: filters.negativeSearch,
+    mime: { ...filters.mime },
+    status: {
+      success: filters.status.success,
+      redirect: filters.status.redirect,
+      client_error: filters.status.clientError,
+      server_error: filters.status.serverError,
+      other: filters.status.other,
+    },
+    hidden_extensions: filters.hiddenExtensions,
+    port: filters.port,
+    color_tags: [...filters.colorTags],
+  };
+}
+
 function sanitizeWebsocketQuery(value) {
   return String(value || "").trim().slice(0, 512);
 }
@@ -15688,6 +15793,11 @@ function applyUiSettingsSnapshot(snapshot) {
   state.activeProxyTab = sanitizeActiveProxyTab(snapshot?.active_proxy_tab);
   state.historyColumnWidths = sanitizeHistoryColumnWidths(snapshot?.history_column_widths);
   state.historyColumnOrder = sanitizeHistoryColumnOrder(snapshot?.history_column_order);
+  state.query = sanitizeHttpQuery(snapshot?.http_query);
+  state.method = sanitizeHttpMethod(snapshot?.http_method);
+  state.sortKey = sanitizeHttpSortKey(snapshot?.http_sort_key);
+  state.sortDirection = sanitizeHttpSortDirection(snapshot?.http_sort_direction);
+  state.filterSettings = sanitizeHttpFilterSettings(snapshot?.http_filter_settings);
   if (snapshot?.ws_column_widths && typeof snapshot.ws_column_widths === "object") {
     Object.entries(snapshot.ws_column_widths).forEach(([k, v]) => {
       if (WS_COLUMN_RULES[k] && WS_COLUMN_RULES[k].max > 0 && typeof v === "number") {
@@ -15709,6 +15819,14 @@ function applyUiSettingsSnapshot(snapshot) {
   if (els.websocketSearchInput) {
     els.websocketSearchInput.value = state.websocketQuery;
   }
+  if (els.searchInput) {
+    els.searchInput.value = state.query;
+  }
+  if (els.methodFilter) {
+    els.methodFilter.value = state.method;
+  }
+  hydrateFilterForm();
+  syncHttpInScopePill();
   document.getElementById("wsInScopeOnly")?.classList.toggle("active", state.websocketInScopeOnly);
   document.getElementById("wsHideClosed")?.classList.toggle("active", state.websocketLiveOnly);
   applyDisplaySettingsState();
@@ -15743,6 +15861,11 @@ function snapshotUiSettings() {
     history_column_widths: { ...state.historyColumnWidths },
     history_column_order: [...state.historyColumnOrder],
     ws_column_widths: { ...state.wsColumnWidths },
+    http_query: sanitizeHttpQuery(state.query),
+    http_method: sanitizeHttpMethod(state.method),
+    http_sort_key: sanitizeHttpSortKey(state.sortKey),
+    http_sort_direction: sanitizeHttpSortDirection(state.sortDirection),
+    http_filter_settings: serializeHttpFilterSettings(),
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,
@@ -15960,6 +16083,7 @@ function applyFilterSettings() {
   };
   closeFilterModal();
   syncHttpInScopePill();
+  scheduleUiSettingsSave();
   clearHttpHistorySelectionPreview();
   scheduleRefresh({ resetScroll: true });
 }
@@ -17729,6 +17853,7 @@ function toggleSort(key) {
 
   invalidateVisibleEntriesCache();
   clearHttpHistorySelectionPreview();
+  scheduleUiSettingsSave();
   scheduleRefresh({ resetScroll: true });
 }
 

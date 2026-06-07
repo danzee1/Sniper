@@ -328,6 +328,14 @@ impl TransactionStore {
         records: Vec<TransactionRecord>,
         max_entries: Option<usize>,
     ) -> Self {
+        Self::from_records_with_max_entries_and_event_sequence(records, max_entries, 0)
+    }
+
+    pub fn from_records_with_max_entries_and_event_sequence(
+        records: Vec<TransactionRecord>,
+        max_entries: Option<usize>,
+        latest_event_sequence: u64,
+    ) -> Self {
         let (events, _) = broadcast::channel(256);
         let (retention_events, _) = broadcast::channel(64);
         let mut inner = StoreInner::from_newest_first(records);
@@ -344,7 +352,7 @@ impl TransactionStore {
             journal_tx: None,
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
-            next_event_sequence: AtomicU64::new(max_seq + 1),
+            next_event_sequence: AtomicU64::new(max_seq.max(latest_event_sequence) + 1),
         }
     }
 
@@ -353,7 +361,20 @@ impl TransactionStore {
         journal_path: PathBuf,
         max_entries: Option<usize>,
     ) -> Self {
-        let mut store = Self::from_records_with_max_entries(records, max_entries);
+        Self::from_records_with_journal_and_event_sequence(records, journal_path, max_entries, 0)
+    }
+
+    pub fn from_records_with_journal_and_event_sequence(
+        records: Vec<TransactionRecord>,
+        journal_path: PathBuf,
+        max_entries: Option<usize>,
+        latest_event_sequence: u64,
+    ) -> Self {
+        let mut store = Self::from_records_with_max_entries_and_event_sequence(
+            records,
+            max_entries,
+            latest_event_sequence,
+        );
         store.journal_tx = start_transaction_journal_writer(journal_path);
         store
     }
@@ -927,7 +948,7 @@ impl TransactionStore {
         previous_user_note: Option<String>,
     ) -> io::Result<bool> {
         let _mutation_guard = self.insert_lock.lock().await;
-        {
+        let previous_annotation_revision = {
             let inner = self.inner.read().await;
             let Some(index) = inner.by_id.get(&id).copied() else {
                 return Ok(false);
@@ -938,15 +959,17 @@ impl TransactionStore {
             if record.color_tag != expected_color_tag || record.user_note != expected_user_note {
                 return Ok(false);
             }
-        }
+            record.annotation_revision
+        };
+        let next_annotation_revision = previous_annotation_revision.saturating_add(1).max(1);
         let mut journal_error = None;
         if let Some(tx) = &self.journal_tx {
             let line = encode_transaction_journal_line(&TransactionJournalEntry::Annotation {
                 id,
                 color_tag: Some(nullable_string_value_patch(previous_color_tag.clone())),
                 user_note: Some(nullable_string_value_patch(previous_user_note.clone())),
-                annotation_revision: None,
-                previous_annotation_revision: None,
+                annotation_revision: Some(next_annotation_revision),
+                previous_annotation_revision: Some(previous_annotation_revision),
                 annotation_client_id: None,
                 annotation_client_version: None,
                 previous_color_tag: Some(nullable_string_value_patch(expected_color_tag.clone())),
@@ -981,8 +1004,11 @@ impl TransactionStore {
         };
         record.color_tag = previous_color_tag;
         record.user_note = previous_user_note;
+        record.annotation_revision = next_annotation_revision;
         let summary = record.summary();
-        inner.summaries[index] = CachedSummary::new(summary);
+        inner.summaries[index] = CachedSummary::new(summary.clone());
+        drop(inner);
+        self.publish_transaction_event(summary);
         Ok(true)
     }
 
@@ -2396,6 +2422,7 @@ mod tests {
             .update_annotations(id, Some(Some("new".to_string())), Some(None))
             .await
             .unwrap();
+        let mut receiver = store.subscribe();
         assert!(store
             .restore_annotations_if_current(
                 id,
@@ -2407,6 +2434,22 @@ mod tests {
             .await
             .unwrap());
 
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.summary.id, id);
+        assert_eq!(event.summary.color_tag.as_deref(), Some("old"));
+        assert!(!event.summary.has_user_note);
+        assert_eq!(
+            event.summary.annotation_revision,
+            update.summary.annotation_revision.saturating_add(1)
+        );
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.color_tag.as_deref(), Some("old"));
+        assert!(stored.user_note.is_none());
+        assert_eq!(
+            stored.annotation_revision,
+            event.summary.annotation_revision
+        );
+
         let lines = std::fs::read_to_string(&journal_path).unwrap();
         let entries = lines
             .lines()
@@ -2415,6 +2458,8 @@ mod tests {
         let Some(TransactionJournalEntry::Annotation {
             color_tag,
             user_note,
+            annotation_revision,
+            previous_annotation_revision,
             ..
         }) = entries.last()
         else {
@@ -2425,6 +2470,14 @@ mod tests {
             Some(NullableStringPatch::Set(value)) if value == "old"
         ));
         assert!(matches!(user_note, Some(NullableStringPatch::Clear)));
+        assert_eq!(
+            *annotation_revision,
+            Some(event.summary.annotation_revision)
+        );
+        assert_eq!(
+            *previous_annotation_revision,
+            Some(update.summary.annotation_revision)
+        );
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
