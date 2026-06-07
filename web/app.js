@@ -3169,6 +3169,7 @@ async function flushBeforeNativeClose() {
   await flushAllPendingAnnotations();
   await flushProxySettingsSaveBeforeClose();
   await flushWsReplayTabsBeforeClose();
+  syncReplayDraftsBeforeWorkspaceClose();
   await flushWorkspaceState();
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = null;
@@ -3181,6 +3182,7 @@ window.__sniperFlushBeforeNativeClose = flushBeforeNativeClose;
 
 function flushWorkspaceStateBeforeHidden() {
   if (document.visibilityState !== "hidden") return;
+  syncReplayDraftsBeforeWorkspaceClose();
   (async () => {
     await drainWsReplayFramesBeforeHidden();
     if (!hasPendingWorkspaceStateSave()) return;
@@ -3196,6 +3198,7 @@ function flushWorkspaceStateOnUnload() {
   window.clearTimeout(wsTranscriptSaveTimer);
   wsTranscriptSaveTimer = null;
   wsTranscriptFirstDirtyAt = 0;
+  syncReplayDraftsBeforeWorkspaceClose();
   disconnectWsReplayTabsOnUnload();
   if (!state.activeSession || (!workspaceSaveDirty && !workspaceSaveTimer && !workspaceSaveInFlight && !hadTranscriptSaveTimer)) {
     return;
@@ -3274,6 +3277,130 @@ function workspaceUnloadSnapshotPayload(snapshot) {
   return utf8ByteLength(payload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES
     ? payload
     : null;
+}
+
+function syncPendingReplayTabRenameFromDom() {
+  const renamingTabId = state.replayRenamingTabId;
+  if (!renamingTabId || !els.replayTabStrip) return false;
+  const tab = state.replayTabs.find((item) => item.id === renamingTabId);
+  if (!tab) return false;
+  const tabElement = Array.from(els.replayTabStrip.querySelectorAll(".replay-tab"))
+    .find((element) => element.dataset.replayTabId === renamingTabId);
+  const input = tabElement?.querySelector(".replay-tab-name-input");
+  if (!input) return false;
+  const nextLabel = normalizeReplayTabCustomLabel(input.value);
+  if ((tab.customLabel || "") === nextLabel) return false;
+  tab.customLabel = nextLabel;
+  scheduleWorkspaceStateSave();
+  return true;
+}
+
+function syncActiveHttpReplayDraftFromDom() {
+  const tab = getActiveReplayTab();
+  if (!tab || tab.type === "websocket") return false;
+  let changed = false;
+  if (state.replayMessageViews.request !== "hex") {
+    const cv = getCMView("replayReq");
+    const requestText = cv
+      ? cv.getContent()
+      : (els.replayRequestEditor?.value ?? els.replayRequestHighlight?.innerText ?? null);
+    if (typeof requestText === "string" && requestText !== tab.requestText) {
+      syncReplayRequestTextFromEditor(requestText);
+      changed = true;
+    }
+  }
+  if (els.replayHostInput && els.replayPortInput) {
+    const validation = validateManualRepeaterTargetInput(
+      els.replayHostInput.value,
+      els.replayPortInput.value,
+    );
+    setReplayTargetInputValidity(validation);
+    if (validation.valid) {
+      const normalizedTarget = normalizeRepeaterTargetInput(
+        els.replayHostInput.value,
+        els.replayPortInput.value,
+        els.replaySchemeSelect?.value || tab.targetScheme || "https",
+      );
+      if (
+        tab.targetScheme !== normalizedTarget.scheme
+        || tab.targetHost !== normalizedTarget.host
+        || tab.targetPort !== normalizedTarget.port
+      ) {
+        tab.targetScheme = normalizedTarget.scheme;
+        tab.targetHost = normalizedTarget.host;
+        tab.targetPort = normalizedTarget.port;
+        tab.targetManuallyEdited = true;
+        clearReplayResponseForDraftChange(tab);
+        scheduleWorkspaceStateSave();
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+function syncActiveWsReplayDraftFromDom() {
+  const tab = getActiveReplayTab();
+  if (!tab || tab.type !== "websocket") return false;
+  let changed = false;
+  if (els.wsSchemeSelect && els.wsHostInput && els.wsPortInput && els.wsPathInput) {
+    const rawPort = els.wsPortInput.value.trim();
+    const normalizedPort = normalizePortValue(rawPort);
+    const validation = validateWsReplayTargetInput(
+      els.wsSchemeSelect.value,
+      els.wsHostInput.value,
+      rawPort,
+      els.wsPathInput.value,
+    );
+    setWsReplayTargetInputValidity(validation);
+    if (validation.valid && normalizedPort) {
+      const nextScheme = els.wsSchemeSelect.value;
+      const nextHost = els.wsHostInput.value.trim();
+      const nextPath = els.wsPathInput.value.trim();
+      if (
+        tab.wsScheme !== nextScheme
+        || tab.wsHost !== nextHost
+        || tab.wsPort !== normalizedPort
+        || tab.wsPath !== nextPath
+      ) {
+        tab.wsScheme = nextScheme;
+        tab.wsHost = nextHost;
+        tab.wsPort = normalizedPort;
+        tab.wsPath = nextPath;
+        scheduleWorkspaceStateSave();
+        changed = true;
+      }
+    }
+  }
+  if (els.wsHandshakeHeaders && tab.wsHandshakeText !== els.wsHandshakeHeaders.value) {
+    tab.wsHandshakeText = els.wsHandshakeHeaders.value;
+    tab.wsHandshakeEdited = true;
+    scheduleWorkspaceStateSave();
+    changed = true;
+  }
+  const nextMessageType = normalizeWsMessageType(els.wsMessageType?.value || tab.wsMessageType);
+  const nextEditorText = els.wsMessageHighlight
+    ? (els.wsMessageHighlight.innerText || "")
+    : (els.wsMessageEditor?.value ?? null);
+  if (
+    tab.wsMessageType !== nextMessageType
+    || (typeof nextEditorText === "string" && tab.wsEditorText !== nextEditorText)
+  ) {
+    tab.wsMessageType = nextMessageType;
+    if (typeof nextEditorText === "string") {
+      tab.wsEditorText = nextEditorText;
+    }
+    tab.wsEditorBodyEncoded = false;
+    scheduleWorkspaceStateSave();
+    changed = true;
+  }
+  return changed;
+}
+
+function syncReplayDraftsBeforeWorkspaceClose() {
+  syncPendingReplayTabRenameFromDom();
+  syncActiveHttpReplayDraftFromDom();
+  syncActiveWsReplayDraftFromDom();
 }
 
 function workspaceUnloadPayload(primarySnapshot) {
@@ -5107,6 +5234,11 @@ async function loadWebsocketDetail(id, options = {}) {
       && !selectedWebsocketDetailMeetsRefreshTarget(refreshTarget)
     ) {
       scheduleSelectedWebsocketDetailRefresh(id, refreshTarget.lastFrameIndex);
+    } else if (
+      refreshTarget?.id === id
+      && selectedWebsocketDetailMeetsRefreshTarget(refreshTarget)
+    ) {
+      _websocketDetailRefreshNeeded = null;
     }
   }
 }
@@ -9747,20 +9879,32 @@ async function syncVisibleWebsocketSelection(preserveSelection = true, options =
     state.selectedWebsocketDetailError = "";
   }
   const selectedSummary = visibleSessions.find((item) => item.id === state.selectedWebsocketId);
+  const selectedRefreshTarget = _websocketDetailRefreshNeeded?.id === state.selectedWebsocketId
+    ? _websocketDetailRefreshNeeded
+    : null;
+  const selectedDetailMissesRefreshTarget = Boolean(
+    selectedRefreshTarget
+    && !selectedWebsocketDetailMeetsRefreshTarget(selectedRefreshTarget),
+  );
   const selectedDetailIsStale = Boolean(
-    selectedSummary
-    && state.selectedWebsocketRecord
+    state.selectedWebsocketRecord
     && (
+      selectedDetailMissesRefreshTarget
+      || (selectedSummary && (
       Number(state.selectedWebsocketRecord.frame_count || 0) !== Number(selectedSummary.frame_count || 0)
       || Number(state.selectedWebsocketRecord.loaded_last_frame_index ?? -1) !== Number(selectedSummary.last_frame_index ?? -1)
       || state.selectedWebsocketRecord.status !== selectedSummary.status
       || (state.selectedWebsocketRecord.closed_at || null) !== (selectedSummary.closed_at || null)
       || (state.selectedWebsocketRecord.duration_ms ?? null) !== (selectedSummary.duration_ms ?? null)
+      ))
     )
   );
   renderWebsocketSessions(renderOptions);
   if (selectedDetailIsStale && deferStaleDetail) {
-    scheduleSelectedWebsocketDetailRefresh(state.selectedWebsocketId);
+    scheduleSelectedWebsocketDetailRefresh(
+      state.selectedWebsocketId,
+      selectedRefreshTarget?.lastFrameIndex ?? selectedSummary?.last_frame_index ?? null,
+    );
     return;
   }
   if (!state.selectedWebsocketRecord || selectedDetailIsStale) {
