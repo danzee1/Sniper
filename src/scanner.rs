@@ -1902,7 +1902,9 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     }
 
     // Source map references
-    let sourcemap_re = Regex::new(r"//[#@]\s*sourceMappingURL\s*=\s*(\S+\.map)").unwrap();
+    let sourcemap_re =
+        Regex::new(r"(?m)(?://[#@]|/\*[#@])\s*sourceMappingURL\s*=\s*[^\s*]+\.map\s*(?:\*/)?")
+            .unwrap();
     if let Some(m) = sourcemap_re.find(body) {
         findings.push(make_finding(
             record,
@@ -3725,6 +3727,21 @@ mod tests {
                 .any(|f| f.category == "info" && f.title.contains("Swagger")),
             "Should detect Swagger/OpenAPI spec exposure"
         );
+    }
+
+    #[test]
+    fn block_comment_source_map_reference_is_reported() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/css")],
+            "body{color:#111}/*# sourceMappingURL=app.css.map */",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "JavaScript source map reference"));
     }
 
     #[test]

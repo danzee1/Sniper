@@ -12,6 +12,7 @@ use crate::model::{
 };
 
 const MAX_WEBSOCKET_BROADCAST_CAPACITY: usize = 4096;
+const DEFAULT_WEBSOCKET_LIST_LIMIT: usize = 5_000;
 
 pub struct WebSocketStore {
     max_entries: usize,
@@ -262,7 +263,7 @@ impl WebSocketStore {
         let total = inner.order.len();
         let limit = filters
             .limit
-            .unwrap_or(self.max_entries)
+            .unwrap_or(DEFAULT_WEBSOCKET_LIST_LIMIT)
             .min(self.max_entries);
         let normalized_query = filters
             .query
@@ -804,6 +805,28 @@ mod tests {
         record.closed_at = Some(Utc::now());
         record.duration_ms = Some(25);
         record
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_without_limit_uses_default_cap() {
+        let now = Utc::now();
+        let records = (0..(DEFAULT_WEBSOCKET_LIST_LIMIT + 5))
+            .map(|idx| {
+                let mut record = session(vec![frame(1)]);
+                record.host = format!("host-{idx}.example.test");
+                record.started_at = now - chrono::Duration::milliseconds(idx as i64);
+                record
+            })
+            .collect::<Vec<_>>();
+        let store = WebSocketStore::from_sessions(10_000, 10, records);
+
+        let page = store
+            .list_page_filtered(&WebSocketListFilters::default())
+            .await;
+
+        assert_eq!(page.items.len(), DEFAULT_WEBSOCKET_LIST_LIMIT);
+        assert_eq!(page.limit, DEFAULT_WEBSOCKET_LIST_LIMIT);
+        assert!(page.has_more);
     }
 
     #[tokio::test]

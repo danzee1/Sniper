@@ -962,6 +962,22 @@ function resetLayoutTextareas() {
   }
 }
 
+function setActiveTool(tool, options = {}) {
+  state.activeTool = sanitizeActiveTool(tool);
+  if (options.persist !== false) {
+    scheduleUiSettingsSave(options.delay);
+  }
+  return state.activeTool;
+}
+
+function setActiveProxyTab(tab, options = {}) {
+  state.activeProxyTab = sanitizeActiveProxyTab(tab);
+  if (options.persist !== false) {
+    scheduleUiSettingsSave(options.delay);
+  }
+  return state.activeProxyTab;
+}
+
 function bindEvents() {
   window.addEventListener("resize", resetLayoutTextareas);
   document.addEventListener("visibilitychange", flushWorkspaceStateBeforeHidden);
@@ -974,8 +990,7 @@ function bindEvents() {
 
   mainTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      state.activeTool = tab.dataset.tool;
-      scheduleUiSettingsSave();
+      setActiveTool(tab.dataset.tool);
       renderToolPanels();
       if (state.activeTool === "dashboard") {
         loadSessions().catch((error) => console.error(error));
@@ -997,8 +1012,7 @@ function bindEvents() {
 
   proxyTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      state.activeProxyTab = tab.dataset.proxyTab;
-      scheduleUiSettingsSave();
+      setActiveProxyTab(tab.dataset.proxyTab);
       renderProxyPanels();
       if (state.activeProxyTab === "intercept") {
         loadIntercepts(true).catch((error) => console.error(error));
@@ -1363,7 +1377,7 @@ function bindEvents() {
 
   els.openCertFolderButton.addEventListener("click", () => openCertificateFolder());
   els.openEventLogButton.addEventListener("click", async () => {
-    state.activeTool = "logger";
+    setActiveTool("logger");
     await loadEventLog();
     renderToolPanels();
   });
@@ -2285,7 +2299,7 @@ function bindEvents() {
       } else if (state.activeTool === "replay" && state.activeReplayTabId) {
         openFuzzerFromReplay().catch(handleSendActionError);
       } else {
-        state.activeTool = "fuzzer";
+        setActiveTool("fuzzer");
         renderToolPanels();
       }
     }
@@ -7050,7 +7064,8 @@ function extractFindingKeywords(finding) {
 }
 
 function jumpToTransaction(recordId) {
-  state.activeProxyTab = "http-history";
+  setActiveTool("proxy");
+  setActiveProxyTab("http-history");
   state.selectedId = recordId;
   state.selectedRecord = null;
   renderProxyPanels();
@@ -7183,7 +7198,7 @@ function openTransactionRecordInReplay(record) {
       path: record.path || "/",
       headers: normalizedHeaders(record.request?.headers),
     });
-    state.activeTool = "replay";
+    setActiveTool("replay");
     scheduleWorkspaceStateSave();
     renderToolPanels();
     return;
@@ -7197,7 +7212,7 @@ function openTransactionRecordInReplay(record) {
   });
   state.replayTabs.push(tab);
   state.activeReplayTabId = tab.id;
-  state.activeTool = "replay";
+  setActiveTool("replay");
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
@@ -7236,7 +7251,7 @@ async function sendFindingToFuzzer(recordId) {
   clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
-  state.activeTool = "fuzzer";
+  setActiveTool("fuzzer");
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
@@ -10826,7 +10841,7 @@ async function openFuzzerFromReplay() {
   clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
-  state.activeTool = "fuzzer";
+  setActiveTool("fuzzer");
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
@@ -10859,7 +10874,7 @@ function openFuzzerFromRecord(record) {
   clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
-  state.activeTool = "fuzzer";
+  setActiveTool("fuzzer");
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
@@ -10895,7 +10910,7 @@ async function sendRecordToSequence(record) {
     target: null,
     extractions: [],
   });
-  state.activeTool = "sequence";
+  setActiveTool("sequence");
   if (!(await saveCurrentSequence())) {
     return;
   }
@@ -12921,7 +12936,7 @@ function openBlankReplayTab() {
   const tab = createReplayTab();
   state.replayTabs.push(tab);
   state.activeReplayTabId = tab.id;
-  state.activeTool = "replay";
+  setActiveTool("replay");
   scheduleWorkspaceStateSave();
   renderToolPanels();
 }
@@ -17263,6 +17278,9 @@ function normalizeWsSetupItem(item = {}) {
 }
 
 function wsSetupItemFromCapturedFrame(frame) {
+  if (!isWsFrameReplayable(frame)) {
+    return null;
+  }
   const kind = wsReplayMessageTypeForFrame(frame);
   const rawFrameBody = frame.body || frame.body_preview || "";
   const bodyEncoded = kind !== "text" && frame.body_encoding === "base64";
@@ -17319,7 +17337,8 @@ function createWsReplayTab(seed = {}) {
         .filter((f) => f.direction === "client_to_server")
         .filter((f) => !Number.isFinite(selectedFrameIndex) || f.index < selectedFrameIndex)
         .filter((f) => !f.preview_truncated)
-        .map((f) => wsSetupItemFromCapturedFrame(f)),
+        .map((f) => wsSetupItemFromCapturedFrame(f))
+        .filter(Boolean),
   };
   rebuildWsReplayFrameTracking(tab);
   state.replayTabs.push(tab);
@@ -18197,11 +18216,15 @@ function renderWsFrameList() {
     const idx = parseInt(bubble.dataset.frameIndex, 10);
     const frame = frames.find((item) => item.index === idx);
     if (frame && frame.direction === "client_to_server") {
-      const messageType = wsReplayMessageTypeForFrame(frame);
       if (frame.preview_truncated) {
         showToast("Frame preview is truncated and cannot be replayed safely.", "error");
         return;
       }
+      if (!isWsFrameReplayable(frame)) {
+        showToast("Close and unknown WebSocket frames cannot be replayed safely.", "error");
+        return;
+      }
+      const messageType = wsReplayMessageTypeForFrame(frame);
       const editorText = wsReplayEditorTextForFrame(frame);
       const editorBodyEncoded = messageType !== "text" && frame.body_encoding === "base64";
       if (els.wsMessageType) {
@@ -18262,6 +18285,11 @@ function wsReplayMessageTypeForFrame(frame) {
   const kind = normalizeWsMessageType(frame?.kind);
   if (kind === "ping" || kind === "pong") return kind;
   return kind === "binary" || frame?.body_encoding === "base64" ? "binary" : "text";
+}
+
+function isWsFrameReplayable(frame) {
+  const kind = normalizeWsFrameKind(frame?.kind);
+  return kind !== "close" && kind !== "other";
 }
 
 function wsReplayEditorTextForFrame(frame) {
@@ -18999,11 +19027,15 @@ function sendWsFrameToReplay(frameIdx) {
     wsScheme = "ws";
   }
 
-  const messageType = wsReplayMessageTypeForFrame(frame);
   if (frame.preview_truncated) {
     showToast("Frame preview is truncated and cannot be replayed safely.", "error");
     return;
   }
+  if (!isWsFrameReplayable(frame)) {
+    showToast("Close and unknown WebSocket frames cannot be replayed safely.", "error");
+    return;
+  }
+  const messageType = wsReplayMessageTypeForFrame(frame);
   const body = wsReplayEditorTextForFrame(frame);
   const editorBodyEncoded = messageType !== "text" && frame.body_encoding === "base64";
 
@@ -19028,7 +19060,7 @@ function sendWsFrameToReplay(frameIdx) {
   if (setupQueueMayBeIncomplete) {
     showToast("WebSocket history is truncated. Replay setup auto-send was disabled.", "warning");
   }
-  state.activeTool = "replay";
+  setActiveTool("replay");
   renderToolPanels();
 }
 
@@ -19970,7 +20002,7 @@ function applyCurlImport() {
   };
   state.replayTabs.push(tab);
   state.activeReplayTabId = tab.id;
-  state.activeTool = "replay";
+  setActiveTool("replay");
   closeCurlImportModal();
   scheduleWorkspaceStateSave();
   renderToolPanels();

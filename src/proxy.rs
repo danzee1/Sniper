@@ -5164,7 +5164,7 @@ async fn relay_websocket_session(
 }
 
 fn should_relay_websocket_frame(message: &WebSocketMessage) -> bool {
-    !message.is_ping() && !message.is_pong()
+    !message.is_ping()
 }
 
 fn capture_websocket_frame(
@@ -6642,11 +6642,11 @@ mod tests {
     }
 
     #[test]
-    fn websocket_relay_does_not_forward_auto_handled_control_frames() {
+    fn websocket_relay_only_auto_handles_ping_frames() {
         assert!(!should_relay_websocket_frame(&WebSocketMessage::Ping(
             b"ping".to_vec().into()
         )));
-        assert!(!should_relay_websocket_frame(&WebSocketMessage::Pong(
+        assert!(should_relay_websocket_frame(&WebSocketMessage::Pong(
             b"pong".to_vec().into()
         )));
         assert!(should_relay_websocket_frame(&WebSocketMessage::Text(
