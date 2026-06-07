@@ -5018,32 +5018,40 @@ function applyWebsocketSummaryEvent(event) {
     return;
   }
   if (!summary?.id) return;
-  if (websocketFilterIsActive()) {
-    scheduleFilteredWebsocketReload();
-    return;
-  }
   if (!websocketServerOrderCanAcceptSummaryEvents()) {
     scheduleWebsocketPageRefresh();
     return;
   }
 
+  const filtersActive = websocketFilterIsActive();
   const sessions = Array.isArray(state.websocketSessions) ? state.websocketSessions : [];
   const existingIndex = sessions.findIndex((item) => item.id === summary.id);
   const previous = existingIndex >= 0 ? sessions[existingIndex] : null;
   if (websocketSummarySignature(previous) === websocketSummarySignature(summary)) {
     return;
   }
+  const summaryMatches = websocketSummaryMatchesCurrentQuery(summary);
+
+  if (filtersActive && existingIndex < 0 && !summaryMatches) {
+    const selectedChanged = applySelectedWebsocketSummary(summary);
+    if (selectedChanged && isWebsocketHistoryVisible()) {
+      scheduleVisibleWebsocketSelectionSync({ deferStaleDetail: true });
+    }
+    return;
+  }
 
   const nextSessions = sessions.slice();
+  let removedVisibleCount = 0;
   if (existingIndex >= 0) {
-    if (!websocketSummaryMatchesCurrentQuery(summary)) {
+    if (!summaryMatches) {
       nextSessions.splice(existingIndex, 1);
+      removedVisibleCount = 1;
     } else {
       nextSessions[existingIndex] = summary;
     }
   } else {
     const paging = state.websocketPaging || createWebsocketPagingState();
-    if (!shouldInsertUnknownWebsocketSummary(summary, sessions, paging)) {
+    if (!summaryMatches || !shouldInsertUnknownWebsocketSummary(summary, sessions, paging)) {
       const selectedChanged = applySelectedWebsocketSummary(summary);
       state.websocketPaging = {
         ...paging,
@@ -5085,6 +5093,9 @@ function applyWebsocketSummaryEvent(event) {
     };
   }
   state.websocketSessions = nextSessions;
+  if (removedVisibleCount) {
+    adjustWebsocketPagingAfterLocalRemoval(removedVisibleCount);
+  }
   _websocketSummaryMutationGeneration += 1;
   _websocketSummaryMutationById.set(summary.id, _websocketSummaryMutationGeneration);
   pruneWebsocketSummaryMutationCache();
@@ -18645,6 +18656,34 @@ function handleWsReplayActionError(error) {
   showToast(error?.message || "WebSocket Replay action failed.", "error");
 }
 
+function syncWsReplayPortInput(options = {}) {
+  const tab = getActiveReplayTab();
+  if (!tab || tab.type !== "websocket") return false;
+  const rawPort = els.wsPortInput.value.trim();
+  const normalizedPort = normalizePortValue(rawPort);
+  const validation = validateWsReplayTargetInput(
+    els.wsSchemeSelect.value,
+    els.wsHostInput.value,
+    rawPort,
+    els.wsPathInput.value,
+  );
+  setWsReplayTargetInputValidity(validation);
+  if (!validation.valid || !normalizedPort) {
+    if (options.reportValidity) {
+      els.wsPortInput.reportValidity();
+    }
+    return false;
+  }
+  if (tab.wsPort !== normalizedPort) {
+    tab.wsPort = normalizedPort;
+    scheduleWorkspaceStateSave();
+  }
+  if (options.normalizeInput) {
+    els.wsPortInput.value = normalizedPort;
+  }
+  return true;
+}
+
 function bindWsReplayEvents() {
   if (!els.wsConnectButton) return;
 
@@ -18688,26 +18727,11 @@ function bindWsReplayEvents() {
       scheduleWorkspaceStateSave();
     }
   });
+  els.wsPortInput.addEventListener("input", () => {
+    syncWsReplayPortInput();
+  });
   els.wsPortInput.addEventListener("change", () => {
-    const tab = getActiveReplayTab();
-    if (tab && tab.type === "websocket") {
-      const rawPort = els.wsPortInput.value.trim();
-      const normalizedPort = normalizePortValue(rawPort);
-      const validation = validateWsReplayTargetInput(
-        els.wsSchemeSelect.value,
-        els.wsHostInput.value,
-        rawPort,
-        els.wsPathInput.value,
-      );
-      setWsReplayTargetInputValidity(validation);
-      if (!validation.valid || !normalizedPort) {
-        els.wsPortInput.reportValidity();
-        return;
-      }
-      tab.wsPort = normalizedPort;
-      els.wsPortInput.value = normalizedPort;
-      scheduleWorkspaceStateSave();
-    }
+    syncWsReplayPortInput({ normalizeInput: true, reportValidity: true });
   });
   els.wsPathInput.addEventListener("input", () => {
     const tab = getActiveReplayTab();

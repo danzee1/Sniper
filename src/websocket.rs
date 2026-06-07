@@ -8,7 +8,8 @@ use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 use crate::model::{
-    MessageRecord, WebSocketFrameRecord, WebSocketSessionRecord, WebSocketSessionSummary,
+    websocket_total_frame_count, MessageRecord, WebSocketFrameRecord, WebSocketSessionRecord,
+    WebSocketSessionSummary,
 };
 
 const MAX_WEBSOCKET_BROADCAST_CAPACITY: usize = 4096;
@@ -51,11 +52,13 @@ struct WebSocketSessionEntry {
     request: MessageRecord,
     response: Option<MessageRecord>,
     frames: VecDeque<WebSocketFrameRecord>,
+    frame_count: usize,
     notes: Vec<String>,
 }
 
 impl From<WebSocketSessionRecord> for WebSocketSessionEntry {
     fn from(record: WebSocketSessionRecord) -> Self {
+        let frame_count = websocket_total_frame_count(&record.frames);
         Self {
             id: record.id,
             started_at: record.started_at,
@@ -68,6 +71,7 @@ impl From<WebSocketSessionRecord> for WebSocketSessionEntry {
             request: record.request,
             response: record.response,
             frames: VecDeque::from(record.frames),
+            frame_count,
             notes: record.notes,
         }
     }
@@ -84,13 +88,7 @@ impl WebSocketSessionEntry {
             host: self.host.clone(),
             path: self.path.clone(),
             status: self.status,
-            frame_count: self
-                .frames
-                .iter()
-                .map(|frame| frame.index)
-                .max()
-                .map(|last_index| last_index.saturating_add(1).max(self.frames.len()))
-                .unwrap_or(0),
+            frame_count: self.frame_count,
             retained_frame_count: self.frames.len(),
             last_frame_index: self.frames.back().map(|frame| frame.index),
             note_count: self.notes.len(),
@@ -171,10 +169,12 @@ impl WebSocketStore {
 
     pub async fn open(&self, mut session: WebSocketSessionRecord) {
         trim_frame_overflow(&mut session.frames, self.max_frames_per_session);
-        let summary = session.summary();
         let started_at = session.started_at;
+        let id = session.id;
+        let entry = WebSocketSessionEntry::from(session);
+        let summary = entry.summary();
         let mut inner = self.inner.write().await;
-        remove_ordered_session(&mut inner, session.id);
+        remove_ordered_session(&mut inner, id);
         if inner.started_at_desc_ordered {
             inner.started_at_desc_ordered = inner
                 .order
@@ -182,11 +182,8 @@ impl WebSocketStore {
                 .and_then(|id| inner.sessions.get(id))
                 .is_none_or(|current_newest| started_at >= current_newest.started_at);
         }
-        let id = session.id;
         inner.order.push_front(id);
-        inner
-            .sessions
-            .insert(id, WebSocketSessionEntry::from(session));
+        inner.sessions.insert(id, entry);
         let removed_any = trim_overflow(&mut inner, self.max_entries);
         if removed_any && !inner.started_at_desc_ordered {
             inner.started_at_desc_ordered = compute_storage_order_matches_started_at_desc(&inner);
@@ -200,7 +197,12 @@ impl WebSocketStore {
     pub async fn append_frame(&self, id: Uuid, frame: WebSocketFrameRecord) -> bool {
         let mut inner = self.inner.write().await;
         if let Some(session) = inner.sessions.get_mut(&id) {
+            let next_frame_count = frame.index.saturating_add(1);
             session.frames.push_back(frame);
+            session.frame_count = session
+                .frame_count
+                .max(next_frame_count)
+                .max(session.frames.len());
             trim_frame_deque_overflow(&mut session.frames, self.max_frames_per_session);
             let _ = self.events.send(session.summary());
             true
@@ -1394,6 +1396,20 @@ mod tests {
         assert_eq!(summary.frame_count, 3);
         assert_eq!(summary.retained_frame_count, 2);
         assert_eq!(summary.last_frame_index, Some(2));
+    }
+
+    #[tokio::test]
+    async fn append_frame_tracks_total_count_when_retention_cap_is_zero() {
+        let record = session(Vec::new());
+        let record_id = record.id;
+        let store = WebSocketStore::from_sessions(10, 0, vec![record]);
+
+        assert!(store.append_frame(record_id, frame(0)).await);
+
+        let summary = &store.list_page(Some(10), None).await.items[0];
+        assert_eq!(summary.frame_count, 1);
+        assert_eq!(summary.retained_frame_count, 0);
+        assert_eq!(summary.last_frame_index, None);
     }
 
     #[tokio::test]
