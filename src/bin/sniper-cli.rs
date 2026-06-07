@@ -1523,13 +1523,16 @@ fn sequence_write_session_id(
     cli_session_id: Option<Uuid>,
     input_session_id: Option<Uuid>,
 ) -> Result<Option<Uuid>> {
-    if cli_session_id.is_some() && input_session_id.is_some() && cli_session_id != input_session_id
-    {
-        bail!("sequence JSON session_id conflicts with --session-id");
+    if let Some(input_session_id) = input_session_id {
+        let Some(cli_session_id) = cli_session_id else {
+            bail!("sequence JSON session_id requires matching --session-id");
+        };
+        if cli_session_id != input_session_id {
+            bail!("sequence JSON session_id conflicts with --session-id");
+        }
+        return Ok(Some(cli_session_id));
     }
-    Ok(session_id_for_write_payload(
-        cli_session_id.or(input_session_id),
-    ))
+    Ok(session_id_for_write_payload(cli_session_id))
 }
 
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
@@ -4899,8 +4902,13 @@ mod tests {
             sequence_write_session_id(Some(cli_session_id), None).unwrap(),
             Some(cli_session_id)
         );
+        let error = sequence_write_session_id(None, Some(input_session_id))
+            .expect_err("sequence JSON session_id without --session-id should fail");
+        assert!(error
+            .to_string()
+            .contains("sequence JSON session_id requires matching --session-id"));
         assert_eq!(
-            sequence_write_session_id(None, Some(input_session_id)).unwrap(),
+            sequence_write_session_id(Some(input_session_id), Some(input_session_id)).unwrap(),
             Some(input_session_id)
         );
 

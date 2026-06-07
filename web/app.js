@@ -2859,6 +2859,7 @@ function snapshotWorkspaceState(options = {}) {
   return {
     revision: state.workspaceRevision || 0,
     session_id: state.activeSession?.id || null,
+    expected_active_session_id: state.activeSession?.id || null,
     client_id: workspaceClientId,
     client_version: workspaceSaveVersion,
     replay: {
@@ -3143,11 +3144,14 @@ async function flushWsReplayTabsBeforeClose() {
     && tab.type === "websocket"
     && (tab.wsStatus === "connected" || tab.wsStatus === "connecting")
   ));
-  for (const tab of tabs) {
-    await cleanupWsReplayTab(tab, {
+  const results = await Promise.allSettled(tabs.map((tab) => cleanupWsReplayTab(tab, {
       markDisconnected: true,
       removeBackend: tab.wsStatus === "connecting",
-    });
+    })));
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.warn("Failed to close WebSocket replay tab before native close:", result.reason);
+    }
   }
 }
 
@@ -3168,8 +3172,8 @@ async function drainWsReplayFramesBeforeHidden() {
 async function flushBeforeNativeClose() {
   await flushAllPendingAnnotations();
   await flushProxySettingsSaveBeforeClose();
-  await flushWsReplayTabsBeforeClose();
   syncReplayDraftsBeforeWorkspaceClose();
+  await flushWsReplayTabsBeforeClose();
   await flushWorkspaceState();
   window.clearTimeout(uiSettingsSaveTimer);
   uiSettingsSaveTimer = null;
@@ -4860,27 +4864,28 @@ function websocketFilterIsActive() {
     || Boolean(state.websocketLiveOnly);
 }
 
+function websocketSummarySearchHaystack(summary) {
+  const durationLabel = summary.duration_ms != null
+    ? `${summary.duration_ms} ms`
+    : (summary.closed_at == null ? "live" : "closed");
+  return [
+    summary.scheme || "",
+    summary.host || "",
+    summary.path || "",
+    summary.status == null ? "" : String(summary.status),
+    summary.frame_count == null ? "" : String(summary.frame_count),
+    durationLabel,
+    summary.started_at || "",
+  ].join("\n").toLowerCase();
+}
+
 function websocketSummaryMatchesCurrentQuery(summary) {
   if (!summary) return false;
   const queryState = createWebsocketQueryState();
   if (queryState.inScopeOnly && !isInScopeHost(summary.host)) return false;
   if (queryState.liveOnly && summary.closed_at != null) return false;
   if (queryState.q) {
-    const haystack = [
-      summary.scheme,
-      summary.host,
-      summary.path,
-      formatStatus(summary.status),
-      String(summary.frame_count),
-      summary.closed_at == null
-        ? "live"
-        : (summary.duration_ms == null ? "closed" : `${summary.duration_ms} ms`),
-      formatTimestamp(summary.started_at),
-      summary.started_at,
-    ]
-      .filter(Boolean)
-      .join("\n")
-      .toLowerCase();
+    const haystack = websocketSummarySearchHaystack(summary);
     if (!haystack.includes(queryState.q.toLowerCase())) return false;
   }
   return true;
@@ -13770,6 +13775,7 @@ async function closeRepeaterTab(id) {
     state.activeReplayTabId = remainingVisualIds[replacementIndex] || state.replayTabs[Math.max(0, currentIndex - 1)].id;
   }
   scheduleWorkspaceStateSave();
+  flushWorkspaceState().catch(handleWorkspaceActionError);
   renderReplay();
 }
 
@@ -17377,15 +17383,27 @@ function isInScopeHost(host) {
     return true;
   }
 
-  const hostname = hostWithoutPort(host).toLowerCase();
+  const hostname = normalizeHostForMatching(host);
   return patterns.some((pattern) => {
-    const normalized = hostWithoutPort(pattern).toLowerCase();
+    const normalized = normalizeHostForMatching(pattern);
     if (normalized.startsWith("*.")) {
       const suffix = normalized.slice(2);
       return hostname === suffix || hostname.endsWith(`.${suffix}`);
     }
     return hostname === normalized;
   });
+}
+
+function normalizeHostForMatching(host) {
+  let value = String(host || "").trim().toLowerCase();
+  const schemeIndex = value.indexOf("://");
+  if (schemeIndex >= 0) {
+    value = value.slice(schemeIndex + 3);
+  } else if (value.startsWith("//")) {
+    value = value.slice(2);
+  }
+  const hostOnly = value.split(/[/?#]/, 1)[0].trim();
+  return hostWithoutPort(hostOnly).toLowerCase();
 }
 
 function hostWithoutPort(host) {

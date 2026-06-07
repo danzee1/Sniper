@@ -947,6 +947,53 @@ fn validate_request_target_override(
     validate_workspace_target_fields(&target.scheme, &target.host, &target.port)
 }
 
+fn validate_fuzzer_target_request_authority(
+    authority: &str,
+    base_request: Option<&EditableRequest>,
+) -> std::result::Result<(), String> {
+    let parsed = url::Url::parse(authority.trim())
+        .map_err(|_| "fuzzer target request authority must be a valid URL".to_string())?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err("fuzzer target request authority scheme must be HTTP or HTTPS".to_string());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || (parsed.path() != "/" && !parsed.path().is_empty())
+    {
+        return Err(
+            "fuzzer target request authority must not include path, query, fragment, or credentials"
+                .to_string(),
+        );
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "fuzzer target request authority host is required".to_string())?;
+    if let Some(base_request) = base_request {
+        if !scheme.eq_ignore_ascii_case(&base_request.scheme) {
+            return Err(
+                "fuzzer target request authority scheme must match fuzzer base request".to_string(),
+            );
+        }
+        let parsed_port = parsed
+            .port()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let parsed_authority = format_authority_for_origin(host, parsed_port, &scheme);
+        if !authorities_equivalent_for_origin(
+            &parsed_authority,
+            &base_request.host,
+            &base_request.scheme,
+        ) {
+            return Err(
+                "fuzzer target request authority must match fuzzer base request".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::Result<(), String> {
     validate_workspace_serialized_size(snapshot)?;
     let mut tab_ids = HashSet::new();
@@ -1181,6 +1228,10 @@ fn validate_workspace_state(snapshot: &WorkspaceStateSnapshot) -> std::result::R
     if let Some(target) = &snapshot.fuzzer.target {
         validate_request_target_override(target)
             .map_err(|error| format!("invalid fuzzer target: {error}"))?;
+    }
+    if let Some(authority) = snapshot.fuzzer.target_request_authority.as_deref() {
+        validate_fuzzer_target_request_authority(authority, snapshot.fuzzer.base_request.as_ref())
+            .map_err(|error| format!("invalid fuzzer target request authority: {error}"))?;
     }
     add_workspace_text_bytes(
         &mut stored_bytes_total,
@@ -2567,6 +2618,8 @@ fn merge_workspace_keepalive_tab(
 ) {
     let request_text_changed =
         keepalive.text_complete() && incoming.request_text != current.request_text;
+    let preserve_http_request_bound_state =
+        current.tab_type != "websocket" && !keepalive.text_complete();
     let current_base_request = current.base_request.clone();
     let current_request_text = current.request_text.clone();
     let current_history_entries = std::mem::take(&mut current.history_entries);
@@ -2586,18 +2639,19 @@ fn merge_workspace_keepalive_tab(
 
     *current = incoming;
 
-    let preserve_history_entries =
-        current.history_entries.is_empty() && !incoming_history_entries_complete;
+    let preserve_history_entries = preserve_http_request_bound_state
+        || (current.history_entries.is_empty() && !incoming_history_entries_complete);
     if preserve_history_entries {
         current.history_entries = current_history_entries;
-        if current.history_index.is_none() {
+        if preserve_http_request_bound_state || current.history_index.is_none() {
             current.history_index = current_history_index;
         }
     }
-    if current.response_record.is_none()
-        && !request_text_changed
-        && !incoming_response_record_complete
-    {
+    let preserve_response_record = preserve_http_request_bound_state
+        || (current.response_record.is_none()
+            && !request_text_changed
+            && !incoming_response_record_complete);
+    if preserve_response_record {
         current.response_record = current_response_record;
     }
     if current.tab_type != "websocket" && !keepalive.text_complete() {
@@ -8189,6 +8243,8 @@ mod tests {
     #[test]
     fn workspace_keepalive_partial_text_preserves_durable_http_and_fuzzer_text() {
         let current_request = "POST /large HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let durable_response = test_replay_response_record("/large", 200);
+        let durable_history_response = test_replay_response_record("/history", 201);
         let current = WorkspaceStateSnapshot {
             replay: ReplayWorkspaceState {
                 active_tab_id: Some("active".to_string()),
@@ -8201,6 +8257,18 @@ mod tests {
                     target_scheme: "https".to_string(),
                     target_host: "example.test".to_string(),
                     target_port: "443".to_string(),
+                    response_record: Some(durable_response.clone()),
+                    history_entries: vec![ReplayHistoryEntryState {
+                        request: Some(test_editable_request("/history")),
+                        request_text: "GET /history HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                            .to_string(),
+                        response_record: Some(durable_history_response.clone()),
+                        target_scheme: "https".to_string(),
+                        target_host: "example.test".to_string(),
+                        target_port: "443".to_string(),
+                        ..ReplayHistoryEntryState::default()
+                    }],
+                    history_index: Some(0),
                     ..ReplayTabState::default()
                 }],
             },
@@ -8227,6 +8295,10 @@ mod tests {
                     target_scheme: "https".to_string(),
                     target_host: "edited.example".to_string(),
                     target_port: "8443".to_string(),
+                    response_record: None,
+                    response_record_complete: Some(true),
+                    history_entries: Vec::new(),
+                    history_entries_complete: Some(true),
                     ..ReplayTabState::default()
                 }],
             },
@@ -8255,6 +8327,16 @@ mod tests {
         assert_eq!(tab.target_port, "8443");
         assert_eq!(tab.request_text, durable_tab_text);
         assert_eq!(tab.base_request.as_ref().unwrap().path, "/large");
+        assert_eq!(
+            tab.response_record.as_ref().unwrap().id,
+            durable_response.id
+        );
+        assert_eq!(tab.history_entries.len(), 1);
+        assert_eq!(
+            tab.history_entries[0].response_record.as_ref().unwrap().id,
+            durable_history_response.id
+        );
+        assert_eq!(tab.history_index, Some(0));
         assert_eq!(merged.fuzzer.request_text, durable_fuzzer_request);
         assert_eq!(merged.fuzzer.payloads_text, durable_fuzzer_payloads);
         assert_eq!(
@@ -8277,6 +8359,27 @@ mod tests {
             Some("x".repeat(crate::workspace::MAX_WORKSPACE_SERIALIZED_BYTES));
         let error = super::validate_workspace_state(&snapshot).unwrap_err();
         assert!(error.contains("serialized bytes"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_invalid_fuzzer_target_request_authority() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.fuzzer.target_request_authority = Some("not a url".to_string());
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+
+        assert!(error.contains("invalid fuzzer target request authority"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_mismatched_fuzzer_target_request_authority() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.fuzzer.base_request = Some(test_editable_request("/fuzz"));
+        snapshot.fuzzer.target_request_authority = Some("https://other.example".to_string());
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+
+        assert!(error.contains("must match fuzzer base request"));
     }
 
     #[tokio::test]
