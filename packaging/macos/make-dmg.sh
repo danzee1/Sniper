@@ -353,8 +353,8 @@ if [[ -n "$REQUESTED_DMG_ARCH" ]]; then
     echo "Unsupported DMG_ARCH value: $REQUESTED_DMG_ARCH" >&2
     exit 1
   fi
-  if [[ "$NORMALIZED_REQUESTED_DMG_ARCH" != "$DMG_ARCH" || "$REQUESTED_DMG_ARCH" != "$DMG_ARCH" ]]; then
-    echo "DMG_ARCH=$REQUESTED_DMG_ARCH does not match bundled app executable architecture: $DMG_ARCH. Use the canonical label $DMG_ARCH." >&2
+  if [[ "$NORMALIZED_REQUESTED_DMG_ARCH" != "$DMG_ARCH" ]]; then
+    echo "DMG_ARCH=$REQUESTED_DMG_ARCH does not match bundled app executable architecture: $DMG_ARCH." >&2
     exit 1
   fi
 fi

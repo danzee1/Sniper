@@ -354,6 +354,10 @@ impl TransactionStore {
         needs_snapshot_fallback || retention_trimmed
     }
 
+    pub async fn len(&self) -> usize {
+        self.inner.read().await.entries.len()
+    }
+
     pub async fn list(&self, filters: &ListFilters) -> Vec<TransactionSummary> {
         self.list_page(filters).await.items
     }

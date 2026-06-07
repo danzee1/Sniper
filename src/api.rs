@@ -2063,7 +2063,7 @@ async fn self_update(
 }
 
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionSummary>> {
-    Json(state.list_sessions())
+    Json(state.list_sessions().await)
 }
 
 async fn create_session(
@@ -2325,10 +2325,12 @@ struct WorkspaceKeepaliveUpdate {
     keepalive: WorkspaceKeepaliveMetadata,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct WorkspaceKeepaliveMetadata {
     #[serde(default)]
     replay_tabs_complete: bool,
+    #[serde(default)]
+    replay_tab_ids: Option<Vec<String>>,
     #[serde(default)]
     fuzzer_complete: bool,
     #[serde(default)]
@@ -2338,11 +2340,11 @@ struct WorkspaceKeepaliveMetadata {
 }
 
 impl WorkspaceKeepaliveMetadata {
-    fn text_complete(self) -> bool {
+    fn text_complete(&self) -> bool {
         self.text_complete.unwrap_or(true)
     }
 
-    fn ws_text_complete(self) -> bool {
+    fn ws_text_complete(&self) -> bool {
         self.ws_text_complete.unwrap_or(true)
     }
 }
@@ -2361,13 +2363,11 @@ fn merge_workspace_keepalive_snapshot(
         .tab_sequence
         .max(incoming.replay.tab_sequence);
 
-    let mut incoming_tab_ids = HashSet::new();
+    let mut incoming_payload_tab_ids = HashSet::new();
     let mut skipped_new_tab_ids = HashSet::new();
     for incoming_tab in incoming.replay.tabs {
         let incoming_tab_id = incoming_tab.id.clone();
-        if keepalive.replay_tabs_complete {
-            incoming_tab_ids.insert(incoming_tab_id.clone());
-        }
+        incoming_payload_tab_ids.insert(incoming_tab_id.clone());
         match current
             .replay
             .tabs
@@ -2375,9 +2375,9 @@ fn merge_workspace_keepalive_snapshot(
             .find(|tab| tab.id == incoming_tab.id)
         {
             Some(current_tab) => {
-                merge_workspace_keepalive_tab(current_tab, incoming_tab, keepalive)
+                merge_workspace_keepalive_tab(current_tab, incoming_tab, &keepalive)
             }
-            None => match keepalive_new_replay_tab(incoming_tab, keepalive) {
+            None => match keepalive_new_replay_tab(incoming_tab, &keepalive) {
                 Some(tab) => current.replay.tabs.push(tab),
                 None => {
                     skipped_new_tab_ids.insert(incoming_tab_id);
@@ -2395,27 +2395,54 @@ fn merge_workspace_keepalive_snapshot(
             .filter(|id| current.replay.tabs.iter().any(|tab| tab.id == *id))
             .or_else(|| current.replay.tabs.first().map(|tab| tab.id.clone()));
     }
-    if keepalive.replay_tabs_complete {
+    let retain_replay_tab_ids = if keepalive.replay_tabs_complete {
+        Some(incoming_payload_tab_ids)
+    } else {
+        keepalive_replay_tab_membership_ids(&keepalive)
+    };
+    if let Some(retain_replay_tab_ids) = retain_replay_tab_ids {
         current
             .replay
             .tabs
-            .retain(|tab| incoming_tab_ids.contains(&tab.id));
+            .retain(|tab| retain_replay_tab_ids.contains(&tab.id));
+        if current
+            .replay
+            .active_tab_id
+            .as_ref()
+            .is_some_and(|id| !current.replay.tabs.iter().any(|tab| tab.id == *id))
+        {
+            current.replay.active_tab_id = current.replay.tabs.first().map(|tab| tab.id.clone());
+        }
     }
 
     if keepalive.fuzzer_complete {
         current.fuzzer =
-            complete_workspace_keepalive_fuzzer(incoming.fuzzer, &current.fuzzer, keepalive);
+            complete_workspace_keepalive_fuzzer(incoming.fuzzer, &current.fuzzer, &keepalive);
     } else if fuzzer_keepalive_has_payload(&incoming.fuzzer) {
         current.fuzzer =
-            merge_workspace_keepalive_fuzzer(current.fuzzer, incoming.fuzzer, keepalive);
+            merge_workspace_keepalive_fuzzer(current.fuzzer, incoming.fuzzer, &keepalive);
     }
 
     current
 }
 
+fn keepalive_replay_tab_membership_ids(
+    keepalive: &WorkspaceKeepaliveMetadata,
+) -> Option<HashSet<String>> {
+    let ids = keepalive.replay_tab_ids.as_ref()?;
+    let mut membership = HashSet::new();
+    for id in ids.iter().take(MAX_WORKSPACE_REPLAY_TABS) {
+        if id.trim().is_empty() || id.len() > MAX_WORKSPACE_REPLAY_TAB_ID_BYTES {
+            continue;
+        }
+        membership.insert(id.clone());
+    }
+    Some(membership)
+}
+
 fn keepalive_new_replay_tab(
     mut tab: ReplayTabState,
-    keepalive: WorkspaceKeepaliveMetadata,
+    keepalive: &WorkspaceKeepaliveMetadata,
 ) -> Option<ReplayTabState> {
     if tab.tab_type == "websocket" {
         if !keepalive.ws_text_complete() {
@@ -2435,7 +2462,7 @@ fn keepalive_new_replay_tab(
 fn complete_workspace_keepalive_fuzzer(
     mut incoming: FuzzerWorkspaceState,
     current: &FuzzerWorkspaceState,
-    keepalive: WorkspaceKeepaliveMetadata,
+    keepalive: &WorkspaceKeepaliveMetadata,
 ) -> FuzzerWorkspaceState {
     if !keepalive.text_complete() {
         incoming.base_request = current.base_request.clone();
@@ -2470,7 +2497,7 @@ fn merge_workspace_keepalive_ws_frames(
 fn merge_workspace_keepalive_tab(
     current: &mut ReplayTabState,
     incoming: ReplayTabState,
-    keepalive: WorkspaceKeepaliveMetadata,
+    keepalive: &WorkspaceKeepaliveMetadata,
 ) {
     let request_text_changed =
         keepalive.text_complete() && incoming.request_text != current.request_text;
@@ -2556,7 +2583,7 @@ fn fuzzer_keepalive_has_payload(fuzzer: &FuzzerWorkspaceState) -> bool {
 fn merge_workspace_keepalive_fuzzer(
     mut current: FuzzerWorkspaceState,
     incoming: FuzzerWorkspaceState,
-    keepalive: WorkspaceKeepaliveMetadata,
+    keepalive: &WorkspaceKeepaliveMetadata,
 ) -> FuzzerWorkspaceState {
     if keepalive.text_complete() && incoming.base_request.is_some() {
         current.base_request = incoming.base_request;
@@ -7457,6 +7484,71 @@ mod tests {
         assert!(merged.replay.tabs[0]
             .request_text
             .contains("/active-edited"));
+    }
+
+    #[test]
+    fn workspace_keepalive_partial_replay_membership_removes_closed_tabs() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 3,
+                tabs: vec![
+                    ReplayTabState {
+                        id: "active".to_string(),
+                        sequence: 1,
+                        request_text: "GET /active HTTP/1.1\r\n\r\n".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                    ReplayTabState {
+                        id: "inactive".to_string(),
+                        sequence: 2,
+                        request_text: "GET /inactive HTTP/1.1\r\n\r\n".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                    ReplayTabState {
+                        id: "closed".to_string(),
+                        sequence: 3,
+                        request_text: "GET /closed HTTP/1.1\r\n\r\n".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                ],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 3,
+                tabs: vec![ReplayTabState {
+                    id: "active".to_string(),
+                    sequence: 1,
+                    request_text: "GET /active-edited HTTP/1.1\r\n\r\n".to_string(),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                replay_tabs_complete: false,
+                replay_tab_ids: Some(vec!["active".to_string(), "inactive".to_string()]),
+                ..super::WorkspaceKeepaliveMetadata::default()
+            },
+        );
+
+        assert_eq!(merged.replay.tabs.len(), 2);
+        assert!(merged.replay.tabs.iter().any(|tab| tab.id == "inactive"));
+        assert!(!merged.replay.tabs.iter().any(|tab| tab.id == "closed"));
+        let active = merged
+            .replay
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "active")
+            .expect("active tab");
+        assert!(active.request_text.contains("/active-edited"));
     }
 
     #[test]

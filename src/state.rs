@@ -88,6 +88,8 @@ pub struct AppState {
     session_activation_lock: Arc<AsyncMutex<()>>,
     /// Canonical contexts for inactive sessions loaded through the API.
     session_contexts: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<SessionContext>>>>,
+    /// Cached read-only inactive sessions for repeated pinned history/detail reads.
+    read_only_session_contexts: Arc<AsyncMutex<HashMap<uuid::Uuid, Arc<SessionContext>>>>,
     /// WebSocket replay connections.
     pub ws_replay: Arc<WsReplayStore>,
     /// Stable owner token for runtime-state writes from this app process.
@@ -130,6 +132,7 @@ impl AppState {
             session_operation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             session_activation_lock: Arc::new(AsyncMutex::new(())),
             session_contexts: Arc::new(AsyncMutex::new(HashMap::new())),
+            read_only_session_contexts: Arc::new(AsyncMutex::new(HashMap::new())),
             ws_replay: Arc::new(WsReplayStore::new()),
             runtime_instance_id,
         })
@@ -272,13 +275,26 @@ impl AppState {
         if !self.sessions.contains_session(id) {
             anyhow::bail!("session {id} was not found");
         }
-        self.sessions.load_context_read_only(id)
+        let mut read_only_contexts = self.read_only_session_contexts.lock().await;
+        if let Some(session) = read_only_contexts.get(&id) {
+            if self.sessions.contains_session(id) {
+                return Ok(session.clone());
+            }
+            read_only_contexts.remove(&id);
+        }
+        if !self.sessions.contains_session(id) {
+            anyhow::bail!("session {id} was not found");
+        }
+        let session = self.sessions.load_context_read_only(id)?;
+        read_only_contexts.insert(id, session.clone());
+        Ok(session)
     }
 
     pub async fn session_context_for_id_operation_locked(
         &self,
         id: uuid::Uuid,
     ) -> Result<Arc<SessionContext>> {
+        self.read_only_session_contexts.lock().await.remove(&id);
         let mut contexts = self.session_contexts.lock().await;
         if let Some(session) = contexts.get(&id) {
             if self.sessions.contains_session(id) {
@@ -296,8 +312,39 @@ impl AppState {
         Ok(session)
     }
 
-    pub fn list_sessions(&self) -> Vec<SessionSummary> {
-        self.sessions.summaries()
+    pub async fn list_sessions(&self) -> Vec<SessionSummary> {
+        let mut summaries = self.sessions.summaries();
+        let mut live_counts = HashMap::new();
+
+        let active = self.session().await;
+        live_counts.insert(active.id(), active.store.len().await);
+
+        let writable_contexts: Vec<_> = {
+            let contexts = self.session_contexts.lock().await;
+            contexts.values().cloned().collect()
+        };
+        for session in writable_contexts {
+            if self.sessions.contains_session(session.id()) {
+                live_counts.insert(session.id(), session.store.len().await);
+            }
+        }
+
+        let read_only_contexts: Vec<_> = {
+            let contexts = self.read_only_session_contexts.lock().await;
+            contexts.values().cloned().collect()
+        };
+        for session in read_only_contexts {
+            if self.sessions.contains_session(session.id()) {
+                live_counts.insert(session.id(), session.store.len().await);
+            }
+        }
+
+        for summary in &mut summaries {
+            if let Some(count) = live_counts.get(&summary.id) {
+                summary.request_count = *count;
+            }
+        }
+        summaries
     }
 
     pub async fn active_session_summary(&self) -> SessionSummary {
@@ -355,6 +402,11 @@ impl AppState {
                 let mut contexts = self.session_contexts.lock().await;
                 contexts.insert(current_id, current.clone());
             }
+            self.read_only_session_contexts
+                .lock()
+                .await
+                .remove(&current_id);
+            self.read_only_session_contexts.lock().await.remove(&id);
             let session = {
                 let mut contexts = self.session_contexts.lock().await;
                 if let Some(session) = contexts.get(&id) {
@@ -420,6 +472,7 @@ impl AppState {
             self.ws_replay.remove_session(id).await;
             self.session_operation_locks.lock().await.remove(&id);
             self.session_contexts.lock().await.remove(&id);
+            self.read_only_session_contexts.lock().await.remove(&id);
         }
         result
     }
@@ -437,6 +490,10 @@ impl AppState {
         &self,
         session: &Arc<SessionContext>,
     ) -> Result<SessionSummary> {
+        self.read_only_session_contexts
+            .lock()
+            .await
+            .remove(&session.id());
         if !self.sessions.contains_session(session.id()) {
             anyhow::bail!("session {} was deleted", session.id());
         }
@@ -448,6 +505,10 @@ impl AppState {
         &self,
         session: &Arc<SessionContext>,
     ) -> Result<SessionSummary> {
+        self.read_only_session_contexts
+            .lock()
+            .await
+            .remove(&session.id());
         if !self.sessions.contains_session(session.id()) {
             anyhow::bail!("session {} was deleted", session.id());
         }
@@ -2514,6 +2575,7 @@ mod tests {
         state.persist_active_session().await.unwrap();
         let summary = state
             .list_sessions()
+            .await
             .into_iter()
             .find(|session| session.id == created.id)
             .unwrap();
@@ -2589,10 +2651,67 @@ mod tests {
         );
         let summary = state
             .list_sessions()
+            .await
             .into_iter()
             .find(|summary| summary.id == session.id())
             .unwrap();
         assert_eq!(summary.request_count, 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn session_list_uses_live_retained_request_count() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-list-live-count-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 2,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let session = state.session().await;
+
+        for path in ["/first", "/second", "/third"] {
+            session
+                .store
+                .insert(TransactionRecord::http(
+                    chrono::Utc::now(),
+                    "GET".to_string(),
+                    "https".to_string(),
+                    "live-count.example".to_string(),
+                    path.to_string(),
+                    Some(200),
+                    1,
+                    MessageRecord {
+                        headers: Vec::new(),
+                        body_preview: String::new(),
+                        body_encoding: BodyEncoding::Utf8,
+                        body_size: 0,
+                        decoded_body_size: None,
+                        preview_truncated: false,
+                        content_type: None,
+                        content_decoded: false,
+                    },
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                ))
+                .await;
+        }
+
+        let summary = state
+            .list_sessions()
+            .await
+            .into_iter()
+            .find(|summary| summary.id == session.id())
+            .unwrap();
+        assert_eq!(summary.request_count, 2);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -2622,6 +2741,67 @@ mod tests {
         state.activate_session(original_id).await.unwrap();
         let active = state.session().await;
         assert!(std::sync::Arc::ptr_eq(&first, &active));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn inactive_read_only_session_contexts_are_cached_until_write_path_loads() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-read-only-session-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original_id = state.active_session_summary().await.id;
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+        state.session_contexts.lock().await.remove(&original_id);
+        state
+            .read_only_session_contexts
+            .lock()
+            .await
+            .remove(&original_id);
+
+        let first_read = state
+            .read_session_context_for_id(original_id)
+            .await
+            .unwrap();
+        let second_read = state
+            .read_session_context_for_id(original_id)
+            .await
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first_read, &second_read));
+        assert!(state
+            .read_only_session_contexts
+            .lock()
+            .await
+            .contains_key(&original_id));
+
+        let writable = state.session_context_for_id(original_id).await.unwrap();
+        assert!(state
+            .session_contexts
+            .lock()
+            .await
+            .contains_key(&original_id));
+        assert!(!state
+            .read_only_session_contexts
+            .lock()
+            .await
+            .contains_key(&original_id));
+        let read_after_write_load = state
+            .read_session_context_for_id(original_id)
+            .await
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&writable, &read_after_write_load));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -3185,6 +3185,9 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
   const replay = snapshot.replay && typeof snapshot.replay === "object" ? snapshot.replay : {};
   const activeTabId = replay.active_tab_id || null;
   const sourceTabs = Array.isArray(replay.tabs) ? replay.tabs : [];
+  const replayTabIds = sourceTabs
+    .map((tab) => tab?.id)
+    .filter((id) => typeof id === "string" && id);
   const sourceReplayTabById = options.sourceReplayTabById instanceof Map
     ? options.sourceReplayTabById
     : null;
@@ -3208,6 +3211,7 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
     },
     keepalive: {
       replay_tabs_complete: !options.activeOnly,
+      replay_tab_ids: replayTabIds,
       fuzzer_complete: !options.dropFuzzer,
       text_complete: !Number.isFinite(options.textByteLimit),
       ws_text_complete: !Number.isFinite(options.wsTextByteLimit),
@@ -19322,10 +19326,19 @@ function copyResponseContentForRecord(record, format) {
     text = record.response.body_encoding === "base64"
       ? safeDecodeBase64(record.response.body_preview || "")
       : (record.response.body_preview || "");
+    if (record.response.preview_truncated) {
+      text = `${text}\n\n[preview truncated]`;
+    }
   } else {
     text = buildRawResponse(record);
   }
-  const label = format === "response-headers" ? "Copied headers" : format === "response-body" ? "Copied body" : "Copied raw response";
+  const label = format === "response-headers"
+    ? "Copied headers"
+    : format === "response-body" && record.response.preview_truncated
+      ? "Copied response preview"
+      : format === "response-body"
+        ? "Copied body"
+        : "Copied raw response";
   return copyTextToClipboard(text)
     .then(() => showToast(label))
     .catch(() => showToast("Failed to copy", "error"));

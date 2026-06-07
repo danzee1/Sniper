@@ -488,8 +488,9 @@ fn check_jwt(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
     // Check Authorization header in request
     if let Some(auth) = record.request.header_value("authorization") {
         if let Some(token) = authorization_bearer_token(auth) {
-            if looks_like_jwt(token) {
-                jwt_sources.push(("Authorization header", token.to_string()));
+            let token = normalize_jwt_token_candidate(token);
+            if looks_like_jwt(&token) {
+                jwt_sources.push(("Authorization header", token));
             }
         }
     }
@@ -500,8 +501,9 @@ fn check_jwt(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
             for part in header.value.split(';') {
                 let part = part.trim();
                 if let Some((_name, value)) = part.split_once('=') {
-                    if looks_like_jwt(value.trim()) {
-                        jwt_sources.push(("Cookie", value.trim().to_string()));
+                    let token = normalize_jwt_token_candidate(value);
+                    if looks_like_jwt(&token) {
+                        jwt_sources.push(("Cookie", token));
                     }
                 }
             }
@@ -514,8 +516,9 @@ fn check_jwt(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
             if header.name.eq_ignore_ascii_case("set-cookie") {
                 if let Some(value) = header.value.split(';').next() {
                     if let Some((_name, val)) = value.split_once('=') {
-                        if looks_like_jwt(val.trim()) {
-                            jwt_sources.push(("Set-Cookie", val.trim().to_string()));
+                        let token = normalize_jwt_token_candidate(val);
+                        if looks_like_jwt(&token) {
+                            jwt_sources.push(("Set-Cookie", token));
                         }
                     }
                 }
@@ -550,6 +553,14 @@ fn looks_like_jwt(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=')
 }
 
+fn normalize_jwt_token_candidate(value: &str) -> String {
+    let trimmed = value.trim().trim_matches(|ch| ch == '"' || ch == '\'');
+    percent_decode(trimmed)
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .to_string()
+}
+
 fn authorization_bearer_token(value: &str) -> Option<&str> {
     let trimmed = value.trim();
     let (scheme, token) = trimmed.split_once(char::is_whitespace)?;
@@ -567,9 +578,14 @@ fn is_non_empty_base64url(value: &str) -> bool {
 }
 
 fn extract_jwt_from_text(text: &str) -> Vec<String> {
-    // Simple pattern: eyJ followed by base64url.base64url.base64url
-    let re = Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*").unwrap();
-    re.find_iter(text).map(|m| m.as_str().to_string()).collect()
+    // Simple pattern: eyJ followed by base64url(. or %2E)base64url(. or %2E)base64url
+    let re =
+        Regex::new(r"eyJ[A-Za-z0-9_-]+(?:\.|%2[eE])eyJ[A-Za-z0-9_-]+(?:\.|%2[eE])[A-Za-z0-9_-]*")
+            .unwrap();
+    re.find_iter(text)
+        .map(|m| normalize_jwt_token_candidate(m.as_str()))
+        .filter(|token| looks_like_jwt(token))
+        .collect()
 }
 
 fn decode_jwt_part(part: &str) -> Option<String> {
@@ -689,14 +705,15 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
         return;
     }
 
-    let has_header = |name: &str| -> bool {
+    let header_value = |name: &str| -> Option<&str> {
         response
             .headers
             .iter()
-            .any(|h| h.name.eq_ignore_ascii_case(name))
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
     };
 
-    if !has_header("content-security-policy") {
+    if !header_value("content-security-policy").is_some_and(|value| !value.trim().is_empty()) {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -707,7 +724,9 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
         ));
     }
 
-    if !has_header("strict-transport-security") && record.scheme == "https" {
+    if !header_value("strict-transport-security").is_some_and(valid_hsts_header_value)
+        && record.scheme == "https"
+    {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -718,7 +737,9 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
         ));
     }
 
-    if !has_header("x-content-type-options") {
+    if !header_value("x-content-type-options")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("nosniff"))
+    {
         findings.push(make_finding(
             record,
             Severity::Info,
@@ -729,7 +750,9 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
         ));
     }
 
-    if !has_header("x-frame-options") && !has_csp_frame_ancestors(response) {
+    if !header_value("x-frame-options").is_some_and(valid_x_frame_options_value)
+        && !has_csp_frame_ancestors(response)
+    {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -741,10 +764,33 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
     }
 }
 
+fn valid_hsts_header_value(value: &str) -> bool {
+    value.split(';').any(|directive| {
+        let Some((name, value)) = directive.trim().split_once('=') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("max-age")
+            && value.trim().parse::<u64>().is_ok_and(|max_age| max_age > 0)
+    })
+}
+
+fn valid_x_frame_options_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "deny" | "sameorigin"
+    )
+}
+
 fn has_csp_frame_ancestors(response: &crate::model::MessageRecord) -> bool {
     response.headers.iter().any(|h| {
-        h.name.eq_ignore_ascii_case("content-security-policy")
-            && h.value.to_ascii_lowercase().contains("frame-ancestors")
+        if !h.name.eq_ignore_ascii_case("content-security-policy") {
+            return false;
+        }
+        h.value.split(';').any(|directive| {
+            let mut tokens = directive.split_whitespace();
+            matches!(tokens.next(), Some(name) if name.eq_ignore_ascii_case("frame-ancestors"))
+                && tokens.next().is_some()
+        })
     })
 }
 
@@ -881,7 +927,11 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             "Anthropic Admin Key",
             Severity::Critical,
         ),
-        (r"hf_[a-zA-Z]{34}", "HuggingFace Token", Severity::High),
+        (
+            r"\bhf_[a-zA-Z0-9]{34}\b",
+            "HuggingFace Token",
+            Severity::High,
+        ),
         (r"gsk_[a-zA-Z0-9]{48}", "Groq API Key", Severity::Critical),
         (
             r"pplx-[a-zA-Z0-9]{48}",
@@ -1310,7 +1360,18 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
                     "ACAO: *",
                 ));
             }
-        } else if origin != "null" && acac.is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        } else if origin.eq_ignore_ascii_case("null")
+            && acac.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        {
+            findings.push(make_finding(
+                record,
+                Severity::Medium,
+                "cors",
+                "CORS: null origin with credentials",
+                "Access-Control-Allow-Origin: null with Access-Control-Allow-Credentials: true can expose credentialed responses to sandboxed or file-origin contexts.",
+                "ACAO: null, ACAC: true",
+            ));
+        } else if acac.is_some_and(|v| v.eq_ignore_ascii_case("true")) {
             // Reflect origin with credentials — potentially dangerous
             let req_origin = record.request.header_value("origin").unwrap_or("").trim();
             if !req_origin.is_empty() && origin == req_origin {
@@ -1663,11 +1724,7 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
     }
 
     // Cache-Control missing on authenticated responses
-    let has_auth = record
-        .request
-        .headers
-        .iter()
-        .any(|h| h.name.eq_ignore_ascii_case("authorization"));
+    let has_auth = has_authenticated_cache_context(record, response);
     if has_auth && !has_header("cache-control") {
         findings.push(make_finding(
             record,
@@ -1721,6 +1778,61 @@ fn cors_allows_method(methods: &str, method: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(method))
 }
 
+fn has_authenticated_cache_context(
+    record: &TransactionRecord,
+    response: &crate::model::MessageRecord,
+) -> bool {
+    record.request.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("authorization") && !header.value.trim().is_empty()
+    }) || request_has_auth_cookie(record)
+        || response_sets_auth_cookie(response)
+}
+
+fn request_has_auth_cookie(record: &TransactionRecord) -> bool {
+    record.request.headers.iter().any(|header| {
+        if !header.name.eq_ignore_ascii_case("cookie") {
+            return false;
+        }
+        header.value.split(';').any(|part| {
+            part.split_once('=')
+                .is_some_and(|(name, _)| is_auth_cookie_name(name))
+        })
+    })
+}
+
+fn response_sets_auth_cookie(response: &crate::model::MessageRecord) -> bool {
+    response.headers.iter().any(|header| {
+        if !header.name.eq_ignore_ascii_case("set-cookie") {
+            return false;
+        }
+        header
+            .value
+            .split(';')
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .is_some_and(|(name, _)| is_auth_cookie_name(name))
+    })
+}
+
+fn is_auth_cookie_name(name: &str) -> bool {
+    let normalized = name.trim().trim_start_matches('$').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "sid"
+            | "jwt"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "phpsessid"
+            | "jsessionid"
+    ) || [
+        "session", "sess", "auth", "access", "refresh", "csrf", "xsrf",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 // ── Rule 9: Information Disclosure ──
 
 fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -1728,6 +1840,8 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
         Some(r) => r,
         None => return,
     };
+
+    push_source_map_header_finding(record, response, findings);
 
     if is_binary_body(response) {
         return;
@@ -1764,21 +1878,6 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
             "JavaScript source map reference",
             "Source map file referenced in response. Source maps can expose original source code, making it easier for attackers to understand application logic.",
             truncate_evidence(m.as_str(), 120),
-        ));
-    }
-
-    // Also check SourceMap header
-    if let Some(sm) = response
-        .header_value("sourcemap")
-        .or_else(|| response.header_value("x-sourcemap"))
-    {
-        findings.push(make_finding(
-            record,
-            Severity::Low,
-            "info",
-            "Source map header present",
-            "SourceMap HTTP header found. Source maps can expose original source code.",
-            format!("SourceMap: {sm}"),
         ));
     }
 
@@ -1891,6 +1990,28 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
             "WSDL service definition exposed",
             "WSDL document found in response. This reveals web service endpoints and data types.",
             "",
+        ));
+    }
+}
+
+fn push_source_map_header_finding(
+    record: &TransactionRecord,
+    response: &crate::model::MessageRecord,
+    findings: &mut Vec<ScannerFinding>,
+) {
+    if let Some(sm) = response
+        .header_value("sourcemap")
+        .or_else(|| response.header_value("x-sourcemap"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        findings.push(make_finding(
+            record,
+            Severity::Low,
+            "info",
+            "Source map header present",
+            "SourceMap HTTP header found. Source maps can expose original source code.",
+            format!("SourceMap: {sm}"),
         ));
     }
 }
@@ -2708,6 +2829,75 @@ mod tests {
     }
 
     #[test]
+    fn jwt_detection_decodes_url_encoded_cookie_values() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234" }),
+        );
+        let encoded_token = token.replace('.', "%2E");
+        let record = make_record(
+            vec![("cookie", &format!("session=\"{encoded_token}\""))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "JWT without expiration"),
+            "percent-encoded JWT cookie values should still be analyzed"
+        );
+    }
+
+    #[test]
+    fn jwt_detection_decodes_url_encoded_bearer_tokens() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234" }),
+        );
+        let encoded_token = token.replace('.', "%2E");
+        let record = make_record(
+            vec![("authorization", &format!("Bearer {encoded_token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "JWT without expiration"),
+            "percent-encoded bearer JWTs should still be analyzed"
+        );
+    }
+
+    #[test]
+    fn jwt_detection_decodes_url_encoded_body_tokens() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234" }),
+        );
+        let encoded_token = token.replace('.', "%2E");
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            &format!(r#"{{"token":"{encoded_token}"}}"#),
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "JWT without expiration"),
+            "percent-encoded JWTs in response bodies should still be analyzed"
+        );
+    }
+
+    #[test]
     fn test_missing_security_headers() {
         let record = make_record(
             vec![],
@@ -2723,6 +2913,85 @@ mod tests {
                 .any(|f| f.title.contains("Content-Security-Policy")),
             "Should detect missing CSP"
         );
+    }
+
+    #[test]
+    fn security_header_checks_reject_invalid_hsts_values() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-security-policy", "default-src 'self'"),
+                ("strict-transport-security", "max-age=0"),
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "DENY"),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Missing Strict-Transport-Security"));
+    }
+
+    #[test]
+    fn security_header_checks_reject_invalid_content_type_options() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-security-policy", "default-src 'self'"),
+                ("strict-transport-security", "max-age=31536000"),
+                ("x-content-type-options", "sniff"),
+                ("x-frame-options", "DENY"),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Missing X-Content-Type-Options"));
+    }
+
+    #[test]
+    fn security_header_checks_reject_invalid_frame_protection() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-security-policy", "default-src 'self'"),
+                ("strict-transport-security", "max-age=31536000"),
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "ALLOWALL"),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Missing X-Frame-Options"));
+    }
+
+    #[test]
+    fn security_header_checks_reject_empty_frame_ancestors_directive() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-security-policy", "frame-ancestors"),
+                ("strict-transport-security", "max-age=31536000"),
+                ("x-content-type-options", "nosniff"),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Missing X-Frame-Options"));
     }
 
     #[test]
@@ -2859,6 +3128,39 @@ mod tests {
     }
 
     #[test]
+    fn cache_control_check_treats_auth_cookies_as_authenticated() {
+        let record = make_record(
+            vec![("cookie", "session=abc123; theme=dark")],
+            vec![("content-type", "application/json")],
+            r#"{"private":true}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+    }
+
+    #[test]
+    fn cache_control_public_check_treats_auth_cookies_as_authenticated() {
+        let record = make_record(
+            vec![("cookie", "access_token=abc123")],
+            vec![
+                ("content-type", "application/json"),
+                ("cache-control", "public, max-age=60"),
+            ],
+            r#"{"private":true}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Cache-Control: public on authenticated response"));
+    }
+
+    #[test]
     fn test_cors_wildcard() {
         let record = make_record(vec![], vec![("access-control-allow-origin", "*")], "", 200);
         let config = ScannerConfig::default();
@@ -2888,6 +3190,24 @@ mod tests {
                 .any(|f| f.category == "cors" && f.severity == Severity::High),
             "OWS around CORS headers should not hide wildcard-with-credentials"
         );
+    }
+
+    #[test]
+    fn cors_null_origin_with_credentials_is_reported() {
+        let record = make_record(
+            vec![("origin", "null")],
+            vec![
+                ("access-control-allow-origin", "null"),
+                ("access-control-allow-credentials", "true"),
+            ],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "CORS: null origin with credentials"));
     }
 
     #[test]
@@ -3191,6 +3511,33 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_scanner_detects_huggingface_token_with_digits() {
+        let body = format!("token={}", format!("hf_{}", "a1".repeat(17)));
+        let record = make_record(vec![], vec![("content-type", "text/html")], &body, 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|f| f.title.contains("HuggingFace Token")));
+    }
+
+    #[test]
+    fn sensitive_scanner_requires_huggingface_token_boundaries() {
+        let token = format!("hf_{}", "a1".repeat(17));
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            &format!("prefix{token} {token}suffix"),
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(!findings
+            .iter()
+            .any(|f| f.title.contains("HuggingFace Token")));
+    }
+
+    #[test]
     fn sensitive_scanner_rejects_invalid_luhn_card_number() {
         let invalid_card = format!("{}{}", "411111111111111", "2");
         let record = make_record(
@@ -3256,6 +3603,26 @@ mod tests {
                 .any(|f| f.category == "info" && f.title.contains("Swagger")),
             "Should detect Swagger/OpenAPI spec exposure"
         );
+    }
+
+    #[test]
+    fn source_map_header_is_reported_even_when_body_is_empty() {
+        let record = make_record(vec![], vec![("sourcemap", "/static/app.js.map")], "", 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Source map header present"));
+    }
+
+    #[test]
+    fn blank_source_map_header_is_ignored() {
+        let record = make_record(vec![], vec![("sourcemap", "   ")], "", 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.title == "Source map header present"));
     }
 
     #[test]
