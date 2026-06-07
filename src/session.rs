@@ -1595,13 +1595,17 @@ fn replay_transaction_journal(
         &mut replayed_transaction_ids,
     );
     let snapshot_record_ids = seen.clone();
-    let replay_insert_after_sequence = (!records.is_empty()).then(|| {
-        records
-            .values()
-            .map(|record| record.sequence)
-            .max()
-            .unwrap_or(0)
-    });
+    let mut backfill_order = VecDeque::new();
+    let mut backfill_records = HashMap::new();
+    let snapshot_fills_retention_window = max_entries > 0 && records.len() >= max_entries;
+    let replay_insert_after_sequence = (snapshot_fills_retention_window && !records.is_empty())
+        .then(|| {
+            records
+                .values()
+                .map(|record| record.sequence)
+                .max()
+                .unwrap_or(0)
+        });
 
     replay_transaction_journal_file(
         &checkpoint_path,
@@ -1610,6 +1614,8 @@ fn replay_transaction_journal(
         &mut records,
         &mut seen,
         &mut replayed_transaction_ids,
+        &mut backfill_order,
+        &mut backfill_records,
         Some(&snapshot_record_ids),
         max_entries,
         repair_files,
@@ -1621,10 +1627,21 @@ fn replay_transaction_journal(
         &mut records,
         &mut seen,
         &mut replayed_transaction_ids,
+        &mut backfill_order,
+        &mut backfill_records,
         None,
         max_entries,
         repair_files,
     )?;
+    apply_transaction_journal_backfill(
+        max_entries,
+        &snapshot_record_ids,
+        &mut order,
+        &mut records,
+        &mut replayed_transaction_ids,
+        &mut backfill_order,
+        &mut backfill_records,
+    );
 
     snapshot.transactions = order
         .into_iter()
@@ -1653,6 +1670,8 @@ fn replay_transaction_journal_file(
     records: &mut HashMap<Uuid, TransactionRecord>,
     seen: &mut HashSet<Uuid>,
     replayed_transaction_ids: &mut HashSet<Uuid>,
+    backfill_order: &mut VecDeque<Uuid>,
+    backfill_records: &mut HashMap<Uuid, TransactionRecord>,
     skip_annotations_for: Option<&HashSet<Uuid>>,
     max_entries: usize,
     repair_files: bool,
@@ -1752,6 +1771,10 @@ fn replay_transaction_journal_file(
         match entry {
             TransactionJournalEntry::Insert { record } => {
                 if insert_after_sequence.is_some_and(|sequence| record.sequence <= sequence) {
+                    if seen.insert(record.id) {
+                        backfill_order.push_back(record.id);
+                        backfill_records.insert(record.id, record);
+                    }
                     continue;
                 }
                 if seen.insert(record.id) {
@@ -1774,7 +1797,10 @@ fn replay_transaction_journal_file(
                 previous_color_tag,
                 previous_user_note,
             } => {
-                if let Some(record) = records.get_mut(&id) {
+                if let Some(record) = records
+                    .get_mut(&id)
+                    .or_else(|| backfill_records.get_mut(&id))
+                {
                     if skip_annotations_for.is_some_and(|ids| ids.contains(&id))
                         && !annotation_previous_values_match(
                             record,
@@ -1798,6 +1824,46 @@ fn replay_transaction_journal_file(
         *order = replayed_order;
     }
     Ok(())
+}
+
+fn apply_transaction_journal_backfill(
+    max_entries: usize,
+    snapshot_record_ids: &HashSet<Uuid>,
+    order: &mut Vec<Uuid>,
+    records: &mut HashMap<Uuid, TransactionRecord>,
+    replayed_transaction_ids: &mut HashSet<Uuid>,
+    backfill_order: &mut VecDeque<Uuid>,
+    backfill_records: &mut HashMap<Uuid, TransactionRecord>,
+) {
+    if max_entries == 0 || records.len() >= max_entries {
+        return;
+    }
+
+    let mut replayed_backfill_order = Vec::new();
+    while records.len() < max_entries {
+        let Some(id) = backfill_order.pop_back() else {
+            break;
+        };
+        let Some(record) = backfill_records.remove(&id) else {
+            continue;
+        };
+        replayed_transaction_ids.insert(id);
+        records.insert(id, record);
+        replayed_backfill_order.push(id);
+    }
+    if replayed_backfill_order.is_empty() {
+        return;
+    }
+
+    let snapshot_start = order
+        .iter()
+        .position(|id| snapshot_record_ids.contains(id))
+        .unwrap_or(order.len());
+    let mut replayed_order = Vec::with_capacity(order.len() + replayed_backfill_order.len());
+    replayed_order.extend_from_slice(&order[..snapshot_start]);
+    replayed_order.extend(replayed_backfill_order);
+    replayed_order.extend_from_slice(&order[snapshot_start..]);
+    *order = replayed_order;
 }
 
 fn trim_transaction_replay_state(
@@ -2023,7 +2089,7 @@ fn sync_directory(path: &Path, label: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     use chrono::{Duration as ChronoDuration, Utc};
     use uuid::Uuid;
@@ -2037,7 +2103,7 @@ mod tests {
         },
         oast::OastProvider,
         runtime::RuntimeSettingsUpdate,
-        scanner::{CustomRule, ScannerConfig, ScannerFinding, Severity},
+        scanner::{CustomRule, ScannerConfig, ScannerFinding, Severity, BUILTIN_RULES},
         store::{
             transaction_journal_checkpoint_path, NullableStringPatch, TransactionJournalEntry,
         },
@@ -3512,6 +3578,8 @@ mod tests {
         let mut records = HashMap::new();
         let mut seen = HashSet::new();
         let mut replayed = HashSet::new();
+        let mut backfill_order = VecDeque::new();
+        let mut backfill_records = HashMap::new();
         super::replay_transaction_journal_file(
             &journal_path,
             None,
@@ -3519,6 +3587,8 @@ mod tests {
             &mut records,
             &mut seen,
             &mut replayed,
+            &mut backfill_order,
+            &mut backfill_records,
             None,
             100,
             true,
@@ -4499,6 +4569,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_replays_low_sequence_journal_when_snapshot_window_is_not_full() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-low-sequence-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+
+        let mut snapshot_record = TransactionRecord::http(
+            Utc::now(),
+            "GET".to_string(),
+            "https".to_string(),
+            "snapshot-high.example:443".to_string(),
+            "/snapshot-high".to_string(),
+            Some(200),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            None,
+            vec![],
+            None,
+            None,
+        );
+        snapshot_record.sequence = 1_000_000;
+        let scanner_config = ScannerConfig {
+            enabled: true,
+            rules: BUILTIN_RULES
+                .iter()
+                .map(|(id, _)| ((*id).to_string(), false))
+                .collect(),
+            custom_rules: vec![CustomRule {
+                id: "journal-secret".to_string(),
+                name: "Journal secret".to_string(),
+                enabled: true,
+                target: "response_body".to_string(),
+                header_name: String::new(),
+                pattern: "journal-secret-token".to_string(),
+                severity: Severity::High,
+                category: "custom".to_string(),
+                description: "journal replay scanner recovery".to_string(),
+            }],
+        };
+        super::write_json(
+            &super::snapshot_path(&storage_dir),
+            &super::StoredSessionSnapshot {
+                transactions: vec![snapshot_record],
+                scanner_config,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut journal_record = TransactionRecord::http(
+            Utc::now(),
+            "POST".to_string(),
+            "https".to_string(),
+            "journal-low.example:443".to_string(),
+            "/journal-low".to_string(),
+            Some(201),
+            1,
+            MessageRecord {
+                headers: vec![],
+                body_preview: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 0,
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: None,
+                content_decoded: false,
+            },
+            Some(MessageRecord {
+                headers: vec![],
+                body_preview: "journal-secret-token".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: "journal-secret-token".len(),
+                decoded_body_size: None,
+                preview_truncated: false,
+                content_type: Some("text/plain".to_string()),
+                content_decoded: false,
+            }),
+            vec![],
+            None,
+            None,
+        );
+        journal_record.sequence = 2;
+        let journal_record_id = journal_record.id;
+        let mut journal = Vec::new();
+        serde_json::to_writer(
+            &mut journal,
+            &TransactionJournalEntry::Insert {
+                record: journal_record,
+            },
+        )
+        .unwrap();
+        journal.push(b'\n');
+        std::fs::write(super::transaction_journal_path(&storage_dir), journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+        let findings = loaded.scanner.list(None).await;
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|record| record.host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["journal-low.example:443", "snapshot-high.example:443"]
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.record_id == journal_record_id && finding.rule_id == "journal-secret"
+        }));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn registry_ignores_trailing_partial_transaction_journal_line() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-session-journal-partial-test-{}",
@@ -5111,6 +5305,70 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].host, "4.example:443");
         assert_eq!(restored[1].host, "3.example:443");
+    }
+
+    #[tokio::test]
+    async fn registry_backfill_does_not_evict_full_snapshot_window() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-journal-backfill-full-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 2, 32).unwrap();
+
+        let mut records = Vec::new();
+        for sequence in 1..=4 {
+            let mut record = TransactionRecord::http(
+                Utc::now(),
+                "GET".to_string(),
+                "https".to_string(),
+                format!("{sequence}.example:443"),
+                format!("/{sequence}"),
+                Some(200),
+                1,
+                MessageRecord {
+                    headers: vec![],
+                    body_preview: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    body_size: 0,
+                    decoded_body_size: None,
+                    preview_truncated: false,
+                    content_type: None,
+                    content_decoded: false,
+                },
+                None,
+                vec![],
+                None,
+                None,
+            );
+            record.sequence = sequence;
+            records.push(record);
+        }
+
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let snapshot = super::StoredSessionSnapshot {
+            transactions: vec![records[3].clone(), records[2].clone()],
+            ..Default::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let mut journal = Vec::new();
+        for record in [records[0].clone(), records[1].clone()] {
+            serde_json::to_writer(&mut journal, &TransactionJournalEntry::Insert { record })
+                .unwrap();
+            journal.push(b'\n');
+        }
+        std::fs::write(super::transaction_journal_path(&storage_dir), journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.store.snapshot(Some(10)).await;
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|record| record.host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["4.example:443", "3.example:443"]
+        );
     }
 
     #[tokio::test]

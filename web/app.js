@@ -7287,9 +7287,18 @@ async function loadScannerConfig(sessionId = currentSessionId()) {
   }
 }
 
-async function saveScannerConfig(config, sessionId = currentSessionId()) {
+async function saveScannerConfig(config, sessionId = currentSessionId(), options = {}) {
   if (sessionId !== currentSessionId()) {
     return false;
+  }
+  if (options.preserveEnabled) {
+    const latestResponse = await fetch(sessionQueryPath("/api/scanner-config", sessionId));
+    await requireOkResponse(latestResponse, "Failed to load scanner settings.");
+    const latestConfig = await latestResponse.json();
+    if (sessionId !== currentSessionId()) {
+      return false;
+    }
+    config.enabled = latestConfig.enabled !== false;
   }
   const res = await fetch(sessionQueryPath("/api/scanner-config", sessionId), {
     method: "POST",
@@ -7421,7 +7430,7 @@ async function saveScannerSettingsFromModal() {
     return;
   }
   const config = collectScannerConfig();
-  if (!(await saveScannerConfig(config, sessionId))) {
+  if (!(await saveScannerConfig(config, sessionId, { preserveEnabled: true }))) {
     return;
   }
   syncQuickToggle(config.enabled);
@@ -9522,8 +9531,12 @@ function renderProxySettings() {
   els.proxySettingIntercept.checked = Boolean(state.runtime.intercept_enabled);
   els.proxySettingWebsocketCapture.checked = Boolean(state.runtime.websocket_capture_enabled);
   els.proxySettingUpstreamInsecure.checked = state.runtime.upstream_insecure !== false;
-  els.proxySettingScopePatterns.value = (state.runtime.scope_patterns || []).join("\n");
-  els.proxySettingPassthroughHosts.value = (state.runtime.passthrough_hosts || []).join("\n");
+  if (document.activeElement !== els.proxySettingScopePatterns) {
+    els.proxySettingScopePatterns.value = (state.runtime.scope_patterns || []).join("\n");
+  }
+  if (document.activeElement !== els.proxySettingPassthroughHosts) {
+    els.proxySettingPassthroughHosts.value = (state.runtime.passthrough_hosts || []).join("\n");
+  }
   if (startup && document.activeElement !== els.proxySettingBindHost) {
     els.proxySettingBindHost.value = startup.proxy_bind_host;
   }
