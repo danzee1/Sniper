@@ -2732,7 +2732,9 @@ fn merge_workspace_keepalive_tab(
     let preserve_http_request_bound_state =
         current.tab_type != "websocket" && !keepalive.text_complete();
     let current_base_request = current.base_request.clone();
+    let current_source_transaction_id = current.source_transaction_id;
     let current_request_text = current.request_text.clone();
+    let current_http_version_mode = current.http_version_mode.clone();
     let current_history_entries = std::mem::take(&mut current.history_entries);
     let current_history_index = current.history_index;
     let current_response_record = current.response_record.take();
@@ -2767,7 +2769,9 @@ fn merge_workspace_keepalive_tab(
     }
     if current.tab_type != "websocket" && !keepalive.text_complete() {
         current.base_request = current_base_request;
+        current.source_transaction_id = current_source_transaction_id;
         current.request_text = current_request_text;
+        current.http_version_mode = current_http_version_mode;
     }
     if current.tab_type == "websocket" && !keepalive.ws_text_complete() {
         current.ws_handshake_text = current_ws_handshake_text;
@@ -2816,7 +2820,11 @@ fn merge_workspace_keepalive_fuzzer(
     incoming: FuzzerWorkspaceState,
     keepalive: &WorkspaceKeepaliveMetadata,
 ) -> FuzzerWorkspaceState {
-    if keepalive.text_complete() && incoming.base_request.is_some() {
+    if !keepalive.text_complete() {
+        current.attack_record = None;
+        return current;
+    }
+    if incoming.base_request.is_some() {
         current.base_request = incoming.base_request;
     }
     if incoming.source_transaction_id.is_some() {
@@ -2831,10 +2839,10 @@ fn merge_workspace_keepalive_fuzzer(
     if !incoming.notice.is_empty() {
         current.notice = incoming.notice;
     }
-    if keepalive.text_complete() && !incoming.request_text.is_empty() {
+    if !incoming.request_text.is_empty() {
         current.request_text = incoming.request_text;
     }
-    if keepalive.text_complete() && !incoming.payloads_text.is_empty() {
+    if !incoming.payloads_text.is_empty() {
         current.payloads_text = incoming.payloads_text;
     }
     if incoming.attack_record_id.is_some() {
@@ -8442,37 +8450,39 @@ mod tests {
             ..WorkspaceStateSnapshot::default()
         };
 
-        let merged = super::merge_workspace_keepalive_snapshot(
-            current,
-            incoming,
-            super::WorkspaceKeepaliveMetadata {
-                replay_tabs_complete: false,
-                fuzzer_complete: true,
-                text_complete: Some(false),
-                ..super::WorkspaceKeepaliveMetadata::default()
-            },
-        );
+        for fuzzer_complete in [true, false] {
+            let merged = super::merge_workspace_keepalive_snapshot(
+                current.clone(),
+                incoming.clone(),
+                super::WorkspaceKeepaliveMetadata {
+                    replay_tabs_complete: false,
+                    fuzzer_complete,
+                    text_complete: Some(false),
+                    ..super::WorkspaceKeepaliveMetadata::default()
+                },
+            );
 
-        assert_eq!(
-            merged.fuzzer.request_text,
-            "GET /old HTTP/1.1\r\nHost: old.example\r\n\r\n".to_string()
-        );
-        assert_eq!(merged.fuzzer.payloads_text, "old-payload");
-        assert_eq!(merged.fuzzer.source_transaction_id, Some(current_source_id));
-        assert_eq!(merged.fuzzer.attack_record_id, Some(current_attack_id));
-        assert_eq!(
-            merged
-                .fuzzer
-                .target
-                .as_ref()
-                .map(|target| target.host.as_str()),
-            Some("old.example")
-        );
-        assert_eq!(
-            merged.fuzzer.target_request_authority.as_deref(),
-            Some("old.example")
-        );
-        assert_eq!(merged.fuzzer.notice, "old notice");
+            assert_eq!(
+                merged.fuzzer.request_text,
+                "GET /old HTTP/1.1\r\nHost: old.example\r\n\r\n".to_string()
+            );
+            assert_eq!(merged.fuzzer.payloads_text, "old-payload");
+            assert_eq!(merged.fuzzer.source_transaction_id, Some(current_source_id));
+            assert_eq!(merged.fuzzer.attack_record_id, Some(current_attack_id));
+            assert_eq!(
+                merged
+                    .fuzzer
+                    .target
+                    .as_ref()
+                    .map(|target| target.host.as_str()),
+                Some("old.example")
+            );
+            assert_eq!(
+                merged.fuzzer.target_request_authority.as_deref(),
+                Some("old.example")
+            );
+            assert_eq!(merged.fuzzer.notice, "old notice");
+        }
     }
 
     #[test]
@@ -8942,6 +8952,8 @@ mod tests {
         let current_request = "POST /large HTTP/1.1\r\nHost: example.test\r\n\r\n";
         let durable_response = test_replay_response_record("/large", 200);
         let durable_history_response = test_replay_response_record("/history", 201);
+        let durable_source_id = Uuid::new_v4();
+        let incoming_source_id = Uuid::new_v4();
         let current = WorkspaceStateSnapshot {
             replay: ReplayWorkspaceState {
                 active_tab_id: Some("active".to_string()),
@@ -8950,7 +8962,9 @@ mod tests {
                     id: "active".to_string(),
                     sequence: 1,
                     base_request: Some(test_editable_request("/large")),
+                    source_transaction_id: Some(durable_source_id),
                     request_text: format!("{current_request}{}", "A".repeat(80_000)),
+                    http_version_mode: "HTTP/2".to_string(),
                     target_scheme: "https".to_string(),
                     target_host: "example.test".to_string(),
                     target_port: "443".to_string(),
@@ -8988,7 +9002,9 @@ mod tests {
                     id: "active".to_string(),
                     sequence: 1,
                     base_request: Some(test_editable_request("/truncated")),
+                    source_transaction_id: Some(incoming_source_id),
                     request_text: format!("{current_request}{}", "A".repeat(1024)),
+                    http_version_mode: "HTTP/1.0".to_string(),
                     target_scheme: "https".to_string(),
                     target_host: "edited.example".to_string(),
                     target_port: "8443".to_string(),
@@ -9024,6 +9040,8 @@ mod tests {
         assert_eq!(tab.target_port, "8443");
         assert_eq!(tab.request_text, durable_tab_text);
         assert_eq!(tab.base_request.as_ref().unwrap().path, "/large");
+        assert_eq!(tab.source_transaction_id, Some(durable_source_id));
+        assert_eq!(tab.http_version_mode, "HTTP/2");
         assert_eq!(
             tab.response_record.as_ref().unwrap().id,
             durable_response.id

@@ -855,7 +855,6 @@ let workspaceSaveCommittedSnapshot = null;
 const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
-let expectedActiveSessionGuardBypassDepth = 0;
 const uiSettingsClientId = createWorkspaceClientId();
 let uiSettingsSaveVersion = 0;
 const annotationClientId = createWorkspaceClientId();
@@ -2991,7 +2990,7 @@ function snapshotWorkspaceState(options = {}) {
   return {
     revision: state.workspaceRevision || 0,
     session_id: state.activeSession?.id || null,
-    expected_active_session_id: expectedActiveSessionIdForWrite(state.activeSession?.id || null),
+    expected_active_session_id: expectedActiveSessionIdForWrite(state.activeSession?.id || null, options),
     client_id: workspaceClientId,
     client_version: workspaceSaveVersion,
     replay: {
@@ -3058,7 +3057,7 @@ function scheduleWsTranscriptWorkspaceSave() {
   }, delay);
 }
 
-async function flushQueuedWorkspaceStateSave() {
+async function flushQueuedWorkspaceStateSave(options = {}) {
   if (!state.activeSession) {
     return;
   }
@@ -3069,22 +3068,22 @@ async function flushQueuedWorkspaceStateSave() {
     return workspaceSaveLoopPromise;
   }
 
-  workspaceSaveLoopPromise = runQueuedWorkspaceStateSaves()
+  workspaceSaveLoopPromise = runQueuedWorkspaceStateSaves(options)
     .finally(() => {
       workspaceSaveLoopPromise = null;
     });
   return workspaceSaveLoopPromise;
 }
 
-async function runQueuedWorkspaceStateSaves() {
+async function runQueuedWorkspaceStateSaves(options = {}) {
   while (state.activeSession && workspaceSaveDirty) {
     workspaceSaveDirty = false;
     const version = workspaceSaveVersion;
-    const snapshot = snapshotWorkspaceState();
+    const snapshot = snapshotWorkspaceState(options);
     workspaceSaveLastSnapshot = snapshot;
     workspaceSaveInFlight = true;
     try {
-      await saveWorkspaceState(snapshot);
+      await saveWorkspaceState(snapshot, options);
     } catch (error) {
       if (!(error instanceof WorkspaceStateConflictError)) {
         workspaceSaveDirty = true;
@@ -3115,9 +3114,12 @@ async function runQueuedWorkspaceStateSaves() {
   }
 }
 
-async function saveWorkspaceState(snapshot = snapshotWorkspaceState()) {
+async function saveWorkspaceState(snapshot = null, options = {}) {
   if (!state.activeSession) {
     return;
+  }
+  if (!snapshot) {
+    snapshot = snapshotWorkspaceState(options);
   }
 
   const response = await fetch("/api/workspace-state", {
@@ -3169,7 +3171,7 @@ function handleWorkspaceActionError(error) {
   showToast(error?.message || "Workspace action failed.", "error", 6000);
 }
 
-async function flushWorkspaceState() {
+async function flushWorkspaceState(options = {}) {
   const hasQueuedChanges = !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer);
   const hasInFlightSave = !!(workspaceSaveInFlight || workspaceSaveLoopPromise);
   const hasPendingConflict = !!workspaceSaveConflictPending;
@@ -3188,7 +3190,7 @@ async function flushWorkspaceState() {
     workspaceSaveDirty = true;
     workspaceSaveVersion += 1;
   }
-  await flushQueuedWorkspaceStateSave();
+  await flushQueuedWorkspaceStateSave(options);
   if (workspaceSaveConflictPending) {
     throw new WorkspaceStateConflictError(null);
   }
@@ -3680,7 +3682,10 @@ function compactWorkspaceUnloadSnapshot(snapshot, options = {}) {
   return {
     revision: snapshot.revision || 0,
     session_id: snapshot.session_id || null,
-    expected_active_session_id: expectedActiveSessionIdForWrite(snapshot.session_id || state.activeSession?.id || null),
+    expected_active_session_id: expectedActiveSessionIdForWrite(
+      snapshot.session_id || state.activeSession?.id || null,
+      options,
+    ),
     client_id: snapshot.client_id || workspaceClientId,
     client_version: snapshot.client_version || workspaceSaveVersion,
     replay: {
@@ -3881,7 +3886,7 @@ function hasPendingWorkspaceStateSave() {
   return !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer || workspaceSaveInFlight || workspaceSaveLoopPromise);
 }
 
-async function cleanupWsReplayTabsBeforeStateReset() {
+async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
   const tabs = (state.replayTabs || []).filter((tab) => (
     tab
     && tab.type === "websocket"
@@ -3891,6 +3896,7 @@ async function cleanupWsReplayTabsBeforeStateReset() {
   const results = await Promise.allSettled(tabs.map((tab) => cleanupWsReplayTab(tab, {
     markDisconnected: true,
     removeBackend: tab.wsStatus === "connecting",
+    bypassExpectedActiveSessionGuard: !!options.bypassExpectedActiveSessionGuard,
   })));
   for (const result of results) {
     if (result.status === "rejected") {
@@ -3898,7 +3904,7 @@ async function cleanupWsReplayTabsBeforeStateReset() {
     }
   }
   if (hasPendingWorkspaceStateSave()) {
-    await flushWorkspaceState();
+    await flushWorkspaceState(options);
   }
 }
 
@@ -4050,8 +4056,10 @@ function renderReplayClearedState() {
   if (els.replayFollowRedirectButton) els.replayFollowRedirectButton.classList.add("hidden");
 }
 
-async function reloadSessionWorkspace() {
-  await cleanupWsReplayTabsBeforeStateReset();
+async function reloadSessionWorkspace({ cleanupBeforeReset = true } = {}) {
+  if (cleanupBeforeReset) {
+    await cleanupWsReplayTabsBeforeStateReset();
+  }
   resetSessionScopedUiState();
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await loadSessions();
@@ -4084,31 +4092,40 @@ async function reloadSessionWorkspace() {
 }
 
 async function handleExternalSessionChanged() {
-  await withExpectedActiveSessionGuardBypassed(async () => {
-    try {
-      if (!(await flushSequenceDraft())) {
-        return;
-      }
-    } catch (error) {
-      handleSequenceActionError(error);
+  const staleSessionWriteOptions = { bypassExpectedActiveSessionGuard: true };
+  let shouldReload = false;
+  try {
+    if (!(await flushSequenceDraft(staleSessionWriteOptions))) {
       return;
     }
+  } catch (error) {
+    handleSequenceActionError(error);
+    return;
+  }
+  try {
+    await flushAllPendingAnnotations(staleSessionWriteOptions);
+  } catch (error) {
+    handleWorkspaceActionError(error);
+    return;
+  }
+  if (hasPendingWorkspaceStateSave()) {
     try {
-      await flushAllPendingAnnotations();
+      await flushWorkspaceState(staleSessionWriteOptions);
     } catch (error) {
       handleWorkspaceActionError(error);
       return;
     }
-    if (hasPendingWorkspaceStateSave()) {
-      try {
-        await flushWorkspaceState();
-      } catch (error) {
-        handleWorkspaceActionError(error);
-        return;
-      }
-    }
-    await reloadSessionWorkspace();
-  });
+  }
+  try {
+    await cleanupWsReplayTabsBeforeStateReset(staleSessionWriteOptions);
+    shouldReload = true;
+  } catch (error) {
+    handleWorkspaceActionError(error);
+    return;
+  }
+  if (shouldReload) {
+    await reloadSessionWorkspace({ cleanupBeforeReset: false });
+  }
 }
 
 async function createSession() {
@@ -4117,6 +4134,7 @@ async function createSession() {
   }
   await flushAllPendingAnnotations();
   await flushWorkspaceState();
+  await cleanupWsReplayTabsBeforeStateReset();
   const name = els.dashboardCreateSessionName.value.trim();
   const response = await fetch("/api/sessions", {
     method: "POST",
@@ -4129,7 +4147,7 @@ async function createSession() {
     throw new Error(await response.text());
   }
   els.dashboardCreateSessionName.value = "";
-  await reloadSessionWorkspace();
+  await reloadSessionWorkspace({ cleanupBeforeReset: false });
 }
 
 async function activateSessionById(id) {
@@ -4138,6 +4156,7 @@ async function activateSessionById(id) {
   }
   await flushAllPendingAnnotations();
   await flushWorkspaceState();
+  await cleanupWsReplayTabsBeforeStateReset();
   const response = await fetch(`/api/sessions/${id}/activate`, {
     method: "POST",
   });
@@ -4145,7 +4164,7 @@ async function activateSessionById(id) {
     throw new Error(await response.text());
   }
   state.selectedSessionId = id;
-  await reloadSessionWorkspace();
+  await reloadSessionWorkspace({ cleanupBeforeReset: false });
 }
 
 async function loadRuntimeSettings() {
@@ -4171,28 +4190,19 @@ function sessionQueryPath(path, sessionId = currentSessionId()) {
   return `${path}${separator}session_id=${encodeURIComponent(sessionId)}`;
 }
 
-function expectedActiveSessionIdForWrite(sessionId = currentSessionId()) {
-  if (expectedActiveSessionGuardBypassDepth > 0) {
+function expectedActiveSessionIdForWrite(sessionId = currentSessionId(), options = {}) {
+  if (options.bypassExpectedActiveSessionGuard) {
     return null;
   }
   return sessionId && sessionId === currentSessionId() ? sessionId : null;
 }
 
-async function withExpectedActiveSessionGuardBypassed(callback) {
-  expectedActiveSessionGuardBypassDepth += 1;
-  try {
-    return await callback();
-  } finally {
-    expectedActiveSessionGuardBypassDepth = Math.max(0, expectedActiveSessionGuardBypassDepth - 1);
-  }
-}
-
-function sessionWritePath(path, sessionId = currentSessionId()) {
+function sessionWritePath(path, sessionId = currentSessionId(), options = {}) {
   const params = new URLSearchParams();
   if (sessionId) {
     params.set("session_id", sessionId);
   }
-  const expectedActiveSessionId = expectedActiveSessionIdForWrite(sessionId);
+  const expectedActiveSessionId = expectedActiveSessionIdForWrite(sessionId, options);
   if (expectedActiveSessionId) {
     params.set("expected_active_session_id", expectedActiveSessionId);
   }
@@ -12523,7 +12533,11 @@ function syncSequenceStepFromDom({ allowInvalidRequests = false } = {}) {
   });
 }
 
-async function saveCurrentSequence({ render = true, preserveSelection = false } = {}) {
+async function saveCurrentSequence({
+  render = true,
+  preserveSelection = false,
+  bypassExpectedActiveSessionGuard = false,
+} = {}) {
   if (!state.editingSequence) return false;
   syncSequenceStepFromDom({ allowInvalidRequests: true });
   const sessionId = currentSequenceSessionId();
@@ -12532,7 +12546,9 @@ async function saveCurrentSequence({ render = true, preserveSelection = false } 
   const draftVersion = state.sequenceDraftVersion || 0;
   const payload = JSON.parse(JSON.stringify(state.editingSequence));
   payload.session_id = sessionId;
-  payload.expected_active_session_id = expectedActiveSessionIdForWrite(sessionId);
+  payload.expected_active_session_id = expectedActiveSessionIdForWrite(sessionId, {
+    bypassExpectedActiveSessionGuard,
+  });
   const response = await fetch("/api/sequences", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -12568,9 +12584,9 @@ async function saveCurrentSequence({ render = true, preserveSelection = false } 
   return true;
 }
 
-async function flushSequenceDraft() {
+async function flushSequenceDraft(options = {}) {
   if (!state.sequenceDirty || !state.editingSequence) return true;
-  return saveCurrentSequence({ render: false, preserveSelection: true });
+  return saveCurrentSequence({ render: false, preserveSelection: true, ...options });
 }
 
 async function deleteSequence(id) {
@@ -18877,7 +18893,11 @@ async function wsDisconnect() {
   });
 }
 
-async function cleanupWsReplayTab(tab, { markDisconnected = false, removeBackend = true } = {}) {
+async function cleanupWsReplayTab(tab, {
+  markDisconnected = false,
+  removeBackend = true,
+  bypassExpectedActiveSessionGuard = false,
+} = {}) {
   if (!tab || tab.type !== "websocket") return;
   const previousStatus = tab.wsStatus;
   tab.wsLifecycleToken = (tab.wsLifecycleToken || 0) + 1;
@@ -18885,7 +18905,11 @@ async function cleanupWsReplayTab(tab, { markDisconnected = false, removeBackend
   clearWsFrameListRender(tab);
   await refreshWsReplayFramesOnce(tab, { lifecycleToken });
   stopWsPoll(tab);
-  const disconnectResult = await disconnectWsReplayBackend(tab.id, { remove: removeBackend, sessionId: tab.wsSessionId || state.activeSession?.id || null });
+  const disconnectResult = await disconnectWsReplayBackend(tab.id, {
+    remove: removeBackend,
+    sessionId: tab.wsSessionId || state.activeSession?.id || null,
+    bypassExpectedActiveSessionGuard,
+  });
   if (!disconnectResult.ok) {
     if (isWsReplayTabAlive(tab, lifecycleToken)) {
       tab.wsStatus = previousStatus === "connecting" ? "error" : previousStatus;
@@ -18961,14 +18985,20 @@ async function refreshWsReplayFramesUntilSettled(tab, options = {}) {
   return sawFrame;
 }
 
-async function disconnectWsReplayBackend(id, { remove = false, sessionId = state.activeSession?.id || null } = {}) {
+async function disconnectWsReplayBackend(id, {
+  remove = false,
+  sessionId = state.activeSession?.id || null,
+  bypassExpectedActiveSessionGuard = false,
+} = {}) {
   try {
     const response = await fetch("/api/replay/ws-disconnect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: sessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId, {
+          bypassExpectedActiveSessionGuard,
+        }),
         id,
         remove,
       }),
@@ -20090,7 +20120,7 @@ function flushAnnotationsOnUnload() {
   }
 }
 
-async function flushAllPendingAnnotations() {
+async function flushAllPendingAnnotations(options = {}) {
   flushContextMenuPendingNote();
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const pendingIds = state._pendingAnnotations ? Array.from(state._pendingAnnotations.keys()) : [];
@@ -20100,7 +20130,10 @@ async function flushAllPendingAnnotations() {
     }
     const idleIds = pendingIds.filter((id) => !inFlight.has(id));
     if (idleIds.length) {
-      await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, { throwOnError: true })));
+      await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, {
+        throwOnError: true,
+        bypassExpectedActiveSessionGuard: !!options.bypassExpectedActiveSessionGuard,
+      })));
     }
     if ((!state._pendingAnnotations || state._pendingAnnotations.size === 0) && (!state._annotationInFlight || state._annotationInFlight.size === 0)) {
       return;
@@ -20123,7 +20156,11 @@ async function flushPendingAnnotations(transactionId, options = {}) {
   let failureMessage = "";
   let saved = false;
   try {
-    const response = await fetch(sessionWritePath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, sessionId), {
+    const response = await fetch(sessionWritePath(
+      `/api/transactions/${encodeURIComponent(transactionId)}/annotations`,
+      sessionId,
+      options,
+    ), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),

@@ -1677,7 +1677,10 @@ fn build_annotations_payload(
     if let Some(value) = user_note {
         payload.insert("user_note".to_string(), json!(value));
     }
-    payload.insert("client_id".to_string(), json!(CLI_WORKSPACE_CLIENT_ID));
+    payload.insert(
+        "client_id".to_string(),
+        json!(next_cli_annotation_client_id()),
+    );
     payload.insert(
         "client_version".to_string(),
         json!(next_cli_annotation_client_version()),
@@ -1686,11 +1689,11 @@ fn build_annotations_payload(
 }
 
 fn next_cli_annotation_client_version() -> u64 {
-    let nanos_since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(1);
-    nanos_since_epoch.clamp(1, u64::MAX as u128) as u64
+    1
+}
+
+fn next_cli_annotation_client_id() -> String {
+    format!("{CLI_WORKSPACE_CLIENT_ID}:{}", Uuid::new_v4())
 }
 
 fn oast_fields_for_output(
@@ -6494,15 +6497,14 @@ mod tests {
     #[test]
     fn history_annotate_payload_includes_client_clock() {
         let payload = build_annotations_payload(Some(Some("red".to_string())), None);
+        let client_id = payload
+            .get("client_id")
+            .and_then(|value| value.as_str())
+            .expect("annotation payload should include client id");
+        assert!(client_id.starts_with(&format!("{CLI_WORKSPACE_CLIENT_ID}:")));
         assert_eq!(
-            payload.get("client_id").and_then(|value| value.as_str()),
-            Some(CLI_WORKSPACE_CLIENT_ID)
-        );
-        assert!(
-            payload
-                .get("client_version")
-                .and_then(|value| value.as_u64())
-                .is_some_and(|version| version > 0)
+            payload.get("client_version").and_then(|value| value.as_u64()),
+            Some(1)
         );
     }
 
