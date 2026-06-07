@@ -4138,11 +4138,15 @@ struct SequenceQuery {
 #[derive(Debug, Deserialize)]
 struct SequenceSessionQuery {
     session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SequenceUpsertPayload {
     session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_active_session_id: Option<Uuid>,
     #[serde(flatten)]
     definition: SequenceDefinition,
 }
@@ -4191,11 +4195,24 @@ async fn upsert_sequence(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        payload.expected_active_session_id,
+        Some(session.id()),
+    ) {
+        return response;
+    }
     let definition = payload.definition;
     if let Err(error) = validate_sequence_definition(&definition) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    let _operation_guard = match guard_session_write_operation(&state, &session, false).await {
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        payload.expected_active_session_id.is_some(),
+    )
+    .await
+    {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -4223,7 +4240,20 @@ async fn delete_sequence(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let _operation_guard = match guard_session_write_operation(&state, &session, false).await {
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        Some(session.id()),
+    ) {
+        return response;
+    }
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -13100,6 +13130,7 @@ mod tests {
             State(state),
             Json(super::SequenceUpsertPayload {
                 session_id: None,
+                expected_active_session_id: None,
                 definition,
             }),
         )
@@ -13107,6 +13138,98 @@ mod tests {
 
         assert_eq!(response.status(), super::StatusCode::CONFLICT);
         assert!(session.sequence.list_definitions().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn sequence_upsert_rejects_stale_expected_active_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-sequence-upsert-stale-active-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Stale active".to_string(),
+            steps: Vec::new(),
+        };
+
+        let response = super::upsert_sequence(
+            State(state),
+            Json(super::SequenceUpsertPayload {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+                definition,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(original.sequence.list_definitions().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn sequence_delete_rejects_stale_expected_active_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-sequence-delete-stale-active-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let original = state.session().await;
+        let original_id = original.id();
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "Stale delete".to_string(),
+            steps: Vec::new(),
+        };
+        original
+            .sequence
+            .upsert_definition(definition.clone())
+            .await;
+        state
+            .create_session(Some("new active".to_string()))
+            .await
+            .unwrap();
+
+        let response = super::delete_sequence(
+            State(state),
+            Path(definition.id.to_string()),
+            Query(super::SequenceSessionQuery {
+                session_id: Some(original_id),
+                expected_active_session_id: Some(original_id),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(original
+            .sequence
+            .get_definition(definition.id)
+            .await
+            .is_some());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -13143,6 +13266,7 @@ mod tests {
             State(state.clone()),
             Json(super::SequenceUpsertPayload {
                 session_id: Some(original_id),
+                expected_active_session_id: None,
                 definition,
             }),
         ));
@@ -13196,6 +13320,7 @@ mod tests {
             Path(definition.id.to_string()),
             Query(super::SequenceSessionQuery {
                 session_id: Some(original_id),
+                expected_active_session_id: None,
             }),
         ));
         let blocked = tokio::time::timeout(Duration::from_millis(30), &mut delete_future).await;
@@ -13486,7 +13611,10 @@ mod tests {
         let active_response = super::get_sequence(
             State(state.clone()),
             Path(inactive_definition.id.to_string()),
-            Query(super::SequenceSessionQuery { session_id: None }),
+            Query(super::SequenceSessionQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            }),
         )
         .await;
         assert_eq!(active_response.status(), super::StatusCode::NOT_FOUND);
@@ -13498,6 +13626,7 @@ mod tests {
             Path(inactive_definition.id.to_string()),
             Query(super::SequenceSessionQuery {
                 session_id: Some(inactive_id),
+                expected_active_session_id: None,
             }),
         )
         .await;
@@ -13508,6 +13637,7 @@ mod tests {
                 State(state.clone()),
                 Query(super::SequenceSessionQuery {
                     session_id: Some(inactive_id),
+                    expected_active_session_id: None,
                 }),
             )
             .await,
@@ -13540,6 +13670,7 @@ mod tests {
             State(state.clone()),
             Json(super::SequenceUpsertPayload {
                 session_id: Some(inactive_id),
+                expected_active_session_id: None,
                 definition: active_definition.clone(),
             }),
         )
@@ -13587,6 +13718,7 @@ mod tests {
             State(state),
             Json(super::SequenceUpsertPayload {
                 session_id: Some(session.id()),
+                expected_active_session_id: None,
                 definition,
             }),
         )

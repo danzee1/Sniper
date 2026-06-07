@@ -3493,11 +3493,12 @@ function workspaceUnloadPayload(primarySnapshot) {
     }
   }
   const changedReplayTabIds = activeAndChangedReplayTabIds(primarySnapshot);
+  let changedReplayTextFields = false;
   if (changedReplayTabIds.size) {
     const activeTabId = primarySnapshot?.replay?.active_tab_id || null;
     const changedIncludesNonActive = Array.from(changedReplayTabIds)
       .some((id) => id && id !== activeTabId);
-    const changedTextFields = changedReplayTabsIncludeTextChanges(
+    changedReplayTextFields = changedReplayTabsIncludeTextChanges(
       primarySnapshot,
       changedReplayTabIds,
       workspaceSaveCommittedSnapshot,
@@ -3519,7 +3520,7 @@ function workspaceUnloadPayload(primarySnapshot) {
     if (changedTabsReplayOnlyPayload) {
       return { payload: changedTabsReplayOnlyPayload, endpoint: "/api/workspace-state/keepalive" };
     }
-    if (!changedTextFields) {
+    if (!changedReplayTextFields) {
       const boundedChangedTabsSnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
         replayTabIdFilter: changedReplayTabIds,
         textByteLimit: 8 * 1024,
@@ -3566,6 +3567,9 @@ function workspaceUnloadPayload(primarySnapshot) {
     if (utf8ByteLength(activeOnlyReplayPayload) <= WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) {
       return { payload: activeOnlyReplayPayload, endpoint: "/api/workspace-state/keepalive" };
     }
+  }
+  if (changedReplayTextFields) {
+    return null;
   }
   const boundedActiveOnlySnapshot = compactWorkspaceUnloadSnapshot(primarySnapshot, {
     activeOnly: true,
@@ -5286,6 +5290,29 @@ function normalizeWebsocketFrameIndex(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function normalizeWebsocketCount(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.floor(numeric) : null;
+}
+
+function websocketRetainedFrameCount(summary, frames = []) {
+  const retained = normalizeWebsocketCount(summary?.retained_frame_count);
+  if (retained != null) return retained;
+  const fullCount = normalizeWebsocketCount(summary?.frame_count);
+  if (fullCount != null) return Math.min(fullCount, frames.length);
+  return frames.length;
+}
+
+function websocketFirstRetainedFrameIndex(summary, frames = []) {
+  const retained = websocketRetainedFrameCount(summary, frames);
+  const lastFrameIndex = normalizeWebsocketFrameIndex(summary?.last_frame_index);
+  if (lastFrameIndex != null && retained > 0) {
+    return Math.max(0, lastFrameIndex - retained + 1);
+  }
+  const firstFrameIndex = frames.length ? normalizeWebsocketFrameIndex(frames[0]?.index) : null;
+  return firstFrameIndex != null ? Math.max(0, firstFrameIndex) : 0;
+}
+
 function mergeWebsocketDetailRefreshTarget(id, lastFrameIndex = null) {
   if (!id) return null;
   const nextIndex = normalizeWebsocketFrameIndex(lastFrameIndex);
@@ -5412,15 +5439,27 @@ async function loadWebsocketDetail(id, options = {}) {
     const loadedLastFrameIndex = mergedFrames.length
       ? Number(mergedFrames[mergedFrames.length - 1]?.index)
       : null;
+    const lastFrameIndex = Number.isFinite(Number(summary?.last_frame_index))
+      ? Number(summary.last_frame_index)
+      : loadedLastFrameIndex;
+    const retainedFrameCount = websocketRetainedFrameCount({
+      retained_frame_count: summary?.retained_frame_count,
+      frame_count: summary?.frame_count,
+      last_frame_index: lastFrameIndex,
+    }, mergedFrames);
+    const firstRetainedFrameIndex = websocketFirstRetainedFrameIndex({
+      retained_frame_count: retainedFrameCount,
+      last_frame_index: lastFrameIndex,
+    }, mergedFrames);
     state.selectedWebsocketRecord = {
       ...detail,
       frames: mergedFrames,
       frame_count: Number.isFinite(Number(summary?.frame_count))
         ? Number(summary.frame_count)
         : mergedFrames.length,
-      last_frame_index: Number.isFinite(Number(summary?.last_frame_index))
-        ? Number(summary.last_frame_index)
-        : loadedLastFrameIndex,
+      retained_frame_count: retainedFrameCount,
+      last_frame_index: lastFrameIndex,
+      retained_first_frame_index: firstRetainedFrameIndex,
       loaded_first_frame_index: Number.isFinite(loadedFirstFrameIndex)
         ? loadedFirstFrameIndex
         : null,
@@ -5433,7 +5472,8 @@ async function loadWebsocketDetail(id, options = {}) {
       frames_truncated: websocketFramesAreTruncated(mergedFrames, summary),
       older_frames_loading: false,
       older_frames_exhausted: Number.isFinite(loadedFirstFrameIndex)
-        ? loadedFirstFrameIndex <= 0 || normalizeWebsocketFrames(detail.frames).length < WEBSOCKET_DETAIL_FRAME_LIMIT
+        ? loadedFirstFrameIndex <= firstRetainedFrameIndex
+          || normalizeWebsocketFrames(detail.frames).length < WEBSOCKET_DETAIL_FRAME_LIMIT
         : true,
     };
     state.selectedWebsocketDetailError = "";
@@ -5632,7 +5672,12 @@ async function loadOlderWebsocketFrames() {
   }
   const frames = getWebsocketFrames(session);
   const firstLoadedFrameIndex = frames.length ? normalizeWebsocketFrameIndex(frames[0]?.index) : null;
-  if (firstLoadedFrameIndex == null || firstLoadedFrameIndex <= 0 || session.older_frames_exhausted) {
+  const firstRetainedFrameIndex = websocketFirstRetainedFrameIndex(session, frames);
+  if (
+    firstLoadedFrameIndex == null
+    || firstLoadedFrameIndex <= firstRetainedFrameIndex
+    || session.older_frames_exhausted
+  ) {
     session.older_frames_exhausted = true;
     renderWebsocketFrameTable();
     return;
@@ -5676,9 +5721,11 @@ async function loadOlderWebsocketFrames() {
     current.loaded_last_frame_index = mergedFrames.length
       ? normalizeWebsocketFrameIndex(mergedFrames[mergedFrames.length - 1]?.index)
       : null;
+    const nextFirstRetainedFrameIndex = websocketFirstRetainedFrameIndex(current, mergedFrames);
+    current.retained_first_frame_index = nextFirstRetainedFrameIndex;
     current.older_frames_exhausted = incomingFrames.length < WEBSOCKET_DETAIL_FRAME_LIMIT
       || nextFirstFrameIndex == null
-      || nextFirstFrameIndex <= 0;
+      || nextFirstFrameIndex <= nextFirstRetainedFrameIndex;
     current.frames_truncated = websocketFramesAreTruncated(current.frames, current);
     current.older_frames_loading = false;
     renderWebsocketSessions();
@@ -5708,7 +5755,9 @@ function applySelectedWebsocketSummary(summary) {
       closed_at: summary.closed_at,
       duration_ms: summary.duration_ms,
       frame_count: summary.frame_count,
+      retained_frame_count: summary.retained_frame_count,
       last_frame_index: summary.last_frame_index,
+      retained_first_frame_index: websocketFirstRetainedFrameIndex(summary, state.selectedWebsocketRecord.frames),
       note_count: summary.note_count,
       frames_truncated: websocketFramesAreTruncated(state.selectedWebsocketRecord.frames, summary),
     };
@@ -9921,11 +9970,18 @@ function renderWebsocketFrameTable() {
     ? Number(session.frame_count)
     : frames.length;
   const firstLoadedFrameIndex = frames.length ? Number(frames[0]?.index) : 0;
-  const olderFrameCount = Number.isFinite(firstLoadedFrameIndex)
-    ? Math.max(0, firstLoadedFrameIndex)
+  const firstRetainedFrameIndex = websocketFirstRetainedFrameIndex(session, frames);
+  const loadableOlderFrameCount = Number.isFinite(firstLoadedFrameIndex)
+    ? Math.max(0, firstLoadedFrameIndex - firstRetainedFrameIndex)
     : Math.max(0, fullFrameCount - frames.length);
-  const canLoadOlderFrames = olderFrameCount > 0 && !session.older_frames_exhausted;
+  const discardedOlderFrameCount = Math.max(0, firstRetainedFrameIndex);
+  const olderFrameCount = loadableOlderFrameCount + discardedOlderFrameCount;
+  const canLoadOlderFrames = loadableOlderFrameCount > 0 && !session.older_frames_exhausted;
   const olderFramesLoading = !!session.older_frames_loading;
+  const olderFrameNotice = [
+    loadableOlderFrameCount > 0 ? `${loadableOlderFrameCount} older not loaded` : "",
+    discardedOlderFrameCount > 0 ? `${discardedOlderFrameCount} discarded by retention` : "",
+  ].filter(Boolean).join(", ");
   const framePositions = new Map(frames.map((frame, index) => {
     const frameIndex = Number(frame.index);
     return [
@@ -9937,7 +9993,7 @@ function renderWebsocketFrameTable() {
     ? `
           <tr class="ws-frame-window-row">
             <td colspan="5">
-              Showing ${frames.length} loaded frame(s) (${olderFrameCount} older not loaded).
+              Showing ${frames.length} loaded frame(s) (${olderFrameNotice}).
               ${canLoadOlderFrames
                 ? `<button type="button" class="link-button${olderFramesLoading ? " disabled" : ""}" data-ws-load-older-frames ${olderFramesLoading ? "disabled" : ""}>${olderFramesLoading ? "Loading..." : "Load older frames"}</button>`
                 : ""}
@@ -18021,7 +18077,11 @@ function websocketFramesAreTruncated(frames, summary) {
     return false;
   }
   const firstFrameIndex = Number(frames[0]?.index);
-  if (Number.isFinite(firstFrameIndex) && firstFrameIndex > 0) {
+  const firstRetainedFrameIndex = websocketFirstRetainedFrameIndex(summary, frames);
+  if (
+    Number.isFinite(firstFrameIndex)
+    && (firstFrameIndex > firstRetainedFrameIndex || firstRetainedFrameIndex > 0)
+  ) {
     return true;
   }
   return Number.isFinite(Number(summary?.frame_count))

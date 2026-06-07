@@ -1385,6 +1385,7 @@ struct SequenceRunPayload {
 #[derive(Serialize)]
 struct SequenceUpsertPayload<'a> {
     session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
     #[serde(flatten)]
     definition: &'a SequenceDefinition,
 }
@@ -2106,8 +2107,10 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                 intercept.request
             };
             let session_id = read_session_id;
-            let action_path =
-                session_query_path(&format!("/api/intercepts/{}/forward", args.id), session_id);
+            let action_path = write_session_query_path(
+                &format!("/api/intercepts/{}/forward", args.id),
+                args.session_id,
+            );
             api.post_status(&action_path, &InterceptForwardPayload { request })
                 .await?;
             print_json(&InterceptActionResult {
@@ -2240,9 +2243,9 @@ async fn handle_response_intercept(
                 item.response
             };
             let session_id = read_session_id;
-            let action_path = session_query_path(
+            let action_path = write_session_query_path(
                 &format!("/api/response-intercepts/{}/forward", args.id),
-                session_id,
+                args.session_id,
             );
             api.post_status(&action_path, &ResponseInterceptForwardPayload { response })
                 .await?;
@@ -2352,10 +2355,12 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             let session_id =
                 sequence_write_session_id(session_id, input.session_id, active_session_id)?;
             let def = input.definition;
+            let expected_active_session_id = active_session_id;
             api.post_status(
                 "/api/sequences",
                 &SequenceUpsertPayload {
                     session_id,
+                    expected_active_session_id,
                     definition: &def,
                 },
             )
@@ -2389,8 +2394,18 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             print_json(&run)
         }
         SequenceCommand::Delete(args) => {
-            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
-            let path = session_query_path(&format!("/api/sequences/{}", args.id), session_id);
+            let expected_active_session_id = if args.session_id.is_none() {
+                active_session_id(&api).await?
+            } else {
+                None
+            };
+            let session_id =
+                explicit_or_active_session_id(args.session_id, expected_active_session_id);
+            let path = session_query_path_with_expected_active(
+                &format!("/api/sequences/{}", args.id),
+                session_id,
+                expected_active_session_id,
+            );
             api.delete_status(&path).await?;
             print_json(&json!({ "ok": true, "deleted": args.id, "session_id": session_id }))
         }
@@ -2869,13 +2884,30 @@ fn websocket_detail_frame_limit(frame_limit: Option<usize>) -> usize {
 }
 
 fn session_query_path(path: &str, session_id: Option<Uuid>) -> String {
-    match session_id {
-        Some(session_id) => {
-            let query = encode_query(vec![("session_id".to_string(), session_id.to_string())]);
-            let separator = if path.contains('?') { '&' } else { '?' };
-            format!("{path}{separator}{query}")
-        }
-        None => path.to_string(),
+    session_query_path_with_expected_active(path, session_id, None)
+}
+
+fn session_query_path_with_expected_active(
+    path: &str,
+    session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
+) -> String {
+    let mut params = Vec::new();
+    if let Some(session_id) = session_id {
+        params.push(("session_id".to_string(), session_id.to_string()));
+    }
+    if let Some(expected_active_session_id) = expected_active_session_id {
+        params.push((
+            "expected_active_session_id".to_string(),
+            expected_active_session_id.to_string(),
+        ));
+    }
+    if params.is_empty() {
+        path.to_string()
+    } else {
+        let query = encode_query(params);
+        let separator = if path.contains('?') { '&' } else { '?' };
+        format!("{path}{separator}{query}")
     }
 }
 

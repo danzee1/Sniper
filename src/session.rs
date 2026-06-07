@@ -251,7 +251,8 @@ impl SessionContext {
         } else {
             snapshot.scanner_findings
         };
-        let websockets = close_restored_open_websockets(snapshot.websockets);
+        let mut websockets = snapshot.websockets;
+        close_restored_open_websockets(&mut websockets);
         Self {
             id: metadata.id,
             storage_dir,
@@ -523,28 +524,25 @@ impl SessionContext {
     }
 }
 
-fn close_restored_open_websockets(
-    records: Vec<WebSocketSessionRecord>,
-) -> Vec<WebSocketSessionRecord> {
+fn close_restored_open_websockets(records: &mut [WebSocketSessionRecord]) -> bool {
     let closed_at = Utc::now();
-    records
-        .into_iter()
-        .map(|mut record| {
-            if record.closed_at.is_none() {
-                record.duration_ms.get_or_insert_with(|| {
-                    closed_at
-                        .signed_duration_since(record.started_at)
-                        .num_milliseconds()
-                        .max(0) as u64
-                });
-                record.closed_at = Some(closed_at);
-                record
-                    .notes
-                    .push("Sniper restarted before this WebSocket session was closed.".to_string());
-            }
+    let mut changed = false;
+    for record in records {
+        if record.closed_at.is_none() {
+            record.duration_ms.get_or_insert_with(|| {
+                closed_at
+                    .signed_duration_since(record.started_at)
+                    .num_milliseconds()
+                    .max(0) as u64
+            });
+            record.closed_at = Some(closed_at);
             record
-        })
-        .collect()
+                .notes
+                .push("Sniper restarted before this WebSocket session was closed.".to_string());
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn recover_missing_scanner_findings(
@@ -871,7 +869,11 @@ impl SessionRegistry {
             .cloned()
             .ok_or_else(|| anyhow!("session {id} was not found"))?;
         let storage_dir = session_dir(&self.root_dir, id);
-        let snapshot = load_session_snapshot(&storage_dir, self.max_entries)?;
+        let mut snapshot = load_session_snapshot(&storage_dir, self.max_entries)?;
+        let repaired_open_websockets = close_restored_open_websockets(&mut snapshot.websockets);
+        if repaired_open_websockets {
+            write_json(&snapshot_path(&storage_dir), &snapshot)?;
+        }
         if update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries) {
             if let Err(error) = self.update_metadata(metadata.clone()) {
                 warn!(
@@ -901,7 +903,8 @@ impl SessionRegistry {
             .cloned()
             .ok_or_else(|| anyhow!("session {id} was not found"))?;
         let storage_dir = session_dir(&self.root_dir, id);
-        let snapshot = load_session_snapshot_read_only(&storage_dir, self.max_entries)?;
+        let mut snapshot = load_session_snapshot_read_only(&storage_dir, self.max_entries)?;
+        close_restored_open_websockets(&mut snapshot.websockets);
         update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries);
         Ok(Arc::new(SessionContext::from_snapshot_read_only(
             metadata,
@@ -2423,7 +2426,7 @@ mod tests {
     #[test]
     fn restored_open_websockets_are_marked_closed_after_restart() {
         let started_at = Utc::now() - ChronoDuration::seconds(5);
-        let records = super::close_restored_open_websockets(vec![WebSocketSessionRecord {
+        let mut records = vec![WebSocketSessionRecord {
             id: Uuid::new_v4(),
             started_at,
             closed_at: None,
@@ -2436,7 +2439,8 @@ mod tests {
             response: None,
             frames: Vec::new(),
             notes: Vec::new(),
-        }]);
+        }];
+        assert!(super::close_restored_open_websockets(&mut records));
 
         let restored = &records[0];
         assert!(restored.closed_at.is_some());
@@ -2445,6 +2449,51 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("restarted before this WebSocket session was closed")));
+    }
+
+    #[tokio::test]
+    async fn load_context_persists_restored_websocket_close_marker() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-websocket-close-repair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let websocket_id = Uuid::new_v4();
+        let snapshot = super::StoredSessionSnapshot {
+            websockets: vec![WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now() - ChronoDuration::seconds(5),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                path: "/ws".to_string(),
+                status: Some(101),
+                request: MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        super::write_json(&super::snapshot_path(&storage_dir), &snapshot).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.websockets.get(websocket_id).await.unwrap();
+        assert!(restored.closed_at.is_some());
+
+        let disk_snapshot: super::StoredSessionSnapshot =
+            serde_json::from_slice(&std::fs::read(super::snapshot_path(&storage_dir)).unwrap())
+                .unwrap();
+        assert!(disk_snapshot.websockets[0].closed_at.is_some());
+        assert_eq!(disk_snapshot.websockets[0].notes.len(), 1);
+
+        let reloaded = registry.load_context(active.id()).unwrap();
+        let restored_again = reloaded.websockets.get(websocket_id).await.unwrap();
+        assert_eq!(restored_again.notes.len(), 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
@@ -2510,7 +2559,7 @@ mod tests {
         ));
         let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 2_000).unwrap();
         let websocket_id = Uuid::new_v4();
-        let total_frames = super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION + 7;
+        let total_frames = super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION + 507;
         let frames = (0..total_frames)
             .map(|index| WebSocketFrameRecord {
                 index,
@@ -2560,8 +2609,17 @@ mod tests {
             restored.frames.len(),
             super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION
         );
-        assert_eq!(restored.frames[0].index, 7);
+        assert_eq!(
+            restored.frames[0].index,
+            total_frames - super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION
+        );
         assert_eq!(restored.frames.last().unwrap().index, total_frames - 1);
+        let summary = restored.summary();
+        assert_eq!(summary.frame_count, total_frames);
+        assert_eq!(
+            summary.retained_frame_count,
+            super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION
+        );
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
