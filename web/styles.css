@@ -4340,17 +4340,20 @@ button.utility-button.replay-tab-add {
 
 /* Evidence highlight — line background */
 .findings-line-hit {
-  background: rgba(250, 204, 21, 0.12) !important;
-  box-shadow: inset 3px 0 0 rgba(250, 204, 21, 0.7);
+  background: rgba(250, 204, 21, 0.2) !important;
+  box-shadow:
+    inset 3px 0 0 rgba(250, 204, 21, 0.95),
+    inset 0 0 0 1px rgba(250, 204, 21, 0.22);
 }
 
 /* Evidence highlight — inline mark */
 .findings-highlight {
-  background: rgba(250, 204, 21, 0.35);
-  color: #fef08a;
+  background: rgba(250, 204, 21, 0.6);
+  color: #fff7c2;
   border-radius: 2px;
   padding: 0 1px;
-  outline: 1px solid rgba(250, 204, 21, 0.5);
+  font-weight: 600;
+  outline: 1px solid rgba(250, 204, 21, 0.85);
 }
 
 /* Related header line (for "missing" findings) */

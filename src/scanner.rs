@@ -1035,7 +1035,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         ),
         // ── Generic secrets ──
         (
-            r#"(?i)\b(api[_-]?key|apikey|api[_-]?secret)\b["']?\s*[:=]\s*["']?[A-Za-z0-9_\-]{20,}"#,
+            r#"(?i)\b(?:api[_-]?key|apikey|api[_-]?secret)\b["']?\s*[:=]\s*["']?([A-Za-z0-9_\-]{20,})"#,
             "API Key/Secret pattern",
             Severity::Medium,
         ),
@@ -1050,7 +1050,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::High,
         ),
         (
-            r#"(?i)\b(secret[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token)\b["']?\s*[:=]\s*["']?[A-Za-z0-9_\-/+=]{16,}"#,
+            r#"(?i)\b(?:secret[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token)\b["']?\s*[:=]\s*["']?([A-Za-z0-9_\-/+=]{16,})"#,
             "Secret/Token pattern",
             Severity::Medium,
         ),
@@ -1224,6 +1224,11 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                 {
                     continue;
                 }
+                if is_generic_secret_label(label)
+                    && !generic_secret_candidate_looks_like_secret(&captures)
+                {
+                    continue;
+                }
                 if is_card_number_label(label) && !luhn_valid(m.as_str()) {
                     continue;
                 }
@@ -1246,24 +1251,31 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
     }
 }
 
-fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool {
-    let Some(value) = captures
+fn captured_secret_value<'a>(captures: &regex::Captures<'a>) -> Option<&'a str> {
+    captures
         .iter()
         .skip(1)
         .flatten()
         .map(|capture| capture.as_str().trim())
         .find(|value| !value.is_empty())
-    else {
+}
+
+fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool {
+    let Some(value) = captured_secret_value(captures) else {
         return false;
     };
     if value.len() < 8 {
         return false;
     }
 
-    let normalized = value
-        .trim_matches(|ch: char| ch.is_ascii_punctuation())
-        .trim()
-        .to_ascii_lowercase();
+    if secret_candidate_is_masked(value) || secret_candidate_is_placeholder(value) {
+        return false;
+    }
+
+    let normalized = normalize_secret_candidate(value);
+    if normalized.is_empty() {
+        return false;
+    }
     if normalized == "password" || normalized == "passwd" {
         return false;
     }
@@ -1298,6 +1310,114 @@ fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool 
         collapsed.as_str(),
         "password required" | "confirm password" | "password confirmation"
     )
+}
+
+fn is_generic_secret_label(label: &str) -> bool {
+    matches!(label, "API Key/Secret pattern" | "Secret/Token pattern")
+}
+
+fn generic_secret_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool {
+    let Some(value) = captured_secret_value(captures) else {
+        return false;
+    };
+    let normalized = normalize_secret_candidate(value);
+    if normalized.len() < 16 {
+        return false;
+    }
+    if secret_candidate_is_masked(&normalized) || secret_candidate_is_placeholder(&normalized) {
+        return false;
+    }
+    if normalized.chars().collect::<HashSet<_>>().len() < 6 {
+        return false;
+    }
+
+    let has_lower = normalized.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_upper = normalized.chars().any(|ch| ch.is_ascii_uppercase());
+    let has_digit = normalized.chars().any(|ch| ch.is_ascii_digit());
+    let has_symbol = normalized
+        .chars()
+        .any(|ch| matches!(ch, '_' | '-' | '/' | '+' | '='));
+    let class_count = [has_lower, has_upper, has_digit, has_symbol]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+
+    class_count >= 2 && (has_digit || has_symbol)
+}
+
+fn normalize_secret_candidate(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`'))
+        .trim_matches(|ch: char| {
+            ch.is_ascii_punctuation() && !matches!(ch, '_' | '-' | '/' | '+' | '=')
+        })
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn secret_candidate_is_masked(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() >= 4
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '*' | 'x' | 'X' | '•' | '-' | '_' | '.'))
+}
+
+fn secret_candidate_is_placeholder(value: &str) -> bool {
+    let normalized = normalize_secret_candidate(value);
+    if normalized.is_empty() {
+        return true;
+    }
+    if normalized
+        .chars()
+        .all(|ch| ch == normalized.chars().next().unwrap_or_default())
+    {
+        return true;
+    }
+
+    let collapsed = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    let placeholder_exact = [
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "client_secret",
+        "secret_key",
+        "secret_token",
+        "password",
+        "passwd",
+        "null",
+        "none",
+        "undefined",
+        "true",
+        "false",
+        "secret",
+        "token",
+    ];
+    let placeholder_fragments = [
+        "placeholder",
+        "changeme",
+        "change_me",
+        "replace_me",
+        "example",
+        "sample",
+        "dummy",
+        "redacted",
+        "masked",
+        "todo",
+        "your_",
+        "_here",
+    ];
+    placeholder_exact.contains(&collapsed.as_str())
+        || placeholder_fragments
+            .iter()
+            .any(|fragment| collapsed.contains(fragment))
 }
 
 fn is_card_number_label(label: &str) -> bool {
@@ -1359,15 +1479,6 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
                     "Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true. Browsers block this, but the misconfiguration indicates sloppy CORS policy.",
                     "ACAO: * + ACAC: true",
                 ));
-            } else {
-                findings.push(make_finding(
-                    record,
-                    Severity::Low,
-                    "cors",
-                    "CORS: wildcard origin",
-                    "Access-Control-Allow-Origin: *. Any site can read responses from this endpoint.",
-                    "ACAO: *",
-                ));
             }
         } else if origin.eq_ignore_ascii_case("null")
             && acac.is_some_and(|v| v.eq_ignore_ascii_case("true"))
@@ -1383,7 +1494,10 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
         } else if acac.is_some_and(|v| v.eq_ignore_ascii_case("true")) {
             // Reflect origin with credentials — potentially dangerous
             let req_origin = record.request.header_value("origin").unwrap_or("").trim();
-            if !req_origin.is_empty() && origin == req_origin {
+            if !req_origin.is_empty()
+                && origin == req_origin
+                && !origin_matches_request_origin(origin, &record.scheme, &record.host)
+            {
                 findings.push(make_finding(
                     record,
                     Severity::Medium,
@@ -1395,6 +1509,24 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
             }
         }
     }
+}
+
+fn origin_matches_request_origin(origin: &str, request_scheme: &str, request_host: &str) -> bool {
+    let Ok(base) = url::Url::parse(&format!("{request_scheme}://{request_host}")) else {
+        return false;
+    };
+    let Ok(origin) = url::Url::parse(origin) else {
+        return false;
+    };
+    let Some(base_host) = base.host_str() else {
+        return false;
+    };
+    let Some(origin_host) = origin.host_str() else {
+        return false;
+    };
+    base.scheme().eq_ignore_ascii_case(origin.scheme())
+        && base_host.eq_ignore_ascii_case(origin_host)
+        && base.port_or_known_default() == origin.port_or_known_default()
 }
 
 // ── Rule 6: Server / Version Disclosure ──
@@ -1628,6 +1760,9 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
 
     for &(pattern, label, ref severity) in ERROR_PATTERNS {
         if body_lower.contains(pattern) {
+            if error_pattern_is_too_generic(pattern, &body_lower) {
+                continue;
+            }
             let evidence_start = body_lower.find(pattern).unwrap_or(0);
             let evidence = evidence_window(body, evidence_start, pattern.len(), 20, 60);
             findings.push(make_finding(
@@ -1640,6 +1775,19 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             ));
             break; // One finding per response is enough
         }
+    }
+}
+
+fn error_pattern_is_too_generic(pattern: &str, body_lower: &str) -> bool {
+    match pattern {
+        "syntax error" => ![
+            "sql", "mysql", "postgres", "sqlite", "oracle", "mariadb", "odbc", "jdbc", "query",
+            "database", "near ",
+        ]
+        .iter()
+        .any(|marker| body_lower.contains(marker)),
+        "internal server error" => body_lower.trim() == "internal server error",
+        _ => false,
     }
 }
 
@@ -1927,7 +2075,7 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     }
 
     // GraphQL Introspection enabled
-    if body.contains("__schema") && body.contains("queryType") {
+    if graphql_introspection_response_detected(body) {
         findings.push(make_finding(
             record,
             Severity::Medium,
@@ -2037,6 +2185,14 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
             "",
         ));
     }
+}
+
+fn graphql_introspection_response_detected(body: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    json.pointer("/data/__schema/queryType")
+        .is_some_and(|value| value.is_object())
 }
 
 fn push_source_map_header_finding(
@@ -2259,7 +2415,7 @@ fn redirect_parameter_controls_location(
         Ok(url) => url,
         Err(_) => return false,
     };
-    parameter_url == location_url || location.contains(value)
+    parameter_url == location_url
 }
 
 // ── Utilities ──
@@ -2300,36 +2456,47 @@ fn percent_decode(value: &str) -> String {
 fn session_token_parameter_in_url(path: &str) -> Option<String> {
     let lower = path.to_ascii_lowercase();
     if lower.contains(";jsessionid=") || lower.contains(";phpsessid=") {
-        return lower.split(';').skip(1).find_map(|segment| {
-            let key = segment
-                .split_once('=')
-                .map(|(key, _)| key)
-                .unwrap_or(segment);
-            matches!(key, "jsessionid" | "phpsessid").then(|| key.to_string())
+        return path.split(';').skip(1).find_map(|segment| {
+            let (key, value) = segment.split_once('=').unwrap_or((segment, ""));
+            let key = percent_decode(&key.replace('+', " ")).to_ascii_lowercase();
+            (matches!(key.as_str(), "jsessionid" | "phpsessid")
+                && session_token_value_looks_sensitive(value))
+            .then_some(key)
         });
     }
 
     let query = path.split_once('?')?.1;
-    let session_param_names = [
-        "jsessionid",
-        "phpsessid",
-        "sessionid",
-        "session_id",
-        "sid",
-        "aspsessionid",
-        "token",
-        "access_token",
-        "auth_token",
-        "api_key",
-    ];
     query.split('&').find_map(|pair| {
-        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = key.replace('+', " ");
         let decoded = percent_decode(&key).to_ascii_lowercase();
-        session_param_names
-            .contains(&decoded.as_str())
+        (is_session_token_parameter_name(&decoded) && session_token_value_looks_sensitive(value))
             .then_some(decoded)
     })
+}
+
+fn is_session_token_parameter_name(name: &str) -> bool {
+    matches!(
+        name,
+        "jsessionid"
+            | "phpsessid"
+            | "sessionid"
+            | "session_id"
+            | "sid"
+            | "aspsessionid"
+            | "token"
+            | "access_token"
+            | "auth_token"
+            | "api_key"
+    )
+}
+
+fn session_token_value_looks_sensitive(value: &str) -> bool {
+    let decoded = percent_decode(&value.replace('+', " "));
+    let trimmed = decoded.trim();
+    !trimmed.is_empty()
+        && !secret_candidate_is_masked(trimmed)
+        && !secret_candidate_is_placeholder(trimmed)
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -2756,6 +2923,38 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_scanner_ignores_masked_password_values() {
+        let record = make_record(vec![], vec![], r#"{ "password": "************" }"#, 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Password in response detected in response"),
+            "masked password placeholders should not be reported as leaked passwords"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_placeholder_api_key_values() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"api_key":"your_api_key_here","access_token":"redacted"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| {
+                finding.title.contains("API Key/Secret pattern")
+                    || finding.title.contains("Secret/Token pattern")
+            }),
+            "placeholder generic secrets should not create Findings"
+        );
+    }
+
+    #[test]
     fn open_redirect_detection_compares_location_host_not_substrings() {
         let mut record = make_record(
             vec![],
@@ -2809,6 +3008,28 @@ mod tests {
                 .iter()
                 .any(|finding| finding.title == "Possible open redirect"),
             "external SSO redirects should not be reported unless the redirect parameter controls the Location"
+        );
+    }
+
+    #[test]
+    fn open_redirect_detection_ignores_external_sso_location_with_nested_return_url() {
+        let mut record = make_record(
+            vec![],
+            vec![(
+                "location",
+                "https://idp.example/login?return=https://evil.example/landing",
+            )],
+            "",
+            302,
+        );
+        record.path = "/login?next=https://evil.example/landing".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Possible open redirect"),
+            "nested URLs inside an unrelated IdP Location should not count as controlled redirects"
         );
     }
 
@@ -3189,7 +3410,7 @@ mod tests {
     #[test]
     fn session_token_detection_decodes_exact_query_parameter_name() {
         let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
-        record.path = "/search?access%5Ftoken=secret".to_string();
+        record.path = "/search?access%5Ftoken=abc123def456".to_string();
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
         assert!(
@@ -3198,6 +3419,26 @@ mod tests {
                 .any(|finding| finding.title == "Session/token parameter in URL: access_token"),
             "percent-encoded token parameter names should be reported"
         );
+    }
+
+    #[test]
+    fn session_token_detection_ignores_empty_or_placeholder_values() {
+        for path in [
+            "/search?token=",
+            "/search?access_token=your_token_here",
+            "/search?api_key=********",
+        ] {
+            let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+            record.path = path.to_string();
+            let findings = scan_transaction(&record, &ScannerConfig::default());
+
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.title.starts_with("Session/token parameter")),
+                "{path} should not report empty or placeholder token values"
+            );
+        }
     }
 
     #[test]
@@ -3314,13 +3555,13 @@ mod tests {
     }
 
     #[test]
-    fn test_cors_wildcard() {
+    fn cors_wildcard_without_credentials_on_public_response_is_ignored() {
         let record = make_record(vec![], vec![("access-control-allow-origin", "*")], "", 200);
         let config = ScannerConfig::default();
         let findings = scan_transaction(&record, &config);
         assert!(
-            findings.iter().any(|f| f.category == "cors"),
-            "Should detect wildcard CORS"
+            !findings.iter().any(|f| f.category == "cors"),
+            "public wildcard CORS without credentials should not be noisy"
         );
     }
 
@@ -3361,6 +3602,45 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.title == "CORS: null origin with credentials"));
+    }
+
+    #[test]
+    fn cors_reflected_same_origin_with_credentials_is_ignored() {
+        let record = make_record(
+            vec![("origin", "https://example.com")],
+            vec![
+                ("access-control-allow-origin", "https://example.com"),
+                ("access-control-allow-credentials", "true"),
+            ],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "CORS: reflected origin with credentials"),
+            "same-origin reflection should not be reported as arbitrary reflected CORS"
+        );
+    }
+
+    #[test]
+    fn cors_reflected_cross_origin_with_credentials_is_reported() {
+        let record = make_record(
+            vec![("origin", "https://evil.example")],
+            vec![
+                ("access-control-allow-origin", "https://evil.example"),
+                ("access-control-allow-credentials", "true"),
+            ],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "CORS: reflected origin with credentials"));
     }
 
     #[test]
@@ -3418,6 +3698,44 @@ mod tests {
         assert!(
             findings.iter().any(|f| f.category == "error"),
             "Should detect SQL error message"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_json_validation_syntax_error() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"message":"Syntax error: expected string at line 1"}"#,
+            400,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "client-side JSON validation copy should not be treated as backend error disclosure"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_plain_internal_server_error() {
+        let record = make_record(vec![], vec![], "Internal Server Error", 500);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "bare 500 title does not reveal backend implementation details"
+        );
+    }
+
+    #[test]
+    fn error_scanner_still_reports_sql_syntax_error() {
+        let record = make_record(vec![], vec![], "syntax error near SELECT in SQL query", 500);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "database-oriented syntax errors should still be reported"
         );
     }
 
@@ -3562,6 +3880,24 @@ mod tests {
     }
 
     #[test]
+    fn graphql_introspection_ignores_error_response_that_mentions_schema_querytype() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"errors":[{"message":"Cannot query field \"__schema\" on type \"queryType\""}]}"#,
+            400,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "GraphQL introspection enabled"),
+            "GraphQL error text mentioning __schema/queryType is not an introspection response"
+        );
+    }
+
+    #[test]
     fn test_session_token_in_url() {
         let record = TransactionRecord::http(
             Utc::now(),
@@ -3668,7 +4004,7 @@ mod tests {
 
     #[test]
     fn sensitive_scanner_detects_json_api_key() {
-        let fake_key = "A".repeat(24);
+        let fake_key = "Ab3dEf6hIj9kLm2nOp5qRs8t";
         let body = format!(r#"{{"api_key":"{fake_key}"}}"#);
         let record = make_record(
             vec![],
@@ -3685,7 +4021,7 @@ mod tests {
 
     #[test]
     fn sensitive_scanner_detects_quoted_secret_token_assignment() {
-        let fake_token = "b".repeat(24);
+        let fake_token = "z9Yx7-Wv5Ut3Sr1Qp0Nm8Lk6";
         let body = format!(r#"const auth_token = "{fake_token}";"#);
         let record = make_record(vec![], vec![("content-type", "text/html")], &body, 200);
         let findings = scan_transaction(&record, &ScannerConfig::default());

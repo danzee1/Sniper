@@ -8097,7 +8097,14 @@ function showFindingDetail(finding, record) {
 
 function updateFindingsCodePaneCM(key, container, text, evidence, finding, searchInput, searchMeta) {
   const highlightQuery = findingHighlightQuery(evidence, finding);
-  const result = updateCodePaneCM(key, container, text, { mode: "http", search: highlightQuery });
+  const result = updateCodePaneCM(key, container, text, {
+    mode: "http",
+    search: highlightQuery,
+    searchClasses: {
+      hit: "tok-finding-evidence-hit",
+      active: "tok-finding-evidence-active",
+    },
+  });
   if (searchInput) searchInput.value = "";
   if (searchMeta) searchMeta.innerHTML = buildSearchMeta(result.lineCount, "raw", result.matchCount);
 }
@@ -22616,6 +22623,8 @@ const sniperCMTheme = CM.EditorView.theme({
   /* ── Search highlight ── */
   ".tok-search-hit":   { background: "rgba(132, 151, 173, 0.2)", borderRadius: "4px", padding: "0 1px" },
   ".tok-search-active": { background: "rgba(201, 169, 110, 0.4)", borderRadius: "4px", padding: "0 1px" },
+  ".tok-finding-evidence-hit": { color: "#fff7c2", background: "rgba(250, 204, 21, 0.58)", borderRadius: "3px", padding: "0 1px", boxShadow: "0 0 0 1px rgba(250, 204, 21, 0.8)" },
+  ".tok-finding-evidence-active": { color: "#fff7c2", background: "rgba(250, 204, 21, 0.76)", borderRadius: "3px", padding: "0 1px", boxShadow: "0 0 0 1px rgba(250, 204, 21, 1), 0 0 10px rgba(250, 204, 21, 0.22)" },
 }, { dark: true });
 
 // ─── HTTP decoration plugin ─────────────────────────────────────────────────
@@ -22871,10 +22880,44 @@ function addCMUpdateListener(view, callback) {
 }
 
 const CM_SEARCH_DECORATION_LIMIT = 5000;
+const CM_DEFAULT_SEARCH_CLASSES = Object.freeze({
+  hit: "tok-search-hit",
+  active: "tok-search-active",
+});
+
+function normalizeSearchClasses(classes) {
+  return {
+    hit: classes?.hit || CM_DEFAULT_SEARCH_CLASSES.hit,
+    active: classes?.active || CM_DEFAULT_SEARCH_CLASSES.active,
+  };
+}
+
+function normalizeSearchEffectValue(value) {
+  if (value && typeof value === "object") {
+    return {
+      query: String(value.query || ""),
+      classes: normalizeSearchClasses(value.classes),
+    };
+  }
+  return {
+    query: String(value || ""),
+    classes: CM_DEFAULT_SEARCH_CLASSES,
+  };
+}
 
 /** Build search highlight decorations. Returns { decos, matchCount, matchPositions }. */
-function buildSearchDecorations(doc, query, activeIndex = -1) {
-  if (!query) return { query: "", activeIndex: -1, decos: CM.Decoration.none, matchCount: 0, matchPositions: [] };
+function buildSearchDecorations(doc, query, activeIndex = -1, classes = CM_DEFAULT_SEARCH_CLASSES) {
+  const searchClasses = normalizeSearchClasses(classes);
+  if (!query) {
+    return {
+      query: "",
+      activeIndex: -1,
+      classes: searchClasses,
+      decos: CM.Decoration.none,
+      matchCount: 0,
+      matchPositions: [],
+    };
+  }
   const text = doc.toString();
   const lower = text.toLowerCase();
   const lq = query.toLowerCase();
@@ -22888,7 +22931,7 @@ function buildSearchDecorations(doc, query, activeIndex = -1) {
       positions.push(pos);
     }
     if (matchIndex < CM_SEARCH_DECORATION_LIMIT) {
-      const cls = matchIndex === activeIndex ? "tok-search-active" : "tok-search-hit";
+      const cls = matchIndex === activeIndex ? searchClasses.active : searchClasses.hit;
       builder.push(CM.Decoration.mark({ class: cls }).range(pos, pos + lq.length));
     }
     matchCount += 1;
@@ -22898,6 +22941,7 @@ function buildSearchDecorations(doc, query, activeIndex = -1) {
   return {
     query,
     activeIndex: safeActiveIndex,
+    classes: searchClasses,
     decos: CM.Decoration.set(builder),
     matchCount,
     matchPositions: positions,
@@ -22957,18 +23001,28 @@ function createBaseExtensions(options = {}) {
 const setSearchQuery = CM.StateEffect.define();
 const setSearchActiveIndex = CM.StateEffect.define();
 const searchDecoField = CM.StateField.define({
-  create() { return { query: "", activeIndex: -1, decos: CM.Decoration.none, matchCount: 0, matchPositions: [] }; },
+  create() {
+    return {
+      query: "",
+      activeIndex: -1,
+      classes: CM_DEFAULT_SEARCH_CLASSES,
+      decos: CM.Decoration.none,
+      matchCount: 0,
+      matchPositions: [],
+    };
+  },
   update(value, tr) {
     for (const e of tr.effects) {
       if (e.is(setSearchQuery)) {
-        return buildSearchDecorations(tr.state.doc, e.value);
+        const config = normalizeSearchEffectValue(e.value);
+        return buildSearchDecorations(tr.state.doc, config.query, -1, config.classes);
       }
       if (e.is(setSearchActiveIndex)) {
-        return buildSearchDecorations(tr.state.doc, value.query, e.value);
+        return buildSearchDecorations(tr.state.doc, value.query, e.value, value.classes);
       }
     }
     if (tr.docChanged && value.query) {
-      return buildSearchDecorations(tr.state.doc, value.query, value.activeIndex);
+      return buildSearchDecorations(tr.state.doc, value.query, value.activeIndex, value.classes);
     }
     return value;
   },
@@ -23028,7 +23082,12 @@ class SniperCodeView {
   /** Apply search highlights and return match info. */
   applySearch(query, options = {}) {
     this._searchNavIndex = -1;
-    this.view.dispatch({ effects: setSearchQuery.of(query || "") });
+    this.view.dispatch({
+      effects: setSearchQuery.of({
+        query: query || "",
+        classes: normalizeSearchClasses(options.classes),
+      }),
+    });
     const field = this.view.state.field(searchDecoField);
     // Scroll to first match
     if (options.scrollToFirst !== false && field.matchPositions.length > 0) {
@@ -23104,7 +23163,7 @@ function updateCodePaneCM(key, container, text, options = {}) {
 
   // Search highlights
   const query = (options.search || "").trim();
-  const searchResult = cv.applySearch(query);
+  const searchResult = cv.applySearch(query, { classes: options.searchClasses });
 
   const lineCount = cv.view.state.doc.lines;
   return { lineCount, matchCount: searchResult.matchCount };
