@@ -3166,11 +3166,28 @@ fn build_target_override(
     host: &str,
     port: &str,
 ) -> Result<Option<RequestTargetOverride>> {
+    let scheme = scheme.trim();
     let host = host.trim();
-    if host.is_empty() {
+    let port = port.trim();
+    if scheme.is_empty() && host.is_empty() && port.is_empty() {
         return Ok(None);
     }
-    let port = if port.trim().is_empty() {
+    if host.is_empty() {
+        return Ok(Some(RequestTargetOverride {
+            scheme: if scheme.is_empty() {
+                String::new()
+            } else {
+                validate_replay_scheme(scheme)?
+            },
+            host: String::new(),
+            port: if port.is_empty() {
+                String::new()
+            } else {
+                normalize_replay_port(port)?
+            },
+        }));
+    }
+    let port = if port.is_empty() {
         default_port_for_scheme(scheme).to_string()
     } else {
         normalize_replay_port(port)?
@@ -3234,6 +3251,12 @@ fn replay_send_target_for_tab(
         let request_target = normalize_target_inputs(None, None, None, Some(request))?;
         if normalized_targets_equivalent(&stored_target, &request_target) {
             return Ok(None);
+        }
+        if strip_ipv6_brackets(&request_target.host)
+            .parse::<IpAddr>()
+            .is_ok()
+        {
+            bail!("Replay target override is not supported when the request host is an IP address");
         }
     }
     Ok(stored)
@@ -6300,6 +6323,75 @@ mod tests {
         assert_eq!(tab.target_host, "new.example.com");
         assert_eq!(tab.target_port, "443");
         assert!(replay_send_target_for_tab(&tab, &new_request)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn replay_send_target_preserves_empty_host_port_override() {
+        let request = EditableRequest {
+            scheme: "http".to_string(),
+            host: "example.com:80".to_string(),
+            headers: vec![HeaderRecord {
+                name: "host".to_string(),
+                value: "example.com:80".to_string(),
+            }],
+            ..default_editable_request()
+        };
+        let tab = ReplayTabState {
+            target_scheme: String::new(),
+            target_host: String::new(),
+            target_port: "8081".to_string(),
+            ..Default::default()
+        };
+
+        let target = replay_send_target_for_tab(&tab, &request)
+            .unwrap()
+            .expect("port-only target should be preserved");
+        assert_eq!(target.scheme, "");
+        assert_eq!(target.host, "");
+        assert_eq!(target.port, "8081");
+    }
+
+    #[test]
+    fn replay_send_target_rejects_ip_literal_request_host_override() {
+        let request = EditableRequest {
+            host: "127.0.0.1".to_string(),
+            headers: vec![HeaderRecord {
+                name: "host".to_string(),
+                value: "127.0.0.1".to_string(),
+            }],
+            ..default_editable_request()
+        };
+        let tab = ReplayTabState {
+            target_scheme: "http".to_string(),
+            target_host: String::new(),
+            target_port: String::new(),
+            ..Default::default()
+        };
+
+        let error = replay_send_target_for_tab(&tab, &request).unwrap_err();
+        assert!(error.to_string().contains("request host is an IP address"));
+    }
+
+    #[test]
+    fn replay_send_target_allows_equivalent_ip_literal_request_host() {
+        let request = EditableRequest {
+            host: "127.0.0.1:443".to_string(),
+            headers: vec![HeaderRecord {
+                name: "host".to_string(),
+                value: "127.0.0.1:443".to_string(),
+            }],
+            ..default_editable_request()
+        };
+        let tab = ReplayTabState {
+            target_scheme: "https".to_string(),
+            target_host: "127.0.0.1".to_string(),
+            target_port: "443".to_string(),
+            ..Default::default()
+        };
+
+        assert!(replay_send_target_for_tab(&tab, &request)
             .unwrap()
             .is_none());
     }

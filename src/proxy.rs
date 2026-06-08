@@ -634,17 +634,30 @@ async fn build_replay_client(
     }
 
     if let Some(target) = target {
-        let request_authority = parse_request_authority(&request.host, &request.scheme)?;
+        let request_scheme = request.scheme.trim();
+        let target_scheme = target.scheme.trim();
+        let effective_scheme = if target_scheme.is_empty() {
+            request_scheme
+        } else {
+            target_scheme
+        };
+        let request_authority = parse_request_authority(&request.host, request_scheme)?;
         let target_host = target.host.trim();
         let target_authority = if target_host.is_empty() {
             None
         } else {
-            Some(parse_replay_target_authority(target_host, &request.scheme)?)
+            Some(parse_replay_target_authority(
+                target_host,
+                effective_scheme,
+            )?)
         };
-        if target_authority.is_some() || !target.port.trim().is_empty() {
+        let changes_target = target_authority.is_some()
+            || !target.port.trim().is_empty()
+            || !target_scheme.is_empty();
+        if changes_target {
             let target_port = replay_target_port(
                 target.port.trim(),
-                &request.scheme,
+                effective_scheme,
                 target_authority
                     .as_ref()
                     .and_then(|authority| authority.port)
@@ -652,12 +665,13 @@ async fn build_replay_client(
             )?;
             let request_port = request_authority
                 .port
-                .unwrap_or(default_port_for_scheme(&request.scheme)?);
+                .unwrap_or(default_port_for_scheme(request_scheme)?);
             let dial_host = target_authority
                 .as_ref()
                 .map(|authority| authority.host.as_str())
                 .unwrap_or(request_authority.host.as_str());
-            if dial_host.eq_ignore_ascii_case(&request_authority.host)
+            if effective_scheme.eq_ignore_ascii_case(request_scheme)
+                && dial_host.eq_ignore_ascii_case(&request_authority.host)
                 && target_port == request_port
             {
                 return builder
@@ -669,8 +683,10 @@ async fn build_replay_client(
                     "Replay target override is not supported when the request host is an IP address"
                 );
             }
-            let resolved_addrs = resolve_target_host(dial_host, target_port).await?;
-            builder = builder.resolve_to_addrs(&request_authority.host, &resolved_addrs);
+            if target_authority.is_some() || !target.port.trim().is_empty() {
+                let resolved_addrs = resolve_target_host(dial_host, target_port).await?;
+                builder = builder.resolve_to_addrs(&request_authority.host, &resolved_addrs);
+            }
         }
     }
 
@@ -2805,16 +2821,41 @@ async fn forward_websocket_request(
                     "websocket relay failed"
                 );
                 if let Some(id) = captured_websocket_id {
-                    session
-                        .websockets
-                        .close(
+                    let close_note = Some(format!("Relay error: {error}"));
+                    match session
+                        .close_websocket_capture(
                             id,
                             Utc::now(),
                             started.elapsed().as_millis() as u64,
-                            Some(format!("Relay error: {error}")),
+                            close_note.clone(),
                         )
-                        .await;
-                    persist_session_quiet(&state, &session).await;
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                websocket_id = %id,
+                                "captured WebSocket was missing before relay error close"
+                            );
+                        }
+                        Err(close_error) => {
+                            warn!(
+                                ?close_error,
+                                websocket_id = %id,
+                                "failed to journal relay error close for captured WebSocket"
+                            );
+                            session
+                                .websockets
+                                .close(
+                                    id,
+                                    Utc::now(),
+                                    started.elapsed().as_millis() as u64,
+                                    close_note,
+                                )
+                                .await;
+                            persist_session_quiet(&state, &session).await;
+                        }
+                    }
                 }
             }
             Err(_aborted) => {

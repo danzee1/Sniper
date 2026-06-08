@@ -1066,9 +1066,7 @@ impl SessionRegistry {
                 "preserving websocket journal because it contains frame or close deltas without a parent session"
             );
         }
-        if !unresolved_websocket_journal
-            && update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries)
-        {
+        if update_metadata_counts_from_snapshot(&mut metadata, &snapshot, self.max_entries) {
             if let Err(error) = self.update_metadata(metadata.clone()) {
                 warn!(
                     ?error,
@@ -3314,6 +3312,66 @@ mod tests {
 
         assert!(loaded.websockets.get(websocket_id).await.is_none());
         assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn load_context_repairs_websocket_count_with_preserved_orphan_journal() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-websocket-mixed-orphan-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let storage_dir = registry.session_storage_path(active.id()).unwrap();
+        let websocket_id = Uuid::new_v4();
+        let orphan_id = Uuid::new_v4();
+        let open = super::encode_websocket_journal_line(&super::WebSocketJournalEntry::Open {
+            record: WebSocketSessionRecord {
+                id: websocket_id,
+                started_at: Utc::now() - ChronoDuration::seconds(1),
+                closed_at: None,
+                duration_ms: None,
+                scheme: "wss".to_string(),
+                host: "valid.example.test".to_string(),
+                path: "/socket".to_string(),
+                status: Some(101),
+                request: MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 1024),
+                response: None,
+                frames: Vec::new(),
+                notes: Vec::new(),
+            },
+        })
+        .unwrap();
+        let orphan = super::encode_websocket_journal_line(&super::WebSocketJournalEntry::Frame {
+            id: orphan_id,
+            frame: WebSocketFrameRecord {
+                index: 0,
+                captured_at: Utc::now(),
+                direction: WebSocketFrameDirection::ServerToClient,
+                kind: WebSocketFrameKind::Text,
+                body_preview: "orphan".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+                body_size: 6,
+                preview_truncated: false,
+            },
+        })
+        .unwrap();
+        let journal_path = super::websocket_journal_path(&storage_dir);
+        let mut journal = open.clone();
+        journal.extend_from_slice(&orphan);
+        std::fs::write(&journal_path, &journal).unwrap();
+
+        let loaded = registry.load_context(active.id()).unwrap();
+        let restored = loaded.websockets.get(websocket_id).await.unwrap();
+        assert_eq!(restored.host, "valid.example.test");
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+        let summary = registry
+            .summaries()
+            .into_iter()
+            .find(|summary| summary.id == active.id())
+            .unwrap();
+        assert_eq!(summary.websocket_count, 1);
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

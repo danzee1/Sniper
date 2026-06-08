@@ -1023,6 +1023,131 @@ fn validate_request_target_override(
     validate_workspace_target_fields(&target.scheme, &target.host, &target.port)
 }
 
+fn request_has_target_validation_authority(request: &EditableRequest) -> bool {
+    !request.scheme.trim().is_empty() && !request.host.trim().is_empty()
+}
+
+fn validate_request_target_override_for_request(
+    request: &EditableRequest,
+    target: &RequestTargetOverride,
+) -> std::result::Result<(), String> {
+    validate_request_target_override(target)?;
+    if target.host.trim().is_empty()
+        && target.port.trim().is_empty()
+        && target.scheme.trim().is_empty()
+    {
+        return Ok(());
+    }
+
+    let request_scheme = request.scheme.trim();
+    validate_http_scheme_field(request_scheme, "request scheme")?;
+    let effective_scheme = if target.scheme.trim().is_empty() {
+        request_scheme
+    } else {
+        target.scheme.trim()
+    };
+    validate_http_scheme_field(effective_scheme, "replay target scheme")?;
+    let request_authority = parse_replay_validation_authority(&request.host, request_scheme)
+        .map_err(|error| format!("invalid request host for replay target: {error}"))?;
+    let target_authority = if target.host.trim().is_empty() {
+        None
+    } else {
+        Some(parse_replay_validation_target_authority(
+            target.host.trim(),
+            effective_scheme,
+        )?)
+    };
+    let target_port = replay_validation_target_port(
+        target.port.trim(),
+        effective_scheme,
+        target_authority
+            .as_ref()
+            .and_then(|authority| authority.port)
+            .or(request_authority.port),
+    )?;
+    let request_port = request_authority
+        .port
+        .unwrap_or(default_replay_validation_port(request_scheme)?);
+    let dial_host = target_authority
+        .as_ref()
+        .map(|authority| authority.host.as_str())
+        .unwrap_or(request_authority.host.as_str());
+    if effective_scheme.eq_ignore_ascii_case(request_scheme)
+        && dial_host.eq_ignore_ascii_case(&request_authority.host)
+        && target_port == request_port
+    {
+        return Ok(());
+    }
+    if request_authority.host.parse::<IpAddr>().is_ok() {
+        return Err(
+            "Replay target override is not supported when the request host is an IP address"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+struct ReplayValidationAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+fn parse_replay_validation_authority(
+    authority: &str,
+    scheme: &str,
+) -> std::result::Result<ReplayValidationAuthority, String> {
+    let parsed = url::Url::parse(&format!("{scheme}://{authority}"))
+        .map_err(|_| format!("failed to parse authority {authority}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "authority is missing a valid host".to_string())?
+        .to_string();
+    Ok(ReplayValidationAuthority {
+        host,
+        port: parsed.port(),
+    })
+}
+
+fn parse_replay_validation_target_authority(
+    authority: &str,
+    scheme: &str,
+) -> std::result::Result<ReplayValidationAuthority, String> {
+    let normalized = if authority.contains(':')
+        && !authority.starts_with('[')
+        && authority.parse::<IpAddr>().is_ok()
+    {
+        format!("[{authority}]")
+    } else {
+        authority.to_string()
+    };
+    parse_replay_validation_authority(&normalized, scheme)
+}
+
+fn replay_validation_target_port(
+    target_port: &str,
+    scheme: &str,
+    request_port: Option<u16>,
+) -> std::result::Result<u16, String> {
+    if target_port.is_empty() {
+        return Ok(request_port.unwrap_or(default_replay_validation_port(scheme)?));
+    }
+    let port = target_port
+        .parse::<u16>()
+        .map_err(|_| format!("invalid replay target port: {target_port}"))?;
+    if port == 0 {
+        return Err(format!("invalid replay target port: {target_port}"));
+    }
+    Ok(port)
+}
+
+fn default_replay_validation_port(scheme: &str) -> std::result::Result<u16, String> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" => Ok(80),
+        "https" => Ok(443),
+        other => Err(format!("unsupported replay target scheme: {other}")),
+    }
+}
+
 fn validate_fuzzer_target_request_authority(
     authority: &str,
     base_request: Option<&EditableRequest>,
@@ -1249,6 +1374,17 @@ pub(crate) fn validate_workspace_state(
         }
         validate_workspace_target_fields(&tab.target_scheme, &tab.target_host, &tab.target_port)
             .map_err(|error| format!("invalid replay target: {error}"))?;
+        if let Some(request) = &tab.base_request {
+            let target = RequestTargetOverride {
+                scheme: tab.target_scheme.clone(),
+                host: tab.target_host.clone(),
+                port: tab.target_port.clone(),
+            };
+            if request_has_target_validation_authority(request) {
+                validate_request_target_override_for_request(request, &target)
+                    .map_err(|error| format!("invalid replay target: {error}"))?;
+            }
+        }
         for entry in &tab.history_entries {
             add_workspace_text_bytes(
                 &mut stored_bytes_total,
@@ -1286,6 +1422,15 @@ pub(crate) fn validate_workspace_state(
                 &entry.target_port,
             )
             .map_err(|error| format!("invalid replay history target: {error}"))?;
+            if let Some(request) = &entry.request {
+                let target = RequestTargetOverride {
+                    scheme: entry.target_scheme.clone(),
+                    host: entry.target_host.clone(),
+                    port: entry.target_port.clone(),
+                };
+                validate_request_target_override_for_request(request, &target)
+                    .map_err(|error| format!("invalid replay history target: {error}"))?;
+            }
         }
     }
     if let Some(active_tab_id) = snapshot.replay.active_tab_id.as_deref() {
@@ -1304,8 +1449,16 @@ pub(crate) fn validate_workspace_state(
         )?;
     }
     if let Some(target) = &snapshot.fuzzer.target {
-        validate_request_target_override(target)
-            .map_err(|error| format!("invalid fuzzer target: {error}"))?;
+        let target_result = if let Some(request) = &snapshot.fuzzer.base_request {
+            if !request_has_target_validation_authority(request) {
+                validate_request_target_override(target)
+            } else {
+                validate_request_target_override_for_request(request, target)
+            }
+        } else {
+            validate_request_target_override(target)
+        };
+        target_result.map_err(|error| format!("invalid fuzzer target: {error}"))?;
     }
     if let Some(authority) = snapshot.fuzzer.target_request_authority.as_deref() {
         validate_fuzzer_target_request_authority(authority, snapshot.fuzzer.base_request.as_ref())
@@ -1797,7 +1950,12 @@ fn validate_sequence_definition(
             )
         })?;
         if let Some(target) = &step.target {
-            validate_request_target_override(target).map_err(|error| {
+            let target_result = if has_request_parse_error {
+                validate_request_target_override(target)
+            } else {
+                validate_request_target_override_for_request(&step.request, target)
+            };
+            target_result.map_err(|error| {
                 format!("invalid target in sequence step {}: {error}", step.label)
             })?;
         }
@@ -2172,6 +2330,19 @@ fn replay_send_error_response(error: impl Into<String>) -> Response {
         }),
     )
         .into_response()
+}
+
+async fn expected_workspace_revision_conflict_response(
+    session: &Arc<crate::session::SessionContext>,
+    expected_revision: Option<u64>,
+) -> Option<Response> {
+    let expected_revision = expected_revision?;
+    let mut current = session.workspace.snapshot().await;
+    if current.revision == expected_revision {
+        return None;
+    }
+    current.session_id = Some(session.id());
+    Some((StatusCode::CONFLICT, Json(current)).into_response())
 }
 
 fn ws_replay_send_error_response(error: anyhow::Error) -> Response {
@@ -4728,19 +4899,18 @@ async fn send_replay(
     ) {
         return response;
     }
-    if let Some(expected_revision) = payload.expected_workspace_revision {
-        let mut current = session.workspace.snapshot().await;
-        if current.revision != expected_revision {
-            current.session_id = Some(session.id());
-            return (StatusCode::CONFLICT, Json(current)).into_response();
-        }
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(&session, payload.expected_workspace_revision)
+            .await
+    {
+        return response;
     }
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
         Ok(value) => value,
         Err(error) => return replay_send_error_response(error),
     };
     if let Some(target) = payload.target.as_ref() {
-        if let Err(error) = validate_request_target_override(target) {
+        if let Err(error) = validate_request_target_override_for_request(&payload.request, target) {
             return replay_send_error_response(error);
         }
     }
@@ -4861,7 +5031,8 @@ async fn run_fuzzer_attack(
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
     if let Some(target) = payload.target.as_ref() {
-        if let Err(error) = validate_request_target_override(target) {
+        if let Err(error) = validate_request_target_override_for_request(&payload.template, target)
+        {
             return (StatusCode::BAD_REQUEST, error).into_response();
         }
     }
@@ -4984,6 +5155,8 @@ struct WsReplayConnectPayload {
     session_id: Option<Uuid>,
     #[serde(default)]
     expected_active_session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_workspace_revision: Option<u64>,
     id: Uuid,
     scheme: String,
     host: String,
@@ -5008,6 +5181,12 @@ async fn ws_replay_connect(
         Ok(session) => session,
         Err(response) => return response,
     };
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(&session, payload.expected_workspace_revision)
+            .await
+    {
+        return response;
+    }
     let _operation_guard = match guard_session_write_operation(
         &state,
         &session,
@@ -5268,6 +5447,8 @@ struct WsReplaySendPayload {
     session_id: Option<Uuid>,
     #[serde(default)]
     expected_active_session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_workspace_revision: Option<u64>,
     id: Uuid,
     body: String,
     #[serde(default)]
@@ -5291,6 +5472,16 @@ async fn ws_replay_send(
     let Some(session_id) = payload.session_id else {
         return active_session_conflict_response(&state);
     };
+    let session = match resolve_session_for_required_id(&state, Some(session_id)).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(&session, payload.expected_workspace_revision)
+            .await
+    {
+        return response;
+    }
     let _operation_guard = match guard_ws_replay_connection_owner_operation(
         &state,
         payload.id,
@@ -7931,6 +8122,42 @@ mod tests {
     }
 
     #[test]
+    fn sequence_validation_rejects_ip_request_host_target_override() {
+        let request = crate::model::EditableRequest {
+            scheme: "https".to_string(),
+            host: "127.0.0.1:443".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+        let definition = SequenceDefinition {
+            id: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            steps: vec![SequenceStep {
+                id: uuid::Uuid::new_v4(),
+                label: "bad target".to_string(),
+                request,
+                source_transaction_id: None,
+                http_version: None,
+                target: Some(RequestTargetOverride {
+                    scheme: "https".to_string(),
+                    host: "127.0.0.2".to_string(),
+                    port: "9443".to_string(),
+                }),
+                request_text: None,
+                request_parse_error: None,
+                extractions: Vec::new(),
+            }],
+        };
+
+        let error = super::validate_sequence_definition(&definition).unwrap_err();
+        assert!(error.contains("request host is an IP address"));
+    }
+
+    #[test]
     fn replay_target_validation_rejects_ambiguous_hosts() {
         for target in [
             RequestTargetOverride {
@@ -8093,6 +8320,112 @@ mod tests {
         });
 
         assert!(super::validate_workspace_state(&snapshot).is_err());
+    }
+
+    #[test]
+    fn workspace_validation_rejects_ip_request_host_replay_target_override() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "ip-target".to_string(),
+            sequence: 1,
+            base_request: Some(EditableRequest {
+                scheme: "https".to_string(),
+                host: "127.0.0.1:443".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: Vec::new(),
+                body: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                preview_truncated: false,
+            }),
+            target_scheme: "https".to_string(),
+            target_host: "127.0.0.2".to_string(),
+            target_port: "9443".to_string(),
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("request host is an IP address"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_ip_request_host_scheme_only_replay_target() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "ip-target".to_string(),
+            sequence: 1,
+            base_request: Some(EditableRequest {
+                scheme: "https".to_string(),
+                host: "127.0.0.1".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: Vec::new(),
+                body: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                preview_truncated: false,
+            }),
+            target_scheme: "http".to_string(),
+            target_host: String::new(),
+            target_port: String::new(),
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("request host is an IP address"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_ip_request_host_replay_history_target_override() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "history-target".to_string(),
+            sequence: 1,
+            history_entries: vec![ReplayHistoryEntryState {
+                request: Some(EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "127.0.0.1:443".to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                }),
+                target_scheme: "https".to_string(),
+                target_host: "127.0.0.2".to_string(),
+                target_port: "9443".to_string(),
+                ..ReplayHistoryEntryState::default()
+            }],
+            ..ReplayTabState::default()
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+        assert!(error.contains("request host is an IP address"));
+    }
+
+    #[test]
+    fn workspace_validation_allows_equivalent_ip_request_host_replay_target() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.replay.tabs.push(ReplayTabState {
+            id: "ip-target".to_string(),
+            sequence: 1,
+            base_request: Some(EditableRequest {
+                scheme: "https".to_string(),
+                host: "127.0.0.1:443".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: Vec::new(),
+                body: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+                preview_truncated: false,
+            }),
+            target_scheme: "https".to_string(),
+            target_host: "127.0.0.1".to_string(),
+            target_port: "443".to_string(),
+            ..ReplayTabState::default()
+        });
+
+        assert!(super::validate_workspace_state(&snapshot).is_ok());
     }
 
     #[test]
@@ -9453,6 +9786,30 @@ mod tests {
         let error = super::validate_workspace_state(&snapshot).unwrap_err();
 
         assert!(error.contains("invalid fuzzer target request authority"));
+    }
+
+    #[test]
+    fn workspace_validation_rejects_ip_request_host_fuzzer_target_override() {
+        let mut snapshot = WorkspaceStateSnapshot::default();
+        snapshot.fuzzer.base_request = Some(EditableRequest {
+            scheme: "https".to_string(),
+            host: "127.0.0.1:443".to_string(),
+            method: "GET".to_string(),
+            path: "/fuzz".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        });
+        snapshot.fuzzer.target = Some(RequestTargetOverride {
+            scheme: "https".to_string(),
+            host: "127.0.0.2".to_string(),
+            port: "9443".to_string(),
+        });
+
+        let error = super::validate_workspace_state(&snapshot).unwrap_err();
+
+        assert!(error.contains("request host is an IP address"));
     }
 
     #[test]
@@ -12552,6 +12909,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_send_rejects_ip_request_host_target_override_before_sending() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-replay-send-ip-target-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+
+        let response = super::send_replay(
+            State(state.clone()),
+            Json(super::ReplaySendPayload {
+                session_id: Some(session.id()),
+                expected_active_session_id: None,
+                expected_workspace_revision: None,
+                request: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                target: Some(RequestTargetOverride {
+                    scheme: "http".to_string(),
+                    host: String::new(),
+                    port: String::new(),
+                }),
+                source_transaction_id: None,
+                http_version: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
+        let body = response_body_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("request host is an IP address"));
+        assert!(session.store.snapshot(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn replay_send_rejects_preview_truncated_request_before_sending() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-replay-send-truncated-{}",
@@ -13490,6 +13902,7 @@ mod tests {
             Json(super::WsReplaySendPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: connection_id,
                 body: "hello".to_string(),
                 binary: false,
@@ -13542,6 +13955,7 @@ mod tests {
             Json(super::WsReplayConnectPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: connection_id,
                 scheme: "wss".to_string(),
                 host: "example.test".to_string(),
@@ -13594,6 +14008,7 @@ mod tests {
             Json(super::WsReplayConnectPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: Some(original_id),
+                expected_workspace_revision: None,
                 id: connect_id,
                 scheme: "wss".to_string(),
                 host: "example.test".to_string(),
@@ -13616,6 +14031,7 @@ mod tests {
             Json(super::WsReplaySendPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: Some(original_id),
+                expected_workspace_revision: None,
                 id: send_id,
                 body: "hello".to_string(),
                 binary: false,
@@ -13648,6 +14064,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_replay_actions_reject_stale_workspace_revision() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-workspace-revision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let stale_revision = session.workspace.snapshot().await.revision;
+        session
+            .workspace
+            .replace_snapshot(WorkspaceStateSnapshot::default())
+            .await;
+        let current_revision = session.workspace.snapshot().await.revision;
+        assert!(current_revision > stale_revision);
+
+        let connect_id = Uuid::new_v4();
+        let response = super::ws_replay_connect(
+            State(state.clone()),
+            Json(super::WsReplayConnectPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(stale_revision),
+                id: connect_id,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                port: 443,
+                path: "/socket".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(connect_id).await.is_none());
+
+        let send_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(send_id, session_id)
+            .await;
+        let response = super::ws_replay_send(
+            State(state.clone()),
+            Json(super::WsReplaySendPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(stale_revision),
+                id: send_id,
+                body: "hello".to_string(),
+                binary: false,
+                kind: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(send_id).await.is_some());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn ws_replay_connect_rejects_unknown_session() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-ws-replay-connect-unknown-session-{}",
@@ -13667,6 +14150,7 @@ mod tests {
             Json(super::WsReplayConnectPayload {
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: Uuid::new_v4(),
                 scheme: "wss".to_string(),
                 host: "example.test".to_string(),
@@ -13701,6 +14185,7 @@ mod tests {
         cases.push(super::WsReplayConnectPayload {
             session_id: Some(session.id()),
             expected_active_session_id: None,
+            expected_workspace_revision: None,
             id: Uuid::new_v4(),
             scheme: "wss".to_string(),
             host: "h".repeat(super::MAX_WS_REPLAY_HOST_BYTES + 1),
@@ -13711,6 +14196,7 @@ mod tests {
         cases.push(super::WsReplayConnectPayload {
             session_id: Some(session.id()),
             expected_active_session_id: None,
+            expected_workspace_revision: None,
             id: Uuid::new_v4(),
             scheme: "wss".to_string(),
             host: "example.test".to_string(),
@@ -13721,6 +14207,7 @@ mod tests {
         cases.push(super::WsReplayConnectPayload {
             session_id: Some(session.id()),
             expected_active_session_id: None,
+            expected_workspace_revision: None,
             id: Uuid::new_v4(),
             scheme: "wss".to_string(),
             host: "example.test".to_string(),
@@ -13736,6 +14223,7 @@ mod tests {
         cases.push(super::WsReplayConnectPayload {
             session_id: Some(session.id()),
             expected_active_session_id: None,
+            expected_workspace_revision: None,
             id: Uuid::new_v4(),
             scheme: "wss".to_string(),
             host: "example.test".to_string(),
@@ -13749,6 +14237,7 @@ mod tests {
         cases.push(super::WsReplayConnectPayload {
             session_id: Some(session.id()),
             expected_active_session_id: None,
+            expected_workspace_revision: None,
             id: Uuid::new_v4(),
             scheme: "wss".to_string(),
             host: "example.test".to_string(),
@@ -15390,12 +15879,12 @@ mod tests {
                 label: "closed local port".to_string(),
                 request: EditableRequest {
                     scheme: "http".to_string(),
-                    host: "127.0.0.1".to_string(),
+                    host: "127.0.0.1:9".to_string(),
                     method: "GET".to_string(),
                     path: "/".to_string(),
                     headers: vec![HeaderRecord {
                         name: "Host".to_string(),
-                        value: "127.0.0.1".to_string(),
+                        value: "127.0.0.1:9".to_string(),
                     }],
                     body: String::new(),
                     body_encoding: BodyEncoding::Utf8,

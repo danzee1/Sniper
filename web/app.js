@@ -3259,6 +3259,11 @@ async function flushWorkspaceState(options = {}) {
   }
 }
 
+async function flushWorkspaceStateForReplayAction() {
+  await flushWorkspaceState();
+  return state.workspaceRevision || 0;
+}
+
 async function flushProxySettingsSaveBeforeClose() {
   const pendingSave = proxySettingsSavePromise;
   if (!pendingSave) {
@@ -13910,6 +13915,14 @@ async function sendReplay() {
     return;
   }
 
+  let expectedWorkspaceRevision;
+  try {
+    expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
+  } catch (error) {
+    handleWorkspaceActionError(error);
+    return;
+  }
+
   // Enter sending state after validation so only a valid send clears the response pane.
   tab.responseRecord = null;
   tab.notice = "";
@@ -13936,7 +13949,7 @@ async function sendReplay() {
       body: JSON.stringify({
         session_id: sendingSessionId,
         expected_active_session_id: expectedActiveSessionIdForWrite(sendingSessionId),
-        expected_workspace_revision: state.workspaceRevision || 0,
+        expected_workspace_revision: expectedWorkspaceRevision,
         request,
         target: targetPayload,
         source_transaction_id: tab.sourceTransactionId,
@@ -13985,6 +13998,10 @@ async function sendReplay() {
   if (!response.ok) {
     const errorPayload = await readReplaySendError(response);
     if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
+      return;
+    }
+    if (errorPayload.workspaceConflict) {
+      handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
       return;
     }
     const notice = errorPayload.notice;
@@ -14044,24 +14061,62 @@ async function sendReplay() {
   scheduleRefresh();
 }
 
+function isWorkspaceRevisionConflictPayload(payload) {
+  return Boolean(
+    payload
+    && typeof payload === "object"
+    && Number.isFinite(payload.revision)
+    && payload.replay
+    && payload.fuzzer
+  );
+}
+
+async function readWorkspaceRevisionConflictPayload(response) {
+  if (response.status !== 409) return null;
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("application/json")) return null;
+  try {
+    const payload = await response.clone().json();
+    return isWorkspaceRevisionConflictPayload(payload) ? payload : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function handleReplayWorkspaceRevisionConflict(snapshot = null) {
+  workspaceSaveConflictPending = true;
+  workspaceSaveConflictLatest = snapshot || null;
+  showToast(
+    "Workspace changed elsewhere; replay was not sent. Reload the workspace to reconcile.",
+    "error",
+    6000,
+  );
+}
+
 async function readReplaySendError(response) {
   const fallback = `Replay failed (${response.status})`;
   const contentType = response.headers.get("content-type") || "";
   if (contentType.toLowerCase().includes("application/json")) {
     try {
       const payload = await response.json();
+      const workspaceConflict = response.status === 409 && isWorkspaceRevisionConflictPayload(payload);
       return {
-        notice: String(payload?.error || fallback),
+        notice: workspaceConflict
+          ? "Workspace changed elsewhere; replay was not sent."
+          : String(payload?.error || fallback),
         responseRecord: payload?.record || payload?.response_record || null,
+        workspaceConflict,
+        workspaceSnapshot: workspaceConflict ? payload : null,
       };
     } catch (_error) {
-      return { notice: fallback, responseRecord: null };
+      return { notice: fallback, responseRecord: null, workspaceConflict: false };
     }
   }
   const text = await response.text();
   return {
     notice: text || fallback,
     responseRecord: null,
+    workspaceConflict: false,
   };
 }
 
@@ -14281,6 +14336,14 @@ async function followRedirect() {
     renderReplayViewTabs();
   }
 
+  let expectedWorkspaceRevision;
+  try {
+    expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
+  } catch (error) {
+    handleWorkspaceActionError(error);
+    return;
+  }
+
   // Send the follow request
   const target = { scheme: newScheme, host: newHost, port: newPort };
   const followingTabId = tab.id;
@@ -14296,7 +14359,7 @@ async function followRedirect() {
       body: JSON.stringify({
         session_id: followingSessionId,
         expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
-        expected_workspace_revision: state.workspaceRevision || 0,
+        expected_workspace_revision: expectedWorkspaceRevision,
         request: newRequest,
         target,
         source_transaction_id: null,
@@ -14334,6 +14397,10 @@ async function followRedirect() {
   if (!response.ok) {
     const errorPayload = await readReplaySendError(response);
     if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
+    if (errorPayload.workspaceConflict) {
+      handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
+      return;
+    }
     const notice = errorPayload.notice;
     const responseRecord = errorPayload.responseRecord;
     const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
@@ -19199,6 +19266,7 @@ async function wsConnect() {
   renderWsFrameList();
 
   try {
+    const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
     const headers = parseWsHandshakeHeaders(tab);
     const resp = await fetch("/api/replay/ws-connect", {
       method: "POST",
@@ -19206,6 +19274,7 @@ async function wsConnect() {
       body: JSON.stringify({
         session_id: sessionId,
         expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+        expected_workspace_revision: expectedWorkspaceRevision,
         id: tab.id,
         scheme: tab.wsScheme,
         host: tab.wsHost,
@@ -19219,6 +19288,11 @@ async function wsConnect() {
       return;
     }
     if (!resp.ok) {
+      const workspaceConflict = await readWorkspaceRevisionConflictPayload(resp);
+      if (workspaceConflict) {
+        handleReplayWorkspaceRevisionConflict(workspaceConflict);
+        return;
+      }
       const text = await resp.text().catch(() => "Connection failed");
       throw new Error(text);
     }
@@ -19278,12 +19352,14 @@ async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
       try {
         const kind = normalizeWsMessageType(item.kind);
         const sendBody = wsReplayBodyForSend(item.body, kind, !!item.bodyEncoded);
+        const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
         const resp = await fetch("/api/replay/ws-send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             session_id: tab.wsSessionId || state.activeSession?.id || null,
             expected_active_session_id: expectedActiveSessionIdForWrite(tab.wsSessionId || state.activeSession?.id || null),
+            expected_workspace_revision: expectedWorkspaceRevision,
             id: tab.id,
             body: sendBody,
             binary: kind !== "text",
@@ -19291,6 +19367,11 @@ async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
           }),
         });
         if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
+        const workspaceConflict = !resp.ok ? await readWorkspaceRevisionConflictPayload(resp) : null;
+        if (workspaceConflict) {
+          handleReplayWorkspaceRevisionConflict(workspaceConflict);
+          return;
+        }
         if (resp.ok) {
           await refreshWsReplayFramesOnce(tab, { lifecycleToken });
           item.sent = true;
@@ -19389,12 +19470,14 @@ async function wsSend() {
   scheduleWorkspaceStateSave();
 
   try {
+    const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
     const resp = await fetch("/api/replay/ws-send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: tab.wsSessionId || state.activeSession?.id || null,
         expected_active_session_id: expectedActiveSessionIdForWrite(tab.wsSessionId || state.activeSession?.id || null),
+        expected_workspace_revision: expectedWorkspaceRevision,
         id: tab.id,
         body: sendBody,
         binary,
@@ -19402,6 +19485,11 @@ async function wsSend() {
       }),
     });
     if (!resp.ok) {
+      const workspaceConflict = await readWorkspaceRevisionConflictPayload(resp);
+      if (workspaceConflict) {
+        handleReplayWorkspaceRevisionConflict(workspaceConflict);
+        return;
+      }
       const text = await resp.text().catch(() => "Send failed");
       showToast(text, "error");
     } else {
@@ -19845,12 +19933,14 @@ function renderWsSetupQueue() {
       try {
         const kind = normalizeWsMessageType(item.kind);
         const sendBody = wsReplayBodyForSend(item.body, kind, !!item.bodyEncoded);
+        const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
         const resp = await fetch("/api/replay/ws-send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             session_id: tab.wsSessionId || state.activeSession?.id || null,
             expected_active_session_id: expectedActiveSessionIdForWrite(tab.wsSessionId || state.activeSession?.id || null),
+            expected_workspace_revision: expectedWorkspaceRevision,
             id: tab.id,
             body: sendBody,
             binary: kind !== "text",
@@ -19859,6 +19949,11 @@ function renderWsSetupQueue() {
         });
         if (!isWsReplayTabAlive(tab, lifecycleToken) || tab.wsStatus !== "connected") return;
         if (!resp.ok) {
+          const workspaceConflict = await readWorkspaceRevisionConflictPayload(resp);
+          if (workspaceConflict) {
+            handleReplayWorkspaceRevisionConflict(workspaceConflict);
+            return;
+          }
           const text = await resp.text().catch(() => "Setup message send failed");
           showToast(text, "error");
           return;
