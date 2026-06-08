@@ -458,7 +458,7 @@ impl TransactionStore {
             .map(|value| value.to_ascii_lowercase());
         let limit = filters.limit.unwrap_or(5000);
         let offset = filters.offset.unwrap_or(0);
-        let before_sequence = if can_stream_in_storage_order(filters) {
+        let before_sequence = if can_stream_descending_index_order(filters) {
             filters.before_sequence
         } else {
             None
@@ -469,8 +469,13 @@ impl TransactionStore {
         let summaries = &inner.summaries;
         let total = summaries.len();
 
-        if can_stream_in_storage_order(filters) {
-            let scan_end = newest_scan_end(summaries, before_sequence);
+        if can_stream_index_order(filters) {
+            let descending = !matches!(filters.sort_direction.as_deref(), Some("asc"));
+            let scan_end = if descending {
+                newest_scan_end(summaries, before_sequence)
+            } else {
+                summaries.len()
+            };
             let mut matched_count = 0usize;
             let mut hidden_connect_count = 0usize;
             let mut exhausted = true;
@@ -485,7 +490,12 @@ impl TransactionStore {
                 Some(offset.saturating_add(limit).saturating_add(1))
             };
 
-            for cached in summaries[..scan_end].iter().rev() {
+            let iter: Box<dyn Iterator<Item = &CachedSummary> + '_> = if descending {
+                Box::new(summaries[..scan_end].iter().rev())
+            } else {
+                Box::new(summaries.iter())
+            };
+            for cached in iter {
                 if filters.hide_connect
                     && cached.summary.method == "CONNECT"
                     && matches_filters(
@@ -1075,10 +1085,16 @@ pub(crate) fn normalize_storage_sequences(entries: &mut [TransactionRecord]) {
     }
 }
 
-fn can_stream_in_storage_order(filters: &ListFilters) -> bool {
+fn can_stream_index_order(filters: &ListFilters) -> bool {
     let key = filters.sort_key.as_deref().unwrap_or("index");
     let direction = filters.sort_direction.as_deref().unwrap_or("desc");
-    direction == "desc" && key == "index"
+    key == "index" && (direction == "asc" || direction == "desc")
+}
+
+fn can_stream_descending_index_order(filters: &ListFilters) -> bool {
+    let key = filters.sort_key.as_deref().unwrap_or("index");
+    let direction = filters.sort_direction.as_deref().unwrap_or("desc");
+    key == "index" && direction == "desc"
 }
 
 fn newest_scan_end(summaries: &[CachedSummary], before_sequence: Option<u64>) -> usize {
@@ -2956,6 +2972,37 @@ mod tests {
             vec!["1.local", "0.local"]
         );
         assert!(!final_page.has_more);
+    }
+
+    #[tokio::test]
+    async fn index_ascending_page_starts_from_oldest_sequence() {
+        let records = (1..=8)
+            .rev()
+            .map(|sequence| {
+                let mut record = test_record(&format!("{sequence}.local"));
+                record.sequence = sequence;
+                record
+            })
+            .collect();
+        let store = TransactionStore::from_records(records);
+
+        let page = store
+            .list_page(&ListFilters {
+                limit: Some(3),
+                sort_key: Some("index".into()),
+                sort_direction: Some("asc".into()),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(page.has_more);
     }
 
     #[tokio::test]

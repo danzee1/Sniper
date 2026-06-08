@@ -591,6 +591,8 @@ pub struct WebSocketFrameRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebSocketSessionRecord {
     pub id: Uuid,
+    #[serde(default)]
+    pub sequence: u64,
     pub started_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
@@ -610,6 +612,7 @@ impl WebSocketSessionRecord {
     pub fn summary(&self) -> WebSocketSessionSummary {
         WebSocketSessionSummary {
             id: self.id,
+            sequence: self.sequence,
             started_at: self.started_at,
             closed_at: self.closed_at,
             duration_ms: self.duration_ms,
@@ -628,6 +631,8 @@ impl WebSocketSessionRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebSocketSessionSummary {
     pub id: Uuid,
+    #[serde(default)]
+    pub sequence: u64,
     pub started_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,

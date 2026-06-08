@@ -10231,9 +10231,10 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
   const rows = windowed.renderedEntries
     .map(({ session, index }) => {
       const selected = session.id === state.selectedWebsocketId ? "selected" : "";
+      const rowNumber = websocketSessionDisplayNumber(session, index);
       return `
             <tr class="history-row ${selected}" data-id="${session.id}">
-              <td>${index + 1}</td>
+              <td>${rowNumber}</td>
               <td>${escapeHtml(session.host)}</td>
               <td>${escapeHtml(session.path)}</td>
               <td>${escapeHtml(formatStatus(session.status))}</td>
@@ -10624,6 +10625,15 @@ function getVisibleWebsocketSessions() {
 
 function getSortedWebsocketEntries() {
   return getVisibleWebsocketSessions().map((session, index) => ({ session, index }));
+}
+
+function websocketSessionDisplayNumber(session, loadedIndex = 0) {
+  const sequence = Number(session?.sequence);
+  if (Number.isFinite(sequence) && sequence > 0) {
+    return Math.floor(sequence);
+  }
+  const fallback = Number(loadedIndex);
+  return Number.isFinite(fallback) && fallback >= 0 ? Math.floor(fallback) + 1 : "";
 }
 
 function defaultWebsocketSortDirection(key) {

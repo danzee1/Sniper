@@ -2768,6 +2768,7 @@ async fn forward_websocket_request(
         if let Err(error) = session
             .open_websocket_capture(WebSocketSessionRecord {
                 id,
+                sequence: 0,
                 started_at,
                 closed_at: None,
                 duration_ms: None,
@@ -5854,6 +5855,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now(),
                 closed_at: None,
                 duration_ms: None,
@@ -6309,6 +6311,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now(),
                 closed_at: None,
                 duration_ms: None,
@@ -6367,6 +6370,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now(),
                 closed_at: None,
                 duration_ms: None,
@@ -6437,6 +6441,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now(),
                 closed_at: None,
                 duration_ms: None,
@@ -6506,6 +6511,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now(),
                 closed_at: None,
                 duration_ms: None,
@@ -6713,6 +6719,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now(),
                 closed_at: None,
                 duration_ms: None,

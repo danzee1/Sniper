@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 
 use chrono::{DateTime, Utc};
@@ -21,6 +22,7 @@ pub struct WebSocketStore {
     inner: RwLock<WebSocketStoreInner>,
     events: broadcast::Sender<WebSocketSessionSummary>,
     retention_events: broadcast::Sender<()>,
+    next_sequence: AtomicU64,
 }
 
 struct WebSocketStoreInner {
@@ -42,6 +44,7 @@ impl WebSocketStoreInner {
 #[derive(Clone)]
 struct WebSocketSessionEntry {
     id: Uuid,
+    sequence: u64,
     started_at: DateTime<Utc>,
     closed_at: Option<DateTime<Utc>>,
     duration_ms: Option<u64>,
@@ -61,6 +64,7 @@ impl From<WebSocketSessionRecord> for WebSocketSessionEntry {
         let frame_count = websocket_total_frame_count(&record.frames);
         Self {
             id: record.id,
+            sequence: record.sequence,
             started_at: record.started_at,
             closed_at: record.closed_at,
             duration_ms: record.duration_ms,
@@ -81,6 +85,7 @@ impl WebSocketSessionEntry {
     fn summary(&self) -> WebSocketSessionSummary {
         WebSocketSessionSummary {
             id: self.id,
+            sequence: self.sequence,
             started_at: self.started_at,
             closed_at: self.closed_at,
             duration_ms: self.duration_ms,
@@ -108,6 +113,7 @@ impl WebSocketSessionEntry {
 
         WebSocketSessionRecord {
             id: self.id,
+            sequence: self.sequence,
             started_at: self.started_at,
             closed_at: self.closed_at,
             duration_ms: self.duration_ms,
@@ -160,7 +166,14 @@ impl WebSocketStore {
             broadcast::channel(max_entries.clamp(32, MAX_WEBSOCKET_BROADCAST_CAPACITY));
         let (retention_events, _) =
             broadcast::channel(max_entries.clamp(32, MAX_WEBSOCKET_BROADCAST_CAPACITY));
-        let records = sessions_with_live_preserved(records, max_entries, max_frames_per_session);
+        let mut records =
+            sessions_with_live_preserved(records, max_entries, max_frames_per_session);
+        normalize_websocket_sequences(&mut records);
+        let max_sequence = records
+            .iter()
+            .map(|record| record.sequence)
+            .max()
+            .unwrap_or(0);
         let inner = inner_from_records(records, max_entries);
         Self {
             max_entries,
@@ -168,15 +181,23 @@ impl WebSocketStore {
             inner: RwLock::new(inner),
             events,
             retention_events,
+            next_sequence: AtomicU64::new(max_sequence.saturating_add(1)),
         }
     }
 
     pub async fn open(&self, mut session: WebSocketSessionRecord) {
+        if session.sequence == 0 {
+            session.sequence = self.next_sequence.fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            advance_next_websocket_sequence(
+                &self.next_sequence,
+                session.sequence.saturating_add(1),
+            );
+        }
         trim_frame_overflow(&mut session.frames, self.max_frames_per_session);
         let started_at = session.started_at;
         let id = session.id;
         let entry = WebSocketSessionEntry::from(session);
-        let summary = entry.summary();
         let mut inner = self.inner.write().await;
         remove_ordered_session(&mut inner, id);
         if inner.started_at_desc_ordered {
@@ -192,7 +213,9 @@ impl WebSocketStore {
         if removed_any && !inner.started_at_desc_ordered {
             inner.started_at_desc_ordered = compute_storage_order_matches_started_at_desc(&inner);
         }
-        let _ = self.events.send(summary);
+        if let Some(summary) = inner.sessions.get(&id).map(WebSocketSessionEntry::summary) {
+            let _ = self.events.send(summary);
+        }
         if removed_any {
             let _ = self.retention_events.send(());
         }
@@ -466,6 +489,33 @@ fn inner_from_records(
     }
     inner.started_at_desc_ordered = compute_storage_order_matches_started_at_desc(&inner);
     inner
+}
+
+fn normalize_websocket_sequences(records: &mut [WebSocketSessionRecord]) {
+    if !records.iter().any(|record| record.sequence == 0) {
+        return;
+    }
+    let total = records.len() as u64;
+    for (index, record) in records.iter_mut().enumerate() {
+        if record.sequence == 0 {
+            record.sequence = total.saturating_sub(index as u64);
+        }
+    }
+}
+
+fn advance_next_websocket_sequence(next_sequence: &AtomicU64, target: u64) {
+    let mut current = next_sequence.load(AtomicOrdering::Relaxed);
+    while current < target {
+        match next_sequence.compare_exchange_weak(
+            current,
+            target,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 fn frame_window(
@@ -892,6 +942,7 @@ mod tests {
     fn session(frames: Vec<WebSocketFrameRecord>) -> WebSocketSessionRecord {
         WebSocketSessionRecord {
             id: Uuid::new_v4(),
+            sequence: 0,
             started_at: Utc::now(),
             closed_at: None,
             duration_ms: None,
@@ -1370,8 +1421,67 @@ mod tests {
 
         assert_eq!(desc.items[0].host, "newest.example.test");
         assert_eq!(desc.items[2].host, "oldest.example.test");
+        assert_eq!(
+            desc.items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
         assert_eq!(asc.items[0].host, "oldest.example.test");
         assert_eq!(asc.items[2].host, "newest.example.test");
+        assert_eq!(
+            asc.items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn index_sort_preserves_capture_sequence_after_retention_trim() {
+        let mut first = closed_session(vec![frame(1)]);
+        first.host = "first.example.test".to_string();
+        let mut second = closed_session(vec![frame(1)]);
+        second.host = "second.example.test".to_string();
+        let mut third = closed_session(vec![frame(1)]);
+        third.host = "third.example.test".to_string();
+        let store = WebSocketStore::new(2, 10);
+
+        store.open(first).await;
+        store.open(second).await;
+        store.open(third).await;
+
+        let desc = store
+            .list_page_filtered(&WebSocketListFilters {
+                sort_key: Some("index".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+        let asc = store
+            .list_page_filtered(&WebSocketListFilters {
+                sort_key: Some("index".to_string()),
+                sort_direction: Some("asc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(
+            desc.items
+                .iter()
+                .map(|item| (item.host.as_str(), item.sequence))
+                .collect::<Vec<_>>(),
+            vec![("third.example.test", 3), ("second.example.test", 2)]
+        );
+        assert_eq!(
+            asc.items
+                .iter()
+                .map(|item| (item.host.as_str(), item.sequence))
+                .collect::<Vec<_>>(),
+            vec![("second.example.test", 2), ("third.example.test", 3)]
+        );
     }
 
     #[tokio::test]

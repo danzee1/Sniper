@@ -3103,6 +3103,7 @@ mod tests {
         let started_at = Utc::now() - ChronoDuration::seconds(5);
         let mut records = vec![WebSocketSessionRecord {
             id: Uuid::new_v4(),
+            sequence: 0,
             started_at,
             closed_at: None,
             duration_ms: None,
@@ -3138,6 +3139,7 @@ mod tests {
         let snapshot = super::StoredSessionSnapshot {
             websockets: vec![WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now() - ChronoDuration::seconds(5),
                 closed_at: None,
                 duration_ms: None,
@@ -3184,6 +3186,7 @@ mod tests {
         active
             .open_websocket_capture(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now() - ChronoDuration::seconds(1),
                 closed_at: None,
                 duration_ms: None,
@@ -3329,6 +3332,7 @@ mod tests {
         let open = super::encode_websocket_journal_line(&super::WebSocketJournalEntry::Open {
             record: WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now() - ChronoDuration::seconds(1),
                 closed_at: None,
                 duration_ms: None,
@@ -3457,6 +3461,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: websocket_id,
+                sequence: 0,
                 started_at: Utc::now(),
                 closed_at: Some(Utc::now()),
                 duration_ms: Some(1),
@@ -3529,6 +3534,7 @@ mod tests {
         let tail_start = total_frames - super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION;
         let snapshot_record = WebSocketSessionRecord {
             id: websocket_id,
+            sequence: 0,
             started_at: Utc::now(),
             closed_at: Some(Utc::now()),
             duration_ms: Some(1),

@@ -2896,6 +2896,7 @@ mod tests {
             .websockets
             .open(WebSocketSessionRecord {
                 id: uuid::Uuid::new_v4(),
+                sequence: 0,
                 started_at: chrono::Utc::now(),
                 closed_at: None,
                 duration_ms: None,

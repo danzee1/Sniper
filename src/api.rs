@@ -14648,6 +14648,7 @@ mod tests {
         };
         let websocket = WebSocketSessionRecord {
             id: Uuid::new_v4(),
+            sequence: 0,
             started_at: Utc::now(),
             closed_at: Some(Utc::now()),
             duration_ms: Some(1),
@@ -14772,6 +14773,7 @@ mod tests {
         let session = state.session().await;
         let websocket = WebSocketSessionRecord {
             id: Uuid::new_v4(),
+            sequence: 0,
             started_at: Utc::now(),
             closed_at: Some(Utc::now()),
             duration_ms: Some(1),
@@ -14970,6 +14972,7 @@ mod tests {
                 .websockets
                 .open(WebSocketSessionRecord {
                     id: Uuid::new_v4(),
+                    sequence: 0,
                     started_at: Utc::now(),
                     closed_at: Some(Utc::now()),
                     duration_ms: Some(1),
@@ -15033,6 +15036,7 @@ mod tests {
 
         let websocket = WebSocketSessionRecord {
             id: Uuid::new_v4(),
+            sequence: 0,
             started_at: Utc::now(),
             closed_at: None,
             duration_ms: None,
