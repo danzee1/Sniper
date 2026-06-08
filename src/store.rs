@@ -1086,15 +1086,33 @@ pub(crate) fn normalize_storage_sequences(entries: &mut [TransactionRecord]) {
 }
 
 fn can_stream_index_order(filters: &ListFilters) -> bool {
-    let key = filters.sort_key.as_deref().unwrap_or("index");
-    let direction = filters.sort_direction.as_deref().unwrap_or("desc");
+    let key = normalized_transaction_sort_key(filters);
+    let direction = normalized_transaction_sort_direction(filters);
     key == "index" && (direction == "asc" || direction == "desc")
 }
 
 fn can_stream_descending_index_order(filters: &ListFilters) -> bool {
-    let key = filters.sort_key.as_deref().unwrap_or("index");
-    let direction = filters.sort_direction.as_deref().unwrap_or("desc");
+    let key = normalized_transaction_sort_key(filters);
+    let direction = normalized_transaction_sort_direction(filters);
     key == "index" && direction == "desc"
+}
+
+fn normalized_transaction_sort_key(filters: &ListFilters) -> &str {
+    filters
+        .sort_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("index")
+}
+
+fn normalized_transaction_sort_direction(filters: &ListFilters) -> &str {
+    filters
+        .sort_direction
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("desc")
 }
 
 fn newest_scan_end(summaries: &[CachedSummary], before_sequence: Option<u64>) -> usize {
@@ -1555,8 +1573,8 @@ fn matches_filters(
 }
 
 fn sort_filtered_records(records: &mut [&CachedSummary], filters: &ListFilters) {
-    let key = filters.sort_key.as_deref().unwrap_or("index");
-    let direction = filters.sort_direction.as_deref().unwrap_or("desc");
+    let key = normalized_transaction_sort_key(filters);
+    let direction = normalized_transaction_sort_direction(filters);
     let ascending = direction == "asc";
 
     match key {
@@ -2599,6 +2617,32 @@ mod tests {
 
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(second_page.items[0].host, "b.example");
+    }
+
+    #[tokio::test]
+    async fn transaction_sort_key_trims_validated_api_whitespace() {
+        let store = TransactionStore::from_records(vec![
+            test_record("c.example"),
+            test_record("b.example"),
+            test_record("a.example"),
+        ]);
+
+        let page = store
+            .list_page(&ListFilters {
+                sort_key: Some(" host ".into()),
+                sort_direction: Some("asc".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.example", "b.example", "c.example"]
+        );
     }
 
     #[tokio::test]

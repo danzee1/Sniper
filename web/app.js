@@ -5067,7 +5067,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     ? (options.afterId || websocketAppendAfterId())
     : null;
   const resetWindow = !append && (options.resetWindow === true || queryChanged);
-  if (queryChanged) {
+  if (resetWindow) {
     resetWebsocketHistoryScroll();
   }
   state.websocketPaging = {
@@ -5196,7 +5196,7 @@ async function loadWebsocketsPageRefresh(preserveSelection = true, options = {})
   const limit = options.resetWindow === true
     ? WEBSOCKET_PAGE_SIZE
     : currentWebsocketRefreshLimit();
-  return loadWebsockets(preserveSelection, { limit });
+  return loadWebsockets(preserveSelection, { ...options, limit });
 }
 
 async function loadMoreWebsockets() {

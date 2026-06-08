@@ -22,7 +22,9 @@ use sniper::{
         BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, RequestTargetOverride,
         TransactionRecord, TransactionSummary, WebSocketSessionRecord, WebSocketSessionSummary,
     },
-    runtime::RuntimeSettingsSnapshot,
+    runtime::{
+        RuntimeSettingsSnapshot, MAX_OAST_POLLING_INTERVAL_SECS, MIN_OAST_POLLING_INTERVAL_SECS,
+    },
     runtime_state::{load_runtime_state, remove_runtime_state_if_matches, RuntimeStateSnapshot},
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     session::SessionSummary,
@@ -63,6 +65,20 @@ fn parse_nonzero_usize(value: &str) -> std::result::Result<usize, String> {
         .map_err(|error| format!("invalid limit: {error}"))?;
     if parsed == 0 {
         Err("limit must be greater than zero".to_string())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_oast_polling_interval(value: &str) -> std::result::Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid OAST polling interval: {error}"))?;
+    if !(MIN_OAST_POLLING_INTERVAL_SECS..=MAX_OAST_POLLING_INTERVAL_SECS).contains(&parsed) {
+        Err(format!(
+            "OAST polling interval must be between {} and {} seconds",
+            MIN_OAST_POLLING_INTERVAL_SECS, MAX_OAST_POLLING_INTERVAL_SECS
+        ))
     } else {
         Ok(parsed)
     }
@@ -613,7 +629,7 @@ struct OastConfigureArgs {
     #[arg(long)]
     token: Option<String>,
     /// Polling interval in seconds
-    #[arg(long)]
+    #[arg(long, value_parser = parse_oast_polling_interval)]
     interval: Option<u64>,
     /// Enable OAST
     #[arg(long, conflicts_with = "disable")]
@@ -4843,7 +4859,7 @@ mod tests {
         RuntimeUpdatePayload, SequenceCommand, SequenceCreateInput, SessionCommand,
         SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
         CLI_REPEATER_HISTORY_LIMIT, CLI_WORKSPACE_CLIENT_ID, MAX_CLI_INPUT_BYTES,
-        SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
+        MAX_OAST_POLLING_INTERVAL_SECS, SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -7155,6 +7171,34 @@ mod tests {
             Cli::try_parse_from(["sniper-cli", "capture", "oast", "list", "--limit", "0",])
                 .is_err()
         );
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "oast",
+            "configure",
+            "--interval",
+            "0",
+        ])
+        .is_err());
+        let too_large_oast_interval = (MAX_OAST_POLLING_INTERVAL_SECS + 1).to_string();
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "oast",
+            "configure",
+            "--interval",
+            too_large_oast_interval.as_str(),
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "oast",
+            "configure",
+            "--interval",
+            MAX_OAST_POLLING_INTERVAL_SECS.to_string().as_str(),
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from(["sniper-cli", "sequence", "runs", "--limit", "0"]).is_err());
     }
 
