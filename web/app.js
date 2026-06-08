@@ -7804,6 +7804,7 @@ function clearFindingDetail() {
   if (els.findingsDetailJump) {
     delete els.findingsDetailJump.dataset.recordId;
   }
+  setFindingDetailActionsEnabled(false);
   if (els.findingsDetailContent) {
     els.findingsDetailContent.classList.add("hidden");
   }
@@ -7818,6 +7819,42 @@ function clearFindingDetail() {
   if (els.findingsReqView) els.findingsReqView.innerHTML = "";
   if (els.findingsResView) els.findingsResView.innerHTML = "";
   resetFindingsSearchUi();
+}
+
+function setFindingDetailActionsEnabled(enabled) {
+  [
+    els.findingsDetailJump,
+    document.getElementById("findingsDetailSendReplay"),
+    document.getElementById("findingsDetailSendFuzzer"),
+  ].forEach((button) => {
+    if (button) button.disabled = !enabled;
+  });
+}
+
+function renderFindingDetailLoading() {
+  setFindingDetailActionsEnabled(false);
+  if (els.findingsDetailPlaceholder) els.findingsDetailPlaceholder.classList.add("hidden");
+  if (els.findingsDetailContent) els.findingsDetailContent.classList.remove("hidden");
+  if (els.findingsDetailSeverity) {
+    els.findingsDetailSeverity.className = "severity-badge";
+    els.findingsDetailSeverity.textContent = "";
+  }
+  if (els.findingsDetailCategory) els.findingsDetailCategory.textContent = "";
+  if (els.findingsDetailTitle) els.findingsDetailTitle.textContent = "Loading finding...";
+  if (els.findingsDetailDesc) els.findingsDetailDesc.textContent = "";
+  if (els.findingsReqCM) {
+    updateCodePaneCM("findingsReq", els.findingsReqCM, "Loading finding detail...", { mode: "http" });
+  } else if (els.findingsReqView) {
+    els.findingsReqView.innerHTML = '<span class="code-line code-line-empty">Loading finding detail...</span>';
+    if (els.findingsReqLines) els.findingsReqLines.textContent = "";
+  }
+  if (els.findingsResCM) {
+    updateCodePaneCM("findingsRes", els.findingsResCM, "", { mode: "http" });
+  } else if (els.findingsResView) {
+    els.findingsResView.innerHTML = "";
+    if (els.findingsResLines) els.findingsResLines.textContent = "";
+  }
+  resetFindingsSearchUi({ lineCount: 1 });
 }
 
 function resetFindingsUiState() {
@@ -8043,10 +8080,11 @@ async function loadFindingDetail(id) {
   const sessionId = currentSessionId();
   if (selectedFindingId === id && els.findingsDetailJump) {
     delete els.findingsDetailJump.dataset.recordId;
+    renderFindingDetailLoading();
   }
   try {
     const res = await fetch(sessionQueryPath(`/api/findings/${encodeURIComponent(id)}`, sessionId));
-    if (selectedFindingId !== id) return;
+    if (currentSessionId() !== sessionId || selectedFindingId !== id) return;
     if (!res.ok) {
       clearFindingDetail();
       return;
@@ -8073,6 +8111,7 @@ async function loadFindingDetail(id) {
 
 function showFindingDetail(finding, record) {
   if (!els.findingsDetailPanel) return;
+  setFindingDetailActionsEnabled(Boolean(finding.record_id));
   if (els.findingsDetailPlaceholder) els.findingsDetailPlaceholder.classList.add("hidden");
   if (els.findingsDetailContent) els.findingsDetailContent.classList.remove("hidden");
 

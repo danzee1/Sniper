@@ -58,17 +58,36 @@ fn normalize_empty_data_dir_env() {
     }
 }
 
-fn request_existing_desktop_focus() {
+fn request_existing_desktop_focus() -> bool {
     #[cfg(target_os = "macos")]
     {
-        if let Err(error) = Command::new(OPEN_PATH)
-            .args(["-b", APP_BUNDLE_IDENTIFIER])
-            .status()
-        {
+        request_existing_desktop_focus_with(Path::new(OPEN_PATH), APP_BUNDLE_IDENTIFIER)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+fn request_existing_desktop_focus_with(open_path: &Path, bundle_identifier: &str) -> bool {
+    match Command::new(open_path)
+        .args(["-b", bundle_identifier])
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            warn!(
+                ?status,
+                "failed to request focus for existing Sniper desktop"
+            );
+            false
+        }
+        Err(error) => {
             warn!(
                 ?error,
                 "failed to request focus for existing Sniper desktop"
             );
+            false
         }
     }
 }
@@ -138,8 +157,7 @@ fn main() -> Result<()> {
             data_dir = %data_dir.display(),
             "another Sniper runtime is already using this data directory"
         );
-        if should_request_existing_desktop_focus(&data_dir) {
-            request_existing_desktop_focus();
+        if should_request_existing_desktop_focus(&data_dir) && request_existing_desktop_focus() {
             return Ok(());
         }
         anyhow::bail!(
@@ -1111,10 +1129,11 @@ mod tests {
         finish_desktop_teardown, handle_navigation_request, handle_new_window_request,
         is_blocked_desktop_navigation_scheme, is_same_origin, load_shell_rc_contents,
         normalize_empty_data_dir_env, persist_desktop_session_state,
-        process_path_points_to_desktop_bundle, shell_single_quote, should_install_cli_path,
-        should_install_cli_path_on_launch, should_install_skills_on_launch,
-        should_request_existing_desktop_focus, upsert_managed_path_line, write_shell_rc_atomically,
-        AppConfig, AppState, DesktopUserEvent, SNIPER_DATA_DIR_ENV,
+        process_path_points_to_desktop_bundle, request_existing_desktop_focus_with,
+        shell_single_quote, should_install_cli_path, should_install_cli_path_on_launch,
+        should_install_skills_on_launch, should_request_existing_desktop_focus,
+        upsert_managed_path_line, write_shell_rc_atomically, AppConfig, AppState, DesktopUserEvent,
+        SNIPER_DATA_DIR_ENV,
     };
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -1219,6 +1238,22 @@ mod tests {
         assert!(!should_request_existing_desktop_focus(&root));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_runtime_focus_reports_open_command_failures() {
+        assert!(request_existing_desktop_focus_with(
+            std::path::Path::new("/usr/bin/true"),
+            "com.sm1ee.sniper"
+        ));
+        assert!(!request_existing_desktop_focus_with(
+            std::path::Path::new("/usr/bin/false"),
+            "com.sm1ee.sniper"
+        ));
+        assert!(!request_existing_desktop_focus_with(
+            std::path::Path::new("/sniper/missing/open"),
+            "com.sm1ee.sniper"
+        ));
     }
 
     #[test]
