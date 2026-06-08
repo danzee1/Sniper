@@ -7665,6 +7665,7 @@ let scannerConfigCache = null;
 let scannerSettingsSessionId = null;
 let findingsSortKey = "found_at";
 let findingsSortDir = "desc";
+const FINDINGS_LIST_LIMIT = 5000;
 
 const BUILTIN_RULE_LABELS = {
   jwt: "JWT Analysis",
@@ -7679,6 +7680,8 @@ const BUILTIN_RULE_LABELS = {
   auth: "Authentication Issues",
 };
 
+const BUILTIN_FINDING_CATEGORIES = new Set(Object.keys(BUILTIN_RULE_LABELS));
+
 let selectedFindingId = null;
 
 async function loadFindings() {
@@ -7689,12 +7692,14 @@ async function loadFindings() {
   findingsLoadSessionId = sessionId;
   findingsLoadPromise = (async () => {
     try {
-      const response = await fetch(sessionQueryPath("/api/findings?limit=5000", sessionId));
+      const countPromise = fetchFindingsCount(sessionId).catch(() => null);
+      const response = await fetch(sessionQueryPath(`/api/findings?limit=${FINDINGS_LIST_LIMIT}`, sessionId));
       if (!response.ok) return;
       const findings = jsonArray(await response.json());
+      const fullCount = await countPromise;
       if (sessionId !== currentSessionId()) return;
       findingsData = findings;
-      findingsBadgeCount = findings.length;
+      findingsBadgeCount = fullCount == null ? findings.length : Math.max(fullCount, findings.length);
       renderFindings();
       updateFindingsBadge();
     } catch (error) {
@@ -7712,14 +7717,20 @@ async function loadFindings() {
 async function updateFindingsBadgeOnly() {
   const sessionId = currentSessionId();
   try {
-    const response = await fetch(sessionQueryPath("/api/findings/count", sessionId));
-    if (!response.ok) return;
-    const payload = await response.json();
+    const count = await fetchFindingsCount(sessionId);
     if (sessionId !== currentSessionId()) return;
-    const count = Number(payload?.count);
-    findingsBadgeCount = Number.isFinite(count) && count >= 0 ? count : 0;
+    if (count == null) return;
+    findingsBadgeCount = count;
     updateFindingsBadge();
   } catch (e) { /* silent */ }
+}
+
+async function fetchFindingsCount(sessionId) {
+  const response = await fetch(sessionQueryPath("/api/findings/count", sessionId));
+  if (!response.ok) return null;
+  const payload = await response.json();
+  const count = Number(payload?.count);
+  return Number.isFinite(count) && count >= 0 ? count : 0;
 }
 
 function updateFindingsBadge() {
@@ -7918,23 +7929,38 @@ function updateFindingsSortHeaders() {
 function updateCategoryFilter() {
   if (!els.findingsFilterCategory) return;
   const current = els.findingsFilterCategory.value;
-  const builtinCats = new Set(["jwt", "header", "cookie", "disclosure", "cors", "error"]);
   const extraCats = new Set();
-  for (const f of findingsData) {
-    if (!builtinCats.has(f.category)) extraCats.add(f.category);
-  }
   // Remove old custom options
   Array.from(els.findingsFilterCategory.options).forEach((opt) => {
     if (opt.dataset.custom) opt.remove();
   });
-  for (const cat of extraCats) {
-    const opt = document.createElement("option");
-    opt.value = cat;
-    opt.textContent = cat;
-    opt.dataset.custom = "1";
-    els.findingsFilterCategory.appendChild(opt);
+
+  for (const f of findingsData) {
+    const category = String(f.category || "").trim();
+    if (!category) continue;
+    if (BUILTIN_FINDING_CATEGORIES.has(category)) {
+      ensureFindingsCategoryOption(category);
+    } else {
+      extraCats.add(category);
+    }
+  }
+
+  for (const cat of [...extraCats].sort((a, b) => a.localeCompare(b))) {
+    ensureFindingsCategoryOption(cat, { custom: true });
   }
   els.findingsFilterCategory.value = current;
+}
+
+function ensureFindingsCategoryOption(category, options = {}) {
+  if (!els.findingsFilterCategory || !category) return;
+  const exists = Array.from(els.findingsFilterCategory.options).some((opt) => opt.value === category);
+  if (exists) return;
+
+  const opt = document.createElement("option");
+  opt.value = category;
+  opt.textContent = BUILTIN_RULE_LABELS[category] || category;
+  if (options.custom) opt.dataset.custom = "1";
+  els.findingsFilterCategory.appendChild(opt);
 }
 
 function renderFindings() {

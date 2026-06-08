@@ -596,6 +596,19 @@ impl AppState {
                 session.id()
             )));
         }
+        self.read_only_session_contexts
+            .lock()
+            .await
+            .remove(&session.id());
+        {
+            let mut contexts = self.session_contexts.lock().await;
+            if contexts
+                .get(&session.id())
+                .is_some_and(|current| !Arc::ptr_eq(current, session))
+            {
+                contexts.remove(&session.id());
+            }
+        }
         let (snapshot, fallback_metadata) = session
             .replace_workspace_snapshot_checked_and_persist(snapshot)
             .await
@@ -2178,7 +2191,9 @@ mod tests {
     use crate::match_replace::{MatchReplaceRule, MatchReplaceScope, MatchReplaceTarget};
     use crate::model::WebSocketSessionRecord;
     use crate::model::{BodyEncoding, EditableRequest, MessageRecord, TransactionRecord};
-    use crate::workspace::{ReplayTabState, ReplayWorkspaceState, WorkspaceReplaceError};
+    use crate::workspace::{
+        ReplayTabState, ReplayWorkspaceState, WorkspaceReplaceError, WorkspaceStateSnapshot,
+    };
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
@@ -3070,6 +3085,80 @@ mod tests {
             .await
             .unwrap();
         assert!(std::sync::Arc::ptr_eq(&writable, &read_after_write_load));
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_persist_invalidates_stale_read_only_session_context() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-workspace-read-only-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        let original = state.session().await;
+        let original_id = original.id();
+        state
+            .create_session(Some("Second".to_string()))
+            .await
+            .unwrap();
+        state.session_contexts.lock().await.remove(&original_id);
+        state
+            .read_only_session_contexts
+            .lock()
+            .await
+            .remove(&original_id);
+
+        let cached_read = state
+            .read_session_context_for_id(original_id)
+            .await
+            .unwrap();
+        assert!(state
+            .read_only_session_contexts
+            .lock()
+            .await
+            .contains_key(&original_id));
+
+        let mut workspace = WorkspaceStateSnapshot {
+            session_id: Some(original_id),
+            client_id: Some("test-ui".to_string()),
+            client_version: 1,
+            ..WorkspaceStateSnapshot::default()
+        };
+        workspace.replay.active_tab_id = Some("fresh-workspace".to_string());
+        workspace.replay.tabs.push(ReplayTabState {
+            id: "fresh-workspace".to_string(),
+            sequence: 1,
+            ..ReplayTabState::default()
+        });
+
+        state
+            .replace_workspace_state_and_persist(&original, workspace)
+            .await
+            .unwrap();
+
+        let read_after_write = state
+            .read_session_context_for_id(original_id)
+            .await
+            .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&cached_read, &read_after_write));
+        assert_eq!(
+            read_after_write
+                .workspace
+                .snapshot()
+                .await
+                .replay
+                .active_tab_id
+                .as_deref(),
+            Some("fresh-workspace")
+        );
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
