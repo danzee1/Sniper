@@ -7658,6 +7658,8 @@ let findingsData = [];
 let findingsBadgeCount = 0;
 let findingsLoadPromise = null;
 let findingsLoadSessionId = null;
+let findingsStateGeneration = 0;
+let findingsLoadGeneration = 0;
 let findingsBadgeRefreshTimer = 0;
 let findingsListRefreshTimer = 0;
 let lastFindingsBadgePollAt = 0;
@@ -7689,15 +7691,24 @@ async function loadFindings() {
   if (findingsLoadPromise && findingsLoadSessionId === sessionId) {
     return findingsLoadPromise;
   }
+  const stateGeneration = findingsStateGeneration;
+  const loadGeneration = ++findingsLoadGeneration;
   findingsLoadSessionId = sessionId;
-  findingsLoadPromise = (async () => {
+  let loadPromise;
+  loadPromise = (async () => {
     try {
       const countPromise = fetchFindingsCount(sessionId).catch(() => null);
       const response = await fetch(sessionQueryPath(`/api/findings?limit=${FINDINGS_LIST_LIMIT}`, sessionId));
       if (!response.ok) return;
       const findings = jsonArray(await response.json());
       const fullCount = await countPromise;
-      if (sessionId !== currentSessionId()) return;
+      if (
+        sessionId !== currentSessionId()
+        || stateGeneration !== findingsStateGeneration
+        || loadGeneration !== findingsLoadGeneration
+      ) {
+        return;
+      }
       findingsData = findings;
       findingsBadgeCount = fullCount == null ? findings.length : Math.max(fullCount, findings.length);
       renderFindings();
@@ -7705,20 +7716,26 @@ async function loadFindings() {
     } catch (error) {
       console.error("Failed to load findings:", error);
     } finally {
-      if (findingsLoadSessionId === sessionId) {
+      if (
+        findingsLoadPromise === loadPromise
+        && findingsLoadSessionId === sessionId
+        && loadGeneration === findingsLoadGeneration
+      ) {
         findingsLoadPromise = null;
         findingsLoadSessionId = null;
       }
     }
   })();
+  findingsLoadPromise = loadPromise;
   return findingsLoadPromise;
 }
 
 async function updateFindingsBadgeOnly() {
   const sessionId = currentSessionId();
+  const stateGeneration = findingsStateGeneration;
   try {
     const count = await fetchFindingsCount(sessionId);
-    if (sessionId !== currentSessionId()) return;
+    if (sessionId !== currentSessionId() || stateGeneration !== findingsStateGeneration) return;
     if (count == null) return;
     findingsBadgeCount = count;
     updateFindingsBadge();
@@ -7804,6 +7821,8 @@ function clearFindingDetail() {
 }
 
 function resetFindingsUiState() {
+  findingsStateGeneration += 1;
+  findingsLoadGeneration += 1;
   findingsData = [];
   findingsBadgeCount = 0;
   findingsLoadPromise = null;

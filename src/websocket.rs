@@ -622,7 +622,7 @@ fn list_filtered_storage_order_page(
             items,
             total,
             filtered_total: None,
-            offset: filters.offset.unwrap_or(0),
+            offset: start_index,
             limit,
             has_more: limit != 0 && matched_count > limit,
         });
@@ -1265,6 +1265,49 @@ mod tests {
             })
             .await;
 
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].id, oldest_id);
+        assert!(!second_page.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_page_filtered_after_id_reports_cursor_offset_without_explicit_offset() {
+        let base = Utc::now();
+        let mut newest = session(vec![frame(1)]);
+        newest.host = "newest.example.test".to_string();
+        newest.started_at = base;
+        let mut middle = session(vec![frame(1)]);
+        middle.host = "middle.example.test".to_string();
+        middle.started_at = base - chrono::Duration::seconds(10);
+        let mut oldest = session(vec![frame(1)]);
+        oldest.host = "oldest.example.test".to_string();
+        oldest.started_at = base - chrono::Duration::seconds(20);
+        let oldest_id = oldest.id;
+        let store = WebSocketStore::from_sessions(10, 10, vec![newest, middle, oldest]);
+
+        let first_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(2),
+                live_only: true,
+                sort_key: Some("started_at".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+        let after_id = first_page.items.last().expect("cursor row").id;
+
+        let second_page = store
+            .list_page_filtered(&WebSocketListFilters {
+                limit: Some(2),
+                after_id: Some(after_id),
+                live_only: true,
+                sort_key: Some("started_at".to_string()),
+                sort_direction: Some("desc".to_string()),
+                ..WebSocketListFilters::default()
+            })
+            .await;
+
+        assert_eq!(second_page.offset, 2);
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(second_page.items[0].id, oldest_id);
         assert!(!second_page.has_more);

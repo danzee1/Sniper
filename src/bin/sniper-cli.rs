@@ -1589,7 +1589,7 @@ async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
                 Some(session_id) => Some(session_id),
                 None => active_session_id(&api).await?,
             };
-            let path = history_list_path(session_id, &args);
+            let path = history_list_path(session_id, &args)?;
             let history: HistoryListResponse = api.get_json(&path).await?;
             print_json(&history.into_cli_output(include_page))
         }
@@ -2820,7 +2820,8 @@ fn transaction_detail_path(transaction_id: Uuid, session_id: Option<Uuid>) -> St
     }
 }
 
-fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> String {
+fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> Result<String> {
+    validate_history_cursor_options(args)?;
     let mut params = Vec::new();
     if let Some(session_id) = session_id {
         params.push(("session_id".to_string(), session_id.to_string()));
@@ -2892,6 +2893,8 @@ fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> String
         .filter(|value| !value.is_empty());
     if let Some(sort_key) = sort_key {
         params.push(("sort_key".to_string(), sort_key.to_string()));
+    } else if args.before_sequence.is_some() {
+        params.push(("sort_key".to_string(), "index".to_string()));
     }
     let sort_direction = args
         .sort_direction
@@ -2900,6 +2903,8 @@ fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> String
         .filter(|value| !value.is_empty());
     if let Some(sort_direction) = sort_direction {
         params.push(("sort_direction".to_string(), sort_direction.to_string()));
+    } else if args.before_sequence.is_some() {
+        params.push(("sort_direction".to_string(), "desc".to_string()));
     }
     let endpoint = if args.page
         || args.offset.is_some()
@@ -2912,11 +2917,37 @@ fn history_list_path(session_id: Option<Uuid>, args: &HistoryListArgs) -> String
         "/api/transactions"
     };
     let query = encode_query(params);
-    if query.is_empty() {
+    Ok(if query.is_empty() {
         endpoint.to_string()
     } else {
         format!("{endpoint}?{query}")
+    })
+}
+
+fn validate_history_cursor_options(args: &HistoryListArgs) -> Result<()> {
+    if args.before_sequence.is_none() {
+        return Ok(());
     }
+    if args.offset.is_some() {
+        bail!("--before-sequence cannot be combined with --offset");
+    }
+
+    let sort_key = args
+        .sort_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("index");
+    let sort_direction = args
+        .sort_direction
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("desc");
+    if sort_key != "index" || !sort_direction.eq_ignore_ascii_case("desc") {
+        bail!("--before-sequence requires --sort-key index and --sort-direction desc");
+    }
+    Ok(())
 }
 
 fn websocket_list_path(session_id: Option<Uuid>, args: &WebSocketListArgs) -> String {
@@ -4909,7 +4940,7 @@ mod tests {
             ..HistoryListArgs::default()
         };
         assert_eq!(
-            history_list_path(Some(session_id), &sorted_args),
+            history_list_path(Some(session_id), &sorted_args).unwrap(),
             "/api/transactions-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&sort_key=host&sort_direction=asc"
         );
 
@@ -4919,7 +4950,7 @@ mod tests {
             ..HistoryListArgs::default()
         };
         assert_eq!(
-            history_list_path(Some(session_id), &legacy_args),
+            history_list_path(Some(session_id), &legacy_args).unwrap(),
             "/api/transactions?session_id=22222222-2222-2222-2222-222222222222&limit=1"
         );
 
@@ -4929,9 +4960,32 @@ mod tests {
             ..HistoryListArgs::default()
         };
         assert_eq!(
-            history_list_path(Some(session_id), &cursor_args),
-            "/api/transactions-page?session_id=22222222-2222-2222-2222-222222222222&limit=50&before_sequence=1234"
+            history_list_path(Some(session_id), &cursor_args).unwrap(),
+            "/api/transactions-page?session_id=22222222-2222-2222-2222-222222222222&limit=50&before_sequence=1234&sort_key=index&sort_direction=desc"
         );
+    }
+
+    #[test]
+    fn history_cursor_path_rejects_incompatible_sort_options() {
+        let session_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        let invalid_sort_key = HistoryListArgs {
+            before_sequence: Some(1234),
+            sort_key: Some("host".to_string()),
+            sort_direction: Some("asc".to_string()),
+            ..HistoryListArgs::default()
+        };
+        let error = history_list_path(Some(session_id), &invalid_sort_key).unwrap_err();
+        assert!(error.to_string().contains("--before-sequence requires"));
+
+        let invalid_sort_direction = HistoryListArgs {
+            before_sequence: Some(1234),
+            sort_key: Some("index".to_string()),
+            sort_direction: Some("asc".to_string()),
+            ..HistoryListArgs::default()
+        };
+        let error = history_list_path(Some(session_id), &invalid_sort_direction).unwrap_err();
+        assert!(error.to_string().contains("--before-sequence requires"));
     }
 
     #[test]
