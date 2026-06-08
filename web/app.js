@@ -2693,7 +2693,7 @@ function applyWorkspaceState(snapshot) {
   }
   for (const tab of state.replayTabs || []) {
     if (tab?.type === "websocket") {
-      cleanupWsReplayTab(tab).catch((error) => console.error(error));
+      cleanupWsReplayTab(tab, { guardWorkspaceRevision: false }).catch((error) => console.error(error));
     }
   }
   state.workspaceRevision = Number.isFinite(snapshot?.revision) ? snapshot.revision : 0;
@@ -3950,6 +3950,7 @@ function disconnectWsReplayTabsOnUnload() {
     const payload = JSON.stringify({
       session_id: sessionId,
       expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+      expected_workspace_revision: state.workspaceRevision || 0,
       id: tab.id,
       remove: false,
     });
@@ -3981,6 +3982,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
     markDisconnected: true,
     removeBackend: tab.wsStatus === "connecting",
     bypassExpectedActiveSessionGuard: !!options.bypassExpectedActiveSessionGuard,
+    guardWorkspaceRevision: false,
     sessionId,
   })));
   for (const result of results) {
@@ -13915,10 +13917,14 @@ async function sendReplay() {
     return;
   }
 
+  const conflictSnapshot = cloneReplayTabState(tab);
   let expectedWorkspaceRevision;
   try {
     expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
   } catch (error) {
+    if (error instanceof WorkspaceStateConflictError) {
+      restoreReplayTabConflictState(tab, conflictSnapshot);
+    }
     handleWorkspaceActionError(error);
     return;
   }
@@ -14001,6 +14007,7 @@ async function sendReplay() {
       return;
     }
     if (errorPayload.workspaceConflict) {
+      restoreReplayTabConflictState(tab, conflictSnapshot);
       handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
       return;
     }
@@ -14185,6 +14192,7 @@ async function followRedirect() {
   const tab = getActiveReplayTab();
   if (!tab || !tab.responseRecord) return;
   if (isReplayTabSending(tab.id)) return;
+  const conflictSnapshot = cloneReplayTabState(tab);
 
   const resp = tab.responseRecord.response;
   if (!resp) return;
@@ -14340,6 +14348,9 @@ async function followRedirect() {
   try {
     expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
   } catch (error) {
+    if (error instanceof WorkspaceStateConflictError) {
+      restoreReplayTabConflictState(tab, conflictSnapshot);
+    }
     handleWorkspaceActionError(error);
     return;
   }
@@ -14398,6 +14409,7 @@ async function followRedirect() {
     const errorPayload = await readReplaySendError(response);
     if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
     if (errorPayload.workspaceConflict) {
+      restoreReplayTabConflictState(tab, conflictSnapshot);
       handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
       return;
     }
@@ -14788,18 +14800,10 @@ async function closeRepeaterTab(id) {
     return;
   }
 
+  const closeSnapshot = snapshotReplayTabsState();
   const visualOrderBeforeClose = getReplayTabVisualOrder().map((tab) => tab.id);
   const visualIndex = visualOrderBeforeClose.indexOf(id);
   const closingTab = state.replayTabs[index];
-  if (closingTab.type === "websocket") {
-    try {
-      await cleanupWsReplayTab(closingTab);
-    } catch (error) {
-      console.warn("Failed to clean up WebSocket replay tab before close:", error);
-      stopWsPoll(closingTab);
-      closingTab.wsStatus = "disconnected";
-    }
-  }
   const currentIndex = state.replayTabs.findIndex((tab) => tab.id === id);
   if (currentIndex === -1) {
     return;
@@ -14828,8 +14832,27 @@ async function closeRepeaterTab(id) {
     state.activeReplayTabId = remainingVisualIds[replacementIndex] || state.replayTabs[Math.max(0, currentIndex - 1)].id;
   }
   scheduleWorkspaceStateSave();
-  flushWorkspaceState().catch(handleWorkspaceActionError);
   renderReplay();
+  try {
+    await flushWorkspaceState();
+  } catch (error) {
+    restoreReplayTabsState(closeSnapshot);
+    handleWorkspaceActionError(error);
+    renderReplay();
+    return;
+  }
+
+  if (closingTab.type === "websocket") {
+    try {
+      await cleanupWsReplayTab(closingTab, {
+        removeBackend: true,
+        guardWorkspaceRevision: false,
+      });
+    } catch (error) {
+      console.warn("Failed to clean up WebSocket replay tab after close:", error);
+      stopWsPoll(closingTab);
+    }
+  }
 }
 
 function replayTabLabel(tab) {
@@ -15305,6 +15328,126 @@ function cloneRepeaterHistoryEntry(entry) {
     targetHost: normalizedTarget.host,
     targetPort: normalizedTarget.port,
   };
+}
+
+function cloneReplayTabState(tab) {
+  if (!tab || typeof tab !== "object") {
+    return null;
+  }
+
+  if (tab.type === "websocket") {
+    const wsFrames = getWsReplayFrames(tab).map((frame) => ({ ...frame }));
+    const clone = {
+      id: tab.id,
+      type: "websocket",
+      sequence: tab.sequence,
+      customLabel: normalizeReplayTabCustomLabel(tab.customLabel || ""),
+      pinned: !!tab.pinned,
+      label: tab.label || `WS ${tab.wsHost || "draft"}`,
+      wsScheme: tab.wsScheme || "wss",
+      wsHost: tab.wsHost || "",
+      wsPort: normalizePortValue(tab.wsPort) || defaultWsPortForScheme(tab.wsScheme || "wss"),
+      wsPath: tab.wsPath || "/",
+      wsHeaders: normalizedHeaders(tab.wsHeaders),
+      wsHandshakeText: tab.wsHandshakeText || "",
+      wsHandshakeEdited: !!tab.wsHandshakeEdited,
+      wsStatus: tab.wsStatus || "disconnected",
+      wsFrames,
+      wsFramesTruncated: !!tab.wsFramesTruncated,
+      wsSelectedFrameIndex: normalizeWsReplaySavedFrameIndex(wsFrames, tab.wsSelectedFrameIndex),
+      wsFrameWindowStart: normalizeWsReplaySavedFrameWindowStart(wsFrames, tab.wsFrameWindowStart),
+      wsSessionId: tab.wsSessionId || null,
+      wsEditorText: tab.wsEditorText || "",
+      wsMessageType: normalizeWsMessageType(tab.wsMessageType),
+      wsEditorBodyEncoded: !!tab.wsEditorBodyEncoded,
+      wsError: tab.wsError || null,
+      wsPollTimer: null,
+      wsLifecycleToken: Number(tab.wsLifecycleToken) || 0,
+      wsSetupPending: !!tab.wsSetupPending,
+      wsSetupRunning: !!tab.wsSetupRunning,
+      wsSetupNotice: tab.wsSetupNotice || "",
+      wsSetupQueue: Array.isArray(tab.wsSetupQueue)
+        ? tab.wsSetupQueue.map((item) => ({
+            ...normalizeWsSetupItem(item),
+            sent: !!item.sent,
+          }))
+        : [],
+    };
+    rebuildWsReplayFrameTracking(clone);
+    return clone;
+  }
+
+  const historyEntries = Array.isArray(tab.historyEntries)
+    ? tab.historyEntries.map(cloneRepeaterHistoryEntry)
+    : [];
+  return {
+    id: tab.id,
+    sequence: tab.sequence,
+    customLabel: normalizeReplayTabCustomLabel(tab.customLabel || ""),
+    pinned: !!tab.pinned,
+    baseRequest: tab.baseRequest ? cloneEditableRequest(tab.baseRequest) : createDefaultEditableRequest(),
+    sourceTransactionId: tab.sourceTransactionId || null,
+    notice: tab.notice || "",
+    requestText: tab.requestText || "",
+    httpVersionMode: normalizeReplayHttpVersionMode(tab.httpVersionMode),
+    responseRecord: cloneTransactionRecord(tab.responseRecord),
+    targetScheme: tab.targetScheme || "https",
+    targetHost: tab.targetHost || "",
+    targetPort: normalizePortValue(tab.targetPort),
+    targetManuallyEdited: !!tab.targetManuallyEdited,
+    historyEntries,
+    historyIndex: normalizeRepeaterHistoryIndex(tab.historyIndex, historyEntries.length),
+    requestBytes: tab.requestBytes ? new Uint8Array(tab.requestBytes) : null,
+    requestOriginalBytes: tab.requestOriginalBytes ? new Uint8Array(tab.requestOriginalBytes) : null,
+  };
+}
+
+function restoreReplayTabState(tab, snapshot) {
+  const restored = cloneReplayTabState(snapshot);
+  if (!tab || !restored) {
+    return;
+  }
+  for (const key of Object.keys(tab)) {
+    delete tab[key];
+  }
+  Object.assign(tab, restored);
+  if (tab.type === "websocket") {
+    rebuildWsReplayFrameTracking(tab);
+  }
+}
+
+function snapshotReplayTabsState() {
+  return {
+    tabs: state.replayTabs.map(cloneReplayTabState).filter(Boolean),
+    activeReplayTabId: state.activeReplayTabId,
+    replayTabSequence: state.replayTabSequence,
+    replayRenamingTabId: state.replayRenamingTabId,
+  };
+}
+
+function restoreReplayTabsState(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.tabs)) {
+    return;
+  }
+  state.replayTabs = snapshot.tabs.map(cloneReplayTabState).filter(Boolean);
+  state.activeReplayTabId = state.replayTabs.some((tab) => tab.id === snapshot.activeReplayTabId)
+    ? snapshot.activeReplayTabId
+    : state.replayTabs[0]?.id ?? null;
+  state.replayTabSequence = Number.isFinite(snapshot.replayTabSequence)
+    ? snapshot.replayTabSequence
+    : Math.max(...state.replayTabs.map((tab) => Number(tab.sequence) || 0), 0);
+  state.replayRenamingTabId = state.replayTabs.some((tab) => tab.id === snapshot.replayRenamingTabId)
+    ? snapshot.replayRenamingTabId
+    : null;
+}
+
+function restoreReplayTabConflictState(tab, snapshot) {
+  restoreReplayTabState(tab, snapshot);
+  if (state.activeReplayTabId === tab?.id) {
+    renderReplay();
+  } else {
+    renderReplayTabs();
+  }
 }
 
 function recordRepeaterHistory(tab, snapshot) {
@@ -19239,6 +19382,7 @@ async function wsConnect() {
     els.wsPathInput.reportValidity();
     return;
   }
+  const conflictSnapshot = cloneReplayTabState(tab);
   const lifecycleToken = (tab.wsLifecycleToken || 0) + 1;
   tab.wsLifecycleToken = lifecycleToken;
   tab.wsSessionId = sessionId;
@@ -19290,6 +19434,7 @@ async function wsConnect() {
     if (!resp.ok) {
       const workspaceConflict = await readWorkspaceRevisionConflictPayload(resp);
       if (workspaceConflict) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
         handleReplayWorkspaceRevisionConflict(workspaceConflict);
         return;
       }
@@ -19310,6 +19455,11 @@ async function wsConnect() {
     await runSetupQueue(tab, lifecycleToken);
   } catch (e) {
     if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+      return;
+    }
+    if (e instanceof WorkspaceStateConflictError) {
+      restoreReplayTabConflictState(tab, conflictSnapshot);
+      handleWorkspaceActionError(e);
       return;
     }
     tab.wsStatus = "error";
@@ -19514,6 +19664,7 @@ async function cleanupWsReplayTab(tab, {
   markDisconnected = false,
   removeBackend = true,
   bypassExpectedActiveSessionGuard = false,
+  guardWorkspaceRevision = true,
   sessionId = null,
 } = {}) {
   if (!tab || tab.type !== "websocket") return;
@@ -19524,10 +19675,14 @@ async function cleanupWsReplayTab(tab, {
   clearWsFrameListRender(tab);
   await refreshWsReplayFramesOnce(tab, { lifecycleToken, sessionId: targetSessionId });
   stopWsPoll(tab);
+  const expectedWorkspaceRevision = guardWorkspaceRevision
+    ? await flushWorkspaceStateForReplayAction()
+    : null;
   const disconnectResult = await disconnectWsReplayBackend(tab.id, {
     remove: removeBackend,
     sessionId: targetSessionId,
     bypassExpectedActiveSessionGuard,
+    expectedWorkspaceRevision,
   });
   if (!disconnectResult.ok) {
     if (isWsReplayTabAlive(tab, lifecycleToken)) {
@@ -19611,6 +19766,7 @@ async function disconnectWsReplayBackend(id, {
   remove = false,
   sessionId = state.activeSession?.id || null,
   bypassExpectedActiveSessionGuard = false,
+  expectedWorkspaceRevision = null,
 } = {}) {
   try {
     const response = await fetch("/api/replay/ws-disconnect", {
@@ -19621,6 +19777,7 @@ async function disconnectWsReplayBackend(id, {
         expected_active_session_id: expectedActiveSessionIdForWrite(sessionId, {
           bypassExpectedActiveSessionGuard,
         }),
+        expected_workspace_revision: expectedWorkspaceRevision,
         id,
         remove,
       }),
@@ -20302,6 +20459,10 @@ function formatWsFrameSize(bytes) {
 
 function handleWsReplayActionError(error) {
   console.error(error);
+  if (error instanceof WorkspaceStateConflictError) {
+    handleWorkspaceActionError(error);
+    return;
+  }
   showToast(error?.message || "WebSocket Replay action failed.", "error");
 }
 

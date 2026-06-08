@@ -1129,7 +1129,7 @@ fn update_metadata_counts_from_snapshot(
     max_entries: usize,
 ) -> bool {
     let next_request_count = snapshot.transactions.len().min(max_entries);
-    let next_websocket_count = snapshot.websockets.len().min(max_entries);
+    let next_websocket_count = snapshot.websockets.len();
     let next_event_count = snapshot.event_log.len().min(max_entries);
     let next_fuzzer_count = snapshot.fuzzer_attacks.len().min(max_entries);
     let next_rule_count = snapshot.match_replace_rules.len();
@@ -5436,7 +5436,7 @@ mod tests {
         ));
 
         assert_eq!(metadata.request_count, 1);
-        assert_eq!(metadata.websocket_count, 1);
+        assert_eq!(metadata.websocket_count, 2);
         assert_eq!(metadata.event_count, 1);
         assert_eq!(metadata.fuzzer_count, 1);
     }

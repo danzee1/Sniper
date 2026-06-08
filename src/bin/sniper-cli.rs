@@ -1815,8 +1815,10 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             if explicit_target_update {
                 let current_target_fallback = replay_tab_target_as_request(tab);
                 let preserve_current_port = replay_update_should_preserve_current_port(
+                    args.scheme.as_deref(),
                     args.host.as_deref(),
                     args.port.as_deref(),
+                    tab.target_scheme.as_str(),
                     tab.target_port.as_str(),
                 );
                 let mut normalized = normalize_target_inputs(
@@ -2755,12 +2757,22 @@ fn push_replay_history_entry(tab: &mut ReplayTabState, entry: ReplayHistoryEntry
 }
 
 fn replay_update_should_preserve_current_port(
+    scheme: Option<&str>,
     host: Option<&str>,
     port: Option<&str>,
+    current_scheme: &str,
     current_port: &str,
 ) -> bool {
     if port.is_some_and(|value| !value.trim().is_empty()) || current_port.trim().is_empty() {
         return false;
+    }
+    if scheme.is_some_and(|value| !value.trim().is_empty()) {
+        let Ok(current_port) = normalize_replay_port(current_port) else {
+            return false;
+        };
+        if current_port == default_port_for_scheme(current_scheme).to_string() {
+            return false;
+        }
     }
     let Some(host) = host.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
@@ -6045,7 +6057,13 @@ mod tests {
 
         let mut target =
             normalize_target_inputs(Some("http".to_string()), None, None, Some(&fallback)).unwrap();
-        if replay_update_should_preserve_current_port(None, None, tab.target_port.as_str()) {
+        if replay_update_should_preserve_current_port(
+            Some("http"),
+            None,
+            None,
+            tab.target_scheme.as_str(),
+            tab.target_port.as_str(),
+        ) {
             target.port = normalize_replay_port(&tab.target_port).unwrap();
         }
 
@@ -6068,8 +6086,10 @@ mod tests {
             normalize_target_inputs(None, Some("new.example".to_string()), None, Some(&fallback))
                 .unwrap();
         if replay_update_should_preserve_current_port(
+            None,
             Some("new.example"),
             None,
+            tab.target_scheme.as_str(),
             tab.target_port.as_str(),
         ) {
             target.port = normalize_replay_port(&tab.target_port).unwrap();
@@ -6078,6 +6098,33 @@ mod tests {
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "new.example");
         assert_eq!(target.port, "9443");
+    }
+
+    #[test]
+    fn replay_update_scheme_only_does_not_preserve_previous_default_port() {
+        let tab = ReplayTabState {
+            target_scheme: "https".to_string(),
+            target_host: "example.com".to_string(),
+            target_port: "443".to_string(),
+            ..Default::default()
+        };
+        let fallback = replay_tab_target_as_request(&tab).unwrap();
+
+        let mut target =
+            normalize_target_inputs(Some("http".to_string()), None, None, Some(&fallback)).unwrap();
+        if replay_update_should_preserve_current_port(
+            Some("http"),
+            None,
+            None,
+            tab.target_scheme.as_str(),
+            tab.target_port.as_str(),
+        ) {
+            target.port = normalize_replay_port(&tab.target_port).unwrap();
+        }
+
+        assert_eq!(target.scheme, "http");
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, "80");
     }
 
     #[test]

@@ -1027,7 +1027,7 @@ fn request_has_target_validation_authority(request: &EditableRequest) -> bool {
     !request.scheme.trim().is_empty() && !request.host.trim().is_empty()
 }
 
-fn validate_request_target_override_for_request(
+pub(crate) fn validate_request_target_override_for_request(
     request: &EditableRequest,
     target: &RequestTargetOverride,
 ) -> std::result::Result<(), String> {
@@ -5031,16 +5031,20 @@ async fn run_fuzzer_attack(
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
     if let Some(target) = payload.target.as_ref() {
-        if let Err(error) = validate_request_target_override_for_request(&payload.template, target)
-        {
+        if let Err(error) = validate_request_target_override(target) {
             return (StatusCode::BAD_REQUEST, error).into_response();
         }
     }
-    if let Err(error) = fuzzer::validate_expanded_requests(
-        &payload.template,
-        &payload.payloads,
-        validate_runnable_editable_request,
-    ) {
+    let target = payload.target.as_ref();
+    if let Err(error) =
+        fuzzer::validate_expanded_requests(&payload.template, &payload.payloads, |request| {
+            validate_runnable_editable_request(request)?;
+            if let Some(target) = target {
+                validate_request_target_override_for_request(request, target)?;
+            }
+            Ok(())
+        })
+    {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
     let _session_owner =
@@ -5569,6 +5573,8 @@ struct WsReplayDisconnectPayload {
     session_id: Option<Uuid>,
     #[serde(default)]
     expected_active_session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_workspace_revision: Option<u64>,
     id: Uuid,
     #[serde(default)]
     remove: bool,
@@ -5581,6 +5587,16 @@ async fn ws_replay_disconnect(
     let Some(session_id) = payload.session_id else {
         return active_session_conflict_response(&state);
     };
+    let session = match resolve_session_for_required_id(&state, Some(session_id)).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(&session, payload.expected_workspace_revision)
+            .await
+    {
+        return response;
+    }
     let _operation_guard = match guard_ws_replay_connection_owner_operation(
         &state,
         payload.id,
@@ -13288,6 +13304,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fuzzer_run_rejects_expanded_ip_host_target_override_before_attack() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-fuzzer-expanded-ip-target-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+
+        let response = super::run_fuzzer_attack(
+            State(state.clone()),
+            Json(crate::fuzzer::FuzzerAttackPayload {
+                session_id: Some(session.id()),
+                expected_active_session_id: None,
+                template: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "$payload$".to_string(),
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                payloads: vec!["127.0.0.1".to_string()],
+                source_transaction_id: None,
+                http_version: None,
+                target: Some(RequestTargetOverride {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    port: "443".to_string(),
+                }),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("request host is an IP address"));
+        assert!(session.fuzzer.list(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn fuzzer_run_rejects_stale_implicit_active_session_guard() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-active-guard-{}",
@@ -13637,6 +13705,7 @@ mod tests {
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: Uuid::new_v4(),
                 remove: false,
             }),
@@ -13668,6 +13737,7 @@ mod tests {
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: Uuid::new_v4(),
                 remove: true,
             }),
@@ -13707,6 +13777,7 @@ mod tests {
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(session_id),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: connection_id,
                 remove: true,
             }),
@@ -13848,6 +13919,7 @@ mod tests {
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: connection_id,
                 remove: true,
             }),
@@ -14052,6 +14124,7 @@ mod tests {
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: Some(original_id),
+                expected_workspace_revision: None,
                 id: remove_id,
                 remove: true,
             }),
@@ -14126,6 +14199,44 @@ mod tests {
         .await;
         assert_eq!(response.status(), super::StatusCode::CONFLICT);
         assert!(state.ws_replay.snapshot(send_id).await.is_some());
+
+        let disconnect_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(disconnect_id, session_id)
+            .await;
+        let response = super::ws_replay_disconnect(
+            State(state.clone()),
+            Json(super::WsReplayDisconnectPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(stale_revision),
+                id: disconnect_id,
+                remove: false,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(disconnect_id).await.is_some());
+
+        let remove_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(remove_id, session_id)
+            .await;
+        let response = super::ws_replay_disconnect(
+            State(state.clone()),
+            Json(super::WsReplayDisconnectPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(stale_revision),
+                id: remove_id,
+                remove: true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        assert!(state.ws_replay.snapshot(remove_id).await.is_some());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -14281,6 +14392,7 @@ mod tests {
             Json(super::WsReplayDisconnectPayload {
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 id: Uuid::new_v4(),
                 remove: true,
             }),
