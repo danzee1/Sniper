@@ -22633,8 +22633,8 @@ const sniperCMTheme = CM.EditorView.theme({
   /* ── Search highlight ── */
   ".tok-search-hit":   { background: "rgba(132, 151, 173, 0.2)", borderRadius: "4px", padding: "0 1px" },
   ".tok-search-active": { background: "rgba(201, 169, 110, 0.4)", borderRadius: "4px", padding: "0 1px" },
-  ".tok-finding-evidence-hit": { color: "#fff7c2", background: "rgba(250, 204, 21, 0.58)", borderRadius: "3px", padding: "0 1px", boxShadow: "0 0 0 1px rgba(250, 204, 21, 0.8)" },
-  ".tok-finding-evidence-active": { color: "#fff7c2", background: "rgba(250, 204, 21, 0.76)", borderRadius: "3px", padding: "0 1px", boxShadow: "0 0 0 1px rgba(250, 204, 21, 1), 0 0 10px rgba(250, 204, 21, 0.22)" },
+  ".tok-finding-evidence-hit": { color: "#1a1200", background: "rgba(250, 204, 21, 0.82)", borderRadius: "3px", padding: "0 2px", fontWeight: "700", boxShadow: "0 0 0 1px rgba(250, 204, 21, 0.95), 0 0 8px rgba(250, 204, 21, 0.18)" },
+  ".tok-finding-evidence-active": { color: "#140d00", background: "rgba(255, 214, 10, 0.94)", borderRadius: "3px", padding: "0 2px", fontWeight: "800", boxShadow: "0 0 0 1px rgba(255, 214, 10, 1), 0 0 12px rgba(250, 204, 21, 0.3)" },
 }, { dark: true });
 
 // ─── HTTP decoration plugin ─────────────────────────────────────────────────

@@ -1327,6 +1327,9 @@ fn generic_secret_candidate_looks_like_secret(captures: &regex::Captures<'_>) ->
     if secret_candidate_is_masked(&normalized) || secret_candidate_is_placeholder(&normalized) {
         return false;
     }
+    if generic_secret_candidate_is_header_value_copy(&normalized) {
+        return false;
+    }
     if normalized.chars().collect::<HashSet<_>>().len() < 6 {
         return false;
     }
@@ -1343,6 +1346,27 @@ fn generic_secret_candidate_looks_like_secret(captures: &regex::Captures<'_>) ->
         .count();
 
     class_count >= 2 && (has_digit || has_symbol)
+}
+
+fn generic_secret_candidate_is_header_value_copy(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if compact.is_empty() {
+        return false;
+    }
+
+    let header_marker = compact.contains("header")
+        || compact.contains("authorization")
+        || compact.contains("contenttype")
+        || compact.contains("cookie");
+    let metadata_marker = compact.contains("value")
+        || compact.contains("request")
+        || compact.contains("response")
+        || compact.contains("example");
+
+    header_marker && metadata_marker
 }
 
 fn normalize_secret_candidate(value: &str) -> String {
@@ -2951,6 +2975,25 @@ mod tests {
                     || finding.title.contains("Secret/Token pattern")
             }),
             "placeholder generic secrets should not create Findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_header_value_copy_as_generic_secret() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Required request header: X-Api-Key: HeaderValueForRequests12345",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| {
+                finding.title.contains("API Key/Secret pattern")
+                    || finding.title.contains("Secret/Token pattern")
+            }),
+            "header documentation values should not create generic secret Findings"
         );
     }
 

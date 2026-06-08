@@ -2938,20 +2938,20 @@ fn websocket_list_path(session_id: Option<Uuid>, args: &WebSocketListArgs) -> St
     if let Some(offset) = args.offset {
         params.push(("offset".to_string(), offset.to_string()));
     }
-    if let Some(sort_key) = args
+    let sort_key = args
         .sort_key
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+        .filter(|value| !value.is_empty());
+    if let Some(sort_key) = sort_key {
         params.push(("sort_key".to_string(), sort_key.to_string()));
     }
-    if let Some(sort_direction) = args
+    let sort_direction = args
         .sort_direction
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+        .filter(|value| !value.is_empty());
+    if let Some(sort_direction) = sort_direction {
         params.push(("sort_direction".to_string(), sort_direction.to_string()));
     }
     if args.in_scope_only {
@@ -2960,7 +2960,13 @@ fn websocket_list_path(session_id: Option<Uuid>, args: &WebSocketListArgs) -> St
     if args.live_only {
         params.push(("live_only".to_string(), "true".to_string()));
     }
-    let endpoint = if args.page || args.offset.is_some() {
+    let endpoint = if args.page
+        || args.offset.is_some()
+        || sort_key.is_some()
+        || sort_direction.is_some()
+        || args.in_scope_only
+        || args.live_only
+    {
         "/api/websockets-page"
     } else {
         "/api/websockets"
@@ -4957,6 +4963,25 @@ mod tests {
         assert_eq!(
             websocket_list_path(Some(session_id), &offset_args),
             "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&offset=100"
+        );
+        let sorted_args = WebSocketListArgs {
+            limit: Some(1),
+            sort_key: Some("host".to_string()),
+            sort_direction: Some("asc".to_string()),
+            ..WebSocketListArgs::default()
+        };
+        assert_eq!(
+            websocket_list_path(Some(session_id), &sorted_args),
+            "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&sort_key=host&sort_direction=asc"
+        );
+        let in_scope_args = WebSocketListArgs {
+            limit: Some(1),
+            in_scope_only: true,
+            ..WebSocketListArgs::default()
+        };
+        assert_eq!(
+            websocket_list_path(Some(session_id), &in_scope_args),
+            "/api/websockets-page?session_id=22222222-2222-2222-2222-222222222222&limit=1&in_scope_only=true"
         );
         let filtered_args = WebSocketListArgs {
             query: Some("chat socket".to_string()),
