@@ -13,6 +13,9 @@ use uuid::Uuid;
 use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
 
 const MAX_SCANNER_BROADCAST_CAPACITY: usize = 4096;
+pub const MAX_SCANNER_CUSTOM_RULES: usize = 250;
+pub const MAX_SCANNER_FIELD_BYTES: usize = 64 * 1024;
+pub const MAX_SCANNER_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
 // ── Scanner config ──
 
@@ -67,6 +70,53 @@ impl Default for ScannerConfig {
     }
 }
 
+pub fn sanitize_scanner_config(mut config: ScannerConfig) -> ScannerConfig {
+    let mut seen_rule_ids = HashSet::new();
+    config.custom_rules = config
+        .custom_rules
+        .into_iter()
+        .filter(|rule| valid_restored_custom_rule(rule, &mut seen_rule_ids))
+        .take(MAX_SCANNER_CUSTOM_RULES)
+        .collect();
+    while serde_json::to_vec(&config)
+        .map(|bytes| bytes.len() > MAX_SCANNER_CONFIG_BYTES)
+        .unwrap_or(true)
+    {
+        if config.custom_rules.pop().is_none() {
+            config = ScannerConfig::default();
+            break;
+        }
+    }
+    config
+}
+
+fn valid_restored_custom_rule(rule: &CustomRule, seen_rule_ids: &mut HashSet<String>) -> bool {
+    if rule.id.len() > MAX_SCANNER_FIELD_BYTES
+        || rule.name.len() > MAX_SCANNER_FIELD_BYTES
+        || rule.target.len() > MAX_SCANNER_FIELD_BYTES
+        || rule.header_name.len() > MAX_SCANNER_FIELD_BYTES
+        || rule.pattern.len() > MAX_SCANNER_FIELD_BYTES
+        || rule.category.len() > MAX_SCANNER_FIELD_BYTES
+        || rule.description.len() > MAX_SCANNER_FIELD_BYTES
+    {
+        return false;
+    }
+    let id = rule.id.trim();
+    if id.is_empty() || !seen_rule_ids.insert(id.to_string()) {
+        return false;
+    }
+    if rule.name.trim().is_empty() || rule.pattern.trim().is_empty() {
+        return false;
+    }
+    if !matches!(
+        rule.target.as_str(),
+        "response_body" | "response_header" | "request_header"
+    ) {
+        return false;
+    }
+    Regex::new(&rule.pattern).is_ok()
+}
+
 fn default_scanner_enabled() -> bool {
     true
 }
@@ -111,6 +161,8 @@ pub struct ScannerFinding {
     pub evidence: String,
     pub host: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<FindingLocation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,6 +177,17 @@ pub struct FindingSummary {
     pub title: String,
     pub host: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<FindingLocation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FindingLocation {
+    pub side: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub section: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 impl ScannerFinding {
@@ -139,6 +202,7 @@ impl ScannerFinding {
             title: self.title.clone(),
             host: self.host.clone(),
             path: self.path.clone(),
+            location: self.location.clone(),
         }
     }
 }
@@ -249,7 +313,7 @@ impl ScannerStore {
     }
 
     pub async fn update_config(&self, new_config: ScannerConfig) {
-        *self.config.write().await = new_config;
+        *self.config.write().await = sanitize_scanner_config(new_config);
     }
 
     /// Create a store pre-populated with persisted findings.
@@ -269,7 +333,7 @@ impl ScannerStore {
             max_entries,
             entries: RwLock::new(VecDeque::from(findings)),
             events,
-            config: RwLock::new(config),
+            config: RwLock::new(sanitize_scanner_config(config)),
             seen: RwLock::new(seen),
             clear_generation: AtomicU64::new(0),
         }
@@ -391,6 +455,12 @@ pub fn scan_transaction(record: &TransactionRecord, config: &ScannerConfig) -> V
         }
     }
 
+    for finding in &mut findings {
+        if finding.location.is_none() {
+            finding.location = infer_finding_location(record, finding);
+        }
+    }
+
     findings
 }
 
@@ -405,13 +475,13 @@ fn check_custom_rule(
         Err(_) => return, // invalid pattern — skip silently
     };
 
-    let targets: Vec<(&str, String)> = match rule.target.as_str() {
+    let targets: Vec<(String, Option<FindingLocation>)> = match rule.target.as_str() {
         "response_body" => {
             if let Some(response) = &record.response {
                 if is_binary_body(response) {
                     vec![]
                 } else {
-                    vec![("response body", response.body_preview.clone())]
+                    vec![(response.body_preview.clone(), None)]
                 }
             } else {
                 vec![]
@@ -422,16 +492,21 @@ fn check_custom_rule(
                 response
                     .headers
                     .iter()
+                    .enumerate()
                     .filter(|h| {
+                        let header = h.1;
                         rule.header_name.is_empty()
-                            || h.name.eq_ignore_ascii_case(&rule.header_name)
+                            || header.name.eq_ignore_ascii_case(&rule.header_name)
                     })
-                    .map(|h| (h.name.as_str(), h.value.clone()))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|(n, v)| {
-                        // Need to own the name for the tuple
-                        (n as &str, v)
+                    .map(|(index, header)| {
+                        (
+                            header.value.clone(),
+                            Some(FindingLocation {
+                                side: "response".to_string(),
+                                section: "header".to_string(),
+                                line: Some(index + 2),
+                            }),
+                        )
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -442,15 +517,28 @@ fn check_custom_rule(
             .request
             .headers
             .iter()
+            .enumerate()
             .filter(|h| {
-                rule.header_name.is_empty() || h.name.eq_ignore_ascii_case(&rule.header_name)
+                let header = h.1;
+                rule.header_name.is_empty() || header.name.eq_ignore_ascii_case(&rule.header_name)
             })
-            .map(|h| ("request header", h.value.clone()))
+            .map(|(index, header)| {
+                (
+                    header.value.clone(),
+                    Some(FindingLocation {
+                        side: "request".to_string(),
+                        section: "header".to_string(),
+                        line: Some(
+                            index + 2 + usize::from(request_finding_synthesizes_host(record)),
+                        ),
+                    }),
+                )
+            })
             .collect(),
         _ => vec![],
     };
 
-    for (_source, text) in targets {
+    for (text, location) in targets {
         if let Some(m) = re.find(&text) {
             let mut finding = make_finding(
                 record,
@@ -461,6 +549,7 @@ fn check_custom_rule(
                 truncate_evidence(m.as_str(), 120),
             );
             finding.rule_id = rule.id.clone();
+            finding.location = location;
             findings.push(finding);
             break; // one match per rule per request is enough
         }
@@ -487,7 +576,254 @@ fn make_finding(
         evidence: evidence.into(),
         host: record.host.clone(),
         path: record.path.clone(),
+        location: None,
     }
+}
+
+fn infer_finding_location(
+    record: &TransactionRecord,
+    finding: &ScannerFinding,
+) -> Option<FindingLocation> {
+    let response_text = raw_response_text_for_finding(record);
+    let request_text = raw_request_text_for_finding(record);
+    let prefer_request = finding.category == "auth"
+        || finding
+            .evidence
+            .to_ascii_lowercase()
+            .starts_with("authorization:");
+
+    let mut sides = if prefer_request {
+        vec![
+            ("request", Some(request_text.as_str())),
+            ("response", response_text.as_deref()),
+        ]
+    } else {
+        vec![
+            ("response", response_text.as_deref()),
+            ("request", Some(request_text.as_str())),
+        ]
+    };
+
+    if let Some(query) = finding_evidence_query(&finding.evidence, finding) {
+        for (side, text) in &sides {
+            let Some(text) = text else {
+                continue;
+            };
+            if let Some(line) = line_number_for_query(text, &query) {
+                return Some(location_for_line(record, side, line));
+            }
+        }
+    }
+
+    for keyword in finding_location_keywords(finding) {
+        for (side, text) in &sides {
+            let Some(text) = text else {
+                continue;
+            };
+            if let Some(line) = line_number_for_query(text, keyword) {
+                return Some(location_for_line(record, side, line));
+            }
+        }
+    }
+
+    sides.clear();
+    if finding.title.starts_with("Missing ")
+        && matches!(finding.category.as_str(), "header" | "misconfig")
+    {
+        return Some(FindingLocation {
+            side: "response".to_string(),
+            section: "headers".to_string(),
+            line: None,
+        });
+    }
+
+    None
+}
+
+fn raw_request_text_for_finding(record: &TransactionRecord) -> String {
+    let start_line = if matches!(&record.kind, &crate::model::TrafficKind::Tunnel) {
+        format!(
+            "CONNECT {} {}",
+            record.host,
+            record.http_version.as_deref().unwrap_or("HTTP/1.1")
+        )
+    } else {
+        format!(
+            "{} {} {}",
+            record.method,
+            if record.path.is_empty() {
+                "/"
+            } else {
+                &record.path
+            },
+            record.http_version.as_deref().unwrap_or("HTTP/1.1")
+        )
+    };
+    let headers = request_headers_for_finding(record);
+    raw_message_text(start_line, &headers, &record.request.body_preview)
+}
+
+fn request_headers_for_finding(record: &TransactionRecord) -> Vec<crate::model::HeaderRecord> {
+    let mut headers = Vec::new();
+    if request_finding_synthesizes_host(record) {
+        headers.push(crate::model::HeaderRecord {
+            name: "Host".to_string(),
+            value: record.host.clone(),
+        });
+    }
+    headers.extend(record.request.headers.iter().cloned());
+    headers
+}
+
+fn request_finding_synthesizes_host(record: &TransactionRecord) -> bool {
+    !record.host.trim().is_empty()
+        && !record
+            .request
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("host"))
+}
+
+fn raw_response_text_for_finding(record: &TransactionRecord) -> Option<String> {
+    let response = record.response.as_ref()?;
+    let start_line = format!(
+        "{} {}",
+        record
+            .response_http_version
+            .as_deref()
+            .or(record.http_version.as_deref())
+            .unwrap_or("HTTP/1.1"),
+        record.status.unwrap_or(0)
+    );
+    Some(raw_message_text(
+        start_line,
+        &response.headers,
+        &response.body_preview,
+    ))
+}
+
+fn raw_message_text(
+    start_line: String,
+    headers: &[crate::model::HeaderRecord],
+    body: &str,
+) -> String {
+    let mut text = start_line;
+    for header in headers {
+        text.push('\n');
+        text.push_str(&header.name);
+        text.push_str(": ");
+        text.push_str(&header.value);
+    }
+    if !body.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(body);
+    }
+    text
+}
+
+fn finding_evidence_query(evidence: &str, finding: &ScannerFinding) -> Option<String> {
+    let keywords = finding_location_keywords(finding);
+    let line = evidence
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            let line_lower = line.to_ascii_lowercase();
+            line.len() >= 3
+                && keywords
+                    .iter()
+                    .any(|keyword| line_lower.contains(keyword.trim_end_matches(':')))
+        })
+        .or_else(|| evidence.lines().map(str::trim).find(|line| line.len() >= 3))?;
+    let line = line.trim_end_matches("...").trim();
+    (line.len() >= 3).then(|| line.to_string())
+}
+
+fn line_number_for_query(text: &str, query: &str) -> Option<usize> {
+    let needle = query.trim();
+    if needle.len() < 3 {
+        return None;
+    }
+    let haystack = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let index = haystack.find(&needle)?;
+    Some(text[..index].bytes().filter(|byte| *byte == b'\n').count() + 1)
+}
+
+fn location_for_line(record: &TransactionRecord, side: &str, line: usize) -> FindingLocation {
+    let header_count = if side == "request" {
+        record.request.headers.len() + usize::from(request_finding_synthesizes_host(record))
+    } else {
+        record
+            .response
+            .as_ref()
+            .map(|response| response.headers.len())
+            .unwrap_or(0)
+    };
+    let section = if line == 1 {
+        "start_line"
+    } else if line <= header_count + 1 {
+        "header"
+    } else {
+        "body"
+    };
+    FindingLocation {
+        side: side.to_string(),
+        section: section.to_string(),
+        line: Some(line),
+    }
+}
+
+fn finding_location_keywords(finding: &ScannerFinding) -> Vec<&'static str> {
+    let title = finding.title.to_ascii_lowercase();
+    let mut keywords = Vec::new();
+    if title.contains("content-security-policy") {
+        keywords.push("content-security-policy:");
+    }
+    if title.contains("strict-transport-security") {
+        keywords.push("strict-transport-security:");
+    }
+    if title.contains("x-content-type-options") {
+        keywords.push("x-content-type-options:");
+    }
+    if title.contains("x-frame-options") {
+        keywords.push("x-frame-options:");
+        keywords.push("frame-ancestors");
+    }
+    if title.contains("httponly") || title.contains("secure flag") || title.contains("samesite") {
+        keywords.push("set-cookie:");
+    }
+    if title.contains("cors") {
+        keywords.push("access-control-allow-origin:");
+        keywords.push("access-control-allow-credentials:");
+        keywords.push("access-control-allow-methods:");
+    }
+    if title.contains("server version") || title.contains("header exposed") {
+        keywords.push("server:");
+        keywords.push("x-powered-by:");
+    }
+    if title.contains("jwt") || title.contains("basic authentication") {
+        keywords.push("authorization:");
+        keywords.push("bearer");
+    }
+    if title.contains("open redirect") {
+        keywords.push("location:");
+    }
+    if title.contains("cache-control") {
+        keywords.push("cache-control:");
+    }
+    if title.contains("source map header") {
+        keywords.push("sourcemap:");
+        keywords.push("x-sourcemap:");
+    }
+    if title.contains("sql") {
+        keywords.push("sql syntax");
+        keywords.push("mysql");
+        keywords.push("postgresql");
+    }
+    if title.contains("syntax error") {
+        keywords.push("syntax error");
+    }
+    keywords
 }
 
 // ── Rule 1: JWT Analysis ──
@@ -592,9 +928,28 @@ fn extract_jwt_from_text(text: &str) -> Vec<String> {
     let re = Regex::new(r"eyJ[A-Za-z0-9_-]*(?:\.|%2[eE])[A-Za-z0-9_-]+(?:\.|%2[eE])[A-Za-z0-9_-]*")
         .unwrap();
     re.find_iter(text)
+        .filter(|m| jwt_body_match_has_token_context(text, m))
         .map(|m| normalize_jwt_token_candidate(m.as_str()))
         .filter(|token| looks_like_jwt(token))
         .collect()
+}
+
+fn jwt_body_match_has_token_context(text: &str, m: &regex::Match<'_>) -> bool {
+    let start = previous_char_boundary(text, m.start().saturating_sub(96));
+    let context = text[start..m.start()].to_ascii_lowercase();
+    [
+        "token",
+        "jwt",
+        "authorization",
+        "bearer",
+        "session",
+        "access",
+        "refresh",
+        "id_token",
+        "auth",
+    ]
+    .iter()
+    .any(|needle| context.contains(needle))
 }
 
 fn decode_jwt_part(part: &str) -> Option<String> {
@@ -625,12 +980,19 @@ fn analyze_jwt(
         Some(json) => json,
         None => return,
     };
-    let payload_json = decode_jwt_part(parts[1]).unwrap_or_default();
+    let Some(payload_json) = decode_jwt_part(parts[1]) else {
+        return;
+    };
 
-    let jwt_alg = jwt_alg_from_header(&header_json);
+    let Some(jwt_alg) = jwt_alg_from_header(&header_json) else {
+        return;
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) else {
+        return;
+    };
 
     // Check alg:none
-    if jwt_alg.as_deref() == Some("none") {
+    if jwt_alg == "none" {
         findings.push(make_finding(
             record,
             Severity::High,
@@ -641,37 +1003,8 @@ fn analyze_jwt(
         ));
     }
 
-    // Check weak algorithms
-    for weak_alg in &["hs256", "hs384", "hs512"] {
-        if jwt_alg.as_deref() == Some(*weak_alg) {
-            findings.push(make_finding(
-                record,
-                Severity::Low,
-                "jwt",
-                format!("JWT uses symmetric algorithm ({})", weak_alg.to_uppercase()),
-                format!("JWT token in {source} uses symmetric signing ({0}). If the secret is weak or shared, tokens can be forged.", weak_alg.to_uppercase()),
-                truncate_evidence(token, 120),
-            ));
-        }
-    }
-
     // Check expiration
-    if payload_json.contains("\"exp\"") {
-        // Try to extract exp value
-        if let Some(exp) = extract_json_number(&payload_json, "exp") {
-            let now = Utc::now().timestamp();
-            if exp < now {
-                findings.push(make_finding(
-                    record,
-                    Severity::Info,
-                    "jwt",
-                    "Expired JWT token",
-                    format!("JWT token in {source} has expired (exp: {exp}, now: {now})."),
-                    truncate_evidence(token, 120),
-                ));
-            }
-        }
-    } else {
+    if payload.get("exp").is_none() {
         findings.push(make_finding(
             record,
             Severity::Medium,
@@ -681,16 +1014,6 @@ fn analyze_jwt(
             truncate_evidence(token, 120),
         ));
     }
-
-    // Always report JWT detection as info (so user knows JWTs are in use)
-    findings.push(make_finding(
-        record,
-        Severity::Info,
-        "jwt",
-        format!("JWT detected in {source}"),
-        format!("JWT token found in {source}. Header: {header_json}"),
-        truncate_evidence(token, 120),
-    ));
 }
 
 fn jwt_alg_from_header(header_json: &str) -> Option<String> {
@@ -709,11 +1032,6 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
         None => return,
     };
 
-    // Only check HTML page responses.
-    if !is_html_page_response(response) {
-        return;
-    }
-
     let header_value = |name: &str| -> Option<&str> {
         response
             .headers
@@ -722,19 +1040,8 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
             .map(|h| h.value.as_str())
     };
 
-    if header_value("content-security-policy").is_none_or(|value| value.trim().is_empty()) {
-        findings.push(make_finding(
-            record,
-            Severity::Low,
-            "header",
-            "Missing Content-Security-Policy",
-            "No CSP header found. CSP helps prevent XSS and data injection attacks.",
-            "",
-        ));
-    }
-
-    if !header_value("strict-transport-security").is_some_and(valid_hsts_header_value)
-        && record.scheme == "https"
+    if should_check_hsts(record)
+        && !header_value("strict-transport-security").is_some_and(valid_hsts_header_value)
     {
         findings.push(make_finding(
             record,
@@ -742,6 +1049,23 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
             "header",
             "Missing Strict-Transport-Security",
             "HTTPS response lacks HSTS header. Browsers may allow HTTP downgrade attacks.",
+            "",
+        ));
+    }
+
+    // Only check successful HTML document responses. Error pages and fallback
+    // HTML snippets create noisy checklist findings in passive capture.
+    if !is_success_html_page_response(record, response) {
+        return;
+    }
+
+    if header_value("content-security-policy").is_none_or(|value| value.trim().is_empty()) {
+        findings.push(make_finding(
+            record,
+            Severity::Low,
+            "header",
+            "Missing Content-Security-Policy",
+            "No CSP header found. CSP helps prevent XSS and data injection attacks.",
             "",
         ));
     }
@@ -822,6 +1146,17 @@ fn is_html_page_response(response: &crate::model::MessageRecord) -> bool {
         || body.contains("<body")
 }
 
+fn is_success_html_page_response(
+    record: &TransactionRecord,
+    response: &crate::model::MessageRecord,
+) -> bool {
+    matches!(record.status, Some(200..=299)) && is_html_page_response(response)
+}
+
+fn should_check_hsts(record: &TransactionRecord) -> bool {
+    record.scheme.eq_ignore_ascii_case("https") && matches!(record.status, Some(200..=399))
+}
+
 // ── Rule 3: Cookie Flags ──
 
 fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -835,7 +1170,16 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
             continue;
         }
 
-        let cookie_name = header.value.split('=').next().unwrap_or("unknown").trim();
+        if set_cookie_is_deletion(&header.value) {
+            continue;
+        }
+
+        let Some((cookie_name, cookie_value)) = set_cookie_name_value(&header.value) else {
+            continue;
+        };
+        if !cookie_requires_security_flags(cookie_name, cookie_value) {
+            continue;
+        }
         let attributes = cookie_attribute_names(&header.value);
 
         if !attributes.contains("httponly") {
@@ -883,6 +1227,55 @@ fn cookie_attribute_names(value: &str) -> HashSet<String> {
         .collect()
 }
 
+fn set_cookie_name_value(value: &str) -> Option<(&str, &str)> {
+    let pair = value.split(';').next()?.trim();
+    let (name, value) = pair.split_once('=')?;
+    let name = name.trim();
+    let value = value.trim().trim_matches('"');
+    if name.is_empty()
+        || name.eq_ignore_ascii_case("null")
+        || value.is_empty()
+        || value.eq_ignore_ascii_case("null")
+    {
+        return None;
+    }
+    Some((name, value))
+}
+
+fn cookie_requires_security_flags(name: &str, value: &str) -> bool {
+    cookie_looks_auth_sensitive(name, value)
+}
+
+fn cookie_looks_auth_sensitive(name: &str, value: &str) -> bool {
+    if is_auth_cookie_name(name) {
+        return true;
+    }
+    looks_like_jwt(&normalize_jwt_token_candidate(value))
+}
+
+fn set_cookie_is_deletion(value: &str) -> bool {
+    if set_cookie_attribute_value(value, "max-age")
+        .and_then(|max_age| max_age.trim().parse::<i64>().ok())
+        .is_some_and(|max_age| max_age <= 0)
+    {
+        return true;
+    }
+
+    set_cookie_attribute_value(value, "expires")
+        .and_then(|expires| DateTime::parse_from_rfc2822(expires.trim()).ok())
+        .is_some_and(|expires| expires.with_timezone(&Utc) <= Utc::now())
+}
+
+fn set_cookie_attribute_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    value.split(';').skip(1).find_map(|attribute| {
+        let (attribute_name, attribute_value) = attribute.trim().split_once('=')?;
+        attribute_name
+            .trim()
+            .eq_ignore_ascii_case(name)
+            .then_some(attribute_value.trim())
+    })
+}
+
 // ── Rule 4: Sensitive Data Exposure ──
 
 fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -902,18 +1295,11 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
     }
 
     static PATTERNS: &[(&str, &str, Severity)] = &[
-        // ── Cloud provider keys ──
-        (r"AKIA[0-9A-Z]{16}", "AWS Access Key ID", Severity::High),
+        // ── Cloud provider secrets ──
         (
             r#"(?i)\b(aws_secret_access_key|aws_secret)\b["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}"#,
             "AWS Secret Access Key",
             Severity::High,
-        ),
-        (r"AIza[0-9A-Za-z_-]{35}", "Google API Key", Severity::High),
-        (
-            r"(?i)\b[0-9]+-[a-z0-9_]+\.apps\.googleusercontent\.com\b",
-            "Google OAuth Client ID",
-            Severity::Medium,
         ),
         // ── AI / ML tokens ──
         (
@@ -1061,11 +1447,6 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::Critical,
         ),
         (
-            r"pk_live_[0-9a-zA-Z]{24,}",
-            "Stripe Publishable Key",
-            Severity::Low,
-        ),
-        (
             r"rk_live_[0-9a-zA-Z]{24,}",
             "Stripe Restricted Key",
             Severity::High,
@@ -1086,7 +1467,6 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             Severity::High,
         ),
         // ── Communication / Messaging tokens ──
-        (r"SK[0-9a-fA-F]{32}", "Twilio API Key", Severity::High),
         (
             r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}",
             "SendGrid API Key",
@@ -1137,11 +1517,6 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             "Grafana Service Account Token",
             Severity::High,
         ),
-        (
-            r"https://[a-zA-Z0-9]+@[a-z]+\.ingest\.sentry\.io/\d+",
-            "Sentry DSN",
-            Severity::Medium,
-        ),
         // ── Database connection strings ──
         (
             r#"mongodb(?:\+srv)?://[^\s'"]{10,}"#,
@@ -1176,23 +1551,6 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             r"(?i)(?:AccountKey|SharedAccessKey)\s*=\s*[A-Za-z0-9+/=]{40,}",
             "Azure Storage/SAS Key",
             Severity::High,
-        ),
-        // ── Firebase ──
-        (
-            r"(?i)[a-z0-9-]+\.firebaseio\.com",
-            "Firebase database URL",
-            Severity::Low,
-        ),
-        (
-            r"(?i)[a-z0-9-]+\.firebaseapp\.com",
-            "Firebase app URL",
-            Severity::Info,
-        ),
-        // ── Network / Infrastructure ──
-        (
-            r"\b(?:10\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)|172\.(?:1[6-9]|2\d|3[01])\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)|192\.168\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d))\b",
-            "Internal IP address",
-            Severity::Low,
         ),
         // ── Sensitive file paths ──
         (
@@ -1229,7 +1587,24 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                 {
                     continue;
                 }
-                if is_card_number_label(label) && !luhn_valid(m.as_str()) {
+                if is_card_number_label(label)
+                    && (!luhn_valid(m.as_str())
+                        || card_number_is_known_test(m.as_str())
+                        || !card_number_match_has_payment_context(body, &m))
+                {
+                    continue;
+                }
+                if is_database_connection_label(label)
+                    && !database_connection_string_has_credentials(m.as_str())
+                {
+                    continue;
+                }
+                if label == "Mailgun API Key" && !mailgun_key_match_has_context(body, &m) {
+                    continue;
+                }
+                if label == "Sensitive file path exposed"
+                    && sensitive_file_path_match_is_template(body, &m)
+                {
                     continue;
                 }
                 // Skip matches embedded inside base64 strings (false positives from
@@ -1249,6 +1624,114 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             }
         }
     }
+
+    check_internal_ip_disclosure(record, body, findings);
+}
+
+fn check_internal_ip_disclosure(
+    record: &TransactionRecord,
+    body: &str,
+    findings: &mut Vec<ScannerFinding>,
+) {
+    let re = Regex::new(r"\b(?:10\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)|172\.(?:1[6-9]|2\d|3[01])\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)|192\.168\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d))\b").unwrap();
+    for m in re.find_iter(body) {
+        if is_embedded_in_base64(body, &m) || !internal_ip_match_has_network_context(body, &m) {
+            continue;
+        }
+        findings.push(make_finding(
+            record,
+            Severity::Low,
+            "disclosure",
+            "Internal IP address detected in response",
+            "Internal IP address found in response body. This may expose sensitive information to clients.",
+            truncate_evidence(m.as_str(), 80),
+        ));
+        break;
+    }
+}
+
+fn internal_ip_match_has_network_context(body: &str, m: &regex::Match<'_>) -> bool {
+    let before_start = previous_char_boundary(body, m.start().saturating_sub(96));
+    let after_end = next_char_boundary(body, (m.end() + 32).min(body.len()));
+    let before = body[before_start..m.start()].to_ascii_lowercase();
+    let after = body[m.end()..after_end].to_ascii_lowercase();
+
+    internal_ip_looks_like_url_endpoint(&before, &after)
+        || internal_ip_has_labeled_network_context(&before)
+}
+
+fn internal_ip_looks_like_url_endpoint(before: &str, after: &str) -> bool {
+    let before =
+        before.trim_end_matches(|ch: char| ch.is_ascii_whitespace() || ch == '"' || ch == '\'');
+    let after = after.trim_start();
+    let has_url_prefix = ["http://", "https://", "ws://", "wss://", "ftp://", "//"]
+        .iter()
+        .any(|prefix| before.ends_with(prefix));
+    if has_url_prefix {
+        return true;
+    }
+
+    if let Some(rest) = after.strip_prefix(':') {
+        return rest.chars().next().is_some_and(|ch| ch.is_ascii_digit());
+    }
+    after.starts_with('/') || after.starts_with('?')
+}
+
+fn internal_ip_has_labeled_network_context(before: &str) -> bool {
+    let tokens = before
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let recent = tokens.iter().rev().take(8).copied().collect::<Vec<_>>();
+    if recent.iter().any(|token| {
+        matches!(
+            *token,
+            "ip" | "addr"
+                | "address"
+                | "host"
+                | "hostname"
+                | "upstream"
+                | "backend"
+                | "proxy"
+                | "gateway"
+                | "endpoint"
+                | "origin"
+                | "dns"
+                | "resolver"
+                | "forwarded"
+                | "remote"
+                | "local"
+                | "internal"
+                | "private"
+                | "intranet"
+                | "listen"
+                | "bind"
+                | "target"
+        )
+    }) {
+        return true;
+    }
+
+    let compact = recent
+        .iter()
+        .rev()
+        .flat_map(|token| token.chars().filter(|ch| ch.is_ascii_alphanumeric()))
+        .collect::<String>();
+    [
+        "internalip",
+        "privateip",
+        "ipaddress",
+        "hostaddress",
+        "serverip",
+        "proxyip",
+        "backendip",
+        "upstreamip",
+        "gatewayip",
+        "remoteaddr",
+        "localaddr",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle))
 }
 
 fn captured_secret_value<'a>(captures: &regex::Captures<'a>) -> Option<&'a str> {
@@ -1291,6 +1774,22 @@ fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool 
         "please ",
         "enter ",
         "confirm ",
+        "at least ",
+        "at most ",
+        "minimum ",
+        "maximum ",
+        "min ",
+        "max ",
+        "too short",
+        "too long",
+        "required ",
+        "invalid ",
+        "missing ",
+        "incorrect ",
+        "wrong ",
+        "authentication ",
+        "login ",
+        "failed ",
         "must ",
         "cannot ",
         "should ",
@@ -1325,6 +1824,9 @@ fn generic_secret_candidate_looks_like_secret(captures: &regex::Captures<'_>) ->
         return false;
     }
     if secret_candidate_is_masked(&normalized) || secret_candidate_is_placeholder(&normalized) {
+        return false;
+    }
+    if secret_candidate_is_public_identifier(value) {
         return false;
     }
     if generic_secret_candidate_is_header_value_copy(&normalized) {
@@ -1444,11 +1946,83 @@ fn secret_candidate_is_placeholder(value: &str) -> bool {
             .any(|fragment| collapsed.contains(fragment))
 }
 
+fn secret_candidate_is_public_identifier(value: &str) -> bool {
+    let trimmed = value.trim().trim_matches(|ch: char| {
+        matches!(ch, '"' | '\'' | '`') || (ch.is_ascii_punctuation() && ch != '_')
+    });
+    let lower = trimmed.to_ascii_lowercase();
+    (trimmed.starts_with("AIza")
+        && trimmed.len() == 39
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        || lower.starts_with("pk_live_")
+        || lower.starts_with("pk_test_")
+}
+
 fn is_card_number_label(label: &str) -> bool {
     matches!(
         label,
         "Possible Visa card number" | "Possible Mastercard number"
     )
+}
+
+fn is_database_connection_label(label: &str) -> bool {
+    matches!(
+        label,
+        "MongoDB connection string"
+            | "PostgreSQL connection string"
+            | "MySQL connection string"
+            | "Redis connection string"
+    )
+}
+
+fn database_connection_string_has_credentials(candidate: &str) -> bool {
+    let Ok(url) = url::Url::parse(candidate) else {
+        return false;
+    };
+    url.password().is_some_and(|password| {
+        !password.is_empty()
+            && !secret_candidate_is_masked(password)
+            && !secret_candidate_is_placeholder(password)
+    })
+}
+
+fn mailgun_key_match_has_context(body: &str, m: &regex::Match<'_>) -> bool {
+    let start = previous_char_boundary(body, m.start().saturating_sub(96));
+    let end = next_char_boundary(body, (m.end() + 64).min(body.len()));
+    let context = body[start..end].to_ascii_lowercase();
+    ["mailgun", "api.mailgun.net", "mg_api", "mailgun_api"]
+        .iter()
+        .any(|needle| context.contains(needle))
+}
+
+fn sensitive_file_path_match_is_template(body: &str, m: &regex::Match<'_>) -> bool {
+    let end = next_char_boundary(body, (m.end() + 16).min(body.len()));
+    let suffix = body[m.end()..end].to_ascii_lowercase();
+    [".example", ".sample", ".template", ".dist"]
+        .iter()
+        .any(|template_suffix| suffix.starts_with(template_suffix))
+}
+
+fn card_number_match_has_payment_context(body: &str, m: &regex::Match<'_>) -> bool {
+    let start = previous_char_boundary(body, m.start().saturating_sub(96));
+    let end = next_char_boundary(body, (m.end() + 48).min(body.len()));
+    let context = body[start..end].to_ascii_lowercase();
+    [
+        "card",
+        "credit",
+        "debit",
+        "payment",
+        "billing",
+        "pan",
+        "cc_number",
+        "card_number",
+        "visa",
+        "mastercard",
+    ]
+    .iter()
+    .any(|needle| context.contains(needle))
 }
 
 fn luhn_valid(candidate: &str) -> bool {
@@ -1477,6 +2051,23 @@ fn luhn_valid(candidate: &str) -> bool {
     sum.is_multiple_of(10)
 }
 
+fn card_number_is_known_test(candidate: &str) -> bool {
+    let digits = candidate
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    matches!(
+        digits.as_str(),
+        "4111111111111111"
+            | "4242424242424242"
+            | "4000000000000002"
+            | "4000000000009995"
+            | "5555555555554444"
+            | "5105105105105100"
+            | "2223003122003222"
+    )
+}
+
 // ── Rule 5: CORS ──
 
 fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -1494,16 +2085,8 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
 
     if let Some(origin) = acao {
         if origin == "*" {
-            if acac.is_some_and(|v| v.eq_ignore_ascii_case("true")) {
-                findings.push(make_finding(
-                    record,
-                    Severity::High,
-                    "cors",
-                    "CORS: wildcard origin with credentials",
-                    "Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true. Browsers block this, but the misconfiguration indicates sloppy CORS policy.",
-                    "ACAO: * + ACAC: true",
-                ));
-            }
+            // Browsers block wildcard ACAO when credentials are enabled, so this
+            // is a policy smell rather than a browser-exploitable passive finding.
         } else if origin.eq_ignore_ascii_case("null")
             && acac.is_some_and(|v| v.eq_ignore_ascii_case("true"))
         {
@@ -1568,10 +2151,7 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
     ] {
         if let Some(value) = response.header_value(header_name) {
             // Only flag if it contains version-like info
-            let has_version = value.chars().any(|c| c.is_ascii_digit())
-                || value.to_ascii_lowercase().contains("php")
-                || value.to_ascii_lowercase().contains("asp");
-            if has_version {
+            if server_header_value_reveals_stack(value) {
                 findings.push(make_finding(
                     record,
                     Severity::Info,
@@ -1614,6 +2194,16 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
             ));
         }
     }
+}
+
+fn server_header_value_reveals_stack(value: &str) -> bool {
+    if value.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    value
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "php" | "asp" | "aspnet"))
 }
 
 // ── Rule 7: Error Messages ──
@@ -1805,13 +2395,224 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
 fn error_pattern_is_too_generic(pattern: &str, body_lower: &str) -> bool {
     match pattern {
         "syntax error" => ![
-            "sql", "mysql", "postgres", "sqlite", "oracle", "mariadb", "odbc", "jdbc", "query",
-            "database", "near ",
+            "sql", "mysql", "postgres", "sqlite", "oracle", "mariadb", "odbc", "jdbc", "database",
+            "sqlstate",
         ]
         .iter()
         .any(|marker| body_lower.contains(marker)),
-        "internal server error" => body_lower.trim() == "internal server error",
+        "unclosed quotation mark" | "unterminated string" => {
+            !sql_error_indicator_has_database_context(body_lower)
+        }
+        "stack trace" => stack_trace_pattern_is_suppressed(body_lower),
+        "internal server error" => !internal_server_error_has_details(body_lower),
+        "mysql"
+        | "postgresql"
+        | "sqlite"
+        | "mongodb"
+        | "mongoose"
+        | "redis"
+        | "mariadb"
+        | "microsoft sql server" => {
+            !error_pattern_has_token_boundary(pattern, body_lower)
+                || !database_error_pattern_has_context(pattern, body_lower)
+        }
+        "runtime error" | "fatal error" | "node_modules/" | "debug mode" | "django.core"
+        | "laravel" | "spring boot" => !framework_error_pattern_has_context(pattern, body_lower),
         _ => false,
+    }
+}
+
+fn error_pattern_has_token_boundary(pattern: &str, body_lower: &str) -> bool {
+    let Some(index) = body_lower.find(pattern) else {
+        return false;
+    };
+    let before = body_lower[..index].chars().next_back();
+    let after = body_lower[index + pattern.len()..].chars().next();
+    before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+        && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+}
+
+fn stack_trace_pattern_is_suppressed(body_lower: &str) -> bool {
+    let Some(index) = body_lower.find("stack trace") else {
+        return false;
+    };
+    let start = previous_char_boundary(body_lower, index.saturating_sub(32));
+    let end = next_char_boundary(body_lower, (index + 96).min(body_lower.len()));
+    let context = &body_lower[start..end];
+    [
+        "no stack trace",
+        "stack trace disabled",
+        "stack trace unavailable",
+        "stack trace not available",
+        "stack trace suppressed",
+        "stack trace hidden",
+        "stack trace omitted",
+        "stack trace redacted",
+    ]
+    .iter()
+    .any(|marker| context.contains(marker))
+}
+
+fn internal_server_error_has_details(body_lower: &str) -> bool {
+    [
+        "exception",
+        "stack trace",
+        "traceback",
+        "caused by",
+        "\n    at ",
+        "\n at ",
+        " in /",
+        ".php on line",
+        ".js:",
+        ".py:",
+        ".rb:",
+        ".java:",
+        "line ",
+        "file ",
+    ]
+    .iter()
+    .any(|marker| body_lower.contains(marker))
+}
+
+fn sql_error_indicator_has_database_context(body_lower: &str) -> bool {
+    [
+        "sql",
+        "sqlstate",
+        "database",
+        "mysql",
+        "postgres",
+        "sqlite",
+        "oracle",
+        "mariadb",
+        "odbc",
+        "jdbc",
+        "microsoft sql server",
+    ]
+    .iter()
+    .any(|marker| body_lower.contains(marker))
+}
+
+fn database_error_pattern_has_context(pattern: &str, body_lower: &str) -> bool {
+    let Some(index) = body_lower.find(pattern) else {
+        return false;
+    };
+    let start = previous_char_boundary(body_lower, index.saturating_sub(96));
+    let end = next_char_boundary(
+        body_lower,
+        (index + pattern.len() + 128).min(body_lower.len()),
+    );
+    let context = &body_lower[start..end];
+    [
+        "error",
+        "exception",
+        "syntax",
+        "query",
+        "driver",
+        "odbc",
+        "jdbc",
+        "database",
+        "sqlstate",
+        "constraint",
+        "table",
+        "column",
+        "connect",
+        "connection",
+        "stack",
+        "trace",
+        "failed",
+    ]
+    .iter()
+    .any(|marker| context.contains(marker))
+}
+
+fn framework_error_pattern_has_context(pattern: &str, body_lower: &str) -> bool {
+    let Some(index) = body_lower.find(pattern) else {
+        return false;
+    };
+    let start = previous_char_boundary(body_lower, index.saturating_sub(128));
+    let end = next_char_boundary(
+        body_lower,
+        (index + pattern.len() + 192).min(body_lower.len()),
+    );
+    let context = &body_lower[start..end];
+
+    match pattern {
+        "debug mode" => {
+            if context.contains("disabled") || context.contains("disable debug mode") {
+                return false;
+            }
+            let tokens = context
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>();
+            tokens
+                .iter()
+                .any(|token| matches!(*token, "enabled" | "true" | "on"))
+                || ["traceback", "stack trace", "debugger", "exception", "error"]
+                    .iter()
+                    .any(|marker| context.contains(marker))
+        }
+        "laravel" => [
+            "whoops",
+            "illuminate\\",
+            "laravel/framework",
+            "vendor/laravel",
+            "queryexception",
+            "stack trace",
+            "exception",
+            " in /",
+            ".php on line",
+        ]
+        .iter()
+        .any(|marker| context.contains(marker)),
+        "spring boot" => [
+            "whitelabel error page",
+            "exception",
+            "stack trace",
+            "trace",
+            "org.springframework",
+            "java.lang.",
+        ]
+        .iter()
+        .any(|marker| context.contains(marker)),
+        "django.core" => [
+            "traceback",
+            "exception",
+            "settings.py",
+            "urls.py",
+            "wsgi.py",
+            "django.views",
+        ]
+        .iter()
+        .any(|marker| context.contains(marker)),
+        "node_modules/" => [
+            "typeerror:",
+            "referenceerror:",
+            "syntaxerror:",
+            "stack",
+            "trace",
+            "\n    at ",
+            "\n at ",
+            ".js:",
+        ]
+        .iter()
+        .any(|marker| context.contains(marker)),
+        "runtime error" | "fatal error" => [
+            "exception",
+            "stack trace",
+            "traceback",
+            " in /",
+            ".php on line",
+            ".js:",
+            ".rb:",
+            ".py:",
+            ".java:",
+            "line ",
+            " at ",
+        ]
+        .iter()
+        .any(|marker| context.contains(marker)),
+        _ => true,
     }
 }
 
@@ -1838,36 +2639,9 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
             .map(|h| h.value.clone())
     };
 
-    // Referrer-Policy missing (HTML responses)
-    if is_html_page_response(response) && !has_header("referrer-policy") {
-        findings.push(make_finding(
-            record,
-            Severity::Info,
-            "misconfig",
-            "Missing Referrer-Policy header",
-            "No Referrer-Policy header. The browser may send full URL as referer to external sites, potentially leaking sensitive path/query info.",
-            "",
-        ));
-    }
-
-    // Permissions-Policy / Feature-Policy missing (HTML responses)
-    if is_html_page_response(response)
-        && !has_header("permissions-policy")
-        && !has_header("feature-policy")
-    {
-        findings.push(make_finding(
-            record,
-            Severity::Info,
-            "misconfig",
-            "Missing Permissions-Policy header",
-            "No Permissions-Policy (or Feature-Policy) header. Browser features like camera, microphone, geolocation are not restricted.",
-            "",
-        ));
-    }
-
     // CSP with unsafe-inline or unsafe-eval
     if let Some(csp) = header_value("content-security-policy") {
-        if csp_script_sources_contain(&csp, "'unsafe-inline'") {
+        if csp_script_sources_have_actionable_unsafe_inline(&csp) {
             findings.push(make_finding(
                 record,
                 Severity::Medium,
@@ -1885,20 +2659,6 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
                 "CSP allows unsafe-eval",
                 "Content-Security-Policy contains 'unsafe-eval', which allows eval() and similar dynamic code execution.",
                 truncate_evidence(&csp, 120),
-            ));
-        }
-    }
-
-    // X-XSS-Protection set (deprecated — can cause issues in modern browsers)
-    if let Some(xxp) = header_value("x-xss-protection") {
-        if xxp.contains("1") {
-            findings.push(make_finding(
-                record,
-                Severity::Info,
-                "misconfig",
-                "Deprecated X-XSS-Protection header",
-                "X-XSS-Protection is deprecated and can introduce XSS vulnerabilities in older browsers. Use CSP instead.",
-                format!("X-XSS-Protection: {xxp}"),
             ));
         }
     }
@@ -1929,23 +2689,6 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
                     "Authenticated response has Cache-Control: public, allowing caching of potentially sensitive data.",
                     format!("Cache-Control: {cc}"),
                 ));
-            }
-        }
-    }
-
-    // Access-Control-Allow-Methods with dangerous methods
-    if let Some(methods) = header_value("access-control-allow-methods") {
-        for dangerous in &["put", "delete", "patch"] {
-            if cors_allows_method(&methods, dangerous) {
-                findings.push(make_finding(
-                    record,
-                    Severity::Info,
-                    "misconfig",
-                    format!("CORS allows {}", dangerous.to_uppercase()),
-                    format!("Access-Control-Allow-Methods includes {}. Verify these methods are intentionally exposed.", dangerous.to_uppercase()),
-                    format!("ACAM: {methods}"),
-                ));
-                break;
             }
         }
     }
@@ -1986,11 +2729,66 @@ fn csp_script_sources_contain(csp: &str, token: &str) -> bool {
     }
 }
 
-fn cors_allows_method(methods: &str, method: &str) -> bool {
-    methods
-        .split(',')
-        .map(str::trim)
-        .any(|candidate| candidate.eq_ignore_ascii_case(method))
+fn csp_script_sources_have_actionable_unsafe_inline(csp: &str) -> bool {
+    let mut default_sources: Option<Vec<String>> = None;
+    let mut script_sources: Option<Vec<String>> = None;
+    let mut script_elem_sources: Option<Vec<String>> = None;
+    let mut script_attr_sources: Option<Vec<String>> = None;
+
+    for directive in csp.split(';') {
+        let mut parts = directive.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
+        let sources = parts.map(str::to_ascii_lowercase).collect::<Vec<String>>();
+        if name == "default-src" {
+            default_sources = Some(sources);
+            continue;
+        }
+        match name.as_str() {
+            "script-src" => script_sources = Some(sources),
+            "script-src-elem" => script_elem_sources = Some(sources),
+            "script-src-attr" => script_attr_sources = Some(sources),
+            _ => {}
+        }
+    }
+
+    let effective_script = script_sources.as_deref().or(default_sources.as_deref());
+    let effective_elem = script_elem_sources
+        .as_deref()
+        .or(script_sources.as_deref())
+        .or(default_sources.as_deref());
+    let effective_attr = script_attr_sources
+        .as_deref()
+        .or(script_sources.as_deref())
+        .or(default_sources.as_deref());
+
+    for sources in [effective_script, effective_elem, effective_attr]
+        .into_iter()
+        .flatten()
+    {
+        if csp_sources_contain(sources, "'unsafe-inline'")
+            && !csp_sources_have_nonce_or_hash(sources)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn csp_sources_contain(sources: &[String], token: &str) -> bool {
+    sources.iter().any(|source| source == token)
+}
+
+fn csp_sources_have_nonce_or_hash(sources: &[String]) -> bool {
+    sources.iter().any(|source| {
+        let source = source.trim_matches('\'');
+        source.starts_with("nonce-")
+            || source.starts_with("sha256-")
+            || source.starts_with("sha384-")
+            || source.starts_with("sha512-")
+    })
 }
 
 fn has_authenticated_cache_context(
@@ -2010,7 +2808,7 @@ fn request_has_auth_cookie(record: &TransactionRecord) -> bool {
         }
         header.value.split(';').any(|part| {
             part.split_once('=')
-                .is_some_and(|(name, _)| is_auth_cookie_name(name))
+                .is_some_and(|(name, value)| cookie_looks_auth_sensitive(name, value))
         })
     })
 }
@@ -2020,32 +2818,70 @@ fn response_sets_auth_cookie(response: &crate::model::MessageRecord) -> bool {
         if !header.name.eq_ignore_ascii_case("set-cookie") {
             return false;
         }
+        if set_cookie_is_deletion(&header.value) {
+            return false;
+        }
         header
             .value
             .split(';')
             .next()
             .and_then(|pair| pair.split_once('='))
-            .is_some_and(|(name, _)| is_auth_cookie_name(name))
+            .is_some_and(|(name, value)| cookie_looks_auth_sensitive(name, value))
     })
 }
 
 fn is_auth_cookie_name(name: &str) -> bool {
     let normalized = name.trim().trim_start_matches('$').to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
+    let compact = normalized
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if compact.contains("csrf") || compact.contains("xsrf") {
+        return false;
+    }
+    if matches!(
+        compact.as_str(),
         "sid"
             | "jwt"
             | "token"
-            | "access_token"
-            | "refresh_token"
-            | "id_token"
+            | "access"
+            | "refresh"
+            | "auth"
+            | "session"
+            | "sessionid"
             | "phpsessid"
             | "jsessionid"
-    ) || [
-        "session", "sess", "auth", "access", "refresh", "csrf", "xsrf",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
+            | "aspsessionid"
+            | "authtoken"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "sessiontoken"
+            | "rememberme"
+            | "remembertoken"
+            | "logintoken"
+    ) {
+        return true;
+    }
+
+    let tokens = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens
+        .iter()
+        .any(|token| matches!(*token, "sid" | "jwt" | "auth" | "session"))
+    {
+        return true;
+    }
+    matches!(
+        tokens.as_slice(),
+        ["access", "token"]
+            | ["refresh", "token"]
+            | ["id", "token"]
+            | ["auth", "token"]
+            | ["session", "token"]
+    )
 }
 
 // ── Rule 9: Information Disclosure ──
@@ -2084,18 +2920,20 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     }
 
     // Source map references
-    let sourcemap_re =
-        Regex::new(r"(?m)(?://[#@]|/\*[#@])\s*sourceMappingURL\s*=\s*[^\s*]+\.map\s*(?:\*/)?")
-            .unwrap();
-    if let Some(m) = sourcemap_re.find(body) {
-        findings.push(make_finding(
-            record,
-            Severity::Low,
-            "info",
-            "JavaScript source map reference",
-            "Source map file referenced in response. Source maps can expose original source code, making it easier for attackers to understand application logic.",
-            truncate_evidence(m.as_str(), 120),
-        ));
+    if javascript_or_css_response(record, response) {
+        let sourcemap_re =
+            Regex::new(r"(?m)(?://[#@]|/\*[#@])\s*sourceMappingURL\s*=\s*[^\s*]+\.map\s*(?:\*/)?")
+                .unwrap();
+        if let Some(m) = sourcemap_re.find(body) {
+            findings.push(make_finding(
+                record,
+                Severity::Low,
+                "info",
+                "JavaScript source map reference",
+                "Source map file referenced in response. Source maps can expose original source code, making it easier for attackers to understand application logic.",
+                truncate_evidence(m.as_str(), 120),
+            ));
+        }
     }
 
     // GraphQL Introspection enabled
@@ -2114,66 +2952,32 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     if let Ok(comment_re) = Regex::new(r"<!--[\s\S]{0,500}?-->") {
         for m in comment_re.find_iter(body) {
             let comment = m.as_str().to_ascii_lowercase();
-            let sensitive_keywords = [
-                "todo",
-                "fixme",
-                "hack",
-                "bug",
-                "password",
-                "secret",
-                "credential",
-                "token",
-                "api_key",
-                "apikey",
-                "admin",
-                "internal",
-                "debug",
-                "temporary",
-                "remove before",
-            ];
-            for keyword in &sensitive_keywords {
-                if comment.contains(keyword) {
-                    findings.push(make_finding(
-                        record,
-                        Severity::Info,
-                        "info",
-                        format!("HTML comment contains '{keyword}'"),
-                        "HTML comments may reveal developer notes, internal paths, or sensitive information to users.",
-                        truncate_evidence(m.as_str(), 120),
-                    ));
-                    break;
-                }
-            }
-        }
-    }
-
-    // Email addresses in response body
-    if let Ok(email_re) = Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}") {
-        let ct = response.content_type.as_deref().unwrap_or("");
-        let ct_lower = ct.to_ascii_lowercase();
-        // Only flag in non-email contexts (HTML/JSON)
-        if ct_lower.contains("html") || ct_lower.contains("json") {
-            for m in email_re.find_iter(body) {
-                // Skip obvious false positives
-                let email = m.as_str();
-                if should_ignore_disclosed_email(email) {
-                    continue;
-                }
+            if let Some(keyword) = sensitive_html_comment_keyword(&comment) {
                 findings.push(make_finding(
                     record,
                     Severity::Info,
                     "info",
-                    "Email address in response",
-                    "Email addresses found in response body. These could be used for phishing or social engineering.",
-                    truncate_evidence(email, 80),
+                    format!("HTML comment contains '{keyword}'"),
+                    "HTML comments may reveal developer notes, internal paths, or sensitive information to users.",
+                    truncate_evidence(m.as_str(), 120),
                 ));
-                break;
             }
         }
     }
 
+    if let Some(email) = structured_email_disclosure(body) {
+        findings.push(make_finding(
+            record,
+            Severity::Low,
+            "info",
+            "Email address in response",
+            "Email address found in a structured response field. This may expose user or account data.",
+            truncate_evidence(&email, 80),
+        ));
+    }
+
     // Version control metadata exposure
-    if body.contains("\"sha\"") && body.contains("\"commit\"") && body.contains("\"author\"") {
+    if git_commit_metadata_response_detected(body) {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -2185,9 +2989,7 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     }
 
     // Swagger/OpenAPI exposure
-    if (body_lower.contains("\"swagger\"") || body_lower.contains("\"openapi\""))
-        && (body_lower.contains("\"paths\"") || body_lower.contains("\"info\""))
-    {
+    if openapi_spec_response_detected(body) {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -2199,7 +3001,7 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     }
 
     // WSDL exposure
-    if body_lower.contains("<wsdl:") || body_lower.contains("xmlns:wsdl") {
+    if wsdl_definition_response_detected(&body_lower) {
         findings.push(make_finding(
             record,
             Severity::Low,
@@ -2219,11 +3021,191 @@ fn graphql_introspection_response_detected(body: &str) -> bool {
         .is_some_and(|value| value.is_object())
 }
 
+fn javascript_or_css_response(
+    record: &TransactionRecord,
+    response: &crate::model::MessageRecord,
+) -> bool {
+    let content_type = response
+        .header_value("content-type")
+        .or(response.content_type.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    content_type.contains("javascript")
+        || content_type.contains("ecmascript")
+        || content_type.contains("text/css")
+        || record.path.ends_with(".js")
+        || record.path.ends_with(".css")
+}
+
+fn git_commit_metadata_response_detected(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(json_value_looks_like_git_commit),
+        ref item => json_value_looks_like_git_commit(item),
+    }
+}
+
+fn json_value_looks_like_git_commit(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let sha = object
+        .get("sha")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let plausible_sha =
+        (7..=64).contains(&sha.len()) && sha.chars().all(|ch| ch.is_ascii_hexdigit());
+    plausible_sha
+        && object
+            .get("commit")
+            .is_some_and(|commit| commit.is_object())
+        && (object.get("author").is_some() || value.pointer("/commit/author").is_some())
+}
+
+fn openapi_spec_response_detected(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let has_version = object
+        .get("openapi")
+        .and_then(|value| value.as_str())
+        .is_some()
+        || object
+            .get("swagger")
+            .and_then(|value| value.as_str())
+            .is_some();
+    has_version
+        && object.get("paths").is_some_and(|value| value.is_object())
+        && object.get("info").is_some_and(|value| value.is_object())
+}
+
+fn wsdl_definition_response_detected(body_lower: &str) -> bool {
+    (body_lower.contains("<wsdl:definitions") || body_lower.contains("<definitions"))
+        && body_lower.contains("xmlns")
+        && body_lower.contains("wsdl")
+}
+
+fn structured_email_disclosure(body: &str) -> Option<String> {
+    let json = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let email_re = Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap();
+    find_structured_email(&json, &mut Vec::new(), &email_re)
+}
+
+fn find_structured_email(
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    email_re: &Regex,
+) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            if !json_path_has_email_context(path) {
+                return None;
+            }
+            email_re.find(text).and_then(|m| {
+                let email = m.as_str();
+                (!should_ignore_structured_email(email)).then(|| email.to_string())
+            })
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(email) = find_structured_email(item, path, email_re) {
+                    return Some(email);
+                }
+            }
+            None
+        }
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                path.push(key.to_string());
+                let result = find_structured_email(child, path, email_re);
+                path.pop();
+                if result.is_some() {
+                    return result;
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn json_path_has_email_context(path: &[String]) -> bool {
+    let Some(key) = path.last() else {
+        return false;
+    };
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if !normalized.contains("email") && !normalized.contains("mail") {
+        return false;
+    }
+    ![
+        "support",
+        "contact",
+        "sales",
+        "marketing",
+        "help",
+        "abuse",
+        "privacy",
+        "noreply",
+        "replyto",
+        "from",
+        "sender",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn should_ignore_structured_email(email: &str) -> bool {
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return true;
+    };
+    let local = local.to_ascii_lowercase();
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if matches!(
+        domain.as_str(),
+        "example.com" | "example.org" | "example.net" | "schema.org" | "w3.org"
+    ) || domain.ends_with(".example.com")
+        || domain.ends_with(".example.org")
+        || domain.ends_with(".example.net")
+        || domain.ends_with(".schema.org")
+        || domain.ends_with(".w3.org")
+    {
+        return true;
+    }
+    matches!(
+        local.as_str(),
+        "support"
+            | "contact"
+            | "security"
+            | "sales"
+            | "help"
+            | "info"
+            | "noreply"
+            | "no-reply"
+            | "abuse"
+            | "privacy"
+            | "postmaster"
+            | "webmaster"
+            | "admin"
+    )
+}
+
 fn push_source_map_header_finding(
     record: &TransactionRecord,
     response: &crate::model::MessageRecord,
     findings: &mut Vec<ScannerFinding>,
 ) {
+    if !javascript_or_css_response(record, response) {
+        return;
+    }
     if let Some(sm) = response
         .header_value("sourcemap")
         .or_else(|| response.header_value("x-sourcemap"))
@@ -2239,6 +3221,37 @@ fn push_source_map_header_finding(
             format!("SourceMap: {sm}"),
         ));
     }
+}
+
+fn sensitive_html_comment_keyword(comment_lower: &str) -> Option<&'static str> {
+    const SENSITIVE_KEYWORDS: &[&str] = &[
+        "password",
+        "secret",
+        "credential",
+        "token",
+        "api_key",
+        "apikey",
+        "admin",
+        "internal",
+        "debug",
+    ];
+    for keyword in SENSITIVE_KEYWORDS {
+        if comment_lower.contains(keyword) {
+            return Some(*keyword);
+        }
+    }
+
+    const DEV_NOTE_KEYWORDS: &[&str] =
+        &["todo", "fixme", "hack", "bug", "temporary", "remove before"];
+    DEV_NOTE_KEYWORDS
+        .iter()
+        .find(|keyword| comment_lower.contains(**keyword))
+        .copied()
+        .filter(|_| {
+            ["auth", "login", "session", "role", "permission", "prod"]
+                .iter()
+                .any(|context| comment_lower.contains(context))
+        })
 }
 
 // ── Rule 10: Authentication Issues ──
@@ -2378,19 +3391,6 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
     }
 }
 
-fn should_ignore_disclosed_email(email: &str) -> bool {
-    let Some((_, domain)) = email.rsplit_once('@') else {
-        return false;
-    };
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-    matches!(domain.as_str(), "example.com" | "example.org")
-        || domain.ends_with(".example.com")
-        || domain.ends_with(".example.org")
-        || matches!(domain.as_str(), "schema.org" | "w3.org")
-        || domain.ends_with(".schema.org")
-        || domain.ends_with(".w3.org")
-}
-
 fn is_external_redirect_location(location: &str, request_scheme: &str, request_host: &str) -> bool {
     let base = match url::Url::parse(&format!("{request_scheme}://{request_host}")) {
         Ok(base) => base,
@@ -2444,21 +3444,6 @@ fn redirect_parameter_controls_location(
 
 // ── Utilities ──
 
-fn extract_json_number(json: &str, key: &str) -> Option<i64> {
-    let pattern = format!("\"{key}\"");
-    let idx = json.find(&pattern)?;
-    let rest = &json[idx + pattern.len()..];
-    // Skip whitespace and colon
-    let rest = rest.trim_start().strip_prefix(':')?;
-    let rest = rest.trim_start();
-    // Parse number
-    let num_str: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    num_str.parse().ok()
-}
-
 fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -2484,7 +3469,7 @@ fn session_token_parameter_in_url(path: &str) -> Option<String> {
             let (key, value) = segment.split_once('=').unwrap_or((segment, ""));
             let key = percent_decode(&key.replace('+', " ")).to_ascii_lowercase();
             (matches!(key.as_str(), "jsessionid" | "phpsessid")
-                && session_token_value_looks_sensitive(value))
+                && session_token_value_looks_sensitive(&key, value))
             .then_some(key)
         });
     }
@@ -2494,8 +3479,9 @@ fn session_token_parameter_in_url(path: &str) -> Option<String> {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = key.replace('+', " ");
         let decoded = percent_decode(&key).to_ascii_lowercase();
-        (is_session_token_parameter_name(&decoded) && session_token_value_looks_sensitive(value))
-            .then_some(decoded)
+        (is_session_token_parameter_name(&decoded)
+            && session_token_value_looks_sensitive(&decoded, value))
+        .then_some(decoded)
     })
 }
 
@@ -2515,12 +3501,34 @@ fn is_session_token_parameter_name(name: &str) -> bool {
     )
 }
 
-fn session_token_value_looks_sensitive(value: &str) -> bool {
+fn session_token_value_looks_sensitive(name: &str, value: &str) -> bool {
     let decoded = percent_decode(&value.replace('+', " "));
     let trimmed = decoded.trim();
+    if name == "api_key" && session_api_key_value_is_public_identifier(trimmed) {
+        return false;
+    }
     !trimmed.is_empty()
         && !secret_candidate_is_masked(trimmed)
         && !secret_candidate_is_placeholder(trimmed)
+        && session_token_value_has_enough_signal(trimmed)
+}
+
+fn session_api_key_value_is_public_identifier(value: &str) -> bool {
+    (value.starts_with("AIza")
+        && value.len() == 39
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        || value.starts_with("pk_live_")
+        || value.starts_with("pk_test_")
+}
+
+fn session_token_value_has_enough_signal(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    compact.len() >= 8 && compact.chars().collect::<HashSet<_>>().len() >= 4
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -2648,6 +3656,21 @@ mod tests {
             evidence: String::new(),
             host: "example.com".to_string(),
             path: "/".to_string(),
+            location: None,
+        }
+    }
+
+    fn custom_rule(id: String) -> CustomRule {
+        CustomRule {
+            id,
+            name: "Custom token".to_string(),
+            enabled: true,
+            target: "response_body".to_string(),
+            header_name: String::new(),
+            pattern: "token".to_string(),
+            severity: Severity::Medium,
+            category: "custom".to_string(),
+            description: "custom token rule".to_string(),
         }
     }
 
@@ -2671,6 +3694,44 @@ mod tests {
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].title, "first");
         assert_eq!(findings[1].title, "second");
+    }
+
+    #[tokio::test]
+    async fn scanner_store_trims_restored_custom_rules_to_config_limit() {
+        let config = ScannerConfig {
+            custom_rules: (0..=MAX_SCANNER_CUSTOM_RULES)
+                .map(|index| custom_rule(format!("custom-{index}")))
+                .collect(),
+            ..ScannerConfig::default()
+        };
+
+        let store = ScannerStore::from_findings_with_config(10, Vec::new(), config);
+
+        assert_eq!(
+            store.get_config().await.custom_rules.len(),
+            MAX_SCANNER_CUSTOM_RULES
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_store_drops_restored_invalid_custom_rules() {
+        let valid = custom_rule("valid".to_string());
+        let mut invalid_regex = custom_rule("invalid-regex".to_string());
+        invalid_regex.pattern = "(".to_string();
+        let mut duplicate = custom_rule("valid".to_string());
+        duplicate.name = "Duplicate".to_string();
+        let mut oversized = custom_rule("oversized".to_string());
+        oversized.description = "x".repeat(MAX_SCANNER_FIELD_BYTES + 1);
+        let config = ScannerConfig {
+            custom_rules: vec![invalid_regex, valid.clone(), duplicate, oversized],
+            ..ScannerConfig::default()
+        };
+
+        let store = ScannerStore::from_findings_with_config(10, Vec::new(), config);
+        let rules = store.get_config().await.custom_rules;
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, valid.id);
     }
 
     #[tokio::test]
@@ -2818,6 +3879,50 @@ mod tests {
             .any(|finding| finding.rule_id == "custom-token-two"));
     }
 
+    #[test]
+    fn custom_request_header_rule_keeps_request_location_when_response_also_matches() {
+        let record = make_record(
+            vec![("x-api-secret", "shared-custom-secret")],
+            vec![],
+            "shared-custom-secret",
+            200,
+        );
+        let rules = BUILTIN_RULES
+            .iter()
+            .map(|(id, _)| ((*id).to_string(), false))
+            .collect();
+        let config = ScannerConfig {
+            enabled: true,
+            rules,
+            custom_rules: vec![CustomRule {
+                id: "request-secret".to_string(),
+                name: "Request secret".to_string(),
+                enabled: true,
+                target: "request_header".to_string(),
+                header_name: "x-api-secret".to_string(),
+                pattern: "shared-custom-secret".to_string(),
+                severity: Severity::Medium,
+                category: "custom".to_string(),
+                description: "request secret".to_string(),
+            }],
+        };
+
+        let findings = scan_transaction(&record, &config);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == "request-secret")
+            .expect("custom request-header finding should be present");
+
+        assert_eq!(
+            finding.location,
+            Some(FindingLocation {
+                side: "request".to_string(),
+                section: "header".to_string(),
+                line: Some(3),
+            })
+        );
+    }
+
     #[tokio::test]
     async fn scanner_store_rejects_pre_clear_generation_findings() {
         let store = ScannerStore::new(10);
@@ -2929,6 +4034,42 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_scanner_ignores_password_policy_copy() {
+        let record = make_record(
+            vec![],
+            vec![],
+            r#"{ "password": "At least 8 characters", "password_hint": "Minimum length required" }"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Password in response detected in response"),
+            "password policy text should not be reported as a leaked password value"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_password_failure_copy() {
+        let record = make_record(
+            vec![],
+            vec![],
+            r#"{ "password": "Authentication failed", "password_error": "Incorrect password" }"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Password in response detected in response"),
+            "password failure text should not be reported as a leaked password value"
+        );
+    }
+
+    #[test]
     fn sensitive_scanner_detects_likely_hardcoded_password() {
         let record = make_record(
             vec![],
@@ -2979,6 +4120,29 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_scanner_ignores_public_identifiers_in_generic_api_key_fields() {
+        for body in [
+            r#"{"api_key":"AIzaabcdefghijklmnopqrstuvwxyz123456789"}"#,
+            r#"{"api_key":"pk_live_1234567890abcdefghijklmnop"}"#,
+        ] {
+            let record = make_record(
+                vec![],
+                vec![("content-type", "application/json")],
+                body,
+                200,
+            );
+            let findings = scan_transaction(&record, &ScannerConfig::default());
+
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.title.contains("API Key/Secret pattern")),
+                "{body} should not create generic secret Findings for public client identifiers"
+            );
+        }
+    }
+
+    #[test]
     fn sensitive_scanner_ignores_header_value_copy_as_generic_secret() {
         let record = make_record(
             vec![],
@@ -2994,6 +4158,230 @@ mod tests {
                     || finding.title.contains("Secret/Token pattern")
             }),
             "header documentation values should not create generic secret Findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_generic_key_prefix_without_mailgun_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"cache_key":"cache-key-1234567890abcdefghijklmnopqrstuv"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Mailgun API Key")),
+            "generic key-* identifiers should not be treated as Mailgun keys without context"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_reports_mailgun_key_with_mailgun_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"mailgun_api_key":"key-1234567890abcdefghijklmnopqrstuv"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title.contains("Mailgun API Key")),
+            "Mailgun key-shaped values with Mailgun context should still be reported"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_google_oauth_client_id() {
+        let body = r#"{"client_id":"123456789012-abcdefghijklmnopqrstuvwxyz123456.apps.googleusercontent.com"}"#;
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Google OAuth Client ID")),
+            "OAuth client IDs are public identifiers and should not create secret findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_public_sentry_dsn() {
+        let body = r#"{"dsn":"https://abc123@o123456.ingest.sentry.io/78910"}"#;
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Sentry DSN")),
+            "Sentry browser DSNs are public project identifiers and should not create secret findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_firebase_app_url() {
+        let body = r#"{"authDomain":"demo-project.firebaseapp.com"}"#;
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Firebase app URL")),
+            "Firebase app URLs are public auth domains and should not create disclosure findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_public_google_api_key() {
+        let body = r#"{"googleMapsApiKey":"AIzaabcdefghijklmnopqrstuvwxyz123456789"}"#;
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Google API Key")),
+            "browser Google API keys are commonly public identifiers and should not create default Findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_standalone_aws_access_key_id() {
+        let body = r#"{"aws_access_key_id":"AKIA1234567890ABCDEF"}"#;
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("AWS Access Key ID")),
+            "an AWS access key id without the secret half is not enough for a high-confidence secret finding"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_twilio_key_sid_without_secret() {
+        let key_sid = format!("SK{}", "1".repeat(32));
+        let body = format!(r#"{{"twilio_key_sid":"{key_sid}"}}"#);
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            body.as_str(),
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Twilio API Key")),
+            "Twilio SK identifiers are not enough to prove a leaked secret"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_firebase_database_url_without_secret() {
+        let body = r#"{"databaseURL":"https://demo-project.firebaseio.com"}"#;
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            body,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Firebase database URL")),
+            "Firebase database URLs alone are not high-confidence secret disclosure"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_database_urls_without_credentials() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"database":"postgres://db.internal:5432/app"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("PostgreSQL connection string")),
+            "database endpoints without embedded credentials should not create secret Findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_database_urls_with_placeholder_passwords() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"database":"postgres://user:password@db.internal:5432/app"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("PostgreSQL connection string")),
+            "database URI template passwords should not create secret Findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_detects_database_urls_with_passwords() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"database":"postgres://app:secretpass@db.internal:5432/app"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title.contains("PostgreSQL connection string")),
+            "database URLs with embedded passwords should still be reported"
         );
     }
 
@@ -3158,7 +4546,49 @@ mod tests {
             !findings
                 .iter()
                 .any(|finding| finding.title.contains("symmetric algorithm")),
-            "non-alg header fields should not trigger symmetric algorithm findings"
+            "symmetric JWT algorithms are not findings by themselves"
+        );
+    }
+
+    #[test]
+    fn jwt_scanner_does_not_report_inventory_only_findings() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "RS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234", "exp": 4_102_444_800_i64 }),
+        );
+        let record = make_record(
+            vec![("authorization", &format!("Bearer {token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "jwt"),
+            "a normal expiring JWT should not create inventory-only Findings"
+        );
+    }
+
+    #[test]
+    fn jwt_scanner_ignores_expired_token_as_noise() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "RS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234", "exp": 1_i64 }),
+        );
+        let record = make_record(
+            vec![("authorization", &format!("Bearer {token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Expired JWT token"),
+            "expired tokens alone are not actionable vulnerability findings"
         );
     }
 
@@ -3273,6 +4703,49 @@ mod tests {
     }
 
     #[test]
+    fn jwt_detection_ignores_three_part_non_json_bearer_tokens() {
+        let token = format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode("not-json"),
+            URL_SAFE_NO_PAD.encode("also-not-json")
+        );
+        let record = make_record(
+            vec![("authorization", &format!("Bearer {token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "jwt"),
+            "opaque three-part bearer tokens should not be reported as JWT findings"
+        );
+    }
+
+    #[test]
+    fn jwt_detection_requires_actual_exp_claim() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "message": "missing \"exp\" claim" }),
+        );
+        let record = make_record(
+            vec![("authorization", &format!("Bearer {token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "JWT without expiration"),
+            "expiration detection should inspect JSON claims, not substring text"
+        );
+    }
+
+    #[test]
     fn jwt_detection_decodes_url_encoded_body_tokens() {
         let token = jwt_token(
             serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
@@ -3292,6 +4765,26 @@ mod tests {
                 .iter()
                 .any(|finding| finding.title == "JWT without expiration"),
             "percent-encoded JWTs in response bodies should still be analyzed"
+        );
+    }
+
+    #[test]
+    fn jwt_detection_ignores_body_tokens_without_token_context() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234" }),
+        );
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            &format!(r#"<pre>{token}</pre>"#),
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "jwt"),
+            "body JWT-looking strings need token/auth context before creating Findings"
         );
     }
 
@@ -3350,6 +4843,33 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.title == "Missing Strict-Transport-Security"));
+    }
+
+    #[test]
+    fn hsts_check_runs_for_non_html_https_redirects() {
+        let mut record = make_record(
+            vec![],
+            vec![("location", "https://example.com/login")],
+            "",
+            302,
+        );
+        if let Some(response) = &mut record.response {
+            response.content_type = None;
+        }
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Missing Strict-Transport-Security"),
+            "HSTS is a host-level HTTPS policy and should be checked on redirects"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Missing Content-Security-Policy"),
+            "page-only header checks should still skip non-HTML redirects"
+        );
     }
 
     #[test]
@@ -3437,6 +4957,27 @@ mod tests {
     }
 
     #[test]
+    fn security_header_checks_skip_error_html_pages() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            "<html><body>Not found</body></html>",
+            404,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| {
+                finding.title == "Missing Content-Security-Policy"
+                    || finding.title == "Missing Strict-Transport-Security"
+                    || finding.title == "Missing X-Content-Type-Options"
+                    || finding.title == "Missing X-Frame-Options"
+            }),
+            "missing security headers on error HTML pages are too noisy for passive findings"
+        );
+    }
+
+    #[test]
     fn session_token_detection_requires_exact_query_parameter_name() {
         let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
         record.path = "/search?notoken=1&xapi_key=2".to_string();
@@ -3485,9 +5026,42 @@ mod tests {
     }
 
     #[test]
+    fn session_token_detection_ignores_public_api_key_identifiers() {
+        for path in [
+            "/maps?api_key=AIzaabcdefghijklmnopqrstuvwxyz123456789",
+            "/checkout?api_key=pk_live_1234567890abcdefghijklmnop",
+        ] {
+            let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+            record.path = path.to_string();
+            let findings = scan_transaction(&record, &ScannerConfig::default());
+
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.title.starts_with("Session/token parameter")),
+                "{path} should not report public client identifiers as session tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn session_token_detection_still_reports_random_api_key_parameter() {
+        let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+        record.path = "/api?api_key=Ab3dEf6hIj9kLm2nOp5qRs8t".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Session/token parameter in URL: api_key"),
+            "non-public API key-looking query values should still be reported"
+        );
+    }
+
+    #[test]
     fn session_token_detection_reports_actual_matrix_parameter_name() {
         let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
-        record.path = "/app;foo=bar;jsessionid=abc".to_string();
+        record.path = "/app;foo=bar;jsessionid=abc123def456".to_string();
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
         assert!(
@@ -3524,6 +5098,62 @@ mod tests {
     }
 
     #[test]
+    fn internal_ip_pattern_detects_private_ip_url_endpoint() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/javascript")],
+            r#"const apiBase = "http://192.168.10.25:8080/status";"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.title.contains("Internal IP address")
+                    && finding.evidence.contains("192.168.10.25")
+            }),
+            "private IP URL endpoints should still be reported"
+        );
+    }
+
+    #[test]
+    fn internal_ip_pattern_detects_camel_case_network_field() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"internalIp":"172.16.4.9"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.title.contains("Internal IP address")
+                    && finding.evidence.contains("172.16.4.9")
+            }),
+            "labeled network fields should still be reported"
+        );
+    }
+
+    #[test]
+    fn internal_ip_pattern_ignores_version_table_values() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/javascript")],
+            r#"const TALK_VERSION = {"10.1.0.0":"10.1.0","10.2.0.0":"10.2.0"};"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Internal IP address")),
+            "version tables in bundled JavaScript should not be reported as internal IP disclosure"
+        );
+    }
+
+    #[test]
     fn test_cookie_flags() {
         let record = make_record(
             vec![],
@@ -3543,7 +5173,10 @@ mod tests {
     fn cookie_flags_are_detected_from_attributes_not_cookie_name_or_value() {
         let record = make_record(
             vec![],
-            vec![("set-cookie", "insecure_samesite=httponly_value; Path=/")],
+            vec![(
+                "set-cookie",
+                "session_secure_samesite=httponly_value; Path=/",
+            )],
             "",
             200,
         );
@@ -3565,6 +5198,93 @@ mod tests {
     }
 
     #[test]
+    fn cookie_flags_ignore_deletion_cookies() {
+        let record = make_record(
+            vec![],
+            vec![("set-cookie", "session=; Path=/; Max-Age=0")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "cookie"),
+            "cookie deletion responses should not be reported as missing cookie flags"
+        );
+    }
+
+    #[test]
+    fn cookie_flags_ignore_non_auth_preference_cookies() {
+        let record = make_record(vec![], vec![("set-cookie", "theme=dark; Path=/")], "", 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "cookie"),
+            "non-auth preference cookies should not create cookie flag Findings"
+        );
+    }
+
+    #[test]
+    fn cookie_flags_ignore_auth_substrings_inside_unrelated_names() {
+        for cookie in [
+            "accessibility=large; Path=/",
+            "refreshRate=60; Path=/",
+            "assessment_id=abc123; Path=/",
+        ] {
+            let record = make_record(vec![], vec![("set-cookie", cookie)], "", 200);
+            let findings = scan_transaction(&record, &ScannerConfig::default());
+
+            assert!(
+                !findings.iter().any(|finding| finding.category == "cookie"),
+                "{cookie} should not be treated as an auth/session cookie"
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_flags_still_detect_access_token_cookie() {
+        let record = make_record(
+            vec![],
+            vec![("set-cookie", "access_token=abc123; Path=/")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "cookie"),
+            "access_token cookies should still require security flags"
+        );
+    }
+
+    #[test]
+    fn cookie_flags_detect_remember_token_cookie() {
+        let record = make_record(
+            vec![],
+            vec![("set-cookie", "remember_token=Ab3dEf6hIj9kLm2nOp5q; Path=/")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "cookie"),
+            "persistent-login remember_token cookies should require security flags"
+        );
+    }
+
+    #[test]
+    fn cookie_flags_ignore_malformed_null_cookie() {
+        let record = make_record(vec![], vec![("set-cookie", "null")], "", 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "cookie"),
+            "malformed/null Set-Cookie values should not create cookie flag Findings"
+        );
+    }
+
+    #[test]
     fn cache_control_check_treats_auth_cookies_as_authenticated() {
         let record = make_record(
             vec![("cookie", "session=abc123; theme=dark")],
@@ -3577,6 +5297,68 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+    }
+
+    #[test]
+    fn cache_control_check_treats_remember_token_cookie_as_authenticated() {
+        let record = make_record(
+            vec![("cookie", "remember_me=Ab3dEf6hIj9kLm2nOp5q; theme=dark")],
+            vec![("content-type", "application/json")],
+            r#"{"private":true}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+    }
+
+    #[test]
+    fn cache_control_check_treats_jwt_cookie_values_as_authenticated() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234", "exp": 4_102_444_800_i64 }),
+        );
+        let record = make_record(
+            vec![("cookie", &format!("identity={token}; theme=dark"))],
+            vec![("content-type", "application/json")],
+            r#"{"private":true}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+            "JWT-valued cookies should establish authenticated cache-control context even with generic names"
+        );
+    }
+
+    #[test]
+    fn cache_control_check_treats_jwt_set_cookie_values_as_authenticated() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234", "exp": 4_102_444_800_i64 }),
+        );
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "application/json"),
+                ("set-cookie", &format!("identity={token}; Path=/")),
+            ],
+            r#"{"private":true}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+            "JWT-valued Set-Cookie headers should establish authenticated cache-control context"
+        );
     }
 
     #[test]
@@ -3598,6 +5380,48 @@ mod tests {
     }
 
     #[test]
+    fn cache_control_check_ignores_csrf_only_cookies() {
+        let record = make_record(
+            vec![("cookie", "csrf_token=abc123; theme=dark")],
+            vec![("content-type", "application/json")],
+            r#"{"private":false}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+            "CSRF-only cookies do not establish an authenticated response context"
+        );
+    }
+
+    #[test]
+    fn cache_control_check_ignores_deleted_auth_cookie() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "application/json"),
+                (
+                    "set-cookie",
+                    "session=deleted; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+                ),
+            ],
+            r#"{"logged_out":true}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+            "deleting an auth cookie should not establish an authenticated response context"
+        );
+    }
+
+    #[test]
     fn cors_wildcard_without_credentials_on_public_response_is_ignored() {
         let record = make_record(vec![], vec![("access-control-allow-origin", "*")], "", 200);
         let config = ScannerConfig::default();
@@ -3609,7 +5433,7 @@ mod tests {
     }
 
     #[test]
-    fn cors_checks_trim_header_ows_before_comparison() {
+    fn cors_wildcard_with_credentials_is_not_reported_as_exploitable() {
         let record = make_record(
             vec![],
             vec![
@@ -3622,10 +5446,10 @@ mod tests {
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
         assert!(
-            findings
+            !findings
                 .iter()
-                .any(|f| f.category == "cors" && f.severity == Severity::High),
-            "OWS around CORS headers should not hide wildcard-with-credentials"
+                .any(|f| f.title == "CORS: wildcard origin with credentials"),
+            "browsers block wildcard ACAO with credentials, so it should not create an exploitable CORS finding"
         );
     }
 
@@ -3703,7 +5527,7 @@ mod tests {
     }
 
     #[test]
-    fn cors_allowed_methods_still_report_patch_token() {
+    fn cors_allowed_methods_without_origin_risk_are_ignored() {
         let record = make_record(
             vec![],
             vec![("access-control-allow-methods", "GET, PATCH")],
@@ -3712,7 +5536,10 @@ mod tests {
         );
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
-        assert!(findings.iter().any(|f| f.title == "CORS allows PATCH"));
+        assert!(
+            !findings.iter().any(|f| f.title == "CORS allows PATCH"),
+            "allowed method inventory is too noisy without a risky CORS origin/credentials policy"
+        );
     }
 
     #[test]
@@ -3725,6 +5552,80 @@ mod tests {
                 .iter()
                 .any(|f| f.category == "server" && f.title.contains("Server version")),
             "Should detect server version disclosure"
+        );
+    }
+
+    #[test]
+    fn server_disclosure_ignores_asp_substrings_inside_words() {
+        let record = make_record(vec![], vec![("server", "Raspbian")], "", 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Server version disclosure"),
+            "ASP detection should use token boundaries instead of matching inside unrelated words"
+        );
+    }
+
+    #[test]
+    fn server_disclosure_still_reports_php_token_without_version() {
+        let record = make_record(vec![], vec![("x-powered-by", "PHP")], "", 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "X-Powered-By version disclosure"),
+            "explicit PHP stack tokens should still be reported even without a version number"
+        );
+    }
+
+    #[test]
+    fn scanner_findings_include_response_header_line_location() {
+        let record = make_record(vec![], vec![("server", "Apache/2.4.51")], "", 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+        let finding = findings
+            .iter()
+            .find(|finding| finding.title == "Server version disclosure")
+            .expect("server finding");
+
+        assert_eq!(
+            finding.location,
+            Some(FindingLocation {
+                side: "response".to_string(),
+                section: "header".to_string(),
+                line: Some(2),
+            })
+        );
+    }
+
+    #[test]
+    fn scanner_request_locations_account_for_synthesized_host_header() {
+        let token = jwt_token(
+            serde_json::json!({ "alg": "HS256", "typ": "JWT" }),
+            serde_json::json!({ "sub": "1234" }),
+        );
+        let record = make_record(
+            vec![("Authorization", &format!("Bearer {token}"))],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+        let finding = findings
+            .iter()
+            .find(|finding| finding.title == "JWT without expiration")
+            .expect("jwt finding");
+
+        assert_eq!(
+            finding.location,
+            Some(FindingLocation {
+                side: "request".to_string(),
+                section: "header".to_string(),
+                line: Some(3),
+            }),
+            "UI inserts Host before captured headers, so scanner locations must use the same line map"
         );
     }
 
@@ -3745,6 +5646,30 @@ mod tests {
     }
 
     #[test]
+    fn scanner_findings_include_response_body_line_location() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "first line\nsecond line\nSQL syntax error near SELECT",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+        let finding = findings
+            .iter()
+            .find(|finding| finding.category == "error")
+            .expect("error finding");
+
+        assert_eq!(
+            finding.location,
+            Some(FindingLocation {
+                side: "response".to_string(),
+                section: "body".to_string(),
+                line: Some(6),
+            })
+        );
+    }
+
+    #[test]
     fn error_scanner_ignores_json_validation_syntax_error() {
         let record = make_record(
             vec![],
@@ -3761,6 +5686,54 @@ mod tests {
     }
 
     #[test]
+    fn error_scanner_ignores_query_parameter_syntax_error() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"message":"Syntax error in query parameter 'filter'"}"#,
+            400,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "query-parameter validation copy should not be treated as SQL error disclosure"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_json_unterminated_string_error() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"message":"Unterminated string in JSON at position 12"}"#,
+            400,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "JSON parser string errors should not be treated as SQL injection indicators"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_sql_unterminated_string_error() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "SQL error: unterminated string literal at or near \"admin\"",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "SQL string literal errors should still be reported"
+        );
+    }
+
+    #[test]
     fn error_scanner_ignores_plain_internal_server_error() {
         let record = make_record(vec![], vec![], "Internal Server Error", 500);
         let findings = scan_transaction(&record, &ScannerConfig::default());
@@ -3772,6 +5745,38 @@ mod tests {
     }
 
     #[test]
+    fn error_scanner_ignores_generic_json_internal_server_error() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"error":"Internal Server Error"}"#,
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "generic JSON 500 messages without stack/file detail should not be reported"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_internal_server_error_with_file_detail() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Internal Server Error in /srv/app/index.js:10:3",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "internal server errors with implementation detail should still be reported"
+        );
+    }
+
+    #[test]
     fn error_scanner_still_reports_sql_syntax_error() {
         let record = make_record(vec![], vec![], "syntax error near SELECT in SQL query", 500);
         let findings = scan_transaction(&record, &ScannerConfig::default());
@@ -3779,6 +5784,214 @@ mod tests {
         assert!(
             findings.iter().any(|finding| finding.category == "error"),
             "database-oriented syntax errors should still be reported"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_database_product_name_without_error_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "This service supports MySQL and PostgreSQL backends.",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "database product names without error context should not create error Findings"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_database_product_name_with_error_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "MySQL driver error: unknown table users",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "database product names with driver/error context should still be reported"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_database_product_substrings() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Application error while rediscovering cached settings.",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "database product names should require token boundaries"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_database_product_with_token_boundary() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Redis connection error: failed to connect to cache backend",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "database product names with token boundaries and error context should still be reported"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_suppressed_stack_trace_copy() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Internal error. Stack trace disabled in production.",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "suppressed stack trace copy should not be reported as stack trace disclosure"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_actual_stack_trace_copy() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Stack trace:\n    at app.render (/srv/app/index.js:10:3)",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "actual stack trace text should still be reported"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_framework_names_without_error_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "This integration supports Laravel and Spring Boot services.",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "framework names alone should not be treated as backend error disclosure"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_laravel_stack_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            r#"Whoops! Illuminate\Routing\Exception in /srv/app/vendor/laravel/framework/src/Routing/Router.php on line 42"#,
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "Laravel stack/debug context should still be reported"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_debug_mode_disabled_copy() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Debug mode disabled for production.",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "disabled debug-mode copy should not create an error Finding"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_debug_mode_configuration_copy() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Debug mode configuration is documented for production deployments.",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "debug mode copy should not be reported just because another word contains 'on'"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_debug_mode_enabled_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Debug mode: enabled\nException detail: template rendering failed",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "enabled debug mode with exception context should still be reported"
+        );
+    }
+
+    #[test]
+    fn error_scanner_ignores_node_modules_documentation_path() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Install dependencies into node_modules/ before build.",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "error"),
+            "documentation paths should not be treated as Node.js path disclosure"
+        );
+    }
+
+    #[test]
+    fn error_scanner_reports_node_modules_stack_path() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/plain")],
+            "Error\n    at render (/srv/app/node_modules/pkg/index.js:10:3)",
+            500,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|finding| finding.category == "error"),
+            "node_modules paths in stack frames should still be reported"
         );
     }
 
@@ -3816,6 +6029,126 @@ mod tests {
                 .iter()
                 .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
             "Should detect CSP unsafe-inline"
+        );
+    }
+
+    #[test]
+    fn csp_unsafe_inline_with_nonce_is_ignored() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                (
+                    "content-security-policy",
+                    "default-src 'self'; script-src 'nonce-abc123' 'unsafe-inline'",
+                ),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
+            "unsafe-inline alongside script nonce/hash should not create a high-confidence finding"
+        );
+    }
+
+    #[test]
+    fn csp_unsafe_inline_with_hash_is_ignored() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                (
+                    "content-security-policy",
+                    "script-src 'sha256-abc123' 'unsafe-inline'",
+                ),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
+            "unsafe-inline alongside script hash should not create a high-confidence finding"
+        );
+    }
+
+    #[test]
+    fn csp_unsafe_inline_in_attr_is_not_suppressed_by_elem_nonce() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                (
+                    "content-security-policy",
+                    "script-src-attr 'unsafe-inline'; script-src-elem 'nonce-abc123'",
+                ),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
+            "nonce/hash suppression must be scoped to the directive containing unsafe-inline"
+        );
+    }
+
+    #[test]
+    fn csp_unsafe_inline_in_script_src_is_not_suppressed_by_elem_nonce() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                (
+                    "content-security-policy",
+                    "script-src 'unsafe-inline'; script-src-elem 'nonce-abc123'",
+                ),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
+            "a nonce in script-src-elem should not suppress unsafe-inline in script-src"
+        );
+    }
+
+    #[test]
+    fn csp_default_src_unsafe_inline_still_applies_to_attrs_when_elem_has_nonce() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                (
+                    "content-security-policy",
+                    "default-src 'self' 'unsafe-inline'; script-src-elem 'nonce-abc123'",
+                ),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "misconfig" && f.title.contains("unsafe-inline")),
+            "script-src-attr should fall back through script-src to default-src independently of script-src-elem"
         );
     }
 
@@ -3985,6 +6318,20 @@ mod tests {
     }
 
     #[test]
+    fn session_token_url_check_ignores_short_low_signal_values() {
+        let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+        record.path = "/app?token=1&sid=abc".to_string();
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.starts_with("Session/token parameter in URL")),
+            "short low-signal token parameters should not create auth Findings"
+        );
+    }
+
+    #[test]
     fn test_basic_auth_over_http() {
         let record = TransactionRecord::http(
             Utc::now(),
@@ -4063,6 +6410,21 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_scanner_ignores_stripe_publishable_key() {
+        let publishable_key = format!("pk_{}_{}a", "live", "TESTKEY000000000000000000");
+        let body = format!(r#"<script>const stripeKey = "{publishable_key}";</script>"#);
+        let record = make_record(vec![], vec![("content-type", "text/html")], &body, 200);
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Stripe Publishable Key")),
+            "Stripe publishable keys are client identifiers and should not create secret findings"
+        );
+    }
+
+    #[test]
     fn sensitive_scanner_detects_quoted_secret_token_assignment() {
         let fake_token = "z9Yx7-Wv5Ut3Sr1Qp0Nm8Lk6";
         let body = format!(r#"const auth_token = "{fake_token}";"#);
@@ -4136,11 +6498,12 @@ mod tests {
 
     #[test]
     fn sensitive_scanner_detects_luhn_valid_visa_card_number() {
-        let valid_card = format!("{}{}", "411111111111111", "1");
+        let valid_card = "4929123456789015";
+        let body = format!(r#"{{"card_number":"{valid_card}"}}"#);
         let record = make_record(
             vec![],
-            vec![("content-type", "text/html")],
-            &valid_card,
+            vec![("content-type", "application/json")],
+            &body,
             200,
         );
         let findings = scan_transaction(&record, &ScannerConfig::default());
@@ -4148,6 +6511,79 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.title.contains("Possible Visa card number")));
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_luhn_number_without_payment_context() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"build":"4929123456789015"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Possible Visa card number")),
+            "Luhn-valid numbers need payment/card context before creating Findings"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_known_test_card_numbers() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            "Use 4242 4242 4242 4242 or 5555 5555 5555 4444 in test mode.",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| {
+                finding.title.contains("Possible Visa card number")
+                    || finding.title.contains("Possible Mastercard number")
+            }),
+            "well-known payment test cards should not be reported as leaked card data"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_ignores_env_template_file_references() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            r#"<a href="/.env.example">environment template</a>"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.contains("Sensitive file path")),
+            ".env.example template references should not be reported as exposed secret files"
+        );
+    }
+
+    #[test]
+    fn sensitive_scanner_still_reports_env_file_reference() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            r#"<a href="/.env">environment file</a>"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title.contains("Sensitive file path")),
+            "direct .env references should still be reported"
+        );
     }
 
     #[test]
@@ -4165,6 +6601,24 @@ mod tests {
                 .iter()
                 .any(|f| f.category == "info" && f.title.contains("HTML comment")),
             "Should detect sensitive HTML comment"
+        );
+    }
+
+    #[test]
+    fn html_comment_ignores_plain_todo_copy() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            "<html><!-- TODO: update footer copy --><body>Hello</body></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title.starts_with("HTML comment contains")),
+            "plain TODO comments without sensitive context should not create Findings"
         );
     }
 
@@ -4187,6 +6641,24 @@ mod tests {
     }
 
     #[test]
+    fn swagger_words_without_spec_shape_are_ignored() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            "<html>Our docs mention swagger, openapi, paths, and info.</html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Swagger/OpenAPI spec exposed"),
+            "OpenAPI findings should require a parseable spec shape"
+        );
+    }
+
+    #[test]
     fn block_comment_source_map_reference_is_reported() {
         let record = make_record(
             vec![],
@@ -4202,13 +6674,60 @@ mod tests {
     }
 
     #[test]
+    fn source_map_reference_in_html_copy_is_ignored() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "text/html")],
+            "<html><body>//# sourceMappingURL=example.js.map</body></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "JavaScript source map reference"),
+            "sourceMappingURL text outside JS/CSS responses should not create source map Findings"
+        );
+    }
+
+    #[test]
     fn source_map_header_is_reported_even_when_body_is_empty() {
-        let record = make_record(vec![], vec![("sourcemap", "/static/app.js.map")], "", 200);
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "application/javascript"),
+                ("sourcemap", "/static/app.js.map"),
+            ],
+            "",
+            200,
+        );
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
         assert!(findings
             .iter()
             .any(|finding| finding.title == "Source map header present"));
+    }
+
+    #[test]
+    fn source_map_header_on_html_response_is_ignored() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-type", "text/html"),
+                ("sourcemap", "/static/app.js.map"),
+            ],
+            "<html></html>",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.title == "Source map header present"),
+            "SourceMap headers outside JS/CSS responses should not create Findings"
+        );
     }
 
     #[test]
@@ -4222,7 +6741,7 @@ mod tests {
     }
 
     #[test]
-    fn email_disclosure_ignores_example_domains_case_insensitively() {
+    fn email_disclosure_is_not_reported_for_public_contact_copy() {
         let record = make_record(
             vec![],
             vec![("content-type", "text/html")],
@@ -4237,7 +6756,7 @@ mod tests {
     }
 
     #[test]
-    fn email_disclosure_does_not_ignore_suffix_lookalike_domains() {
+    fn email_disclosure_is_not_reported_for_non_example_contact_copy() {
         let record = make_record(
             vec![],
             vec![("content-type", "text/html")],
@@ -4246,8 +6765,63 @@ mod tests {
         );
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
-        assert!(findings
+        assert!(!findings
             .iter()
             .any(|f| f.title == "Email address in response"));
+    }
+
+    #[test]
+    fn email_disclosure_reports_structured_user_email() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"user":{"id":12,"email":"alice.smith@corp.test"}}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            findings.iter().any(|f| {
+                f.title == "Email address in response"
+                    && f.evidence.contains("alice.smith@corp.test")
+            }),
+            "structured user/account email fields should still be reported"
+        );
+    }
+
+    #[test]
+    fn email_disclosure_ignores_role_account_json() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"support_email":"security@corp.test"}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title == "Email address in response"),
+            "role/contact mailbox fields should not create email Findings"
+        );
+    }
+
+    #[test]
+    fn email_disclosure_ignores_example_json_values() {
+        let record = make_record(
+            vec![],
+            vec![("content-type", "application/json")],
+            r#"{"user":{"email":"alice@example.com"}}"#,
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title == "Email address in response"),
+            "example domains should not create email Findings"
+        );
     }
 }

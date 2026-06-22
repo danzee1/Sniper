@@ -27,6 +27,7 @@ async fn proxy_captures_basic_http_exchange() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!("sniper-test-http-{}", uuid::Uuid::new_v4())),
     };
@@ -92,6 +93,7 @@ async fn websocket_upstream_http_handshake_failure_preserves_status_and_body() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-websocket-http-failure-{}",
@@ -169,6 +171,7 @@ async fn proxy_streams_open_upstream_response_before_eof() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-streaming-http-{}",
@@ -245,6 +248,7 @@ async fn flush_pending_persists_waits_for_streaming_body_pump_store() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir()
             .join(format!("sniper-test-stream-flush-{}", uuid::Uuid::new_v4())),
@@ -336,6 +340,7 @@ async fn response_intercept_drop_records_synthetic_response_version() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-response-intercept-drop-version-{}",
@@ -435,6 +440,7 @@ async fn proxy_records_origin_form_rejection_without_host_header() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-missing-host-rejection-{}",
@@ -485,6 +491,7 @@ async fn proxy_records_http10_rejection_version() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-http10-rejection-{}",
@@ -533,6 +540,7 @@ async fn proxy_rejects_absolute_form_host_mismatch_before_upstream_dial() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-absolute-host-mismatch-{}",
@@ -587,6 +595,7 @@ async fn proxy_rejects_duplicate_host_headers_before_upstream_dial() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-duplicate-host-rejection-{}",
@@ -642,6 +651,7 @@ async fn proxy_rejects_origin_form_host_userinfo_before_upstream_dial() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-host-userinfo-rejection-{}",
@@ -697,6 +707,7 @@ async fn proxy_rejects_absolute_form_userinfo_even_when_host_header_matches() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-absolute-userinfo-rejection-{}",
@@ -753,6 +764,7 @@ async fn proxy_records_invalid_connect_rejection() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-invalid-connect-rejection-{}",
@@ -825,6 +837,7 @@ async fn proxy_rejects_connect_userinfo_authority() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-connect-userinfo-rejection-{}",
@@ -882,6 +895,7 @@ async fn passthrough_connect_returns_bad_gateway_when_upstream_dial_fails() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-passthrough-connect-failure-{}",

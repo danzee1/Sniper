@@ -100,20 +100,39 @@ Session → Scope → Capture → Replay → Fuzz
 
 ```bash
 sniper-cli session list
-sniper-cli capture http list --limit 10
-sniper-cli capture http replay --id <id>
-sniper-cli scope set-scope --pattern '*.example.com'
-sniper-cli fuzzer run
+sniper-cli --output compact capture http list --limit 10
+sniper-cli capture http replay --id <id> --dry-run
+sniper-cli capture http replay --id <id> --yes
+sniper-cli scope set-scope --pattern '*.example.com' --dry-run
+sniper-cli scope set-scope --pattern '*.example.com' --yes
+sniper-cli fuzzer run --dry-run
+sniper-cli fuzzer run --yes
 ```
 
-Full JSON output, scriptable, AI-agent friendly.
+Legacy subcommands keep their original raw JSON success output for compatibility. `call` success output is wrapped in an automation envelope; use `--output compact` for one-line JSON and read `call` results from `data`.
+
+AI/automation callers can invoke manifest operations directly:
+
+```bash
+sniper-cli --output compact call capture.http.list --input '{"limit":20,"page":true}'
+sniper-cli --output compact call replay.send --input '{"tab_id":"<tab-id>"}' --dry-run
+sniper-cli --output compact call replay.send --input '{"tab_id":"<tab-id>"}' --yes
+```
+
+All side-effecting commands with `side_effect: "write"` in `sniper-cli manifest` require `--dry-run` or `--yes`.
+
+```bash
+sniper-cli manifest
+sniper-cli schema input replay.send
+sniper-cli examples capture.http.list
+printf "%s" "$OAST_TOKEN" | sniper-cli capture oast configure --provider custom --url https://oast.example --token-stdin --yes
+```
 
 ## AI integration
 
 ```bash
-sniper-cli skills install --claude   # Install Claude skill
-sniper-cli skills install --codex    # Install Codex skill
-sniper-cli skills install --all      # Install all
+sniper-cli skills install --all --dry-run
+sniper-cli skills install --all --yes
 ```
 
 AI agents can drive the full workflow through CLI — capture, scope, replay, fuzz — no UI scraping needed.

@@ -22,6 +22,7 @@ async fn proxy_mitm_captures_inner_https_requests() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!("sniper-test-mitm-{}", uuid::Uuid::new_v4())),
     };
@@ -90,6 +91,7 @@ async fn mitm_connect_tls_failure_after_200_records_connect_success_status() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-mitm-post-ok-failure-{}",

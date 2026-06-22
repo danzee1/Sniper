@@ -1484,6 +1484,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 4096,
             data_dir: root.clone(),
         })

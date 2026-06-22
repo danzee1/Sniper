@@ -1677,16 +1677,27 @@ fn transfer_encoding_tokens(headers: &HeaderMap) -> std::result::Result<Vec<Stri
 }
 
 fn text_response(status: StatusCode, message: impl Into<String>) -> Response<Body> {
+    text_response_for_method(status, message, "GET")
+}
+
+fn text_response_for_method(
+    status: StatusCode,
+    message: impl Into<String>,
+    request_method: &str,
+) -> Response<Body> {
     let message = message.into();
     let len = message.len();
-    let mut response = Response::new(Body::from(message));
+    let body = local_response_wire_body(status, request_method, message.into_bytes());
+    let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
-    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
-        response.headers_mut().insert(CONTENT_LENGTH, value);
+    if response_allows_synthesized_content_length(status) {
+        if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+            response.headers_mut().insert(CONTENT_LENGTH, value);
+        }
     }
     response
 }
@@ -1763,7 +1774,8 @@ async fn record_http_rejection(
         request_body,
         state.config.body_preview_bytes,
     );
-    let (response, response_capture) = synthetic_error_response(status, &message, state);
+    let (response, response_capture) =
+        synthetic_error_response_for_method(status, &message, state, &identity.method);
     let record = with_record_http_versions(
         TransactionRecord::http(
             started_at,
@@ -1866,12 +1878,32 @@ impl EmptyStringExt for String {
     }
 }
 
+fn local_response_wire_body(status: StatusCode, request_method: &str, body: Vec<u8>) -> Vec<u8> {
+    if response_must_not_include_body(status, request_method) {
+        Vec::new()
+    } else {
+        body
+    }
+}
+
 fn build_local_response(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Response<Body> {
+    build_local_response_for_method(status, headers, body, "GET")
+}
+
+fn build_local_response_for_method(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    request_method: &str,
+) -> Response<Body> {
+    let body = local_response_wire_body(status, request_method, body);
     let len = body.len();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
-    if response_allows_synthesized_content_length(status) {
+    if response_allows_synthesized_content_length(status)
+        && !response_must_not_include_body(status, request_method)
+    {
         if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
             response.headers_mut().insert(CONTENT_LENGTH, value);
         }
@@ -2170,8 +2202,12 @@ async fn handle_special_host_request(
                 &[],
                 state.config.body_preview_bytes,
             );
-            let (response, response_capture) =
-                synthetic_error_response(error.status(), &message, &state);
+            let (response, response_capture) = synthetic_error_response_for_method(
+                error.status(),
+                &message,
+                &state,
+                parts.method.as_str(),
+            );
             let insert_outcome = insert_transaction_quiet(
                 &session,
                 with_record_http_versions(
@@ -2206,9 +2242,16 @@ async fn handle_special_host_request(
     );
     let proxy_addr = state.get_active_proxy_addr().await;
     let response = special_host::respond(&path, &parts.method, state.as_ref(), true, proxy_addr);
+    let special_host::SpecialHostResponse {
+        status,
+        headers,
+        body,
+        notes,
+    } = response;
+    let response_body = local_response_wire_body(status, parts.method.as_str(), body);
     let response_capture = MessageRecord::from_headers_and_body(
-        &response.headers,
-        response.body.as_ref(),
+        &headers,
+        response_body.as_ref(),
         state.config.body_preview_bytes,
     );
 
@@ -2221,11 +2264,11 @@ async fn handle_special_host_request(
                 "https".to_string(),
                 request_authority,
                 path,
-                Some(response.status.as_u16()),
+                Some(status.as_u16()),
                 started.elapsed().as_millis() as u64,
                 request_capture,
                 Some(response_capture),
-                response.notes.clone(),
+                notes,
                 None,
                 None,
             ),
@@ -2237,10 +2280,11 @@ async fn handle_special_host_request(
     .await;
     persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
 
-    Ok(build_local_response(
-        response.status,
-        response.headers,
-        response.body,
+    Ok(build_local_response_for_method(
+        status,
+        headers,
+        response_body,
+        parts.method.as_str(),
     ))
 }
 
@@ -2381,8 +2425,12 @@ async fn forward_http_request(
                 }
                 ResponseInterceptResolution::Drop => {
                     let message = "Response dropped in intercept.";
-                    let (response, response_capture) =
-                        synthetic_error_response(StatusCode::BAD_GATEWAY, message, &state);
+                    let (response, response_capture) = synthetic_error_response_for_method(
+                        StatusCode::BAD_GATEWAY,
+                        message,
+                        &state,
+                        &response_method,
+                    );
                     record.status = Some(StatusCode::BAD_GATEWAY.as_u16());
                     record.response = Some(response_capture);
                     record = record.with_response_http_version(Version::HTTP_11);
@@ -2391,7 +2439,7 @@ async fn forward_http_request(
                 }
             }
         }
-        Err(error) => text_response(error.status, error.message),
+        Err(error) => text_response_for_method(error.status, error.message, &response_method),
     };
 
     store_record_and_scan(&state, &session, record).await;
@@ -2476,7 +2524,7 @@ async fn forward_websocket_request(
                 response.body,
                 &response_method,
             ),
-            Err(error) => text_response(error.status, error.message),
+            Err(error) => text_response_for_method(error.status, error.message, &response_method),
         };
     }
 
@@ -2489,8 +2537,12 @@ async fn forward_websocket_request(
     if let Some(message) =
         websocket_upgrade_validation_error_for_editable(&forwarded_request, &request_headers)
     {
-        let (client_response, response_capture) =
-            synthetic_error_response(StatusCode::BAD_REQUEST, message, &state);
+        let (client_response, response_capture) = synthetic_error_response_for_method(
+            StatusCode::BAD_REQUEST,
+            message,
+            &state,
+            &forwarded_request.method,
+        );
         let record = with_record_http_versions(
             TransactionRecord::http(
                 started_at,
@@ -2552,7 +2604,7 @@ async fn forward_websocket_request(
                 response.body,
                 &response_method,
             ),
-            Err(error) => text_response(error.status, error.message),
+            Err(error) => text_response_for_method(error.status, error.message, &response_method),
         };
     }
 
@@ -2604,8 +2656,12 @@ async fn forward_websocket_request(
         }
         Err(UpstreamWebSocketConnectError::Other(error)) => {
             let message = format!("WebSocket connect failed: {error}");
-            let (client_response, response_capture) =
-                synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+            let (client_response, response_capture) = synthetic_error_response_for_method(
+                StatusCode::BAD_GATEWAY,
+                &message,
+                &state,
+                &forwarded_request.method,
+            );
             let record = with_record_http_versions(
                 TransactionRecord::http(
                     started_at,
@@ -2638,8 +2694,12 @@ async fn forward_websocket_request(
         Ok(headers) => headers,
         Err(error) => {
             let message = format!("Invalid WebSocket handshake: {error}");
-            let (client_response, response_capture) =
-                synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
+            let (client_response, response_capture) = synthetic_error_response_for_method(
+                StatusCode::BAD_REQUEST,
+                &message,
+                &state,
+                &forwarded_request.method,
+            );
             let record = with_record_http_versions(
                 TransactionRecord::http(
                     started_at,
@@ -2692,8 +2752,12 @@ async fn forward_websocket_request(
         &applied_response.headers,
     ) {
         let message = format!("Invalid WebSocket handshake response: {error}");
-        let (client_response, response_capture) =
-            synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
+        let (client_response, response_capture) = synthetic_error_response_for_method(
+            StatusCode::BAD_REQUEST,
+            &message,
+            &state,
+            &forwarded_request.method,
+        );
         let record = with_record_http_versions(
             TransactionRecord::http(
                 started_at,
@@ -3177,8 +3241,12 @@ async fn execute_streaming_http_exchange(
         Err(error) => {
             let message = error.to_string();
             notes.push(message.clone());
-            let (response, response_capture) =
-                synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
+            let (response, response_capture) = synthetic_error_response_for_method(
+                StatusCode::BAD_REQUEST,
+                &message,
+                &state,
+                method.as_str(),
+            );
             let record = with_record_http_versions(
                 TransactionRecord::http(
                     started_at,
@@ -3238,8 +3306,12 @@ async fn execute_streaming_http_exchange(
                         message.clone(),
                     )
                     .await;
-                let (response, response_capture) =
-                    synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+                let (response, response_capture) = synthetic_error_response_for_method(
+                    StatusCode::BAD_GATEWAY,
+                    &message,
+                    &state,
+                    method.as_str(),
+                );
                 let record = with_record_http_versions(
                     TransactionRecord::http(
                         started_at,
@@ -3311,8 +3383,12 @@ async fn execute_streaming_http_exchange(
                     message.clone(),
                 )
                 .await;
-            let (response, response_capture) =
-                synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+            let (response, response_capture) = synthetic_error_response_for_method(
+                StatusCode::BAD_GATEWAY,
+                &message,
+                &state,
+                method.as_str(),
+            );
             let record = with_record_http_versions(
                 TransactionRecord::http(
                     started_at,
@@ -3586,9 +3662,11 @@ async fn execute_http_exchange(
             secure_special_host || request.scheme.eq_ignore_ascii_case("https"),
             proxy_addr,
         );
+        let response_body =
+            local_response_wire_body(response.status, method.as_str(), response.body);
         let response_capture = MessageRecord::from_headers_and_body(
             &response.headers,
-            response.body.as_ref(),
+            response_body.as_ref(),
             state.config.body_preview_bytes,
         );
         notes.extend(response.notes.clone());
@@ -3614,7 +3692,7 @@ async fn execute_http_exchange(
             response: Ok(UpstreamResponse {
                 status: response.status,
                 headers: response.headers,
-                body: Bytes::from(response.body),
+                body: Bytes::from(response_body),
             }),
         };
     }
@@ -3624,8 +3702,12 @@ async fn execute_http_exchange(
         Err(error) => {
             let message = error.to_string();
             notes.push(message.clone());
-            let (_response, response_capture) =
-                synthetic_error_response(StatusCode::BAD_REQUEST, &message, &state);
+            let (_response, response_capture) = synthetic_error_response_for_method(
+                StatusCode::BAD_REQUEST,
+                &message,
+                &state,
+                method.as_str(),
+            );
             return ExecutedExchange {
                 record: with_record_http_versions(
                     TransactionRecord::http(
@@ -3688,8 +3770,12 @@ async fn execute_http_exchange(
                         message.clone(),
                     )
                     .await;
-                let (_response, response_capture) =
-                    synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+                let (_response, response_capture) = synthetic_error_response_for_method(
+                    StatusCode::BAD_GATEWAY,
+                    &message,
+                    &state,
+                    method.as_str(),
+                );
                 return ExecutedExchange {
                     record: with_record_http_versions(
                         TransactionRecord::http(
@@ -3790,8 +3876,12 @@ async fn execute_http_exchange(
                             message.clone(),
                         )
                         .await;
-                    let (_response, response_capture) =
-                        synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+                    let (_response, response_capture) = synthetic_error_response_for_method(
+                        StatusCode::BAD_GATEWAY,
+                        &message,
+                        &state,
+                        method.as_str(),
+                    );
                     ExecutedExchange {
                         record: with_record_http_versions(
                             TransactionRecord::http(
@@ -3831,8 +3921,12 @@ async fn execute_http_exchange(
                     message.clone(),
                 )
                 .await;
-            let (_response, response_capture) =
-                synthetic_error_response(StatusCode::BAD_GATEWAY, &message, &state);
+            let (_response, response_capture) = synthetic_error_response_for_method(
+                StatusCode::BAD_GATEWAY,
+                &message,
+                &state,
+                method.as_str(),
+            );
             ExecutedExchange {
                 record: with_record_http_versions(
                     TransactionRecord::http(
@@ -3956,9 +4050,19 @@ fn editable_request_from_parts(
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
+    let plain_chunked_transfer = transfer_encoding_tokens(&parts.headers)
+        .map(|codings| codings.len() == 1 && codings[0].eq_ignore_ascii_case("chunked"))
+        .unwrap_or(false);
     let mut headers: Vec<HeaderRecord> = parts
         .headers
         .iter()
+        .filter(|(name, _)| {
+            !plain_chunked_transfer
+                || (!name
+                    .as_str()
+                    .eq_ignore_ascii_case(TRANSFER_ENCODING.as_str())
+                    && !name.as_str().eq_ignore_ascii_case(CONTENT_LENGTH.as_str()))
+        })
         .map(|(name, value)| HeaderRecord {
             name: name.as_str().to_string(),
             value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
@@ -3976,6 +4080,12 @@ fn editable_request_from_parts(
                 value: host.clone(),
             },
         );
+    }
+    if plain_chunked_transfer {
+        headers.push(HeaderRecord {
+            name: CONTENT_LENGTH.as_str().to_string(),
+            value: request_bytes.len().to_string(),
+        });
     }
 
     let body_encoding = if is_raw_request_body_utf8(request_bytes.as_ref()) {
@@ -4085,17 +4195,24 @@ fn synthetic_error_response(
     message: &str,
     state: &Arc<AppState>,
 ) -> (Response<Body>, MessageRecord) {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
+    synthetic_error_response_for_method(status, message, state, "GET")
+}
+
+fn synthetic_error_response_for_method(
+    status: StatusCode,
+    message: &str,
+    state: &Arc<AppState>,
+    request_method: &str,
+) -> (Response<Body>, MessageRecord) {
+    let response = text_response_for_method(status, message, request_method);
+    let capture_body =
+        local_response_wire_body(status, request_method, message.as_bytes().to_vec());
     let capture = MessageRecord::from_headers_and_body(
-        &headers,
-        message.as_bytes(),
+        response.headers(),
+        capture_body.as_ref(),
         state.config.body_preview_bytes,
     );
-    (text_response(status, message), capture)
+    (response, capture)
 }
 
 struct DroppedExchange {
@@ -4117,10 +4234,16 @@ fn build_dropped_transaction(
         &request.body_bytes(),
         state.config.body_preview_bytes,
     );
-    let response = text_response(StatusCode::FORBIDDEN, note);
+    let request_method = request.method.clone();
+    let response = text_response_for_method(StatusCode::FORBIDDEN, note, &request_method);
+    let capture_body = local_response_wire_body(
+        StatusCode::FORBIDDEN,
+        &request_method,
+        note.as_bytes().to_vec(),
+    );
     let response_capture = MessageRecord::from_headers_and_body(
         response.headers(),
-        note.as_bytes(),
+        capture_body.as_ref(),
         state.config.body_preview_bytes,
     );
     DroppedExchange {
@@ -5345,10 +5468,6 @@ async fn relay_websocket_session(
                             }
                             if let WebSocketMessage::Ping(payload) = &message {
                                 let reply = WebSocketMessage::Pong(payload.clone());
-                                client_sink
-                                    .send(reply.clone())
-                                    .await
-                                    .context("failed to send websocket pong to client")?;
                                 if let Some(id) = session_id {
                                     if let Some(frame) = capture_websocket_frame(
                                         frame_index,
@@ -5415,10 +5534,6 @@ async fn relay_websocket_session(
                             }
                             if let WebSocketMessage::Ping(payload) = &message {
                                 let reply = WebSocketMessage::Pong(payload.clone());
-                                upstream_sink
-                                    .send(reply.clone())
-                                    .await
-                                    .context("failed to send websocket pong upstream")?;
                                 if let Some(id) = session_id {
                                     if let Some(frame) = capture_websocket_frame(
                                         frame_index,
@@ -5670,6 +5785,19 @@ mod tests {
         }
     }
 
+    fn test_proxy_state(name: &str) -> (Arc<AppState>, std::path::PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!("{name}-{}", Uuid::new_v4()));
+        let config = crate::config::AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            max_transaction_entries: 32,
+            body_preview_bytes: 1024,
+            data_dir: data_dir.clone(),
+        };
+        (Arc::new(AppState::new(config).unwrap()), data_dir)
+    }
+
     fn ws_text_frame(index: usize) -> WebSocketFrameRecord {
         WebSocketFrameRecord {
             index,
@@ -5776,6 +5904,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-proxy-persist-generation-{}",
@@ -5810,6 +5939,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-proxy-ws-frame-persist-generation-{}",
@@ -5845,6 +5975,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: data_dir.clone(),
         };
@@ -5901,6 +6032,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: data_dir.clone(),
         };
@@ -5933,6 +6065,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: data_dir.clone(),
         };
@@ -5971,6 +6104,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 2,
+            max_transaction_entries: 2,
             body_preview_bytes: 1024,
             data_dir: data_dir.clone(),
         };
@@ -6024,6 +6158,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: data_dir.clone(),
         };
@@ -6082,6 +6217,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: data_dir.clone(),
         };
@@ -6169,6 +6305,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-proxy-flush-persist-generation-{}",
@@ -6206,6 +6343,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-proxy-flush-same-generation-dirty-{}",
@@ -6267,6 +6405,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 1024,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-proxy-clean-forget-dirty-{}",
@@ -6301,6 +6440,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6360,6 +6500,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6431,6 +6572,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6501,6 +6643,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6579,6 +6722,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6623,6 +6767,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6649,6 +6794,7 @@ mod tests {
             proxy_addr: "127.0.0.1:18080".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6698,6 +6844,7 @@ mod tests {
             proxy_addr: "127.0.0.1:18080".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6770,6 +6917,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6815,6 +6963,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6854,6 +7003,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -6902,6 +7052,37 @@ mod tests {
             .headers
             .iter()
             .any(|header| header.name.eq_ignore_ascii_case("content-length")));
+    }
+
+    #[test]
+    fn proxy_editable_request_canonicalizes_plain_chunked_body() {
+        let body = Bytes::from_static(b"hello");
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/upload")
+            .header(HOST, "example.com")
+            .header(TRANSFER_ENCODING, "chunked")
+            .header(CONTENT_LENGTH, "999")
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let absolute_uri: Uri = "http://example.com/upload".parse().unwrap();
+
+        let editable = editable_request_from_parts(&parts, &body, &absolute_uri);
+
+        assert_eq!(editable.body_encoding, BodyEncoding::Utf8);
+        assert_eq!(editable.body, "hello");
+        assert!(!editable
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding")));
+        let content_lengths = editable
+            .headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("content-length"))
+            .collect::<Vec<_>>();
+        assert_eq!(content_lengths.len(), 1);
+        assert_eq!(content_lengths[0].value, "5");
     }
 
     #[test]
@@ -7586,6 +7767,111 @@ mod tests {
 
         assert!(!headers.contains_key("x-hop"));
         assert!(!headers.contains_key(CONNECTION));
+    }
+
+    #[tokio::test]
+    async fn head_synthetic_error_response_has_empty_wire_and_capture_body() {
+        let (state, data_dir) = test_proxy_state("sniper-head-synthetic-response");
+
+        let (response, capture) = synthetic_error_response_for_method(
+            StatusCode::BAD_REQUEST,
+            "invalid host",
+            &state,
+            "HEAD",
+        );
+
+        assert_eq!(capture.body_size, 0);
+        assert!(capture.body_preview.is_empty());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn dropped_head_transaction_has_empty_wire_and_capture_body() {
+        let (state, data_dir) = test_proxy_state("sniper-head-dropped-response");
+        let request = EditableRequest {
+            scheme: "http".to_string(),
+            host: "example.com".to_string(),
+            method: "HEAD".to_string(),
+            path: "/".to_string(),
+            headers: vec![record("Host", "example.com")],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+
+        let dropped = build_dropped_transaction(
+            state.as_ref(),
+            request,
+            Utc::now(),
+            Instant::now(),
+            "Request dropped in intercept.",
+            Some(Version::HTTP_11),
+        );
+
+        let response_capture = dropped.record.response.as_ref().unwrap();
+        assert_eq!(response_capture.body_size, 0);
+        assert!(response_capture.body_preview.is_empty());
+        let body = dropped
+            .response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(body.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn http_special_host_head_exchange_records_empty_response_body() {
+        let (state, data_dir) = test_proxy_state("sniper-http-special-host-head");
+        let session = state.session().await;
+        let request = EditableRequest {
+            scheme: "http".to_string(),
+            host: "sniper".to_string(),
+            method: "HEAD".to_string(),
+            path: "/".to_string(),
+            headers: vec![record("Host", "sniper")],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+            preview_truncated: false,
+        };
+
+        let exchange = execute_http_exchange(
+            state.clone(),
+            session,
+            &build_client(false),
+            request,
+            Utc::now(),
+            Instant::now(),
+            Vec::new(),
+            false,
+            None,
+            Some(Version::HTTP_11),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            exchange
+                .record
+                .response
+                .as_ref()
+                .map(|response| response.body_size),
+            Some(0)
+        );
+        let response = match exchange.response {
+            Ok(response) => response,
+            Err(error) => panic!("special-host exchange failed: {}", error.message),
+        };
+        assert!(response.body.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

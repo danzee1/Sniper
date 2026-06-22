@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
@@ -15,6 +16,7 @@ use crate::model::{
 
 const MAX_WEBSOCKET_BROADCAST_CAPACITY: usize = 4096;
 const DEFAULT_WEBSOCKET_LIST_LIMIT: usize = 5_000;
+const WEBSOCKET_CAPTURE_PREVIEW_BYTES: usize = 64 * 1024;
 
 pub struct WebSocketStore {
     max_entries: usize,
@@ -462,6 +464,7 @@ pub(crate) fn sessions_with_live_preserved(
         .into_iter()
         .filter_map(|mut session| {
             trim_frame_overflow(&mut session.frames, max_frames_per_session);
+            normalize_restored_frame_previews(&mut session.frames);
             if session.closed_at.is_none() {
                 return Some(session);
             }
@@ -472,6 +475,51 @@ pub(crate) fn sessions_with_live_preserved(
             Some(session)
         })
         .collect()
+}
+
+fn normalize_restored_frame_previews(frames: &mut [WebSocketFrameRecord]) {
+    for frame in frames {
+        match frame.body_encoding {
+            crate::model::BodyEncoding::Utf8 => normalize_restored_utf8_frame(frame),
+            crate::model::BodyEncoding::Base64 => normalize_restored_base64_frame(frame),
+        }
+    }
+}
+
+fn normalize_restored_utf8_frame(frame: &mut WebSocketFrameRecord) {
+    let preview_len = frame.body_preview.len();
+    if frame.body_size < preview_len {
+        frame.body_size = preview_len;
+    }
+    if preview_len <= WEBSOCKET_CAPTURE_PREVIEW_BYTES {
+        return;
+    }
+
+    let mut truncate_at = WEBSOCKET_CAPTURE_PREVIEW_BYTES;
+    while !frame.body_preview.is_char_boundary(truncate_at) {
+        truncate_at -= 1;
+    }
+    frame.body_preview.truncate(truncate_at);
+    frame.preview_truncated = true;
+}
+
+fn normalize_restored_base64_frame(frame: &mut WebSocketFrameRecord) {
+    let Ok(mut decoded) = STANDARD.decode(frame.body_preview.as_bytes()) else {
+        frame.body_preview.clear();
+        frame.body_size = 0;
+        frame.preview_truncated = false;
+        return;
+    };
+    if frame.body_size < decoded.len() {
+        frame.body_size = decoded.len();
+    }
+    if decoded.len() <= WEBSOCKET_CAPTURE_PREVIEW_BYTES {
+        return;
+    }
+
+    decoded.truncate(WEBSOCKET_CAPTURE_PREVIEW_BYTES);
+    frame.body_preview = STANDARD.encode(decoded);
+    frame.preview_truncated = true;
 }
 
 fn inner_from_records(
@@ -1537,6 +1585,21 @@ mod tests {
         assert_eq!(restored[0].frames.len(), 2);
         assert_eq!(restored[0].frames[0].index, 2);
         assert_eq!(restored[0].frames[1].index, 3);
+    }
+
+    #[tokio::test]
+    async fn from_sessions_normalizes_oversized_restored_frame_previews() {
+        let mut restored_frame = frame(1);
+        restored_frame.body_preview = "x".repeat(WEBSOCKET_CAPTURE_PREVIEW_BYTES + 1);
+        restored_frame.body_size = restored_frame.body_preview.len();
+        restored_frame.preview_truncated = false;
+        let store = WebSocketStore::from_sessions(10, 10, vec![session(vec![restored_frame])]);
+
+        let restored = store.snapshot(None).await;
+        let frame = &restored[0].frames[0];
+
+        assert_eq!(frame.body_preview.len(), WEBSOCKET_CAPTURE_PREVIEW_BYTES);
+        assert!(frame.preview_truncated);
     }
 
     #[tokio::test]

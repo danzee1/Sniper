@@ -432,6 +432,7 @@ fn callbacks_to_entries(
     let mut seen = HashSet::new();
     callbacks
         .into_iter()
+        .filter(callback_fields_within_oast_limits)
         .filter(|callback| seen.insert(callback_dedup_key(callback)))
         .take(max_entries)
         .collect()
@@ -1930,6 +1931,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_drops_oversized_callback_fields() {
+        let store = OastStore::new(4);
+        let mut oversized = callback("oversized");
+        oversized.raw_data = "x".repeat(MAX_OAST_CALLBACK_FIELD_BYTES + 1);
+        store.restore(vec![oversized, callback("kept")]).await;
+
+        let callbacks = store.list(None).await;
+
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].protocol, "kept");
+    }
+
+    #[tokio::test]
     async fn push_skips_duplicate_callbacks_without_broadcasting() {
         let store = OastStore::new(16);
         let mut receiver = store.subscribe();
@@ -2170,6 +2184,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 100,
+                max_transaction_entries: 100,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })
@@ -2264,6 +2279,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 100,
+                max_transaction_entries: 100,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })
@@ -2363,6 +2379,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 100,
+                max_transaction_entries: 100,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })

@@ -455,30 +455,13 @@ impl WsReplayStore {
                             match msg_result {
                                 Ok(msg) => {
                                     if let WsMessage::Ping(payload) = msg {
-                                        let sender = {
-                                            let mut c = conn.write().await;
-                                            c.push_frame(
-                                                WebSocketFrameDirection::ServerToClient,
-                                                &WsMessage::Ping(payload.clone()),
-                                            );
-                                            c.sender.clone()
-                                        };
-                                        if let Some(sender) = sender {
-                                            if let Err(error) = sender
-                                                .send(WsReplayOutboundMessage::Message {
-                                                    msg: WsMessage::Pong(payload),
-                                                    recorded_index: None,
-                                                })
-                                                .await
-                                            {
-                                                let message = format!(
-                                                    "ws replay pong auto-reply failed: {error}"
-                                                );
-                                                warn!("{}", message);
-                                                read_error = Some(message);
-                                                break;
-                                            }
-                                        }
+                                        let ping = WsMessage::Ping(payload);
+                                        let mut c = conn.write().await;
+                                        c.push_frame(
+                                            WebSocketFrameDirection::ServerToClient,
+                                            &ping,
+                                        );
+                                        c.push_auto_reply_frame(&ping);
                                         continue;
                                     }
 
@@ -1302,6 +1285,63 @@ mod tests {
             conn.frames[3].direction,
             WebSocketFrameDirection::ClientToServer
         ));
+    }
+
+    #[tokio::test]
+    async fn server_ping_receives_single_automatic_pong() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(WsMessage::Ping(b"hello".to_vec().into()))
+                .await
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut pongs = Vec::new();
+            while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+                match tokio::time::timeout(remaining, ws.next()).await {
+                    Ok(Some(Ok(WsMessage::Pong(payload)))) => pongs.push(payload.to_vec()),
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(error))) => panic!("server websocket read failed: {error}"),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            pongs
+        });
+
+        let store = WsReplayStore::new();
+        let id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let url = format!("ws://{addr}/");
+        store
+            .connect(id, owner, &url, Vec::new(), false)
+            .await
+            .unwrap();
+
+        let pongs = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server should finish")
+            .expect("server task should succeed");
+        assert_eq!(pongs, vec![b"hello".to_vec()]);
+
+        for _ in 0..20 {
+            if store
+                .snapshot(id)
+                .await
+                .is_some_and(|snapshot| snapshot.frames.len() >= 2)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let snapshot = store.snapshot(id).await.unwrap();
+        assert_eq!(snapshot.frames.len(), 2);
+        assert!(matches!(snapshot.frames[0].kind, WebSocketFrameKind::Ping));
+        assert!(matches!(snapshot.frames[1].kind, WebSocketFrameKind::Pong));
+
+        store.remove(id).await;
     }
 
     #[tokio::test]

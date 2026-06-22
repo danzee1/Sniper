@@ -125,6 +125,23 @@ async fn session_live_counts(session: &Arc<SessionContext>) -> LiveSessionCounts
     }
 }
 
+fn apply_live_session_counts(summary: &mut SessionSummary, counts: LiveSessionCounts) {
+    summary.request_count = counts.request_count;
+    summary.websocket_count = counts.websocket_count;
+    summary.event_count = counts.event_count;
+    summary.fuzzer_count = counts.fuzzer_count;
+    summary.rule_count = counts.rule_count;
+}
+
+async fn session_summary_with_live_counts(
+    session: &Arc<SessionContext>,
+    active: bool,
+) -> SessionSummary {
+    let mut summary = session.summary(active);
+    apply_live_session_counts(&mut summary, session_live_counts(session).await);
+    summary
+}
+
 impl AppState {
     pub fn new(config: AppConfig) -> Result<Self> {
         let certificates = Arc::new(CertificateAuthority::load_or_create(&config.data_dir)?);
@@ -133,9 +150,10 @@ impl AppState {
             config.proxy_addr,
         )?);
         let ui_settings = Arc::new(AppUiSettingsStore::load_or_create(&config.data_dir)?);
-        let (sessions, active_session) = SessionRegistry::load_or_create(
+        let (sessions, active_session) = SessionRegistry::load_or_create_with_transaction_limit(
             &config.data_dir,
             config.max_entries,
+            config.max_transaction_entries,
             MAX_WEBSOCKET_FRAMES_PER_SESSION,
         )?;
 
@@ -388,11 +406,7 @@ impl AppState {
 
         for summary in &mut summaries {
             if let Some(counts) = live_counts.get(&summary.id) {
-                summary.request_count = counts.request_count;
-                summary.websocket_count = counts.websocket_count;
-                summary.event_count = counts.event_count;
-                summary.fuzzer_count = counts.fuzzer_count;
-                summary.rule_count = counts.rule_count;
+                apply_live_session_counts(summary, *counts);
             }
         }
         summaries
@@ -401,7 +415,7 @@ impl AppState {
     pub async fn active_session_summary(&self) -> SessionSummary {
         let active_id = self.sessions.active_session_id();
         let session = self.session().await;
-        session.summary(session.id() == active_id)
+        session_summary_with_live_counts(&session, session.id() == active_id).await
     }
 
     pub async fn create_session(&self, name: Option<String>) -> Result<SessionSummary> {
@@ -694,7 +708,7 @@ impl AppState {
 
     pub async fn runtime_info(&self) -> RuntimeInfo {
         let session = self.session().await;
-        let active_session = session.summary(true);
+        let active_session = session_summary_with_live_counts(&session, true).await;
         let active_addr = self.get_active_proxy_addr().await;
         let ui_addr = self.get_active_ui_addr().await;
         RuntimeInfo {
@@ -702,6 +716,7 @@ impl AppState {
             proxy_addr: active_addr.to_string(),
             ui_addr: ui_addr.to_string(),
             max_entries: self.config.max_entries,
+            max_transaction_entries: self.config.max_transaction_entries,
             body_preview_bytes: self.config.body_preview_bytes,
             data_dir: self.config.data_dir.display().to_string(),
             proxy_online: self.is_proxy_online(),
@@ -1250,6 +1265,7 @@ pub struct RuntimeInfo {
     pub proxy_addr: String,
     pub ui_addr: String,
     pub max_entries: usize,
+    pub max_transaction_entries: usize,
     pub body_preview_bytes: usize,
     pub data_dir: String,
     pub proxy_online: bool,
@@ -2622,6 +2638,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -2643,6 +2660,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -2668,6 +2686,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 100,
+                max_transaction_entries: 100,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })
@@ -2710,6 +2729,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -2745,6 +2765,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -2820,6 +2841,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -2873,6 +2895,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 2,
+            max_transaction_entries: 2,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -2993,6 +3016,20 @@ mod tests {
         assert_eq!(summary.fuzzer_count, 1);
         assert_eq!(summary.rule_count, 1);
 
+        let active_summary = state.active_session_summary().await;
+        assert_eq!(active_summary.request_count, 2);
+        assert_eq!(active_summary.websocket_count, 1);
+        assert_eq!(active_summary.event_count, 1);
+        assert_eq!(active_summary.fuzzer_count, 1);
+        assert_eq!(active_summary.rule_count, 1);
+
+        let runtime_info = state.runtime_info().await;
+        assert_eq!(runtime_info.active_session.request_count, 2);
+        assert_eq!(runtime_info.active_session.websocket_count, 1);
+        assert_eq!(runtime_info.active_session.event_count, 1);
+        assert_eq!(runtime_info.active_session.fuzzer_count, 1);
+        assert_eq!(runtime_info.active_session.rule_count, 1);
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -3004,6 +3041,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3035,6 +3073,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3099,6 +3138,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3173,6 +3213,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3210,6 +3251,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3245,6 +3287,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3270,6 +3313,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3312,6 +3356,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3350,6 +3395,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3392,6 +3438,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3428,6 +3475,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3461,6 +3509,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3501,6 +3550,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })
@@ -3535,6 +3585,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         })

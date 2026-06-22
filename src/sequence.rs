@@ -23,6 +23,10 @@ use crate::{
 const MAX_SEQUENCE_EXPANDED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SEQUENCE_VARIABLE_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_SEQUENCE_VARIABLES_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SEQUENCE_RESTORED_RUN_STEP_RESULTS: usize = 250;
+const MAX_SEQUENCE_RESTORED_RUN_EXTRACTED_VALUES: usize = 50;
+const MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES: usize = 64 * 1024;
+const MAX_SEQUENCE_RESTORED_RUN_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
 static SEQUENCE_VARIABLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{([^{}]+)\}\}").expect("valid sequence variable regex"));
@@ -173,8 +177,7 @@ impl SequenceStore {
         definitions: Vec<SequenceDefinition>,
         runs: Vec<SequenceRunRecord>,
     ) -> Self {
-        let mut run_deque = VecDeque::with_capacity(runs.len().min(max_entries));
-        run_deque.extend(runs.into_iter().take(max_entries));
+        let run_deque = sanitize_sequence_runs(runs, max_entries);
         Self {
             max_entries,
             definitions: RwLock::new(bound_sequence_definitions(definitions, max_entries)),
@@ -232,8 +235,7 @@ impl SequenceStore {
 
     pub async fn replace_runs(&self, runs: Vec<SequenceRunRecord>) {
         let mut current = self.runs.write().await;
-        current.clear();
-        current.extend(runs.into_iter().take(self.max_entries));
+        *current = sanitize_sequence_runs(runs, self.max_entries);
     }
 
     pub async fn remove_run_and_restore(&self, id: Uuid, restore: Vec<SequenceRunRecord>) -> bool {
@@ -290,6 +292,83 @@ fn bound_sequence_definitions(
         definitions.drain(0..remove);
     }
     definitions
+}
+
+fn sanitize_sequence_runs(
+    runs: Vec<SequenceRunRecord>,
+    max_entries: usize,
+) -> VecDeque<SequenceRunRecord> {
+    let mut sanitized = VecDeque::with_capacity(runs.len().min(max_entries));
+    for run in runs
+        .into_iter()
+        .filter_map(sanitize_sequence_run_record)
+        .take(max_entries)
+    {
+        sanitized.push_back(run);
+    }
+    sanitized
+}
+
+fn sanitize_sequence_run_record(mut run: SequenceRunRecord) -> Option<SequenceRunRecord> {
+    if run.sequence_name.len() > MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES {
+        return None;
+    }
+    run.step_results = run
+        .step_results
+        .into_iter()
+        .filter_map(sanitize_sequence_step_result)
+        .take(MAX_SEQUENCE_RESTORED_RUN_STEP_RESULTS)
+        .collect();
+    while serde_json::to_vec(&run)
+        .map(|bytes| bytes.len() > MAX_SEQUENCE_RESTORED_RUN_RECORD_BYTES)
+        .unwrap_or(true)
+    {
+        run.step_results.pop()?;
+    }
+    Some(run)
+}
+
+fn sanitize_sequence_step_result(mut result: StepResult) -> Option<StepResult> {
+    if result.label.len() > MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES {
+        return None;
+    }
+    if let Some(error) = &result.error {
+        if error.len() > MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES {
+            return None;
+        }
+    }
+    if let Some(status) = result.status {
+        if !(100..=599).contains(&status) {
+            return None;
+        }
+    }
+    let mut total_extracted_bytes = 0usize;
+    let mut extracted = HashMap::with_capacity(
+        result
+            .extracted
+            .len()
+            .min(MAX_SEQUENCE_RESTORED_RUN_EXTRACTED_VALUES),
+    );
+    for (name, value) in result.extracted {
+        if extracted.len() >= MAX_SEQUENCE_RESTORED_RUN_EXTRACTED_VALUES {
+            break;
+        }
+        if name.is_empty()
+            || name.len() > MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES
+            || value.len() > MAX_SEQUENCE_VARIABLE_VALUE_BYTES
+        {
+            continue;
+        }
+        total_extracted_bytes = total_extracted_bytes
+            .saturating_add(name.len())
+            .saturating_add(value.len());
+        if total_extracted_bytes > MAX_SEQUENCE_VARIABLES_TOTAL_BYTES {
+            break;
+        }
+        extracted.insert(name, value);
+    }
+    result.extracted = extracted;
+    Some(result)
 }
 
 fn substitute_variables(text: &str, variables: &HashMap<String, String>) -> String {
@@ -1019,6 +1098,69 @@ mod tests {
         assert_eq!(store.runs.read().await.capacity(), 0);
     }
 
+    #[tokio::test]
+    async fn from_data_sanitizes_restored_run_records() {
+        fn step_result(label: &str) -> StepResult {
+            StepResult {
+                step_id: Uuid::new_v4(),
+                label: label.to_string(),
+                transaction_id: None,
+                status: Some(200),
+                duration_ms: None,
+                extracted: HashMap::from([("token".to_string(), "abc".to_string())]),
+                error: None,
+            }
+        }
+
+        let oversized_run = SequenceRunRecord {
+            id: Uuid::new_v4(),
+            sequence_id: Uuid::new_v4(),
+            sequence_name: "x".repeat(MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES + 1),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            status: SequenceRunStatus::Completed,
+            step_results: Vec::new(),
+        };
+        let mut restored_run = SequenceRunRecord {
+            id: Uuid::new_v4(),
+            sequence_id: Uuid::new_v4(),
+            sequence_name: "Restored".to_string(),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            status: SequenceRunStatus::Completed,
+            step_results: (0..=MAX_SEQUENCE_RESTORED_RUN_STEP_RESULTS)
+                .map(|index| step_result(&format!("step-{index}")))
+                .collect(),
+        };
+        restored_run.step_results[0].label = "x".repeat(MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES + 1);
+        restored_run.step_results[1].status = Some(700);
+        restored_run.step_results[2].extracted = HashMap::from([(
+            "token".to_string(),
+            "x".repeat(MAX_SEQUENCE_VARIABLE_VALUE_BYTES + 1),
+        )]);
+        let restored_run_id = restored_run.id;
+
+        let store = SequenceStore::from_data(10, Vec::new(), vec![oversized_run, restored_run]);
+        let runs = store.snapshot_runs(None).await;
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, restored_run_id);
+        assert_eq!(
+            runs[0].step_results.len(),
+            MAX_SEQUENCE_RESTORED_RUN_STEP_RESULTS - 1
+        );
+        assert!(runs[0].step_results.iter().all(|result| {
+            result.label.len() <= MAX_SEQUENCE_RESTORED_RUN_FIELD_BYTES
+                && result
+                    .status
+                    .is_some_and(|status| (100..=599).contains(&status))
+        }));
+        assert!(runs[0].step_results.iter().all(|result| result
+            .extracted
+            .values()
+            .all(|value| { value.len() <= MAX_SEQUENCE_VARIABLE_VALUE_BYTES })));
+    }
+
     #[test]
     fn step_result_accepts_legacy_missing_extracted_map() {
         let result: StepResult = serde_json::from_value(serde_json::json!({
@@ -1102,6 +1244,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-sequence-invalid-variable-{}",
@@ -1203,6 +1346,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-sequence-target-variable-{}",
@@ -1306,6 +1450,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir()
                 .join(format!("sniper-sequence-http2-failure-{}", Uuid::new_v4())),
@@ -1363,6 +1508,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir().join(format!(
                 "sniper-sequence-upstream-failure-{}",
@@ -1431,6 +1577,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 32,
+                max_transaction_entries: 32,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })

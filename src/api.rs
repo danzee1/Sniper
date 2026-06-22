@@ -83,12 +83,12 @@ const MAX_SEQUENCE_STEPS: usize = 250;
 const MAX_SEQUENCE_EXTRACTIONS_PER_STEP: usize = 50;
 const MAX_SEQUENCE_TEXT_FIELD_BYTES: usize = 64 * 1024;
 const MAX_SEQUENCE_DEFINITION_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SCANNER_CUSTOM_RULES: usize = 250;
-const MAX_SCANNER_FIELD_BYTES: usize = 64 * 1024;
-const MAX_SCANNER_CONFIG_BYTES: usize = 4 * 1024 * 1024;
-const MAX_MATCH_REPLACE_RULES: usize = 500;
-const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
-const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SCANNER_CUSTOM_RULES: usize = crate::scanner::MAX_SCANNER_CUSTOM_RULES;
+const MAX_SCANNER_FIELD_BYTES: usize = crate::scanner::MAX_SCANNER_FIELD_BYTES;
+const MAX_SCANNER_CONFIG_BYTES: usize = crate::scanner::MAX_SCANNER_CONFIG_BYTES;
+const MAX_MATCH_REPLACE_RULES: usize = crate::match_replace::MAX_MATCH_REPLACE_RULES;
+const MAX_MATCH_REPLACE_FIELD_BYTES: usize = crate::match_replace::MAX_MATCH_REPLACE_FIELD_BYTES;
+const MAX_MATCH_REPLACE_RULES_BYTES: usize = crate::match_replace::MAX_MATCH_REPLACE_RULES_BYTES;
 const MAX_ANNOTATION_NOTE_BYTES: usize = 32 * 1024;
 const MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const ALLOWED_COLOR_TAGS: &[&str] = &["red", "orange", "yellow", "green", "blue", "purple"];
@@ -725,7 +725,7 @@ pub(crate) fn validate_editable_request(
     let body = request
         .try_body_bytes()
         .map_err(|_| "request body is not valid base64".to_string())?;
-    validate_editable_body_framing(&request.headers, body.len())
+    validate_editable_body_framing(&request.headers, body.len(), false)
 }
 
 pub(crate) fn validate_runnable_editable_request(
@@ -861,7 +861,15 @@ fn is_http_token_byte(byte: u8) -> bool {
         )
 }
 
+#[cfg(test)]
 fn validate_editable_response(response: &EditableResponse) -> std::result::Result<(), String> {
+    validate_editable_response_for_request_method(response, "GET")
+}
+
+fn validate_editable_response_for_request_method(
+    response: &EditableResponse,
+    request_method: &str,
+) -> std::result::Result<(), String> {
     if !(100..=599).contains(&response.status) {
         return Err(format!("invalid response status: {}", response.status));
     }
@@ -871,7 +879,30 @@ fn validate_editable_response(response: &EditableResponse) -> std::result::Resul
     let body = response
         .try_body_bytes()
         .map_err(|_| "response body is not valid base64".to_string())?;
-    validate_editable_body_framing(&response.headers, body.len())
+    if response_must_not_include_body(response.status, request_method) && !body.is_empty() {
+        return Err(format!(
+            "response status {} must not include a body",
+            response.status
+        ));
+    }
+    validate_editable_body_framing(
+        &response.headers,
+        body.len(),
+        response_content_length_may_describe_representation(response.status, request_method),
+    )
+}
+
+fn response_status_must_not_include_body(status: u16) -> bool {
+    status < 200 || status == 204 || status == 205 || status == 304
+}
+
+fn response_must_not_include_body(status: u16, request_method: &str) -> bool {
+    response_status_must_not_include_body(status) || request_method.eq_ignore_ascii_case("HEAD")
+}
+
+fn response_content_length_may_describe_representation(status: u16, request_method: &str) -> bool {
+    status == 304
+        || (request_method.eq_ignore_ascii_case("HEAD") && !matches!(status, 100..=199 | 204 | 205))
 }
 
 fn canonicalize_intercept_forward_request(
@@ -887,12 +918,13 @@ fn canonicalize_intercept_forward_request(
 
 fn canonicalize_intercept_forward_response(
     mut response: EditableResponse,
+    request_method: &str,
 ) -> std::result::Result<EditableResponse, String> {
     let body = response
         .try_body_bytes()
         .map_err(|_| "response body is not valid base64".to_string())?;
     canonicalize_plain_chunked_transfer_encoding(&mut response.headers, body.len())?;
-    validate_editable_response(&response)?;
+    validate_editable_response_for_request_method(&response, request_method)?;
     Ok(response)
 }
 
@@ -946,6 +978,7 @@ fn editable_transfer_encoding_tokens(
 fn validate_editable_body_framing(
     headers: &[HeaderRecord],
     body_len: usize,
+    allow_representation_content_length: bool,
 ) -> std::result::Result<(), String> {
     if headers.iter().any(|header| {
         header.name.eq_ignore_ascii_case("transfer-encoding")
@@ -979,6 +1012,9 @@ fn validate_editable_body_framing(
 
     if let Some(expected) = content_length {
         if expected != body_len {
+            if allow_representation_content_length && body_len == 0 {
+                return Ok(());
+            }
             return Err(format!(
                 "Content-Length {expected} does not match body length {body_len}"
             ));
@@ -1259,6 +1295,12 @@ pub(crate) fn validate_workspace_state(
                 tab.id
             ));
         }
+        if is_websocket_tab && replay_tab_has_http_replay_payload(tab) {
+            return Err(format!(
+                "websocket replay tab {} must not include HTTP replay state",
+                tab.id
+            ));
+        }
         add_workspace_text_bytes(
             &mut stored_bytes_total,
             "replay tab request text",
@@ -1509,6 +1551,23 @@ fn replay_tab_has_websocket_payload(tab: &crate::workspace::ReplayTabState) -> b
         || tab.ws_frame_window_start.is_some()
 }
 
+fn replay_tab_has_http_replay_payload(tab: &crate::workspace::ReplayTabState) -> bool {
+    tab.base_request.is_some()
+        || tab.source_transaction_id.is_some()
+        || !tab.notice.is_empty()
+        || !tab.request_text.is_empty()
+        || !tab.http_version_mode.is_empty()
+        || tab.response_record.is_some()
+        || tab.response_record_complete.is_some()
+        || !tab.target_scheme.is_empty()
+        || !tab.target_host.is_empty()
+        || !tab.target_port.is_empty()
+        || tab.target_manually_edited
+        || !tab.history_entries.is_empty()
+        || tab.history_index.is_some()
+        || tab.history_entries_complete.is_some()
+}
+
 fn add_workspace_text_bytes(
     total: &mut usize,
     label: &str,
@@ -1585,7 +1644,7 @@ fn validate_workspace_draft_request(request: &EditableRequest) -> std::result::R
     let body = request
         .try_body_bytes()
         .map_err(|_| "request body is not valid base64".to_string())?;
-    validate_editable_body_framing(&request.headers, body.len())
+    validate_editable_body_framing(&request.headers, body.len(), false)
 }
 
 fn validate_workspace_target_fields(
@@ -1889,7 +1948,7 @@ fn validate_port_text(port: &str, label: &str) -> std::result::Result<(), String
     Ok(())
 }
 
-fn validate_sequence_definition(
+pub(crate) fn validate_sequence_definition(
     definition: &SequenceDefinition,
 ) -> std::result::Result<(), String> {
     validate_serialized_size(
@@ -2783,7 +2842,9 @@ fn merge_workspace_keepalive_snapshot(
     current.client_id = incoming.client_id;
     current.client_version = incoming.client_version;
     let previous_active_tab_id = current.replay.active_tab_id.clone();
-    current.replay.active_tab_id = incoming.replay.active_tab_id.clone();
+    if keepalive.replay_tabs_complete || incoming.replay.active_tab_id.is_some() {
+        current.replay.active_tab_id = incoming.replay.active_tab_id.clone();
+    }
     current.replay.tab_sequence = current
         .replay
         .tab_sequence
@@ -2945,7 +3006,7 @@ fn merge_incomplete_workspace_update_ws_frames(
         .map(|tab| (tab.id.as_str(), tab))
         .collect::<IndexMap<_, _>>();
     for tab in &mut snapshot.replay.tabs {
-        if tab.tab_type != "websocket" || tab.ws_frames_complete.unwrap_or(false) {
+        if tab.tab_type != "websocket" || tab.ws_frames_complete != Some(false) {
             continue;
         }
         let Some(current_tab) = current_tabs.get(tab.id.as_str()) else {
@@ -3254,6 +3315,7 @@ async fn begin_session_proxy_operation(
     state: &Arc<AppState>,
     session: &Arc<SessionContext>,
     expected_active_session_id: Option<Uuid>,
+    expected_workspace_revision: Option<u64>,
 ) -> std::result::Result<proxy::ActiveProxySessionGuard, Response> {
     let operation_lock = state.session_operation_lock(session.id()).await;
     let _operation_guard = operation_lock.lock().await;
@@ -3271,6 +3333,11 @@ async fn begin_session_proxy_operation(
         && proxy::session_has_active_proxy_work(session.id())
     {
         return Err(session_proxy_work_conflict_response(session.id()));
+    }
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(session, expected_workspace_revision).await
+    {
+        return Err(response);
     }
     Ok(proxy::remember_active_proxy_session_owner(session.id()))
 }
@@ -3311,9 +3378,11 @@ async fn guard_ws_replay_connection_owner_read(
 async fn guard_ws_replay_connection_owner_operation(
     state: &Arc<AppState>,
     id: Uuid,
-    session_id: Uuid,
+    session: &Arc<SessionContext>,
     expected_active_session_id: Option<Uuid>,
+    expected_workspace_revision: Option<u64>,
 ) -> std::result::Result<OwnedMutexGuard<()>, Response> {
+    let session_id = session.id();
     if !state.sessions.contains_session(session_id) {
         return Err(StatusCode::NOT_FOUND.into_response());
     }
@@ -3333,6 +3402,11 @@ async fn guard_ws_replay_connection_owner_operation(
         && proxy::session_has_active_proxy_work(session_id)
     {
         return Err(session_proxy_work_conflict_response(session_id));
+    }
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(session, expected_workspace_revision).await
+    {
+        return Err(response);
     }
     match state.ws_replay.owner_session_id(id).await {
         Some(owner_session_id) if owner_session_id == session_id => Ok(guard),
@@ -3939,7 +4013,7 @@ async fn get_target_site_map(
                 is_websocket: path.is_websocket,
             })
             .collect::<Vec<_>>();
-        paths.sort_by(|left, right| right.last_seen.cmp(&left.last_seen));
+        paths.sort_by_key(|path| std::cmp::Reverse(path.last_seen));
 
         site_map.push(TargetHostNode {
             host: host.host.clone(),
@@ -4480,13 +4554,14 @@ async fn forward_response_intercept(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if session.response_intercepts.get(id).await.is_none() {
+    let Some(intercept_record) = session.response_intercepts.get(id).await else {
         return StatusCode::NOT_FOUND.into_response();
-    }
-    let response_payload = match canonicalize_intercept_forward_response(payload.response) {
-        Ok(response) => response,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
+    let response_payload =
+        match canonicalize_intercept_forward_response(payload.response, &intercept_record.method) {
+            Ok(response) => response,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
 
     let _operation_guard = match guard_session_write_operation(
         &state,
@@ -4831,13 +4906,17 @@ async fn run_sequence(
     ) {
         return response;
     }
-    let _session_owner =
-        match begin_session_proxy_operation(&state, &session, payload.expected_active_session_id)
-            .await
-        {
-            Ok(owner) => owner,
-            Err(response) => return response,
-        };
+    let _session_owner = match begin_session_proxy_operation(
+        &state,
+        &session,
+        payload.expected_active_session_id,
+        None,
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
     let definition = match session.sequence.get_definition(id).await {
         Some(def) => def,
         None => return (StatusCode::NOT_FOUND, "Sequence not found").into_response(),
@@ -4917,15 +4996,19 @@ async fn send_replay(
     if let Err(error) = validate_runnable_editable_request(&payload.request) {
         return replay_send_error_response(error);
     }
-    let _session_owner =
-        match begin_session_proxy_operation(&state, &session, payload.expected_active_session_id)
-            .await
-        {
-            Ok(owner) => owner,
-            Err(response) => {
-                return response;
-            }
-        };
+    let _session_owner = match begin_session_proxy_operation(
+        &state,
+        &session,
+        payload.expected_active_session_id,
+        payload.expected_workspace_revision,
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(response) => {
+            return response;
+        }
+    };
     match proxy::try_send_replay_request_for_session(
         state,
         session,
@@ -5026,6 +5109,12 @@ async fn run_fuzzer_attack(
     ) {
         return response;
     }
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(&session, payload.expected_workspace_revision)
+            .await
+    {
+        return response;
+    }
     let http_version = match normalize_replay_http_version(payload.http_version.as_deref()) {
         Ok(value) => value,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
@@ -5047,13 +5136,17 @@ async fn run_fuzzer_attack(
     {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
-    let _session_owner =
-        match begin_session_proxy_operation(&state, &session, payload.expected_active_session_id)
-            .await
-        {
-            Ok(owner) => owner,
-            Err(response) => return response,
-        };
+    let _session_owner = match begin_session_proxy_operation(
+        &state,
+        &session,
+        payload.expected_active_session_id,
+        payload.expected_workspace_revision,
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
     match fuzzer::run_attack_for_session(
         state,
         session,
@@ -5201,6 +5294,12 @@ async fn ws_replay_connect(
         Ok(guard) => guard,
         Err(response) => return response,
     };
+    if let Some(response) =
+        expected_workspace_revision_conflict_response(&session, payload.expected_workspace_revision)
+            .await
+    {
+        return response;
+    }
     if let Some(owner_session_id) = state.ws_replay.owner_session_id(payload.id).await {
         if owner_session_id != session.id() {
             return ws_replay_connection_owner_conflict_response(owner_session_id);
@@ -5489,8 +5588,9 @@ async fn ws_replay_send(
     let _operation_guard = match guard_ws_replay_connection_owner_operation(
         &state,
         payload.id,
-        session_id,
+        &session,
         payload.expected_active_session_id,
+        payload.expected_workspace_revision,
     )
     .await
     {
@@ -5600,8 +5700,9 @@ async fn ws_replay_disconnect(
     let _operation_guard = match guard_ws_replay_connection_owner_operation(
         &state,
         payload.id,
-        session_id,
+        &session,
         payload.expected_active_session_id,
+        payload.expected_workspace_revision,
     )
     .await
     {
@@ -6351,6 +6452,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4())),
         }
@@ -6990,6 +7092,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:18080".parse().unwrap(),
                 ui_addr: "127.0.0.1:23001".parse().unwrap(),
                 max_entries: 32,
+                max_transaction_entries: 32,
                 body_preview_bytes: 1024,
                 data_dir: data_dir.clone(),
             })
@@ -7288,6 +7391,62 @@ mod tests {
     }
 
     #[test]
+    fn editable_response_validation_rejects_body_for_no_body_status() {
+        for status in [100, 101, 102, 103, 204, 205, 304] {
+            let response = EditableResponse {
+                status,
+                headers: Vec::new(),
+                body: "illegal".to_string(),
+                body_encoding: BodyEncoding::Utf8,
+            };
+
+            assert!(
+                validate_editable_response(&response)
+                    .unwrap_err()
+                    .contains("must not include a body"),
+                "status {status}"
+            );
+        }
+
+        let response = EditableResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: "ok".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+        };
+        assert!(validate_editable_response(&response).is_ok());
+    }
+
+    #[test]
+    fn editable_response_validation_allows_304_representation_content_length() {
+        let response = EditableResponse {
+            status: 304,
+            headers: vec![HeaderRecord {
+                name: "Content-Length".to_string(),
+                value: "55".to_string(),
+            }],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+        };
+
+        assert!(validate_editable_response(&response).is_ok());
+
+        let response = EditableResponse {
+            status: 204,
+            headers: vec![HeaderRecord {
+                name: "Content-Length".to_string(),
+                value: "55".to_string(),
+            }],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+        };
+
+        assert!(validate_editable_response(&response)
+            .unwrap_err()
+            .contains("does not match body length"));
+    }
+
+    #[test]
     fn editable_response_validation_checks_base64_decoded_content_length() {
         let mut response = EditableResponse {
             status: 200,
@@ -7431,6 +7590,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 32,
+                max_transaction_entries: 32,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })
@@ -7743,7 +7903,7 @@ mod tests {
             body_encoding: BodyEncoding::Utf8,
         };
 
-        let response = super::canonicalize_intercept_forward_response(response).unwrap();
+        let response = super::canonicalize_intercept_forward_response(response, "GET").unwrap();
 
         assert!(!response
             .headers
@@ -7784,6 +7944,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 32,
+                max_transaction_entries: 32,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })
@@ -7819,6 +7980,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 32,
+                max_transaction_entries: 32,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })
@@ -7930,6 +8092,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 32,
+                max_transaction_entries: 32,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })
@@ -8586,6 +8749,53 @@ mod tests {
     }
 
     #[test]
+    fn workspace_keepalive_partial_payload_preserves_missing_active_tab_id() {
+        let current = WorkspaceStateSnapshot {
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some("active".to_string()),
+                tab_sequence: 2,
+                tabs: vec![
+                    ReplayTabState {
+                        id: "active".to_string(),
+                        sequence: 1,
+                        request_text: "GET /active HTTP/1.1\r\n\r\n".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                    ReplayTabState {
+                        id: "inactive".to_string(),
+                        sequence: 2,
+                        request_text: "GET /inactive HTTP/1.1\r\n\r\n".to_string(),
+                        ..ReplayTabState::default()
+                    },
+                ],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let incoming = WorkspaceStateSnapshot {
+            client_version: 2,
+            replay: ReplayWorkspaceState {
+                active_tab_id: None,
+                tab_sequence: 2,
+                tabs: Vec::new(),
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+
+        let merged = super::merge_workspace_keepalive_snapshot(
+            current,
+            incoming,
+            super::WorkspaceKeepaliveMetadata {
+                replay_tabs_complete: false,
+                ..super::WorkspaceKeepaliveMetadata::default()
+            },
+        );
+
+        assert_eq!(merged.replay.active_tab_id.as_deref(), Some("active"));
+        assert_eq!(merged.replay.tabs.len(), 2);
+        assert_eq!(merged.client_version, 2);
+    }
+
+    #[test]
     fn workspace_keepalive_merge_preserves_websocket_state_missing_from_compact_payload() {
         let frame = WsReplayFrame {
             index: 7,
@@ -8790,6 +9000,73 @@ mod tests {
         );
         assert_eq!(tab.ws_selected_frame_index, Some(1));
         assert_eq!(tab.ws_frame_window_start, Some(1));
+        assert!(!tab.ws_frames_truncated);
+    }
+
+    #[tokio::test]
+    async fn workspace_full_update_missing_ws_frames_complete_replaces_frames() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-full-save-ws-frame-replace")).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let tab_id = Uuid::new_v4().to_string();
+        let current = WorkspaceStateSnapshot {
+            session_id: Some(session_id),
+            client_id: Some("browser".to_string()),
+            client_version: 1,
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some(tab_id.clone()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: tab_id.clone(),
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_frames: vec![test_ws_replay_frame(1, "stale")],
+                    ws_frames_complete: Some(true),
+                    ws_selected_frame_index: Some(0),
+                    ws_frame_window_start: Some(1),
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let current_response =
+            super::update_workspace_state(State(state.clone()), Json(current)).await;
+        assert_eq!(current_response.status(), StatusCode::OK);
+        let saved_current: WorkspaceStateSnapshot = response_json(current_response).await;
+
+        let incoming = WorkspaceStateSnapshot {
+            session_id: Some(session_id),
+            revision: saved_current.revision,
+            client_id: Some("browser".to_string()),
+            client_version: 2,
+            replay: ReplayWorkspaceState {
+                active_tab_id: Some(tab_id.clone()),
+                tab_sequence: 1,
+                tabs: vec![ReplayTabState {
+                    id: tab_id,
+                    tab_type: "websocket".to_string(),
+                    sequence: 1,
+                    ws_frames: Vec::new(),
+                    ws_frames_complete: None,
+                    ws_selected_frame_index: None,
+                    ws_frame_window_start: None,
+                    ws_frames_truncated: false,
+                    ..ReplayTabState::default()
+                }],
+            },
+            ..WorkspaceStateSnapshot::default()
+        };
+        let update_response =
+            super::update_workspace_state(State(state.clone()), Json(incoming)).await;
+        assert_eq!(update_response.status(), StatusCode::OK);
+
+        let reloaded = state.sessions.load_context(session_id).unwrap();
+        let snapshot = reloaded.workspace.snapshot().await;
+        let tab = snapshot.replay.tabs.first().expect("ws tab should persist");
+        assert!(tab.ws_frames.is_empty());
+        assert_eq!(tab.ws_selected_frame_index, None);
+        assert_eq!(tab.ws_frame_window_start, None);
         assert!(!tab.ws_frames_truncated);
     }
 
@@ -9983,6 +10260,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_intercept_forward_allows_head_representation_content_length() {
+        let state = Arc::new(
+            AppState::new(test_app_config(
+                "sniper-forward-response-head-content-length",
+            ))
+            .unwrap(),
+        );
+        let session = state.session().await;
+        let response = EditableResponse {
+            status: 200,
+            headers: vec![HeaderRecord {
+                name: "Content-Length".to_string(),
+                value: "123".to_string(),
+            }],
+            body: String::new(),
+            body_encoding: BodyEncoding::Utf8,
+        };
+        let record = ResponseInterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "HEAD".to_string(),
+            path: "/queued".to_string(),
+            status: 200,
+            response: response.clone(),
+        };
+        let record_id = record.id;
+        let queue = session.response_intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(record).await }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+
+        let api_response = super::forward_response_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session.id()),
+                expected_active_session_id: None,
+            }),
+            Json(super::ResponseInterceptForwardPayload {
+                session_id: None,
+                response,
+            }),
+        )
+        .await;
+
+        assert_eq!(api_response.status(), StatusCode::NO_CONTENT);
+        match task.await.unwrap() {
+            ResponseInterceptResolution::Forward(response) => {
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, "");
+                assert_eq!(response.headers[0].name, "Content-Length");
+                assert_eq!(response.headers[0].value, "123");
+            }
+            other => panic!("expected forward resolution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_intercept_forward_rejects_head_response_body() {
+        let state =
+            Arc::new(AppState::new(test_app_config("sniper-forward-response-head-body")).unwrap());
+        let session = state.session().await;
+        let response = EditableResponse {
+            status: 200,
+            headers: vec![HeaderRecord {
+                name: "Content-Length".to_string(),
+                value: "4".to_string(),
+            }],
+            body: "body".to_string(),
+            body_encoding: BodyEncoding::Utf8,
+        };
+        let record = ResponseInterceptRecord {
+            id: Uuid::new_v4(),
+            started_at: Utc::now(),
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            method: "HEAD".to_string(),
+            path: "/queued".to_string(),
+            status: 200,
+            response: EditableResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: String::new(),
+                body_encoding: BodyEncoding::Utf8,
+            },
+        };
+        let record_id = record.id;
+        let queue = session.response_intercepts.clone();
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.enqueue(record).await }
+        });
+        for _ in 0..20 {
+            if queue.list().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.list().await.len(), 1);
+
+        let api_response = super::forward_response_intercept(
+            State(state.clone()),
+            Path(record_id.to_string()),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session.id()),
+                expected_active_session_id: None,
+            }),
+            Json(super::ResponseInterceptForwardPayload {
+                session_id: None,
+                response,
+            }),
+        )
+        .await;
+
+        assert_eq!(api_response.status(), StatusCode::BAD_REQUEST);
+        queue.drop_response(record_id).await.unwrap();
+        match task.await.unwrap() {
+            ResponseInterceptResolution::Drop => {}
+            other => panic!("expected drop resolution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn request_intercept_drop_body_session_id_targets_inactive_session() {
         let state =
             Arc::new(AppState::new(test_app_config("sniper-drop-request-body-session")).unwrap());
@@ -10657,6 +11067,41 @@ mod tests {
     }
 
     #[test]
+    fn workspace_validation_rejects_http_state_on_websocket_tabs() {
+        fn assert_rejects(tab: ReplayTabState) {
+            let mut snapshot = WorkspaceStateSnapshot::default();
+            snapshot.replay.tabs.push(tab);
+            let error = super::validate_workspace_state(&snapshot).unwrap_err();
+            assert!(error.contains("must not include HTTP replay state"));
+        }
+
+        assert_rejects(ReplayTabState {
+            id: Uuid::new_v4().to_string(),
+            tab_type: "websocket".to_string(),
+            sequence: 1,
+            request_text: "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_string(),
+            ..ReplayTabState::default()
+        });
+        assert_rejects(ReplayTabState {
+            id: Uuid::new_v4().to_string(),
+            tab_type: "websocket".to_string(),
+            sequence: 1,
+            base_request: Some(test_editable_request("/")),
+            ..ReplayTabState::default()
+        });
+        assert_rejects(ReplayTabState {
+            id: Uuid::new_v4().to_string(),
+            tab_type: "websocket".to_string(),
+            sequence: 1,
+            history_entries: vec![ReplayHistoryEntryState {
+                request_text: "GET /history HTTP/1.1\r\n\r\n".to_string(),
+                ..ReplayHistoryEntryState::default()
+            }],
+            ..ReplayTabState::default()
+        });
+    }
+
+    #[test]
     fn workspace_validation_rejects_oversized_websocket_headers() {
         let mut snapshot = WorkspaceStateSnapshot::default();
         snapshot.replay.tabs.push(ReplayTabState {
@@ -10788,6 +11233,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir()
                 .join(format!("sniper-test-target-notes-{}", uuid::Uuid::new_v4())),
@@ -10848,6 +11294,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -10898,6 +11345,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -10943,6 +11391,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -10980,6 +11429,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11025,6 +11475,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11039,7 +11490,7 @@ mod tests {
         let operation_guard = operation_lock.lock().await;
 
         let mut proxy_future = Box::pin(super::begin_session_proxy_operation(
-            &state, &original, None,
+            &state, &original, None, None,
         ));
         let blocked = tokio::time::timeout(Duration::from_millis(30), &mut proxy_future).await;
         assert!(blocked.is_err());
@@ -11068,6 +11519,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11081,6 +11533,7 @@ mod tests {
             &state,
             &original,
             Some(original_id),
+            None,
         ));
         let blocked = tokio::time::timeout(Duration::from_millis(30), &mut proxy_future).await;
         assert!(blocked.is_err());
@@ -11111,6 +11564,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_proxy_operation_rechecks_workspace_revision_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-proxy-operation-workspace-revision-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let expected_revision = session.workspace.snapshot().await.revision;
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard = operation_lock.lock().await;
+
+        let mut proxy_future = Box::pin(super::begin_session_proxy_operation(
+            &state,
+            &session,
+            None,
+            Some(expected_revision),
+        ));
+        let blocked = tokio::time::timeout(Duration::from_millis(30), &mut proxy_future).await;
+        assert!(blocked.is_err());
+
+        session
+            .workspace
+            .replace_snapshot(WorkspaceStateSnapshot::default())
+            .await;
+        let current_revision = session.workspace.snapshot().await.revision;
+        assert!(current_revision > expected_revision);
+        drop(operation_guard);
+
+        match proxy_future.await {
+            Ok(owner) => {
+                drop(owner);
+                panic!("proxy operation should reject stale workspace revisions after waiting");
+            }
+            Err(response) => {
+                assert_eq!(response.status(), super::StatusCode::CONFLICT);
+                let body = response_body_json(response).await;
+                assert_eq!(
+                    body.get("revision"),
+                    Some(&serde_json::json!(current_revision))
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn session_proxy_operation_rejects_deleted_session_as_not_found() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-proxy-operation-deleted-session-{}",
@@ -11120,6 +11629,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11139,7 +11649,7 @@ mod tests {
         assert!(blocked_delete.is_err());
 
         let mut proxy_future = Box::pin(super::begin_session_proxy_operation(
-            &state, &original, None,
+            &state, &original, None, None,
         ));
         let blocked_proxy =
             tokio::time::timeout(Duration::from_millis(30), &mut proxy_future).await;
@@ -11168,6 +11678,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11227,6 +11738,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11287,6 +11799,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11338,6 +11851,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11650,6 +12164,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -11674,6 +12189,7 @@ mod tests {
             evidence: String::new(),
             host: "active.test".to_string(),
             path: "/".to_string(),
+            location: None,
         };
         let inactive_finding = ScannerFinding {
             id: Uuid::new_v4(),
@@ -11687,6 +12203,7 @@ mod tests {
             evidence: String::new(),
             host: "inactive.test".to_string(),
             path: "/finding".to_string(),
+            location: None,
         };
         active.scanner.replace_all(vec![active_finding]).await;
         inactive
@@ -11865,6 +12382,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12067,6 +12585,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12150,6 +12669,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12206,6 +12726,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12247,6 +12768,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12280,6 +12802,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12317,6 +12840,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12377,6 +12901,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12436,6 +12961,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12489,6 +13015,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12546,6 +13073,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12606,6 +13134,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12671,6 +13200,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12716,6 +13246,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12761,6 +13292,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12821,6 +13353,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12882,6 +13415,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12934,6 +13468,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -12989,6 +13524,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13040,6 +13576,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13103,6 +13640,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13180,6 +13718,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13223,6 +13762,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13234,6 +13774,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -13268,6 +13809,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13279,6 +13821,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: None,
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -13313,6 +13856,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13324,6 +13868,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "$payload$".to_string(),
@@ -13365,6 +13910,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13381,6 +13927,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(original_id),
                 expected_active_session_id: Some(original_id),
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -13416,6 +13963,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fuzzer_run_rejects_stale_workspace_revision_before_attack() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-fuzzer-workspace-revision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let stale_revision = session.workspace.snapshot().await.revision;
+        session
+            .workspace
+            .replace_snapshot(WorkspaceStateSnapshot::default())
+            .await;
+        let current_revision = session.workspace.snapshot().await.revision;
+        assert!(current_revision > stale_revision);
+
+        let response = super::run_fuzzer_attack(
+            State(state.clone()),
+            Json(crate::fuzzer::FuzzerAttackPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(stale_revision),
+                template: EditableRequest {
+                    scheme: "https".to_string(),
+                    host: "example.test".to_string(),
+                    method: "GET".to_string(),
+                    path: "/$payload$".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                payloads: vec!["one".to_string()],
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("revision"),
+            Some(&serde_json::json!(current_revision))
+        );
+        assert!(session.fuzzer.list(Some(10)).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn fuzzer_run_rejects_expected_active_target_mismatch() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-active-target-mismatch-{}",
@@ -13425,6 +14032,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13440,6 +14048,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(inactive.id),
                 expected_active_session_id: Some(active_id),
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -13486,6 +14095,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13496,6 +14106,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "ftp".to_string(),
                     host: String::new(),
@@ -13529,6 +14140,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13540,6 +14152,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -13574,6 +14187,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13596,6 +14210,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "http".to_string(),
                     host: addr.to_string(),
@@ -13636,6 +14251,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13647,6 +14263,7 @@ mod tests {
             Json(crate::fuzzer::FuzzerAttackPayload {
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
+                expected_workspace_revision: None,
                 template: EditableRequest {
                     scheme: "https".to_string(),
                     host: "example.test".to_string(),
@@ -13694,6 +14311,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13726,6 +14344,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13758,6 +14377,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13806,6 +14426,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13851,6 +14472,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13896,6 +14518,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13942,6 +14565,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_replay_remove_rechecks_workspace_revision_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-remove-workspace-revision-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let expected_revision = session.workspace.snapshot().await.revision;
+        let connection_id = Uuid::new_v4();
+        state
+            .ws_replay
+            .remember_disconnected_connection_for_test(connection_id, session_id)
+            .await;
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard = operation_lock.lock_owned().await;
+
+        let response_task = tokio::spawn(super::ws_replay_disconnect(
+            State(state.clone()),
+            Json(super::WsReplayDisconnectPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(expected_revision),
+                id: connection_id,
+                remove: true,
+            }),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !response_task.is_finished(),
+            "ws replay remove should wait before rechecking workspace revision"
+        );
+        session
+            .workspace
+            .replace_snapshot(WorkspaceStateSnapshot::default())
+            .await;
+        let current_revision = session.workspace.snapshot().await.revision;
+        assert!(current_revision > expected_revision);
+        drop(operation_guard);
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("revision"),
+            Some(&serde_json::json!(current_revision))
+        );
+        assert!(state.ws_replay.snapshot(connection_id).await.is_some());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn ws_replay_send_rechecks_proxy_work_after_lock_wait() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-ws-replay-send-proxy-work-race-{}",
@@ -13951,6 +14636,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -13999,6 +14685,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_replay_connect_rechecks_workspace_revision_after_lock_wait() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-test-ws-replay-connect-workspace-revision-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        };
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.session().await;
+        let session_id = session.id();
+        let expected_revision = session.workspace.snapshot().await.revision;
+        let connection_id = Uuid::new_v4();
+        let operation_lock = state.session_operation_lock(session_id).await;
+        let operation_guard = operation_lock.lock_owned().await;
+
+        let response_task = tokio::spawn(super::ws_replay_connect(
+            State(state.clone()),
+            Json(super::WsReplayConnectPayload {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+                expected_workspace_revision: Some(expected_revision),
+                id: connection_id,
+                scheme: "wss".to_string(),
+                host: "example.test".to_string(),
+                port: 443,
+                path: "/socket".to_string(),
+                headers: Vec::new(),
+            }),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !response_task.is_finished(),
+            "ws replay connect should wait before rechecking workspace revision"
+        );
+        session
+            .workspace
+            .replace_snapshot(WorkspaceStateSnapshot::default())
+            .await;
+        let current_revision = session.workspace.snapshot().await.revision;
+        assert!(current_revision > expected_revision);
+        drop(operation_guard);
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), super::StatusCode::CONFLICT);
+        let body = response_body_json(response).await;
+        assert_eq!(
+            body.get("revision"),
+            Some(&serde_json::json!(current_revision))
+        );
+        assert!(state.ws_replay.snapshot(connection_id).await.is_none());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn ws_replay_connect_rechecks_proxy_work_after_lock_wait() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-ws-replay-connect-proxy-work-race-{}",
@@ -14008,6 +14756,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14063,6 +14812,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14146,6 +14896,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14251,6 +15002,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14286,6 +15038,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14382,6 +15135,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14413,6 +15167,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14604,6 +15359,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14766,6 +15522,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -14961,6 +15718,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 600,
+            max_transaction_entries: 600,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15018,6 +15776,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15089,6 +15848,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15143,6 +15903,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15181,6 +15942,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15219,6 +15981,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15270,6 +16033,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15310,6 +16074,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15356,6 +16121,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15393,6 +16159,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15435,6 +16202,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15485,6 +16253,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15534,6 +16303,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15591,6 +16361,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15629,6 +16400,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15685,6 +16457,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15738,6 +16511,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15828,6 +16602,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15940,6 +16715,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };
@@ -15982,6 +16758,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 100,
+            max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: data_dir.clone(),
         };

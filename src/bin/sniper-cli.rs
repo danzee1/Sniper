@@ -1,13 +1,14 @@
 use std::{
-    env, fs,
+    env, fmt, fs,
     io::{self, Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::{Method, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -48,12 +49,53 @@ const SNIPER_API_PROBE_RETRY_DELAYS: [std::time::Duration; 2] = [
 ];
 const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const SNIPER_DATA_DIR_ENV: &str = "SNIPER_DATA_DIR";
+const CLI_SCHEMA_VERSION: &str = "2026-06-22";
+
+static CLI_OUTPUT_CONTEXT: OnceLock<CliOutputContext> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum OutputFormat {
+    Pretty,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CliSideEffect {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum SchemaKind {
+    Input,
+    Output,
+}
+
+struct CliOutputContext {
+    format: OutputFormat,
+    operation: String,
+    success_envelope: bool,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.")]
 struct Cli {
     #[arg(long, global = true)]
     api: Option<String>,
+
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Pretty)]
+    output: OutputFormat,
+
+    /// Preview the CLI/API plan without applying a write or sending traffic.
+    #[arg(long, global = true, conflicts_with = "yes")]
+    dry_run: bool,
+
+    /// Confirm a side-effecting operation that can delete, forward, or send traffic.
+    #[arg(long, global = true)]
+    yes: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -86,6 +128,17 @@ fn parse_oast_polling_interval(value: &str) -> std::result::Result<u64, String> 
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    Manifest,
+    Schema {
+        #[arg(value_enum)]
+        kind: SchemaKind,
+        operation: String,
+    },
+    Examples {
+        operation: String,
+    },
+    /// Invoke an operation by canonical manifest name.
+    Call(CallArgs),
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -136,6 +189,14 @@ enum Command {
         #[command(subcommand)]
         command: AutoReplaceCommand,
     },
+}
+
+#[derive(Args, Debug)]
+struct CallArgs {
+    operation: String,
+    /// JSON object, @file path, or - for stdin. Omit for {}.
+    #[arg(long)]
+    input: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -625,9 +686,12 @@ struct OastConfigureArgs {
     /// OAST server URL
     #[arg(long)]
     url: Option<String>,
-    /// Authentication token
-    #[arg(long)]
+    /// Deprecated unsafe token argv path. Use --token-stdin instead.
+    #[arg(long, hide = true, conflicts_with = "token_stdin")]
     token: Option<String>,
+    /// Read the authentication token from stdin.
+    #[arg(long, conflicts_with = "token")]
+    token_stdin: bool,
     /// Polling interval in seconds
     #[arg(long, value_parser = parse_oast_polling_interval)]
     interval: Option<u64>,
@@ -1405,6 +1469,7 @@ struct ReplaySendErrorBody {
 struct FuzzerRunPayload {
     session_id: Option<Uuid>,
     expected_active_session_id: Option<Uuid>,
+    expected_workspace_revision: Option<u64>,
     template: EditableRequest,
     payloads: Vec<String>,
     source_transaction_id: Option<Uuid>,
@@ -1438,14 +1503,2663 @@ struct InterceptForwardPayload {
     request: EditableRequest,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct CliOperationSpec {
+    operation: &'static str,
+    command: &'static str,
+    description: &'static str,
+    side_effect: CliSideEffect,
+    requires_confirmation: bool,
+    input_schema: Value,
+    output_schema: Value,
+    examples: Vec<Value>,
+}
+
+impl Command {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            Command::Manifest => "manifest",
+            Command::Schema { .. } => "schema",
+            Command::Examples { .. } => "examples",
+            Command::Call { .. } => "call",
+            Command::Session { command } => command.operation_name(),
+            Command::Capture { command } => command.operation_name(),
+            Command::Scope { command } => command.operation_name(),
+            Command::Replay { command } => command.operation_name(),
+            Command::Fuzzer { command } => command.operation_name(),
+            Command::Sequence { command } => command.operation_name(),
+            Command::Skills { command } => command.operation_name(),
+            Command::History { command } => command.operation_name(),
+            Command::Intercept { command } => command.operation_name(),
+            Command::Websocket { command } => command.operation_name(),
+            Command::AutoReplace { command } => command.operation_name(),
+        }
+    }
+
+    fn requires_confirmation(&self) -> bool {
+        operation_spec(self.operation_name())
+            .map(|spec| spec.requires_confirmation)
+            .unwrap_or(false)
+    }
+
+    fn output_operation_name(&self) -> String {
+        match self {
+            Command::Call(args) => args.operation.clone(),
+            _ => self.operation_name().to_string(),
+        }
+    }
+}
+
+impl SessionCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            SessionCommand::List => "session.list",
+            SessionCommand::Create(_) => "session.create",
+            SessionCommand::Switch(_) => "session.switch",
+            SessionCommand::Delete(_) => "session.delete",
+            SessionCommand::Reveal(_) => "session.reveal",
+        }
+    }
+}
+
+impl CaptureCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            CaptureCommand::Http { command } => command.operation_name(),
+            CaptureCommand::Intercept { command } => command.operation_name(),
+            CaptureCommand::ResponseIntercept { command } => command.operation_name(),
+            CaptureCommand::InterceptRule { command } => command.operation_name(),
+            CaptureCommand::WebSocket { command } => command.operation_name(),
+            CaptureCommand::AutoReplace { command } => command.operation_name(),
+            CaptureCommand::Oast { command } => command.operation_name(),
+        }
+    }
+}
+
+impl HistoryCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            HistoryCommand::List(_) => "capture.http.list",
+            HistoryCommand::Get(_) => "capture.http.get",
+            HistoryCommand::Replay(_) => "capture.http.replay",
+            HistoryCommand::Fuzzer(_) => "capture.http.fuzzer",
+            HistoryCommand::Annotate(_) => "capture.http.annotate",
+        }
+    }
+}
+
+impl TargetCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            TargetCommand::GetScope(_) => "scope.get",
+            TargetCommand::SetScope(_) => "scope.set",
+        }
+    }
+}
+
+impl ReplayCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            ReplayCommand::List(_) => "replay.list",
+            ReplayCommand::Open(_) => "replay.open",
+            ReplayCommand::Update(_) => "replay.update",
+            ReplayCommand::Send(_) => "replay.send",
+        }
+    }
+}
+
+impl FuzzerCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            FuzzerCommand::SetTemplate(_) => "fuzzer.set_template",
+            FuzzerCommand::SetPayloads(_) => "fuzzer.set_payloads",
+            FuzzerCommand::Run(_) => "fuzzer.run",
+            FuzzerCommand::Status(_) => "fuzzer.status",
+            FuzzerCommand::Results(_) => "fuzzer.results",
+            FuzzerCommand::List(_) => "fuzzer.list",
+        }
+    }
+}
+
+impl InterceptCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            InterceptCommand::On(_) => "capture.intercept.on",
+            InterceptCommand::Off(_) => "capture.intercept.off",
+            InterceptCommand::List(_) => "capture.intercept.list",
+            InterceptCommand::Forward(_) => "capture.intercept.forward",
+            InterceptCommand::Drop(_) => "capture.intercept.drop",
+            InterceptCommand::ForwardAll(_) => "capture.intercept.forward_all",
+        }
+    }
+}
+
+impl WebSocketCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            WebSocketCommand::List(_) => "capture.websocket.list",
+            WebSocketCommand::Get(_) => "capture.websocket.get",
+        }
+    }
+}
+
+impl AutoReplaceCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            AutoReplaceCommand::List(_) => "capture.auto_replace.list",
+            AutoReplaceCommand::Set(_) => "capture.auto_replace.set",
+        }
+    }
+}
+
+impl ResponseInterceptCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            ResponseInterceptCommand::List(_) => "capture.response_intercept.list",
+            ResponseInterceptCommand::Get(_) => "capture.response_intercept.get",
+            ResponseInterceptCommand::Forward(_) => "capture.response_intercept.forward",
+            ResponseInterceptCommand::Drop(_) => "capture.response_intercept.drop",
+            ResponseInterceptCommand::ForwardAll(_) => "capture.response_intercept.forward_all",
+        }
+    }
+}
+
+impl InterceptRuleCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            InterceptRuleCommand::List(_) => "capture.intercept_rule.list",
+            InterceptRuleCommand::Create(_) => "capture.intercept_rule.create",
+            InterceptRuleCommand::Delete(_) => "capture.intercept_rule.delete",
+        }
+    }
+}
+
+impl SequenceCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            SequenceCommand::List(_) => "sequence.list",
+            SequenceCommand::Get(_) => "sequence.get",
+            SequenceCommand::Create(_) => "sequence.create",
+            SequenceCommand::Run(_) => "sequence.run",
+            SequenceCommand::RunGet(_) => "sequence.run_get",
+            SequenceCommand::Delete(_) => "sequence.delete",
+            SequenceCommand::Runs(_) => "sequence.runs",
+        }
+    }
+}
+
+impl OastCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            OastCommand::Status(_) => "capture.oast.status",
+            OastCommand::List(_) => "capture.oast.list",
+            OastCommand::Get(_) => "capture.oast.get",
+            OastCommand::Generate(_) => "capture.oast.generate",
+            OastCommand::Clear(_) => "capture.oast.clear",
+            OastCommand::Configure(_) => "capture.oast.configure",
+        }
+    }
+}
+
+impl SkillsCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            SkillsCommand::Install(_) => "skills.install",
+        }
+    }
+}
+
+fn manifest_operations() -> Vec<CliOperationSpec> {
+    use CliSideEffect::{Read, Write};
+    vec![
+        op(
+            "manifest",
+            "manifest",
+            "Print the AI-readable Sniper CLI operation catalog.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "schema",
+            "schema <input|output> <operation>",
+            "Print the JSON schema for one Sniper CLI operation.",
+            Read,
+            false,
+            &["kind", "operation"],
+            vec![json!({"operation":"replay.send","kind":"input"})],
+        ),
+        op(
+            "examples",
+            "examples <operation>",
+            "Print example inputs for one Sniper CLI operation.",
+            Read,
+            false,
+            &["operation"],
+            vec![json!({"operation":"capture.http.list"})],
+        ),
+        op(
+            "skills.install",
+            "skills install",
+            "Install Sniper operator skills into Codex and/or Claude.",
+            Write,
+            false,
+            &[],
+            vec![json!({"all":true})],
+        ),
+        op(
+            "session.list",
+            "session list",
+            "List Sniper sessions.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "session.create",
+            "session create",
+            "Create a Sniper session.",
+            Write,
+            false,
+            &[],
+            vec![json!({"name":"test session"})],
+        ),
+        op(
+            "session.switch",
+            "session switch --id <uuid>",
+            "Switch the active Sniper session.",
+            Write,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "session.delete",
+            "session delete --id <uuid>",
+            "Delete a Sniper session.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "session.reveal",
+            "session reveal --id <uuid>",
+            "Reveal a session folder in Finder.",
+            Write,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.list",
+            "capture http list",
+            "List captured HTTP transactions.",
+            Read,
+            false,
+            &[],
+            vec![json!({"limit":20,"page":true})],
+        ),
+        op(
+            "capture.http.get",
+            "capture http get --id <uuid>",
+            "Get one captured HTTP transaction.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.replay",
+            "capture http replay --id <uuid>",
+            "Open a captured HTTP transaction in Replay.",
+            Write,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.fuzzer",
+            "capture http fuzzer --id <uuid>",
+            "Seed the Fuzzer from a captured HTTP transaction.",
+            Write,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.annotate",
+            "capture http annotate --id <uuid>",
+            "Set or clear a transaction note/color.",
+            Write,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000","note":"interesting"})],
+        ),
+        op(
+            "scope.get",
+            "scope get-scope",
+            "Read the active scope patterns.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "scope.set",
+            "scope set-scope",
+            "Replace or clear active scope patterns.",
+            Write,
+            false,
+            &[],
+            vec![json!({"patterns":["*.example.com"]})],
+        ),
+        op(
+            "replay.list",
+            "replay list",
+            "List Replay tabs.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "replay.open",
+            "replay open",
+            "Open a new Replay tab.",
+            Write,
+            false,
+            &[],
+            vec![json!({"transaction_id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "replay.update",
+            "replay update --tab-id <id>",
+            "Update a Replay tab request or connection target.",
+            Write,
+            false,
+            &["tab_id"],
+            vec![json!({"tab_id":"tab-1","host":"example.com"})],
+        ),
+        op(
+            "replay.send",
+            "replay send --tab-id <id>",
+            "Send a Replay tab request to the network.",
+            Write,
+            true,
+            &["tab_id"],
+            vec![json!({"tab_id":"tab-1"})],
+        ),
+        op(
+            "fuzzer.set_template",
+            "fuzzer set-template",
+            "Set the Fuzzer request template.",
+            Write,
+            false,
+            &[],
+            vec![json!({"transaction_id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "fuzzer.set_payloads",
+            "fuzzer set-payloads",
+            "Set Fuzzer payloads.",
+            Write,
+            false,
+            &[],
+            vec![json!({"payloads":["admin","test"]})],
+        ),
+        op(
+            "fuzzer.run",
+            "fuzzer run",
+            "Run the Fuzzer, sending generated HTTP requests.",
+            Write,
+            true,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "fuzzer.status",
+            "fuzzer status --id <uuid>",
+            "Read Fuzzer attack status.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "fuzzer.results",
+            "fuzzer results --id <uuid>",
+            "Read Fuzzer attack results.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "fuzzer.list",
+            "fuzzer list",
+            "List Fuzzer attacks.",
+            Read,
+            false,
+            &[],
+            vec![json!({"limit":20})],
+        ),
+        op(
+            "capture.intercept.on",
+            "capture intercept on",
+            "Enable request interception.",
+            Write,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.intercept.off",
+            "capture intercept off",
+            "Disable request interception.",
+            Write,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.intercept.list",
+            "capture intercept list",
+            "List held requests.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.intercept.forward",
+            "capture intercept forward --id <uuid>",
+            "Forward one held request.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.intercept.drop",
+            "capture intercept drop --id <uuid>",
+            "Drop one held request.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.intercept.forward_all",
+            "capture intercept forward-all",
+            "Forward all held requests.",
+            Write,
+            true,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.websocket.list",
+            "capture web-socket list",
+            "List captured WebSocket sessions.",
+            Read,
+            false,
+            &[],
+            vec![json!({"limit":20,"page":true})],
+        ),
+        op(
+            "capture.websocket.get",
+            "capture web-socket get --id <uuid>",
+            "Get one WebSocket session and frames.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.auto_replace.list",
+            "capture auto-replace list",
+            "List match/replace rules.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.auto_replace.set",
+            "capture auto-replace set",
+            "Replace match/replace rules.",
+            Write,
+            false,
+            &[],
+            vec![json!({"stdin":true})],
+        ),
+        op(
+            "capture.response_intercept.list",
+            "capture response-intercept list",
+            "List held responses.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.response_intercept.get",
+            "capture response-intercept get --id <uuid>",
+            "Get one held response.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.response_intercept.forward",
+            "capture response-intercept forward --id <uuid>",
+            "Forward one held response.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.response_intercept.drop",
+            "capture response-intercept drop --id <uuid>",
+            "Drop one held response.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.response_intercept.forward_all",
+            "capture response-intercept forward-all",
+            "Forward all held responses.",
+            Write,
+            true,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.intercept_rule.list",
+            "capture intercept-rule list",
+            "List intercept rules.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.intercept_rule.create",
+            "capture intercept-rule create",
+            "Create an intercept rule.",
+            Write,
+            false,
+            &[],
+            vec![json!({"all":true})],
+        ),
+        op(
+            "capture.intercept_rule.delete",
+            "capture intercept-rule delete --id <uuid>",
+            "Delete an intercept rule.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "sequence.list",
+            "sequence list",
+            "List saved sequences.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "sequence.get",
+            "sequence get --id <uuid>",
+            "Get one saved sequence.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "sequence.create",
+            "sequence create",
+            "Create a saved sequence.",
+            Write,
+            false,
+            &[],
+            vec![json!({"file":"sequence.json"})],
+        ),
+        op(
+            "sequence.run",
+            "sequence run --id <uuid>",
+            "Run a saved sequence, sending HTTP requests.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "sequence.run_get",
+            "sequence run-get --id <uuid>",
+            "Get one sequence run result.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "sequence.delete",
+            "sequence delete --id <uuid>",
+            "Delete a saved sequence.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "sequence.runs",
+            "sequence runs",
+            "List sequence runs.",
+            Read,
+            false,
+            &[],
+            vec![json!({"limit":20})],
+        ),
+        op(
+            "capture.oast.status",
+            "capture oast status",
+            "Read OAST provider status.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.oast.list",
+            "capture oast list",
+            "List OAST callbacks.",
+            Read,
+            false,
+            &[],
+            vec![json!({"limit":20})],
+        ),
+        op(
+            "capture.oast.get",
+            "capture oast get --id <uuid>",
+            "Get one OAST callback.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.oast.generate",
+            "capture oast generate",
+            "Generate a fresh OAST payload.",
+            Write,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.oast.clear",
+            "capture oast clear",
+            "Clear OAST callbacks.",
+            Write,
+            true,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "capture.oast.configure",
+            "capture oast configure",
+            "Configure the OAST provider.",
+            Write,
+            true,
+            &[],
+            vec![json!({"provider":"interactsh","url":"https://oast.example","token_stdin":true})],
+        ),
+    ]
+}
+
+fn op(
+    operation: &'static str,
+    command: &'static str,
+    description: &'static str,
+    side_effect: CliSideEffect,
+    requires_confirmation: bool,
+    required_fields: &[&'static str],
+    examples: Vec<Value>,
+) -> CliOperationSpec {
+    CliOperationSpec {
+        operation,
+        command,
+        description,
+        side_effect,
+        requires_confirmation: requires_confirmation || side_effect == CliSideEffect::Write,
+        input_schema: input_schema(operation, required_fields),
+        output_schema: json!({
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Returned in the envelope data field."
+        }),
+        examples,
+    }
+}
+
+fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
+    let mut properties = serde_json::Map::new();
+    let fields = call_allowed_fields(operation).unwrap_or(required_fields);
+    for field in fields {
+        properties.insert(
+            (*field).to_string(),
+            json!({
+                "description": format!("CLI argument `{field}`"),
+            }),
+        );
+    }
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": required_fields,
+        "properties": properties,
+    })
+}
+
+fn operation_spec(operation: &str) -> Option<CliOperationSpec> {
+    manifest_operations()
+        .into_iter()
+        .find(|spec| spec.operation == operation)
+}
+
+fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
+    Some(match operation {
+        "manifest" | "session.list" => &[],
+        "schema" => &["kind", "operation"],
+        "examples" => &["operation"],
+        "skills.install" => &["codex", "claude", "all", "codex_dir", "claude_dir"],
+        "session.create" => &["name"],
+        "session.switch" | "session.delete" | "session.reveal" => &["id"],
+        "capture.http.list" => &[
+            "session_id",
+            "query",
+            "method",
+            "limit",
+            "offset",
+            "before_sequence",
+            "page",
+            "host",
+            "status",
+            "status_range",
+            "since",
+            "mime",
+            "sort_key",
+            "sort_direction",
+        ],
+        "capture.http.get" => &["id", "session_id"],
+        "capture.http.replay" | "capture.http.fuzzer" => {
+            &["id", "session_id", "scheme", "host", "port"]
+        }
+        "capture.http.annotate" => &[
+            "id",
+            "session_id",
+            "color",
+            "clear_color",
+            "note",
+            "clear_note",
+        ],
+        "scope.get" => &["session_id"],
+        "scope.set" => &[
+            "session_id",
+            "clear",
+            "patterns",
+            "pattern",
+            "file",
+            "stdin",
+        ],
+        "replay.list" => &["session_id"],
+        "replay.open" | "fuzzer.set_template" => &[
+            "session_id",
+            "transaction_id",
+            "request_file",
+            "stdin",
+            "scheme",
+            "host",
+            "port",
+        ],
+        "replay.update" => &[
+            "tab_id",
+            "session_id",
+            "request_file",
+            "stdin",
+            "scheme",
+            "host",
+            "port",
+        ],
+        "replay.send" => &["tab_id", "session_id"],
+        "fuzzer.set_payloads" => &["session_id", "payloads", "payload", "file", "stdin"],
+        "fuzzer.run" => &["session_id", "async", "r#async"],
+        "fuzzer.status" | "fuzzer.results" => &["id", "session_id"],
+        "fuzzer.list" => &["session_id", "limit"],
+        "capture.intercept.on"
+        | "capture.intercept.off"
+        | "capture.intercept.list"
+        | "capture.intercept.forward_all"
+        | "capture.auto_replace.list"
+        | "capture.response_intercept.list"
+        | "capture.response_intercept.forward_all"
+        | "capture.intercept_rule.list"
+        | "sequence.list"
+        | "capture.oast.status"
+        | "capture.oast.generate"
+        | "capture.oast.clear" => &["session_id"],
+        "capture.intercept.forward" => &["id", "session_id", "request_file", "stdin"],
+        "capture.intercept.drop"
+        | "capture.response_intercept.get"
+        | "capture.response_intercept.drop"
+        | "capture.intercept_rule.delete"
+        | "sequence.get"
+        | "sequence.run"
+        | "sequence.run_get"
+        | "sequence.delete"
+        | "capture.oast.get" => &["id", "session_id"],
+        "capture.websocket.list" => &[
+            "session_id",
+            "query",
+            "limit",
+            "offset",
+            "sort_key",
+            "sort_direction",
+            "in_scope_only",
+            "live_only",
+            "page",
+        ],
+        "capture.websocket.get" => &["id", "session_id", "frame_limit", "before_index"],
+        "capture.auto_replace.set" => &["session_id", "file", "stdin"],
+        "capture.response_intercept.forward" => &["id", "session_id", "response_file", "stdin"],
+        "capture.intercept_rule.create" => &[
+            "session_id",
+            "scope",
+            "all",
+            "host_pattern",
+            "path_pattern",
+            "method_filter",
+            "method",
+            "enabled",
+        ],
+        "sequence.create" => &["file", "stdin", "session_id"],
+        "sequence.runs" | "capture.oast.list" => &["session_id", "limit"],
+        "capture.oast.configure" => &[
+            "session_id",
+            "provider",
+            "url",
+            "token",
+            "token_stdin",
+            "interval",
+            "enable",
+            "disable",
+        ],
+        _ => return None,
+    })
+}
+
+fn dry_run_command(command: &Command) -> Result<Value> {
+    let operation = command.operation_name();
+    let spec =
+        operation_spec(operation).ok_or_else(|| anyhow!("unknown operation `{operation}`"))?;
+    Ok(json!({
+        "dry_run": true,
+        "operation": operation,
+        "command": spec.command,
+        "side_effect": spec.side_effect,
+        "requires_confirmation": spec.requires_confirmation,
+        "input": command_input_preview(command),
+        "api": command_api_preview(command)?,
+        "notes": dry_run_notes(command),
+    }))
+}
+
+fn command_input_preview(command: &Command) -> Value {
+    match command {
+        Command::Manifest => json!({}),
+        Command::Schema { kind, operation } => json!({ "kind": kind, "operation": operation }),
+        Command::Examples { operation } => json!({ "operation": operation }),
+        Command::Call(args) => json!({ "operation": args.operation, "input": args.input }),
+        Command::Session { command } => match command {
+            SessionCommand::List => json!({}),
+            SessionCommand::Create(args) => json!({ "name": args.name }),
+            SessionCommand::Switch(args) => json!({ "id": args.id }),
+            SessionCommand::Delete(args) => json!({ "id": args.id }),
+            SessionCommand::Reveal(args) => json!({ "id": args.id }),
+        },
+        Command::Capture { command } => match command {
+            CaptureCommand::Http { command } => history_input_preview(command),
+            CaptureCommand::Intercept { command } => intercept_input_preview(command),
+            CaptureCommand::ResponseIntercept { command } => {
+                response_intercept_input_preview(command)
+            }
+            CaptureCommand::InterceptRule { command } => intercept_rule_input_preview(command),
+            CaptureCommand::WebSocket { command } => websocket_input_preview(command),
+            CaptureCommand::AutoReplace { command } => auto_replace_input_preview(command),
+            CaptureCommand::Oast { command } => oast_input_preview(command),
+        },
+        Command::Scope { command } => match command {
+            TargetCommand::GetScope(args) => json!({ "session_id": args.session_id }),
+            TargetCommand::SetScope(args) => json!({
+                "session_id": args.session_id,
+                "clear": args.clear,
+                "patterns": args.patterns,
+                "file": args.file,
+                "stdin": args.stdin,
+            }),
+        },
+        Command::Replay { command } => replay_input_preview(command),
+        Command::Fuzzer { command } => fuzzer_input_preview(command),
+        Command::Sequence { command } => sequence_input_preview(command),
+        Command::Skills { command } => match command {
+            SkillsCommand::Install(args) => json!({
+                "codex": args.codex,
+                "claude": args.claude,
+                "all": args.all,
+                "codex_dir": args.codex_dir,
+                "claude_dir": args.claude_dir,
+            }),
+        },
+        Command::History { command } => history_input_preview(command),
+        Command::Intercept { command } => intercept_input_preview(command),
+        Command::Websocket { command } => websocket_input_preview(command),
+        Command::AutoReplace { command } => auto_replace_input_preview(command),
+    }
+}
+
+fn history_input_preview(command: &HistoryCommand) -> Value {
+    match command {
+        HistoryCommand::List(args) => json!({
+            "session_id": args.session_id,
+            "query": args.query,
+            "method": args.method,
+            "limit": args.limit,
+            "offset": args.offset,
+            "before_sequence": args.before_sequence,
+            "page": args.page,
+            "host": args.host,
+            "status": args.status,
+            "status_range": args.status_range,
+            "since": args.since,
+            "mime": args.mime,
+            "sort_key": args.sort_key,
+            "sort_direction": args.sort_direction,
+        }),
+        HistoryCommand::Get(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        HistoryCommand::Replay(args) => json!({
+            "id": args.id,
+            "session_id": args.session_id,
+            "scheme": args.scheme,
+            "host": args.host,
+            "port": args.port,
+        }),
+        HistoryCommand::Fuzzer(args) => json!({
+            "id": args.id,
+            "session_id": args.session_id,
+            "scheme": args.scheme,
+            "host": args.host,
+            "port": args.port,
+        }),
+        HistoryCommand::Annotate(args) => json!({
+            "id": args.id,
+            "session_id": args.session_id,
+            "color": args.color,
+            "clear_color": args.clear_color,
+            "note": args.note,
+            "clear_note": args.clear_note,
+        }),
+    }
+}
+
+fn replay_input_preview(command: &ReplayCommand) -> Value {
+    match command {
+        ReplayCommand::List(args) => json!({ "session_id": args.session_id }),
+        ReplayCommand::Open(args) => json!({
+            "session_id": args.session_id,
+            "transaction_id": args.transaction_id,
+            "request_file": args.request_file,
+            "stdin": args.stdin,
+            "scheme": args.scheme,
+            "host": args.host,
+            "port": args.port,
+        }),
+        ReplayCommand::Update(args) => json!({
+            "tab_id": args.tab_id,
+            "session_id": args.session_id,
+            "request_file": args.request_file,
+            "stdin": args.stdin,
+            "scheme": args.scheme,
+            "host": args.host,
+            "port": args.port,
+        }),
+        ReplayCommand::Send(args) => {
+            json!({ "tab_id": args.tab_id, "session_id": args.session_id })
+        }
+    }
+}
+
+fn fuzzer_input_preview(command: &FuzzerCommand) -> Value {
+    match command {
+        FuzzerCommand::SetTemplate(args) => json!({
+            "session_id": args.session_id,
+            "transaction_id": args.transaction_id,
+            "request_file": args.request_file,
+            "stdin": args.stdin,
+            "scheme": args.scheme,
+            "host": args.host,
+            "port": args.port,
+        }),
+        FuzzerCommand::SetPayloads(args) => json!({
+            "session_id": args.session_id,
+            "payloads": args.payloads,
+            "file": args.file,
+            "stdin": args.stdin,
+        }),
+        FuzzerCommand::Run(args) => json!({ "session_id": args.session_id, "async": args.r#async }),
+        FuzzerCommand::Status(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        FuzzerCommand::Results(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        FuzzerCommand::List(args) => json!({ "session_id": args.session_id, "limit": args.limit }),
+    }
+}
+
+fn intercept_input_preview(command: &InterceptCommand) -> Value {
+    match command {
+        InterceptCommand::On(args)
+        | InterceptCommand::Off(args)
+        | InterceptCommand::List(args)
+        | InterceptCommand::ForwardAll(args) => json!({ "session_id": args.session_id }),
+        InterceptCommand::Forward(args) => json!({
+            "id": args.id,
+            "session_id": args.session_id,
+            "request_file": args.request_file,
+            "stdin": args.stdin,
+        }),
+        InterceptCommand::Drop(args) => json!({ "id": args.id, "session_id": args.session_id }),
+    }
+}
+
+fn websocket_input_preview(command: &WebSocketCommand) -> Value {
+    match command {
+        WebSocketCommand::List(args) => json!({
+            "session_id": args.session_id,
+            "query": args.query,
+            "limit": args.limit,
+            "offset": args.offset,
+            "sort_key": args.sort_key,
+            "sort_direction": args.sort_direction,
+            "in_scope_only": args.in_scope_only,
+            "live_only": args.live_only,
+            "page": args.page,
+        }),
+        WebSocketCommand::Get(args) => json!({
+            "id": args.id,
+            "session_id": args.session_id,
+            "frame_limit": args.frame_limit,
+            "before_index": args.before_index,
+        }),
+    }
+}
+
+fn auto_replace_input_preview(command: &AutoReplaceCommand) -> Value {
+    match command {
+        AutoReplaceCommand::List(args) => json!({ "session_id": args.session_id }),
+        AutoReplaceCommand::Set(args) => json!({
+            "session_id": args.session_id,
+            "file": args.file,
+            "stdin": args.stdin,
+        }),
+    }
+}
+
+fn response_intercept_input_preview(command: &ResponseInterceptCommand) -> Value {
+    match command {
+        ResponseInterceptCommand::List(args) | ResponseInterceptCommand::ForwardAll(args) => {
+            json!({ "session_id": args.session_id })
+        }
+        ResponseInterceptCommand::Get(args) => {
+            json!({ "id": args.id, "session_id": args.session_id })
+        }
+        ResponseInterceptCommand::Forward(args) => json!({
+            "id": args.id,
+            "session_id": args.session_id,
+            "response_file": args.response_file,
+            "stdin": args.stdin,
+        }),
+        ResponseInterceptCommand::Drop(args) => {
+            json!({ "id": args.id, "session_id": args.session_id })
+        }
+    }
+}
+
+fn intercept_rule_input_preview(command: &InterceptRuleCommand) -> Value {
+    match command {
+        InterceptRuleCommand::List(args) => json!({ "session_id": args.session_id }),
+        InterceptRuleCommand::Create(args) => json!({
+            "session_id": args.session_id,
+            "scope": args.scope,
+            "all": args.all,
+            "host_pattern": args.host_pattern,
+            "path_pattern": args.path_pattern,
+            "method_filter": args.method_filter,
+            "enabled": args.enabled,
+        }),
+        InterceptRuleCommand::Delete(args) => {
+            json!({ "id": args.id, "session_id": args.session_id })
+        }
+    }
+}
+
+fn sequence_input_preview(command: &SequenceCommand) -> Value {
+    match command {
+        SequenceCommand::List(args) => json!({ "session_id": args.session_id }),
+        SequenceCommand::Get(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        SequenceCommand::Create(args) => json!({
+            "file": args.file,
+            "stdin": args.stdin,
+            "session_id": args.session_id,
+        }),
+        SequenceCommand::Run(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        SequenceCommand::RunGet(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        SequenceCommand::Delete(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        SequenceCommand::Runs(args) => {
+            json!({ "session_id": args.session_id, "limit": args.limit })
+        }
+    }
+}
+
+fn oast_input_preview(command: &OastCommand) -> Value {
+    match command {
+        OastCommand::Status(args) | OastCommand::Generate(args) | OastCommand::Clear(args) => {
+            json!({ "session_id": args.session_id })
+        }
+        OastCommand::List(args) => json!({ "session_id": args.session_id, "limit": args.limit }),
+        OastCommand::Get(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        OastCommand::Configure(args) => json!({
+            "session_id": args.session_id,
+            "provider": args.provider,
+            "url": args.url,
+            "token_stdin": args.token_stdin,
+            "interval": args.interval,
+            "enable": args.enable,
+            "disable": args.disable,
+        }),
+    }
+}
+
+fn command_api_preview(command: &Command) -> Result<Value> {
+    let api = match command {
+        Command::Manifest | Command::Schema { .. } | Command::Examples { .. } => Value::Null,
+        Command::Call { .. } => Value::Null,
+        Command::Skills { .. } => json!({ "local": true }),
+        Command::Session { command } => match command {
+            SessionCommand::List => api_preview("GET", "/api/sessions", None),
+            SessionCommand::Create(args) => {
+                api_preview("POST", "/api/sessions", Some(json!({ "name": args.name })))
+            }
+            SessionCommand::Switch(args) => api_preview(
+                "POST",
+                format!("/api/sessions/{}/activate", args.id),
+                Some(json!({})),
+            ),
+            SessionCommand::Delete(args) => {
+                api_preview("DELETE", format!("/api/sessions/{}", args.id), None)
+            }
+            SessionCommand::Reveal(args) => api_preview(
+                "POST",
+                format!("/api/sessions/{}/reveal", args.id),
+                Some(json!({})),
+            ),
+        },
+        Command::Capture { command } => capture_api_preview(command)?,
+        Command::Scope { command } => match command {
+            TargetCommand::GetScope(args) => api_preview(
+                "GET",
+                session_query_path("/api/runtime", args.session_id),
+                None,
+            ),
+            TargetCommand::SetScope(args) => api_preview(
+                "POST",
+                "/api/runtime",
+                Some(json!({
+                    "session_id": args.session_id,
+                    "scope_patterns": if args.clear { Some(Vec::<String>::new()) } else { None },
+                })),
+            ),
+        },
+        Command::Replay { command } => replay_api_preview(command),
+        Command::Fuzzer { command } => fuzzer_api_preview(command),
+        Command::Sequence { command } => sequence_api_preview(command),
+        Command::History { command } => history_api_preview(command)?,
+        Command::Intercept { command } => intercept_api_preview(command),
+        Command::Websocket { command } => websocket_api_preview(command),
+        Command::AutoReplace { command } => auto_replace_api_preview(command),
+    };
+    Ok(api)
+}
+
+fn capture_api_preview(command: &CaptureCommand) -> Result<Value> {
+    match command {
+        CaptureCommand::Http { command } => history_api_preview(command),
+        CaptureCommand::Intercept { command } => Ok(intercept_api_preview(command)),
+        CaptureCommand::ResponseIntercept { command } => {
+            Ok(response_intercept_api_preview(command))
+        }
+        CaptureCommand::InterceptRule { command } => Ok(intercept_rule_api_preview(command)),
+        CaptureCommand::WebSocket { command } => Ok(websocket_api_preview(command)),
+        CaptureCommand::AutoReplace { command } => Ok(auto_replace_api_preview(command)),
+        CaptureCommand::Oast { command } => Ok(oast_api_preview(command)),
+    }
+}
+
+fn history_api_preview(command: &HistoryCommand) -> Result<Value> {
+    Ok(match command {
+        HistoryCommand::List(args) => {
+            api_preview("GET", history_list_path(args.session_id, args)?, None)
+        }
+        HistoryCommand::Get(args) => api_preview(
+            "GET",
+            transaction_detail_path(args.id, args.session_id),
+            None,
+        ),
+        HistoryCommand::Replay(_) | HistoryCommand::Fuzzer(_) => api_preview(
+            "POST",
+            "/api/workspace-state",
+            Some(json!({ "note": "loads transaction, then updates workspace state" })),
+        ),
+        HistoryCommand::Annotate(args) => api_preview(
+            "PATCH",
+            session_query_path(
+                &format!("/api/transactions/{}/annotations", args.id),
+                args.session_id,
+            ),
+            Some(json!({ "note": "annotation payload" })),
+        ),
+    })
+}
+
+fn replay_api_preview(command: &ReplayCommand) -> Value {
+    match command {
+        ReplayCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/workspace-state", args.session_id),
+            None,
+        ),
+        ReplayCommand::Open(_) | ReplayCommand::Update(_) => api_preview(
+            "POST",
+            "/api/workspace-state",
+            Some(json!({ "note": "updates Replay workspace state" })),
+        ),
+        ReplayCommand::Send(_) => api_preview(
+            "POST",
+            "/api/replay/send",
+            Some(json!({ "note": "sends the selected Replay tab request" })),
+        ),
+    }
+}
+
+fn fuzzer_api_preview(command: &FuzzerCommand) -> Value {
+    match command {
+        FuzzerCommand::SetTemplate(_) | FuzzerCommand::SetPayloads(_) => api_preview(
+            "POST",
+            "/api/workspace-state",
+            Some(json!({ "note": "updates Fuzzer workspace state" })),
+        ),
+        FuzzerCommand::Run(_) => api_preview(
+            "POST",
+            "/api/fuzzer/attacks",
+            Some(json!({ "note": "runs payload-generated HTTP requests" })),
+        ),
+        FuzzerCommand::Status(args) => api_preview(
+            "GET",
+            session_query_path(&format!("/api/fuzzer/attacks/{}", args.id), args.session_id),
+            None,
+        ),
+        FuzzerCommand::Results(args) => api_preview(
+            "GET",
+            session_query_path(
+                &format!("/api/fuzzer/attacks/{}/results", args.id),
+                args.session_id,
+            ),
+            None,
+        ),
+        FuzzerCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/fuzzer/attacks", args.session_id),
+            None,
+        ),
+    }
+}
+
+fn intercept_api_preview(command: &InterceptCommand) -> Value {
+    match command {
+        InterceptCommand::On(args) | InterceptCommand::Off(args) => api_preview(
+            "POST",
+            "/api/runtime",
+            Some(
+                json!({ "session_id": args.session_id, "intercept_enabled": matches!(command, InterceptCommand::On(_)) }),
+            ),
+        ),
+        InterceptCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/intercepts", args.session_id),
+            None,
+        ),
+        InterceptCommand::Forward(args) => api_preview(
+            "POST",
+            session_query_path(
+                &format!("/api/intercepts/{}/forward", args.id),
+                args.session_id,
+            ),
+            Some(json!({ "note": "optional edited request" })),
+        ),
+        InterceptCommand::Drop(args) => api_preview(
+            "POST",
+            session_query_path(
+                &format!("/api/intercepts/{}/drop", args.id),
+                args.session_id,
+            ),
+            Some(json!({})),
+        ),
+        InterceptCommand::ForwardAll(args) => api_preview(
+            "POST",
+            session_query_path("/api/intercepts/forward-all", args.session_id),
+            Some(json!({})),
+        ),
+    }
+}
+
+fn websocket_api_preview(command: &WebSocketCommand) -> Value {
+    match command {
+        WebSocketCommand::List(args) => {
+            api_preview("GET", websocket_list_path(args.session_id, args), None)
+        }
+        WebSocketCommand::Get(args) => api_preview(
+            "GET",
+            websocket_detail_path(
+                args.id,
+                args.session_id,
+                args.frame_limit,
+                args.before_index,
+            ),
+            None,
+        ),
+    }
+}
+
+fn auto_replace_api_preview(command: &AutoReplaceCommand) -> Value {
+    match command {
+        AutoReplaceCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/match-replace", args.session_id),
+            None,
+        ),
+        AutoReplaceCommand::Set(args) => api_preview(
+            "POST",
+            session_query_path("/api/match-replace", args.session_id),
+            Some(json!({ "note": "replacement rules from file/stdin" })),
+        ),
+    }
+}
+
+fn response_intercept_api_preview(command: &ResponseInterceptCommand) -> Value {
+    match command {
+        ResponseInterceptCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/response-intercepts", args.session_id),
+            None,
+        ),
+        ResponseInterceptCommand::Get(args) => api_preview(
+            "GET",
+            session_query_path(
+                &format!("/api/response-intercepts/{}", args.id),
+                args.session_id,
+            ),
+            None,
+        ),
+        ResponseInterceptCommand::Forward(args) => api_preview(
+            "POST",
+            session_query_path(
+                &format!("/api/response-intercepts/{}/forward", args.id),
+                args.session_id,
+            ),
+            Some(json!({ "note": "optional edited response" })),
+        ),
+        ResponseInterceptCommand::Drop(args) => api_preview(
+            "POST",
+            session_query_path(
+                &format!("/api/response-intercepts/{}/drop", args.id),
+                args.session_id,
+            ),
+            Some(json!({})),
+        ),
+        ResponseInterceptCommand::ForwardAll(args) => api_preview(
+            "POST",
+            session_query_path("/api/response-intercepts/forward-all", args.session_id),
+            Some(json!({})),
+        ),
+    }
+}
+
+fn intercept_rule_api_preview(command: &InterceptRuleCommand) -> Value {
+    match command {
+        InterceptRuleCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/intercept-rules", args.session_id),
+            None,
+        ),
+        InterceptRuleCommand::Create(args) => api_preview(
+            "POST",
+            session_query_path("/api/intercept-rules", args.session_id),
+            Some(json!({ "scope": args.scope, "all": args.all })),
+        ),
+        InterceptRuleCommand::Delete(args) => api_preview(
+            "DELETE",
+            session_query_path(
+                &format!("/api/intercept-rules/{}", args.id),
+                args.session_id,
+            ),
+            None,
+        ),
+    }
+}
+
+fn sequence_api_preview(command: &SequenceCommand) -> Value {
+    match command {
+        SequenceCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/sequences", args.session_id),
+            None,
+        ),
+        SequenceCommand::Get(args) => api_preview(
+            "GET",
+            session_query_path(&format!("/api/sequences/{}", args.id), args.session_id),
+            None,
+        ),
+        SequenceCommand::Create(args) => api_preview(
+            "POST",
+            session_query_path("/api/sequences", args.session_id),
+            Some(json!({ "note": "sequence definition from file/stdin" })),
+        ),
+        SequenceCommand::Run(args) => api_preview(
+            "POST",
+            session_query_path(&format!("/api/sequences/{}/run", args.id), args.session_id),
+            Some(json!({})),
+        ),
+        SequenceCommand::RunGet(args) => api_preview(
+            "GET",
+            session_query_path(&format!("/api/sequence-runs/{}", args.id), args.session_id),
+            None,
+        ),
+        SequenceCommand::Delete(args) => api_preview(
+            "DELETE",
+            session_query_path(&format!("/api/sequences/{}", args.id), args.session_id),
+            None,
+        ),
+        SequenceCommand::Runs(args) => api_preview(
+            "GET",
+            session_query_path("/api/sequence-runs", args.session_id),
+            None,
+        ),
+    }
+}
+
+fn oast_api_preview(command: &OastCommand) -> Value {
+    match command {
+        OastCommand::Status(args) => api_preview(
+            "GET",
+            session_query_path("/api/oast/status", args.session_id),
+            None,
+        ),
+        OastCommand::List(args) => api_preview(
+            "GET",
+            session_query_path("/api/oast/callbacks", args.session_id),
+            None,
+        ),
+        OastCommand::Get(args) => api_preview(
+            "GET",
+            session_query_path(&format!("/api/oast/callbacks/{}", args.id), args.session_id),
+            None,
+        ),
+        OastCommand::Generate(args) => api_preview(
+            "POST",
+            session_query_path("/api/oast/generate", args.session_id),
+            Some(json!({})),
+        ),
+        OastCommand::Clear(args) => api_preview(
+            "POST",
+            session_query_path("/api/oast/callbacks/clear", args.session_id),
+            Some(json!({})),
+        ),
+        OastCommand::Configure(_) => api_preview(
+            "POST",
+            "/api/runtime",
+            Some(
+                json!({ "note": "updates OAST runtime settings; token value is read from stdin when token_stdin=true" }),
+            ),
+        ),
+    }
+}
+
+fn api_preview(method: &str, path: impl Into<String>, body: Option<Value>) -> Value {
+    json!({
+        "method": method,
+        "path": path.into(),
+        "body": body,
+    })
+}
+
+fn dry_run_notes(command: &Command) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if command.requires_confirmation() {
+        notes.push("Use --yes to apply this side-effecting operation after reviewing the dry-run.");
+    }
+    if matches!(
+        command.operation_name(),
+        "replay.send" | "fuzzer.run" | "sequence.run"
+    ) {
+        notes.push("This operation may send traffic; failed sends should not be retried blindly.");
+    }
+    notes
+}
+
+fn command_from_call_args(args: CallArgs) -> Result<Command> {
+    let input_from_stdin = args.input.as_deref() == Some("-");
+    let input = parse_call_input(args.input)?;
+    let command = command_from_operation_input(&args.operation, &input)?;
+    if input_from_stdin && command_uses_stdin(&command) {
+        bail!("call --input - cannot be combined with operation stdin fields");
+    }
+    Ok(command)
+}
+
+fn parse_call_input(source: Option<String>) -> Result<Value> {
+    let Some(source) = source else {
+        return Ok(json!({}));
+    };
+    let raw = if source == "-" {
+        read_text_input(None, true)?
+    } else if let Some(path) = source.strip_prefix('@') {
+        if path.is_empty() {
+            bail!("call --input @ requires a file path");
+        }
+        read_text_input(Some(PathBuf::from(path)), false)?
+    } else {
+        source
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(trimmed).context("failed to parse call input JSON")
+}
+
+fn command_from_operation_input(operation: &str, input: &Value) -> Result<Command> {
+    let Some(_) = operation_spec(operation) else {
+        bail!("unknown operation `{operation}`");
+    };
+    validate_call_known_fields(operation, input)?;
+    Ok(match operation {
+        "manifest" => Command::Manifest,
+        "schema" => Command::Schema {
+            kind: call_schema_kind(operation, input)?,
+            operation: call_required(operation, input, "operation")?,
+        },
+        "examples" => Command::Examples {
+            operation: call_required(operation, input, "operation")?,
+        },
+        "skills.install" => Command::Skills {
+            command: SkillsCommand::Install(SkillsInstallArgs {
+                codex: call_bool(operation, input, "codex")?,
+                claude: call_bool(operation, input, "claude")?,
+                all: call_bool(operation, input, "all")?,
+                codex_dir: call_optional_path(operation, input, "codex_dir")?,
+                claude_dir: call_optional_path(operation, input, "claude_dir")?,
+            }),
+        },
+        "session.list" => Command::Session {
+            command: SessionCommand::List,
+        },
+        "session.create" => Command::Session {
+            command: SessionCommand::Create(CreateSessionArgs {
+                name: call_optional(operation, input, "name")?,
+            }),
+        },
+        "session.switch" => Command::Session {
+            command: SessionCommand::Switch(SessionSwitchArgs {
+                id: call_required(operation, input, "id")?,
+            }),
+        },
+        "session.delete" => Command::Session {
+            command: SessionCommand::Delete(SessionDeleteArgs {
+                id: call_required(operation, input, "id")?,
+            }),
+        },
+        "session.reveal" => Command::Session {
+            command: SessionCommand::Reveal(SessionRevealArgs {
+                id: call_required(operation, input, "id")?,
+            }),
+        },
+        "capture.http.list" => {
+            let offset = call_optional(operation, input, "offset")?;
+            let before_sequence = call_optional(operation, input, "before_sequence")?;
+            validate_call_conflicts(
+                operation,
+                "offset",
+                offset.is_some(),
+                "before_sequence",
+                before_sequence.is_some(),
+            )?;
+            Command::Capture {
+                command: CaptureCommand::Http {
+                    command: HistoryCommand::List(HistoryListArgs {
+                        session_id: call_optional(operation, input, "session_id")?,
+                        query: call_optional(operation, input, "query")?,
+                        method: call_optional(operation, input, "method")?,
+                        limit: call_optional_nonzero_usize(operation, input, "limit")?,
+                        offset,
+                        before_sequence,
+                        page: call_bool(operation, input, "page")?,
+                        host: call_optional(operation, input, "host")?,
+                        status: call_optional_http_status(operation, input, "status")?,
+                        status_range: call_optional(operation, input, "status_range")?,
+                        since: call_optional(operation, input, "since")?,
+                        mime: call_optional(operation, input, "mime")?,
+                        sort_key: call_optional_enum_string(
+                            operation,
+                            input,
+                            "sort_key",
+                            &[
+                                "index",
+                                "host",
+                                "method",
+                                "path",
+                                "status",
+                                "length",
+                                "mime",
+                                "notes",
+                                "tls",
+                                "started_at",
+                            ],
+                        )?,
+                        sort_direction: call_optional_enum_string(
+                            operation,
+                            input,
+                            "sort_direction",
+                            &["asc", "desc"],
+                        )?,
+                    }),
+                },
+            }
+        }
+        "capture.http.get" => Command::Capture {
+            command: CaptureCommand::Http {
+                command: HistoryCommand::Get(HistoryGetArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.http.replay" => Command::Capture {
+            command: CaptureCommand::Http {
+                command: HistoryCommand::Replay(HistoryReplayArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                    scheme: call_optional(operation, input, "scheme")?,
+                    host: call_optional(operation, input, "host")?,
+                    port: call_optional(operation, input, "port")?,
+                }),
+            },
+        },
+        "capture.http.fuzzer" => Command::Capture {
+            command: CaptureCommand::Http {
+                command: HistoryCommand::Fuzzer(HistoryFuzzerArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                    scheme: call_optional(operation, input, "scheme")?,
+                    host: call_optional(operation, input, "host")?,
+                    port: call_optional(operation, input, "port")?,
+                }),
+            },
+        },
+        "capture.http.annotate" => {
+            let color = call_optional(operation, input, "color")?;
+            let clear_color = call_bool(operation, input, "clear_color")?;
+            let note = call_optional(operation, input, "note")?;
+            let clear_note = call_bool(operation, input, "clear_note")?;
+            validate_call_conflicts(
+                operation,
+                "color",
+                color.is_some(),
+                "clear_color",
+                clear_color,
+            )?;
+            validate_call_conflicts(operation, "note", note.is_some(), "clear_note", clear_note)?;
+            Command::Capture {
+                command: CaptureCommand::Http {
+                    command: HistoryCommand::Annotate(HistoryAnnotateArgs {
+                        id: call_required(operation, input, "id")?,
+                        session_id: call_optional(operation, input, "session_id")?,
+                        color,
+                        clear_color,
+                        note,
+                        clear_note,
+                    }),
+                },
+            }
+        }
+        "scope.get" => Command::Scope {
+            command: TargetCommand::GetScope(TargetSessionArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "scope.set" => {
+            let clear = call_bool(operation, input, "clear")?;
+            let patterns = call_string_list(operation, input, "patterns", "pattern")?;
+            let file = call_optional_path(operation, input, "file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_exactly_one(
+                operation,
+                "scope_source",
+                &[
+                    ("clear", clear),
+                    ("patterns", !patterns.is_empty()),
+                    ("file", file.is_some()),
+                    ("stdin", stdin),
+                ],
+            )?;
+            Command::Scope {
+                command: TargetCommand::SetScope(TargetSetScopeArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    clear,
+                    patterns,
+                    file,
+                    stdin,
+                }),
+            }
+        }
+        "replay.list" => Command::Replay {
+            command: ReplayCommand::List(ReplayListArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "replay.open" => {
+            let transaction_id = call_optional(operation, input, "transaction_id")?;
+            let request_file = call_optional_path(operation, input, "request_file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_at_most_one(
+                operation,
+                "request_source",
+                &[
+                    ("transaction_id", transaction_id.is_some()),
+                    ("request_file", request_file.is_some()),
+                    ("stdin", stdin),
+                ],
+            )?;
+            Command::Replay {
+                command: ReplayCommand::Open(ReplayOpenArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    transaction_id,
+                    request_file,
+                    stdin,
+                    scheme: call_optional(operation, input, "scheme")?,
+                    host: call_optional(operation, input, "host")?,
+                    port: call_optional(operation, input, "port")?,
+                }),
+            }
+        }
+        "replay.update" => {
+            let request_file = call_optional_path(operation, input, "request_file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            let scheme = call_optional(operation, input, "scheme")?;
+            let host = call_optional(operation, input, "host")?;
+            let port = call_optional(operation, input, "port")?;
+            validate_call_at_most_one(
+                operation,
+                "request_source",
+                &[("request_file", request_file.is_some()), ("stdin", stdin)],
+            )?;
+            validate_call_at_least_one(
+                operation,
+                "update_input",
+                &[
+                    ("request_file", request_file.is_some()),
+                    ("stdin", stdin),
+                    ("scheme", scheme.is_some()),
+                    ("host", host.is_some()),
+                    ("port", port.is_some()),
+                ],
+            )?;
+            Command::Replay {
+                command: ReplayCommand::Update(ReplayUpdateArgs {
+                    tab_id: call_required(operation, input, "tab_id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                    request_file,
+                    stdin,
+                    scheme,
+                    host,
+                    port,
+                }),
+            }
+        }
+        "replay.send" => Command::Replay {
+            command: ReplayCommand::Send(ReplaySendArgs {
+                tab_id: call_required(operation, input, "tab_id")?,
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "fuzzer.set_template" => {
+            let transaction_id = call_optional(operation, input, "transaction_id")?;
+            let request_file = call_optional_path(operation, input, "request_file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_exactly_one(
+                operation,
+                "request_source",
+                &[
+                    ("transaction_id", transaction_id.is_some()),
+                    ("request_file", request_file.is_some()),
+                    ("stdin", stdin),
+                ],
+            )?;
+            Command::Fuzzer {
+                command: FuzzerCommand::SetTemplate(FuzzerSetTemplateArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    transaction_id,
+                    request_file,
+                    stdin,
+                    scheme: call_optional(operation, input, "scheme")?,
+                    host: call_optional(operation, input, "host")?,
+                    port: call_optional(operation, input, "port")?,
+                }),
+            }
+        }
+        "fuzzer.set_payloads" => {
+            let payloads = call_string_list(operation, input, "payloads", "payload")?;
+            let file = call_optional_path(operation, input, "file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_exactly_one(
+                operation,
+                "payload_source",
+                &[
+                    ("payloads", !payloads.is_empty()),
+                    ("file", file.is_some()),
+                    ("stdin", stdin),
+                ],
+            )?;
+            Command::Fuzzer {
+                command: FuzzerCommand::SetPayloads(FuzzerSetPayloadsArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    payloads,
+                    file,
+                    stdin,
+                }),
+            }
+        }
+        "fuzzer.run" => Command::Fuzzer {
+            command: FuzzerCommand::Run(FuzzerRunArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                r#async: call_bool_any(operation, input, &["async", "r#async"])?,
+            }),
+        },
+        "fuzzer.status" => Command::Fuzzer {
+            command: FuzzerCommand::Status(FuzzerStatusArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "fuzzer.results" => Command::Fuzzer {
+            command: FuzzerCommand::Results(FuzzerResultsArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "fuzzer.list" => Command::Fuzzer {
+            command: FuzzerCommand::List(FuzzerListArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                limit: call_optional_nonzero_usize(operation, input, "limit")?,
+            }),
+        },
+        "capture.intercept.on" => Command::Capture {
+            command: CaptureCommand::Intercept {
+                command: InterceptCommand::On(InterceptSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept.off" => Command::Capture {
+            command: CaptureCommand::Intercept {
+                command: InterceptCommand::Off(InterceptSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept.list" => Command::Capture {
+            command: CaptureCommand::Intercept {
+                command: InterceptCommand::List(InterceptSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept.forward" => {
+            let request_file = call_optional_path(operation, input, "request_file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_at_most_one(
+                operation,
+                "request_source",
+                &[("request_file", request_file.is_some()), ("stdin", stdin)],
+            )?;
+            Command::Capture {
+                command: CaptureCommand::Intercept {
+                    command: InterceptCommand::Forward(InterceptForwardArgs {
+                        id: call_required(operation, input, "id")?,
+                        session_id: call_optional(operation, input, "session_id")?,
+                        request_file,
+                        stdin,
+                    }),
+                },
+            }
+        }
+        "capture.intercept.drop" => Command::Capture {
+            command: CaptureCommand::Intercept {
+                command: InterceptCommand::Drop(InterceptDropArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept.forward_all" => Command::Capture {
+            command: CaptureCommand::Intercept {
+                command: InterceptCommand::ForwardAll(InterceptSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.websocket.list" => Command::Capture {
+            command: CaptureCommand::WebSocket {
+                command: WebSocketCommand::List(WebSocketListArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    query: call_optional(operation, input, "query")?,
+                    limit: call_optional_nonzero_usize(operation, input, "limit")?,
+                    offset: call_optional(operation, input, "offset")?,
+                    sort_key: call_optional_enum_string(
+                        operation,
+                        input,
+                        "sort_key",
+                        &[
+                            "index",
+                            "host",
+                            "path",
+                            "status",
+                            "frame_count",
+                            "duration_ms",
+                            "started_at",
+                        ],
+                    )?,
+                    sort_direction: call_optional_enum_string(
+                        operation,
+                        input,
+                        "sort_direction",
+                        &["asc", "desc"],
+                    )?,
+                    in_scope_only: call_bool(operation, input, "in_scope_only")?,
+                    live_only: call_bool(operation, input, "live_only")?,
+                    page: call_bool(operation, input, "page")?,
+                }),
+            },
+        },
+        "capture.websocket.get" => Command::Capture {
+            command: CaptureCommand::WebSocket {
+                command: WebSocketCommand::Get(WebSocketGetArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                    frame_limit: call_optional(operation, input, "frame_limit")?,
+                    before_index: call_optional(operation, input, "before_index")?,
+                }),
+            },
+        },
+        "capture.auto_replace.list" => Command::Capture {
+            command: CaptureCommand::AutoReplace {
+                command: AutoReplaceCommand::List(AutoReplaceSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.auto_replace.set" => {
+            let file = call_optional_path(operation, input, "file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_exactly_one(
+                operation,
+                "rules_source",
+                &[("file", file.is_some()), ("stdin", stdin)],
+            )?;
+            Command::Capture {
+                command: CaptureCommand::AutoReplace {
+                    command: AutoReplaceCommand::Set(AutoReplaceSetArgs {
+                        session_id: call_optional(operation, input, "session_id")?,
+                        file,
+                        stdin,
+                    }),
+                },
+            }
+        }
+        "capture.response_intercept.list" => Command::Capture {
+            command: CaptureCommand::ResponseIntercept {
+                command: ResponseInterceptCommand::List(ResponseInterceptSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.response_intercept.get" => Command::Capture {
+            command: CaptureCommand::ResponseIntercept {
+                command: ResponseInterceptCommand::Get(ResponseInterceptGetArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.response_intercept.forward" => {
+            let response_file = call_optional_path(operation, input, "response_file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_at_most_one(
+                operation,
+                "response_source",
+                &[("response_file", response_file.is_some()), ("stdin", stdin)],
+            )?;
+            Command::Capture {
+                command: CaptureCommand::ResponseIntercept {
+                    command: ResponseInterceptCommand::Forward(ResponseInterceptForwardArgs {
+                        id: call_required(operation, input, "id")?,
+                        session_id: call_optional(operation, input, "session_id")?,
+                        response_file,
+                        stdin,
+                    }),
+                },
+            }
+        }
+        "capture.response_intercept.drop" => Command::Capture {
+            command: CaptureCommand::ResponseIntercept {
+                command: ResponseInterceptCommand::Drop(ResponseInterceptDropArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.response_intercept.forward_all" => Command::Capture {
+            command: CaptureCommand::ResponseIntercept {
+                command: ResponseInterceptCommand::ForwardAll(ResponseInterceptSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept_rule.list" => Command::Capture {
+            command: CaptureCommand::InterceptRule {
+                command: InterceptRuleCommand::List(InterceptRuleSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept_rule.create" => {
+            let all = call_bool(operation, input, "all")?;
+            let host_pattern = call_optional(operation, input, "host_pattern")?;
+            let path_pattern = call_optional(operation, input, "path_pattern")?;
+            let method_filter = call_string_list(operation, input, "method_filter", "method")?;
+            if all
+                && (host_pattern.is_some() || path_pattern.is_some() || !method_filter.is_empty())
+            {
+                bail!("field `all` conflicts with matcher fields for `{operation}`");
+            }
+            if !all && host_pattern.is_none() && path_pattern.is_none() && method_filter.is_empty()
+            {
+                bail!("provide at least one matcher field for `{operation}`");
+            }
+            Command::Capture {
+                command: CaptureCommand::InterceptRule {
+                    command: InterceptRuleCommand::Create(InterceptRuleCreateArgs {
+                        session_id: call_optional(operation, input, "session_id")?,
+                        scope: call_optional_enum_string(
+                            operation,
+                            input,
+                            "scope",
+                            &["request", "response", "both"],
+                        )?
+                        .unwrap_or_else(|| "both".to_string()),
+                        all,
+                        host_pattern,
+                        path_pattern,
+                        method_filter,
+                        enabled: call_optional(operation, input, "enabled")?,
+                    }),
+                },
+            }
+        }
+        "capture.intercept_rule.delete" => Command::Capture {
+            command: CaptureCommand::InterceptRule {
+                command: InterceptRuleCommand::Delete(InterceptRuleDeleteArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "sequence.list" => Command::Sequence {
+            command: SequenceCommand::List(SequenceListArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "sequence.get" => Command::Sequence {
+            command: SequenceCommand::Get(SequenceGetArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "sequence.create" => {
+            let file = call_optional_path(operation, input, "file")?;
+            let stdin = call_bool(operation, input, "stdin")?;
+            validate_call_exactly_one(
+                operation,
+                "sequence_source",
+                &[("file", file.is_some()), ("stdin", stdin)],
+            )?;
+            Command::Sequence {
+                command: SequenceCommand::Create(SequenceCreateArgs {
+                    file,
+                    stdin,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            }
+        }
+        "sequence.run" => Command::Sequence {
+            command: SequenceCommand::Run(SequenceRunArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "sequence.run_get" => Command::Sequence {
+            command: SequenceCommand::RunGet(SequenceRunGetArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "sequence.delete" => Command::Sequence {
+            command: SequenceCommand::Delete(SequenceDeleteArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_optional(operation, input, "session_id")?,
+            }),
+        },
+        "sequence.runs" => Command::Sequence {
+            command: SequenceCommand::Runs(SequenceRunsArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                limit: call_optional_nonzero_usize(operation, input, "limit")?,
+            }),
+        },
+        "capture.oast.status" => Command::Capture {
+            command: CaptureCommand::Oast {
+                command: OastCommand::Status(OastSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.oast.list" => Command::Capture {
+            command: CaptureCommand::Oast {
+                command: OastCommand::List(OastListArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    limit: call_optional_nonzero_usize(operation, input, "limit")?,
+                }),
+            },
+        },
+        "capture.oast.get" => Command::Capture {
+            command: CaptureCommand::Oast {
+                command: OastCommand::Get(OastGetArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.oast.generate" => Command::Capture {
+            command: CaptureCommand::Oast {
+                command: OastCommand::Generate(OastSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.oast.clear" => Command::Capture {
+            command: CaptureCommand::Oast {
+                command: OastCommand::Clear(OastSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.oast.configure" => {
+            let enable = call_bool(operation, input, "enable")?;
+            let disable = call_bool(operation, input, "disable")?;
+            if enable && disable {
+                bail!("enable and disable conflicts for `{operation}`");
+            }
+            let token = call_optional(operation, input, "token")?;
+            let token_stdin = call_bool(operation, input, "token_stdin")?;
+            validate_call_conflicts(
+                operation,
+                "token",
+                token.is_some(),
+                "token_stdin",
+                token_stdin,
+            )?;
+            Command::Capture {
+                command: CaptureCommand::Oast {
+                    command: OastCommand::Configure(OastConfigureArgs {
+                        session_id: call_optional(operation, input, "session_id")?,
+                        provider: call_optional_enum_string(
+                            operation,
+                            input,
+                            "provider",
+                            &["interactsh", "boast", "custom"],
+                        )?,
+                        url: call_optional(operation, input, "url")?,
+                        token,
+                        token_stdin,
+                        interval: call_optional_oast_polling_interval(
+                            operation, input, "interval",
+                        )?,
+                        enable,
+                        disable,
+                    }),
+                },
+            }
+        }
+        _ => bail!("unsupported call operation `{operation}`"),
+    })
+}
+
+fn call_schema_kind(operation: &str, input: &Value) -> Result<SchemaKind> {
+    let kind: String = call_required(operation, input, "kind")?;
+    match kind.as_str() {
+        "input" => Ok(SchemaKind::Input),
+        "output" => Ok(SchemaKind::Output),
+        _ => bail!("invalid schema kind `{kind}` for `{operation}`; expected input or output"),
+    }
+}
+
+fn validate_call_known_fields(operation: &str, input: &Value) -> Result<()> {
+    let allowed = call_allowed_fields(operation).unwrap_or(&[]);
+    let Value::Object(map) = input else {
+        bail!("call input for `{operation}` must be a JSON object");
+    };
+    for field in map.keys() {
+        if !allowed.contains(&field.as_str()) {
+            bail!("invalid field `{field}` for `{operation}`");
+        }
+    }
+    Ok(())
+}
+
+fn call_required<T: DeserializeOwned>(operation: &str, input: &Value, field: &str) -> Result<T> {
+    let value = call_field(operation, input, field)?
+        .ok_or_else(|| anyhow!("missing required field `{field}` for `{operation}`"))?;
+    serde_json::from_value(value.clone())
+        .with_context(|| format!("invalid field `{field}` for `{operation}`"))
+}
+
+fn call_optional<T: DeserializeOwned>(
+    operation: &str,
+    input: &Value,
+    field: &str,
+) -> Result<Option<T>> {
+    let Some(value) = call_field(operation, input, field)? else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .with_context(|| format!("invalid field `{field}` for `{operation}`"))
+}
+
+fn call_optional_path(operation: &str, input: &Value, field: &str) -> Result<Option<PathBuf>> {
+    Ok(call_optional::<String>(operation, input, field)?.map(PathBuf::from))
+}
+
+fn call_bool(operation: &str, input: &Value, field: &str) -> Result<bool> {
+    Ok(call_optional::<bool>(operation, input, field)?.unwrap_or(false))
+}
+
+fn call_optional_nonzero_usize(
+    operation: &str,
+    input: &Value,
+    field: &str,
+) -> Result<Option<usize>> {
+    let value = call_optional::<usize>(operation, input, field)?;
+    if value == Some(0) {
+        bail!("field `{field}` for `{operation}` must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn call_optional_http_status(operation: &str, input: &Value, field: &str) -> Result<Option<u16>> {
+    let value = call_optional::<u16>(operation, input, field)?;
+    if let Some(status) = value {
+        if !(100..=599).contains(&status) {
+            bail!("field `{field}` for `{operation}` must be between 100 and 599");
+        }
+    }
+    Ok(value)
+}
+
+fn call_optional_oast_polling_interval(
+    operation: &str,
+    input: &Value,
+    field: &str,
+) -> Result<Option<u64>> {
+    let value = call_optional::<u64>(operation, input, field)?;
+    if let Some(interval) = value {
+        if !(MIN_OAST_POLLING_INTERVAL_SECS..=MAX_OAST_POLLING_INTERVAL_SECS).contains(&interval) {
+            bail!(
+                "field `{field}` for `{operation}` must be between {} and {} seconds",
+                MIN_OAST_POLLING_INTERVAL_SECS,
+                MAX_OAST_POLLING_INTERVAL_SECS
+            );
+        }
+    }
+    Ok(value)
+}
+
+fn call_optional_enum_string(
+    operation: &str,
+    input: &Value,
+    field: &str,
+    allowed: &[&str],
+) -> Result<Option<String>> {
+    let value = call_optional::<String>(operation, input, field)?;
+    if let Some(value) = value.as_deref() {
+        if !allowed.contains(&value) {
+            bail!(
+                "invalid field `{field}` for `{operation}`; expected one of: {}",
+                allowed.join(", ")
+            );
+        }
+    }
+    Ok(value)
+}
+
+fn call_bool_any(operation: &str, input: &Value, fields: &[&str]) -> Result<bool> {
+    for field in fields {
+        if call_field(operation, input, field)?.is_some() {
+            return call_bool(operation, input, field);
+        }
+    }
+    Ok(false)
+}
+
+fn call_string_list(
+    operation: &str,
+    input: &Value,
+    plural_field: &str,
+    singular_field: &str,
+) -> Result<Vec<String>> {
+    let plural_present = call_field_present(operation, input, plural_field)?;
+    let singular_present = call_field_present(operation, input, singular_field)?;
+    if plural_present && singular_present {
+        bail!("fields `{plural_field}` and `{singular_field}` have conflicts for `{operation}`");
+    }
+    if plural_present {
+        let value = call_field(operation, input, plural_field)?.expect("present field exists");
+        return parse_call_string_list(operation, plural_field, value);
+    }
+    if singular_present {
+        let value = call_field(operation, input, singular_field)?.expect("present field exists");
+        return parse_call_string_list(operation, singular_field, value);
+    }
+    Ok(Vec::new())
+}
+
+fn parse_call_string_list(operation: &str, field: &str, value: &Value) -> Result<Vec<String>> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    if let Some(value) = value.as_str() {
+        return Ok(vec![value.to_string()]);
+    }
+    serde_json::from_value::<Vec<String>>(value.clone())
+        .with_context(|| format!("invalid field `{field}` for `{operation}`"))
+}
+
+fn call_field<'a>(operation: &str, input: &'a Value, field: &str) -> Result<Option<&'a Value>> {
+    match input {
+        Value::Object(map) => Ok(map.get(field)),
+        _ => bail!("call input for `{operation}` must be a JSON object"),
+    }
+}
+
+fn call_field_present(operation: &str, input: &Value, field: &str) -> Result<bool> {
+    Ok(match call_field(operation, input, field)? {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Array(values)) => !values.is_empty(),
+        Some(_) => true,
+    })
+}
+
+fn validate_call_conflicts(
+    operation: &str,
+    left_name: &str,
+    left_present: bool,
+    right_name: &str,
+    right_present: bool,
+) -> Result<()> {
+    if left_present && right_present {
+        bail!("fields `{left_name}` and `{right_name}` have conflicts for `{operation}`");
+    }
+    Ok(())
+}
+
+fn validate_call_exactly_one(
+    operation: &str,
+    group_name: &str,
+    fields: &[(&str, bool)],
+) -> Result<()> {
+    let present = present_call_fields(fields);
+    if present.len() != 1 {
+        bail!(
+            "provide exactly one `{group_name}` field for `{operation}`: {}",
+            field_names(fields)
+        );
+    }
+    Ok(())
+}
+
+fn validate_call_at_most_one(
+    operation: &str,
+    group_name: &str,
+    fields: &[(&str, bool)],
+) -> Result<()> {
+    let present = present_call_fields(fields);
+    if present.len() > 1 {
+        bail!(
+            "fields have conflicts in `{group_name}` for `{operation}`: {}",
+            present.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn validate_call_at_least_one(
+    operation: &str,
+    group_name: &str,
+    fields: &[(&str, bool)],
+) -> Result<()> {
+    if present_call_fields(fields).is_empty() {
+        bail!(
+            "provide at least one `{group_name}` field for `{operation}`: {}",
+            field_names(fields)
+        );
+    }
+    Ok(())
+}
+
+fn present_call_fields<'a>(fields: &'a [(&'a str, bool)]) -> Vec<&'a str> {
+    fields
+        .iter()
+        .filter_map(|(field, present)| present.then_some(*field))
+        .collect()
+}
+
+fn field_names(fields: &[(&str, bool)]) -> String {
+    fields
+        .iter()
+        .map(|(field, _)| *field)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn command_uses_stdin(command: &Command) -> bool {
+    match command {
+        Command::Scope {
+            command: TargetCommand::SetScope(args),
+        } => args.stdin,
+        Command::Replay {
+            command: ReplayCommand::Open(args),
+        } => args.stdin,
+        Command::Replay {
+            command: ReplayCommand::Update(args),
+        } => args.stdin,
+        Command::Fuzzer {
+            command: FuzzerCommand::SetTemplate(args),
+        } => args.stdin,
+        Command::Fuzzer {
+            command: FuzzerCommand::SetPayloads(args),
+        } => args.stdin,
+        Command::Capture {
+            command:
+                CaptureCommand::Intercept {
+                    command: InterceptCommand::Forward(args),
+                },
+        } => args.stdin,
+        Command::Capture {
+            command:
+                CaptureCommand::AutoReplace {
+                    command: AutoReplaceCommand::Set(args),
+                },
+        } => args.stdin,
+        Command::Capture {
+            command:
+                CaptureCommand::ResponseIntercept {
+                    command: ResponseInterceptCommand::Forward(args),
+                },
+        } => args.stdin,
+        Command::Sequence {
+            command: SequenceCommand::Create(args),
+        } => args.stdin,
+        Command::Capture {
+            command:
+                CaptureCommand::Oast {
+                    command: OastCommand::Configure(args),
+                },
+        } => args.token_stdin,
+        _ => false,
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    run(cli).await
+async fn main() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.exit();
+        }
+        Err(error) => {
+            let raw_args: Vec<String> = env::args().skip(1).collect();
+            let operation = cli_parse_error_operation(&raw_args);
+            let _ = CLI_OUTPUT_CONTEXT.set(CliOutputContext {
+                format: cli_output_format_from_raw_args(&raw_args),
+                operation: operation.clone(),
+                success_envelope: true,
+            });
+            let payload = clap_error_payload(&error);
+            if let Err(write_error) = print_error_json(&operation, payload.exit_code, &payload) {
+                eprintln!("sniper-cli: failed to write JSON error output: {write_error}");
+                eprintln!("sniper-cli: original parse error: {error}");
+                std::process::exit(1);
+            }
+            std::process::exit(payload.exit_code);
+        }
+    };
+    let operation = cli.command.output_operation_name();
+    let output_format = cli.output;
+    let success_envelope = matches!(cli.command, Command::Call(_));
+    let _ = CLI_OUTPUT_CONTEXT.set(CliOutputContext {
+        format: output_format,
+        operation: operation.clone(),
+        success_envelope,
+    });
+    if let Err(error) = run(cli).await {
+        let payload = cli_error_payload(&operation, &error);
+        if let Err(write_error) = print_error_json(&operation, payload.exit_code, &payload) {
+            eprintln!("sniper-cli: failed to write JSON error output: {write_error}");
+            eprintln!("sniper-cli: original error: {error:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(payload.exit_code);
+    }
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let api_override = cli.api;
+    let dry_run = cli.dry_run;
+    let yes = cli.yes;
+    let command = match cli.command {
+        Command::Call(args) => command_from_call_args(args)?,
+        command => command,
+    };
+
+    validate_command_preflight(&command)?;
+    if dry_run {
+        let plan = dry_run_command(&command)?;
+        return print_json(&plan);
+    }
+    if command.requires_confirmation() && !yes {
+        bail!(
+            "operation `{}` requires --dry-run or --yes",
+            command.operation_name()
+        );
+    }
+
+    match command {
+        Command::Manifest => print_json(&json!({ "operations": manifest_operations() })),
+        Command::Schema { kind, operation } => {
+            let spec = operation_spec(&operation)
+                .ok_or_else(|| anyhow!("unknown operation `{operation}`"))?;
+            let schema = match kind {
+                SchemaKind::Input => spec.input_schema,
+                SchemaKind::Output => spec.output_schema,
+            };
+            print_json(&json!({
+                "operation": operation,
+                "kind": kind,
+                "schema": schema,
+            }))
+        }
+        Command::Examples { operation } => {
+            let spec = operation_spec(&operation)
+                .ok_or_else(|| anyhow!("unknown operation `{operation}`"))?;
+            print_json(&json!({
+                "operation": operation,
+                "examples": spec.examples,
+            }))
+        }
         Command::Skills {
             command: SkillsCommand::Install(args),
         } => {
@@ -1453,7 +4167,7 @@ async fn run(cli: Cli) -> Result<()> {
             print_json(&result)
         }
         command => {
-            let api = ApiClient::discover(cli.api).await?;
+            let api = ApiClient::discover(api_override).await?;
             match command {
                 Command::Session { command } => handle_session(api, command).await,
                 Command::Capture { command } => match command {
@@ -1476,12 +4190,60 @@ async fn run(cli: Cli) -> Result<()> {
                 Command::Fuzzer { command } => handle_fuzzer(api, command).await,
                 Command::Sequence { command } => handle_sequence(api, command).await,
                 Command::Skills { .. } => unreachable!(),
+                Command::Manifest | Command::Schema { .. } | Command::Examples { .. } => {
+                    unreachable!()
+                }
+                Command::Call { .. } => unreachable!(),
                 Command::History { command } => handle_history(api, command).await,
                 Command::Intercept { command } => handle_intercept(api, command).await,
                 Command::Websocket { command } => handle_websocket(api, command).await,
                 Command::AutoReplace { command } => handle_auto_replace(api, command).await,
             }
         }
+    }
+}
+
+fn validate_command_preflight(command: &Command) -> Result<()> {
+    if let Some(args) = oast_configure_args(command) {
+        if args.token.is_some() {
+            bail!("--token is unsafe because it can be stored in shell history; pipe the token with --token-stdin");
+        }
+        if args.provider.as_deref() == Some("boast") && args.token_stdin {
+            bail!("BOAST provider does not use an OAST token");
+        }
+    }
+    if let Some(args) = history_annotate_args(command) {
+        if !args.clear_color && args.color.is_none() && !args.clear_note && args.note.is_none() {
+            bail!("provide at least one of --color, --clear-color, --note, or --clear-note");
+        }
+    }
+    Ok(())
+}
+
+fn oast_configure_args(command: &Command) -> Option<&OastConfigureArgs> {
+    match command {
+        Command::Capture {
+            command:
+                CaptureCommand::Oast {
+                    command: OastCommand::Configure(args),
+                },
+        } => Some(args),
+        _ => None,
+    }
+}
+
+fn history_annotate_args(command: &Command) -> Option<&HistoryAnnotateArgs> {
+    match command {
+        Command::Capture {
+            command:
+                CaptureCommand::Http {
+                    command: HistoryCommand::Annotate(args),
+                },
+        }
+        | Command::History {
+            command: HistoryCommand::Annotate(args),
+        } => Some(args),
+        _ => None,
     }
 }
 
@@ -1806,12 +4568,10 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
         ReplayCommand::Update(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
             let tab = find_replay_tab_mut(&mut workspace.replay, &args.tab_id)?;
+            ensure_http_replay_tab(tab, &args.tab_id)?;
             let explicit_target_update =
                 args.scheme.is_some() || args.host.is_some() || args.port.is_some();
             if args.request_file.is_some() || args.stdin {
-                let target_followed_previous_request =
-                    replay_tab_target_matches_request(tab, tab.base_request.as_ref())
-                        .unwrap_or(false);
                 let (parsed_request, request_text) = read_raw_request_input(
                     args.request_file,
                     args.stdin,
@@ -1823,9 +4583,6 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                     tab.http_version_mode = parsed_request.http_version.unwrap_or_default();
                     tab.response_record = None;
                     tab.notice.clear();
-                    if !explicit_target_update && target_followed_previous_request {
-                        sync_replay_tab_target_to_request(tab, &parsed_request.request)?;
-                    }
                 }
             }
             if explicit_target_update {
@@ -1866,6 +4623,7 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
         ReplayCommand::Send(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
             let tab = find_replay_tab_mut(&mut workspace.replay, &args.tab_id)?.clone();
+            ensure_http_replay_tab(&tab, &args.tab_id)?;
             let parsed_request = parse_editable_raw_request_with_version(
                 &tab.request_text,
                 tab.base_request.as_ref(),
@@ -1903,8 +4661,6 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 tab_mut.target_scheme = target.scheme.clone();
                 tab_mut.target_host = target.host.clone();
                 tab_mut.target_port = target.port.clone();
-            } else {
-                sync_replay_tab_target_to_request(tab_mut, &request)?;
             }
             tab_mut.response_record = Some(record.clone());
             tab_mut.notice = replay_error.clone().unwrap_or_default();
@@ -1931,13 +4687,17 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 });
                 if let Some(save_error) = workspace_save_error {
                     attach_workspace_save_error(&mut output, &save_error);
-                    print_json(&output)?;
-                    bail!(
-                        "replay failed after storing transaction record: {error}; workspace state was not saved: {save_error}"
-                    );
+                    return Err(cli_partial_apply_error(
+                        format!(
+                            "replay failed after storing transaction record: {error}; workspace state was not saved: {save_error}"
+                        ),
+                        output,
+                    ));
                 }
-                print_json(&output)?;
-                bail!("replay failed after storing transaction record: {error}");
+                Err(cli_partial_apply_error(
+                    format!("replay failed after storing transaction record: {error}"),
+                    output,
+                ))
             } else {
                 let output = json_value_with_session_and_workspace_save_error(
                     &record,
@@ -2015,6 +4775,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                             &workspace,
                             args.session_id,
                         ),
+                        expected_workspace_revision: Some(workspace.revision),
                         template,
                         payloads,
                         source_transaction_id: workspace.fuzzer.source_transaction_id,
@@ -2037,11 +4798,15 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 if let Some(save_error) = &workspace_save_error {
                     attach_workspace_save_error(&mut output, save_error);
                 }
-                print_json(&output)?;
                 if let Some(save_error) = workspace_save_error {
-                    bail!("fuzzer attack failed; workspace state was not saved: {save_error}");
+                    return Err(cli_partial_apply_error(
+                        format!(
+                            "fuzzer attack failed; workspace state was not saved: {save_error}"
+                        ),
+                        output,
+                    ));
                 }
-                bail!("fuzzer attack failed");
+                return Err(cli_partial_apply_error("fuzzer attack failed", output));
             }
             let record_output = json_value_with_session_and_workspace_save_error(
                 &record,
@@ -2326,7 +5091,12 @@ async fn handle_response_intercept(
             );
             let item: ResponseInterceptRecord = api.get_json(&detail_path).await?;
             let response = if args.response_file.is_some() || args.stdin {
-                read_raw_response_input(args.response_file, args.stdin, Some(&item.response))?
+                read_raw_response_input(
+                    args.response_file,
+                    args.stdin,
+                    Some(&item.response),
+                    &item.method,
+                )?
             } else {
                 item.response
             };
@@ -2487,8 +5257,7 @@ async fn handle_sequence(api: ApiClient, command: SequenceCommand) -> Result<()>
             attach_session_id(&mut result, session_id);
             if let Some(mut output) = failed_record_output("sequence run", &result) {
                 attach_session_id(&mut output, session_id);
-                print_json(&output)?;
-                bail!("sequence run failed");
+                return Err(cli_partial_apply_error("sequence run failed", output));
             }
             print_json(&result)?;
             Ok(())
@@ -2588,10 +5357,23 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
         OastCommand::Configure(args) => {
             let (session_id, expected_active_session_id) =
                 runtime_write_session_ids(&api, args.session_id).await?;
-            if args.provider.as_deref() == Some("boast") && args.token.is_some() {
+            if args.token.is_some() {
+                bail!("--token is unsafe because it can be stored in shell history; pipe the token with --token-stdin");
+            }
+            if args.provider.as_deref() == Some("boast") && args.token_stdin {
                 bail!("BOAST provider does not use an OAST token");
             }
-            let update = build_oast_configure_update(&args, session_id, expected_active_session_id);
+            let stdin_token = if args.token_stdin {
+                Some(read_secret_stdin("OAST token")?)
+            } else {
+                None
+            };
+            let update = build_oast_configure_update(
+                &args,
+                stdin_token.as_deref(),
+                session_id,
+                expected_active_session_id,
+            );
             let identity_field_count = usize::from(session_id.is_some())
                 + usize::from(expected_active_session_id.is_some());
             if update.len() == identity_field_count {
@@ -2615,6 +5397,7 @@ async fn handle_oast(api: ApiClient, command: OastCommand) -> Result<()> {
 
 fn build_oast_configure_update(
     args: &OastConfigureArgs,
+    stdin_token: Option<&str>,
     session_id: Option<Uuid>,
     expected_active_session_id: Option<Uuid>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -2640,7 +5423,7 @@ fn build_oast_configure_update(
             serde_json::Value::String(url.to_string()),
         );
     }
-    if let Some(token) = args.token.as_deref() {
+    if let Some(token) = stdin_token {
         update.insert(
             "oast_token".into(),
             serde_json::Value::String(token.to_string()),
@@ -3265,48 +6048,11 @@ fn build_target_override(
     }))
 }
 
-fn replay_tab_target_matches_request(
-    tab: &ReplayTabState,
-    request: Option<&EditableRequest>,
-) -> Result<bool> {
-    let Some(request) = request else {
-        return Ok(false);
-    };
-    let Some(tab_target) =
-        build_target_override(&tab.target_scheme, &tab.target_host, &tab.target_port)?
-    else {
-        return Ok(false);
-    };
-    let request_target = normalize_target_inputs(None, None, None, Some(request))?;
-    Ok(normalized_targets_equivalent(
-        &NormalizedTarget {
-            scheme: tab_target.scheme,
-            host: tab_target.host,
-            port: tab_target.port,
-        },
-        &request_target,
-    ))
-}
-
-fn sync_replay_tab_target_to_request(
-    tab: &mut ReplayTabState,
-    request: &EditableRequest,
-) -> Result<()> {
-    let normalized = normalize_target_inputs(None, None, None, Some(request))?;
-    tab.target_scheme = normalized.scheme;
-    tab.target_host = normalized.host;
-    tab.target_port = normalized.port;
-    Ok(())
-}
-
 fn replay_send_target_for_tab(
     tab: &ReplayTabState,
     request: &EditableRequest,
 ) -> Result<Option<RequestTargetOverride>> {
     let stored = build_target_override(&tab.target_scheme, &tab.target_host, &tab.target_port)?;
-    if replay_tab_target_is_stale_default(tab, request, stored.as_ref())? {
-        return Ok(None);
-    }
     if let Some(target) = stored.as_ref() {
         let stored_target = NormalizedTarget {
             scheme: target.scheme.clone(),
@@ -3325,25 +6071,6 @@ fn replay_send_target_for_tab(
         }
     }
     Ok(stored)
-}
-
-fn replay_tab_target_is_stale_default(
-    tab: &ReplayTabState,
-    request: &EditableRequest,
-    target: Option<&RequestTargetOverride>,
-) -> Result<bool> {
-    let (Some(base_request), Some(target)) = (tab.base_request.as_ref(), target) else {
-        return Ok(false);
-    };
-    let stored = NormalizedTarget {
-        scheme: target.scheme.clone(),
-        host: target.host.clone(),
-        port: target.port.clone(),
-    };
-    let base = normalize_target_inputs(None, None, None, Some(base_request))?;
-    let derived = normalize_target_inputs(None, None, None, Some(request))?;
-    Ok(normalized_targets_equivalent(&stored, &base)
-        && !normalized_targets_equivalent(&derived, &base))
 }
 
 fn normalized_targets_equivalent(left: &NormalizedTarget, right: &NormalizedTarget) -> bool {
@@ -3511,6 +6238,19 @@ fn read_text_input(file: Option<PathBuf>, stdin: bool) -> Result<String> {
     String::from_utf8(bytes).context("input is not valid UTF-8")
 }
 
+fn read_secret_stdin(label: &str) -> Result<String> {
+    let mut stdin = io::stdin();
+    let bytes = read_limited_to_end(&mut stdin, "stdin", MAX_CLI_INPUT_BYTES)?;
+    let token = String::from_utf8(bytes)
+        .with_context(|| format!("{label} from stdin is not valid UTF-8"))?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        bail!("{label} from stdin is empty");
+    }
+    Ok(token)
+}
+
 fn read_bytes_input(file: Option<PathBuf>, stdin: bool) -> Result<Vec<u8>> {
     if let Some(file) = file {
         return read_file_bytes_limited(&file);
@@ -3580,10 +6320,11 @@ fn read_raw_response_input(
     file: Option<PathBuf>,
     stdin: bool,
     fallback: Option<&EditableResponse>,
+    request_method: &str,
 ) -> Result<EditableResponse> {
     let bytes = read_bytes_input(file, stdin)?;
     ensure_raw_http_input_not_empty(&bytes, "response")?;
-    parse_editable_raw_response_bytes(&bytes, fallback)
+    parse_editable_raw_response_bytes_for_request_method(&bytes, fallback, request_method)
 }
 
 fn ensure_raw_http_input_not_empty(bytes: &[u8], label: &str) -> Result<()> {
@@ -4245,7 +6986,7 @@ fn parse_editable_raw_request_parts(
         RawRequestBody::Bytes(_) => None,
     };
     let body_len = raw_body.wire_len(inferred_text_encoding.as_ref(), "request")?;
-    validate_raw_http_body_framing(&headers, body_len)?;
+    validate_raw_http_body_framing(&headers, body_len, false)?;
 
     let (body, body_encoding) = match raw_body {
         RawRequestBody::Text(body) => (body, inferred_text_encoding.unwrap_or(BodyEncoding::Utf8)),
@@ -4380,7 +7121,11 @@ fn infer_text_body_encoding(
     Ok(fallback_encoding.cloned())
 }
 
-fn validate_raw_http_body_framing(headers: &[HeaderRecord], body_len: usize) -> Result<()> {
+fn validate_raw_http_body_framing(
+    headers: &[HeaderRecord],
+    body_len: usize,
+    allow_representation_content_length: bool,
+) -> Result<()> {
     if headers.iter().any(|header| {
         header.name.eq_ignore_ascii_case("transfer-encoding")
             && header
@@ -4392,7 +7137,7 @@ fn validate_raw_http_body_framing(headers: &[HeaderRecord], body_len: usize) -> 
     }
 
     if let Some(expected) = declared_content_length(headers)? {
-        if expected != body_len {
+        if expected != body_len && !(allow_representation_content_length && body_len == 0) {
             bail!("Content-Length {expected} does not match raw body length {body_len}");
         }
     }
@@ -4513,10 +7258,326 @@ fn encode_query(params: Vec<(String, String)>) -> String {
     serializer.finish()
 }
 
+#[derive(Debug)]
+struct CliPartialApplyError {
+    message: String,
+    details: Value,
+}
+
+impl fmt::Display for CliPartialApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliPartialApplyError {}
+
+#[derive(Clone, Debug, Serialize)]
+struct CliErrorPayload {
+    code: &'static str,
+    message: String,
+    hint: Option<&'static str>,
+    retryable: bool,
+    details: Value,
+    #[serde(skip)]
+    exit_code: i32,
+}
+
+fn cli_output_format_from_raw_args(args: &[String]) -> OutputFormat {
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix("--output=") {
+            return output_format_from_raw_value(value).unwrap_or(OutputFormat::Pretty);
+        }
+        if arg == "--output" {
+            if let Some(value) = args.get(index + 1) {
+                return output_format_from_raw_value(value).unwrap_or(OutputFormat::Pretty);
+            }
+        }
+    }
+    OutputFormat::Pretty
+}
+
+fn output_format_from_raw_value(value: &str) -> Option<OutputFormat> {
+    match value {
+        "compact" => Some(OutputFormat::Compact),
+        "pretty" => Some(OutputFormat::Pretty),
+        _ => None,
+    }
+}
+
+fn cli_parse_error_operation(args: &[String]) -> String {
+    let mut tokens = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--output" || arg == "--api" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--output=") || arg.starts_with("--api=") || arg.starts_with('-') {
+            continue;
+        }
+        tokens.push(arg.as_str());
+    }
+
+    match tokens.as_slice() {
+        ["session", action, ..] => format!("session.{action}"),
+        ["scope" | "target", "get-scope", ..] => "scope.get".to_string(),
+        ["scope" | "target", "set-scope", ..] => "scope.set".to_string(),
+        ["replay" | "repeater", action, ..] => format!("replay.{action}"),
+        ["fuzzer", action, ..] => format!("fuzzer.{}", action.replace('-', "_")),
+        ["sequence", action, ..] => format!("sequence.{}", action.replace('-', "_")),
+        ["skills", action, ..] => format!("skills.{action}"),
+        ["capture", "http", action, ..] | ["http" | "history", action, ..] => {
+            format!("capture.http.{}", action.replace('-', "_"))
+        }
+        ["capture", "intercept", action, ..] | ["intercept", action, ..] => {
+            format!("capture.intercept.{}", action.replace('-', "_"))
+        }
+        ["capture", "response-intercept", action, ..] => {
+            format!("capture.response_intercept.{}", action.replace('-', "_"))
+        }
+        ["capture", "intercept-rule", action, ..] => {
+            format!("capture.intercept_rule.{}", action.replace('-', "_"))
+        }
+        ["capture", "web-socket", action, ..] | ["websocket", action, ..] => {
+            format!("capture.websocket.{}", action.replace('-', "_"))
+        }
+        ["capture", "auto-replace", action, ..] | ["auto-replace", action, ..] => {
+            format!("capture.auto_replace.{}", action.replace('-', "_"))
+        }
+        ["capture", "oast", action, ..] => format!("capture.oast.{}", action.replace('-', "_")),
+        ["call", operation, ..] => (*operation).to_string(),
+        ["manifest", ..] => "manifest".to_string(),
+        ["schema", ..] => "schema".to_string(),
+        ["examples", ..] => "examples".to_string(),
+        [first, ..] => (*first).to_string(),
+        [] => "parse".to_string(),
+    }
+}
+
+fn cli_partial_apply_error(message: impl Into<String>, mut details: Value) -> anyhow::Error {
+    if let Value::Object(map) = &mut details {
+        map.insert("partial_apply".to_string(), json!(true));
+        map.insert("idempotent".to_string(), json!(false));
+    }
+    anyhow!(CliPartialApplyError {
+        message: message.into(),
+        details,
+    })
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    let data = serde_json::to_value(value).context("failed to encode JSON output")?;
+    let context = output_context();
+    if !context.success_envelope {
+        return write_json_envelope(&data, context.format);
+    }
+    let envelope = json!({
+        "ok": true,
+        "operation": context.operation,
+        "schema_version": CLI_SCHEMA_VERSION,
+        "data": data,
+        "meta": {},
+        "warnings": [],
+    });
+    write_json_envelope(&envelope, context.format)
+}
+
+fn print_error_json(operation: &str, exit_code: i32, payload: &CliErrorPayload) -> Result<()> {
+    let context = output_context();
+    let envelope = json!({
+        "ok": false,
+        "operation": operation,
+        "schema_version": CLI_SCHEMA_VERSION,
+        "error": payload,
+        "meta": {},
+        "warnings": [],
+    });
+    write_json_envelope(&envelope, context.format)
+        .with_context(|| format!("failed to write error envelope with exit code {exit_code}"))
+}
+
+fn output_context() -> CliOutputContext {
+    CLI_OUTPUT_CONTEXT
+        .get()
+        .map(|context| CliOutputContext {
+            format: context.format,
+            operation: context.operation.clone(),
+            success_envelope: context.success_envelope,
+        })
+        .unwrap_or_else(|| CliOutputContext {
+            format: OutputFormat::Pretty,
+            operation: "unknown".to_string(),
+            success_envelope: false,
+        })
+}
+
+fn write_json_envelope(value: &Value, format: OutputFormat) -> Result<()> {
+    let rendered = match format {
+        OutputFormat::Pretty => {
+            serde_json::to_string_pretty(value).context("failed to encode JSON output")?
+        }
+        OutputFormat::Compact => {
+            serde_json::to_string(value).context("failed to encode JSON output")?
+        }
+    };
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer_pretty(&mut stdout, value).context("failed to encode JSON output")?;
-    stdout.write_all(b"\n").context("failed to write stdout")
+    write_stdout_bytes(&mut stdout, rendered.as_bytes())?;
+    write_stdout_bytes(&mut stdout, b"\n")
+}
+
+fn write_stdout_bytes(stdout: &mut io::StdoutLock<'_>, bytes: &[u8]) -> Result<()> {
+    match stdout.write_all(bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(error) => Err(error).context("failed to write stdout"),
+    }
+}
+
+fn clap_error_payload(error: &clap::Error) -> CliErrorPayload {
+    CliErrorPayload {
+        code: "INVALID_INPUT",
+        message: error.to_string().trim().to_string(),
+        hint: Some("Run the command with --help, or inspect `sniper-cli manifest`."),
+        retryable: false,
+        details: json!({ "kind": format!("{:?}", error.kind()) }),
+        exit_code: error.exit_code(),
+    }
+}
+
+fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload {
+    if let Some(partial) = error.downcast_ref::<CliPartialApplyError>() {
+        return CliErrorPayload {
+            code: "PARTIAL_APPLY",
+            message: partial.message.clone(),
+            hint: Some(
+                "This operation may have partially applied; inspect current state before retrying.",
+            ),
+            retryable: false,
+            details: partial.details.clone(),
+            exit_code: 5,
+        };
+    }
+
+    let message = error.to_string();
+    let mut payload = if message.contains("requires --dry-run or --yes") {
+        CliErrorPayload {
+            code: "CONFIRMATION_REQUIRED",
+            message,
+            hint: Some(
+                "Run the same command with --dry-run to inspect the plan, then --yes to apply.",
+            ),
+            retryable: false,
+            details: json!({ "operation": operation }),
+            exit_code: 2,
+        }
+    } else if message.contains("unknown operation") {
+        CliErrorPayload {
+            code: "UNKNOWN_OPERATION",
+            message,
+            hint: Some("Run `sniper-cli manifest` to list known operations."),
+            retryable: false,
+            details: json!({ "operation": operation }),
+            exit_code: 2,
+        }
+    } else if message.contains("could not discover Sniper API")
+        || message.contains("did not point to a reachable Sniper API")
+        || message.contains("is not responding")
+        || message.contains("failed to probe Sniper API")
+        || message.contains("Sniper API probe returned")
+        || message.contains("Sniper API probe response was not JSON")
+        || message.contains("Sniper API probe response did not match")
+    {
+        CliErrorPayload {
+            code: "API_UNAVAILABLE",
+            message,
+            hint: Some("Start Sniper Desktop, or pass --api http://HOST:PORT explicitly."),
+            retryable: true,
+            details: json!({}),
+            exit_code: 6,
+        }
+    } else if message.contains("workspace state revision conflict") {
+        CliErrorPayload {
+            code: "WORKSPACE_CONFLICT",
+            message,
+            hint: Some("Refresh workspace state and retry deliberately."),
+            retryable: false,
+            details: json!({}),
+            exit_code: 5,
+        }
+    } else if let Some(status) = http_status_from_message(&message) {
+        CliErrorPayload {
+            code: "HTTP_STATUS_ERROR",
+            message,
+            hint: None,
+            retryable: status >= 500,
+            details: json!({ "status": status }),
+            exit_code: if status < 500 { 5 } else { 6 },
+        }
+    } else if message.contains("invalid")
+        || message.contains("must ")
+        || message.contains("provide ")
+        || message.contains("expected ")
+        || message.contains("cannot ")
+        || message.contains("conflicts")
+        || message.contains(" is unsafe")
+        || message.contains("does not use an OAST token")
+        || message.contains("input is empty")
+        || message.contains("failed to parse ")
+        || message.contains("missing required field")
+        || message.contains(" not found")
+        || message.contains("no active session")
+        || message.contains("multiple active sessions")
+    {
+        CliErrorPayload {
+            code: "INVALID_INPUT",
+            message,
+            hint: Some(
+                "Check `sniper-cli schema input <operation>` or run the command with --help.",
+            ),
+            retryable: false,
+            details: json!({ "operation": operation }),
+            exit_code: 2,
+        }
+    } else {
+        CliErrorPayload {
+            code: "CLI_ERROR",
+            message,
+            hint: None,
+            retryable: false,
+            details: json!({}),
+            exit_code: 1,
+        }
+    };
+
+    let write_may_have_been_sent = payload.code == "HTTP_STATUS_ERROR"
+        || (payload.code == "CLI_ERROR"
+            && (payload.message.contains("failed to POST")
+                || payload.message.contains("failed to DELETE")));
+    if operation_spec(operation)
+        .is_some_and(|spec| spec.side_effect == CliSideEffect::Write && spec.requires_confirmation)
+        && write_may_have_been_sent
+    {
+        payload.retryable = false;
+        payload.hint = Some(
+            "This operation may have partially applied; inspect current state before retrying.",
+        );
+        if let Some(details) = payload.details.as_object_mut() {
+            details.insert("idempotent".to_string(), json!(false));
+        }
+    }
+    payload
+}
+
+fn http_status_from_message(message: &str) -> Option<u16> {
+    let marker = "failed (";
+    let start = message.find(marker)? + marker.len();
+    let status = message.get(start..start + 3)?;
+    status.parse::<u16>().ok()
 }
 
 fn print_json_with_session<T: Serialize>(value: &T, session_id: Option<Uuid>) -> Result<()> {
@@ -4590,6 +7651,13 @@ fn find_replay_tab_mut<'a>(
         .iter_mut()
         .find(|tab| tab.id == tab_id)
         .ok_or_else(|| anyhow!("replay tab not found: {tab_id}"))
+}
+
+fn ensure_http_replay_tab(tab: &ReplayTabState, tab_id: &str) -> Result<()> {
+    if tab.tab_type == "websocket" {
+        bail!("replay tab {tab_id} is a WebSocket replay tab");
+    }
+    Ok(())
 }
 
 fn split_host_port(value: &str) -> Option<(&str, &str)> {
@@ -4733,22 +7801,41 @@ fn parse_editable_raw_response(
     text: &str,
     fallback: Option<&EditableResponse>,
 ) -> Result<EditableResponse> {
-    let (head, body) = split_raw_http_message(text);
-    parse_editable_raw_response_parts(head, RawRequestBody::Text(body), fallback)
+    parse_editable_raw_response_for_request_method(text, fallback, "GET")
 }
 
+#[cfg(test)]
+fn parse_editable_raw_response_for_request_method(
+    text: &str,
+    fallback: Option<&EditableResponse>,
+    request_method: &str,
+) -> Result<EditableResponse> {
+    let (head, body) = split_raw_http_message(text);
+    parse_editable_raw_response_parts(head, RawRequestBody::Text(body), fallback, request_method)
+}
+
+#[cfg(test)]
 fn parse_editable_raw_response_bytes(
     bytes: &[u8],
     fallback: Option<&EditableResponse>,
 ) -> Result<EditableResponse> {
+    parse_editable_raw_response_bytes_for_request_method(bytes, fallback, "GET")
+}
+
+fn parse_editable_raw_response_bytes_for_request_method(
+    bytes: &[u8],
+    fallback: Option<&EditableResponse>,
+    request_method: &str,
+) -> Result<EditableResponse> {
     let (head, body) = split_raw_http_message_bytes(bytes)?;
-    parse_editable_raw_response_parts(head, RawRequestBody::Bytes(body), fallback)
+    parse_editable_raw_response_parts(head, RawRequestBody::Bytes(body), fallback, request_method)
 }
 
 fn parse_editable_raw_response_parts(
     head: String,
     raw_body: RawRequestBody,
     fallback: Option<&EditableResponse>,
+    request_method: &str,
 ) -> Result<EditableResponse> {
     let mut lines = head.lines();
     let first_line = lines.next();
@@ -4791,7 +7878,14 @@ fn parse_editable_raw_response_parts(
         RawRequestBody::Bytes(_) => None,
     };
     let body_len = raw_body.wire_len(inferred_text_encoding.as_ref(), "response")?;
-    validate_raw_http_body_framing(&headers, body_len)?;
+    if response_must_not_include_body(status, request_method) && body_len != 0 {
+        bail!("response status {status} must not include a body");
+    }
+    validate_raw_http_body_framing(
+        &headers,
+        body_len,
+        response_content_length_may_describe_representation(status, request_method),
+    )?;
     let (body, body_encoding) = match raw_body {
         RawRequestBody::Text(body) => (body, inferred_text_encoding.unwrap_or(BodyEncoding::Utf8)),
         RawRequestBody::Bytes(body) => {
@@ -4812,6 +7906,19 @@ fn parse_editable_raw_response_parts(
         .try_body_bytes()
         .context("response body is not valid base64")?;
     Ok(response)
+}
+
+fn response_status_must_not_include_body(status: u16) -> bool {
+    status < 200 || status == 204 || status == 205 || status == 304
+}
+
+fn response_must_not_include_body(status: u16, request_method: &str) -> bool {
+    response_status_must_not_include_body(status) || request_method.eq_ignore_ascii_case("HEAD")
+}
+
+fn response_content_length_may_describe_representation(status: u16, request_method: &str) -> bool {
+    status == 304
+        || (request_method.eq_ignore_ascii_case("HEAD") && !matches!(status, 100..=199 | 204 | 205))
 }
 
 fn parse_response_status_line(status_line: &str) -> Result<u16> {
@@ -4837,32 +7944,39 @@ mod tests {
         active_session_id_from_summaries, api_failure_detail, api_url, attach_session_id,
         attach_workspace_save_error, auto_replace_write_session_id, build_annotations_payload,
         build_editable_raw_request, build_editable_raw_request_with_version,
-        build_oast_configure_update, cli_data_dir, data_dir_strings_match, default_cli_data_dir,
-        default_editable_request, discover_api_base_url, discover_api_base_url_from_data_dir,
+        build_oast_configure_update, clap_error_payload, cli_data_dir, cli_error_payload,
+        cli_output_format_from_raw_args, cli_parse_error_operation, cli_partial_apply_error,
+        command_from_call_args, command_from_operation_input, data_dir_strings_match,
+        default_cli_data_dir, default_editable_request, discover_api_base_url,
+        discover_api_base_url_from_data_dir, dry_run_command, ensure_http_replay_tab,
         explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
         fuzzer_target_request_authority_for_request, history_list_path, install_skills,
-        json_value_with_session_and_workspace_save_error, next_replay_tab_sequence,
-        normalize_api_base_url, normalize_replay_port, normalize_target_inputs,
-        oast_fields_for_output, parse_editable_raw_request,
-        parse_editable_raw_request_bytes_with_version, parse_editable_raw_request_with_version,
-        parse_editable_raw_response, parse_editable_raw_response_bytes, prepare_cli_workspace_save,
-        process_path_strings_match, push_replay_history_entry, read_limited_to_end,
-        read_payloads_input, read_raw_request_input, read_raw_response_input, read_text_input,
-        replay_send_http_version, replay_send_target_for_tab, replay_tab_target_as_request,
-        replay_tab_target_matches_request, replay_update_should_preserve_current_port,
+        json_value_with_session_and_workspace_save_error, manifest_operations,
+        next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
+        normalize_target_inputs, oast_fields_for_output, operation_spec,
+        parse_editable_raw_request, parse_editable_raw_request_bytes_with_version,
+        parse_editable_raw_request_with_version, parse_editable_raw_response,
+        parse_editable_raw_response_bytes, parse_editable_raw_response_for_request_method,
+        prepare_cli_workspace_save, process_path_strings_match, push_replay_history_entry,
+        read_limited_to_end, read_payloads_input, read_raw_request_input, read_raw_response_input,
+        read_text_input, replay_send_http_version, replay_send_target_for_tab,
+        replay_tab_target_as_request, replay_update_should_preserve_current_port,
         sequence_write_session_id, session_id_for_write_payload, session_query_path,
         session_query_path_with_expected_active, sniper_settings_probe_matches, split_host_port,
-        split_payload_lines, strip_host_port, sync_replay_tab_target_to_request,
-        transaction_detail_path, validate_sniper_settings_probe, websocket_detail_path,
-        websocket_list_path, workspace_conflict_message, workspace_state_conflict_detail, Cli,
-        Command, HistoryCommand, HistoryListArgs, HistoryListResponse, OastConfigureArgs,
-        RuntimeUpdatePayload, SequenceCommand, SequenceCreateInput, SessionCommand,
-        SkillsInstallArgs, SniperApiProbeExpectation, WebSocketListArgs, WebSocketListResponse,
-        CLI_REPEATER_HISTORY_LIMIT, CLI_WORKSPACE_CLIENT_ID, MAX_CLI_INPUT_BYTES,
-        MAX_OAST_POLLING_INTERVAL_SECS, SNIPER_API_PROBE_RETRY_DELAYS, SNIPER_DATA_DIR_ENV,
+        split_payload_lines, strip_host_port, transaction_detail_path, validate_command_preflight,
+        validate_sniper_settings_probe, websocket_detail_path, websocket_list_path,
+        workspace_conflict_message, workspace_state_conflict_detail, CaptureCommand, Cli,
+        CliSideEffect, Command, FuzzerCommand, HistoryCommand, HistoryListArgs,
+        HistoryListResponse, InterceptRuleCommand, OastCommand, OastConfigureArgs, OutputFormat,
+        ReplayCommand, RuntimeUpdatePayload, SequenceCommand, SequenceCreateInput, SessionCommand,
+        SkillsInstallArgs, SniperApiProbeExpectation, TargetCommand, WebSocketListArgs,
+        WebSocketListResponse, CLI_REPEATER_HISTORY_LIMIT, CLI_WORKSPACE_CLIENT_ID,
+        MAX_CLI_INPUT_BYTES, MAX_OAST_POLLING_INTERVAL_SECS, SNIPER_API_PROBE_RETRY_DELAYS,
+        SNIPER_DATA_DIR_ENV,
     };
     use chrono::Utc;
     use clap::Parser;
+    use serde_json::{json, Value};
     use sniper::model::{
         BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, RequestTargetOverride,
     };
@@ -5393,6 +8507,7 @@ mod tests {
             },
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -5409,6 +8524,7 @@ mod tests {
                 provider: Some("boast".to_string()),
                 ..Default::default()
             },
+            None,
             None,
             None,
         );
@@ -5450,6 +8566,7 @@ mod tests {
                 enable: true,
                 ..Default::default()
             },
+            None,
             Some(session_id),
             Some(session_id),
         );
@@ -5601,7 +8718,7 @@ mod tests {
             body_encoding: BodyEncoding::Utf8,
         };
 
-        let error = read_raw_response_input(Some(path.clone()), false, Some(&fallback))
+        let error = read_raw_response_input(Some(path.clone()), false, Some(&fallback), "GET")
             .unwrap_err()
             .to_string();
         let _ = fs::remove_file(path);
@@ -6038,6 +9155,66 @@ mod tests {
     }
 
     #[test]
+    fn raw_response_parser_rejects_body_for_no_body_status() {
+        let text_error =
+            parse_editable_raw_response("HTTP/1.1 204 No Content\r\n\r\nbody", None).unwrap_err();
+        assert!(text_error.to_string().contains("must not include a body"));
+
+        let binary_error =
+            parse_editable_raw_response_bytes(b"HTTP/1.1 304 Not Modified\r\n\r\n\x00", None)
+                .unwrap_err();
+        assert!(binary_error.to_string().contains("must not include a body"));
+    }
+
+    #[test]
+    fn raw_response_parser_allows_304_representation_content_length() {
+        let response = parse_editable_raw_response(
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 55\r\n\r\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 304);
+        assert_eq!(response.body, "");
+    }
+
+    #[test]
+    fn raw_response_parser_allows_head_representation_content_length() {
+        let response = parse_editable_raw_response_for_request_method(
+            "HTTP/1.1 200 OK\r\nContent-Length: 55\r\n\r\n",
+            None,
+            "HEAD",
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "");
+    }
+
+    #[test]
+    fn raw_response_parser_rejects_head_response_body() {
+        let error = parse_editable_raw_response_for_request_method(
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody",
+            None,
+            "HEAD",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must not include a body"));
+    }
+
+    #[test]
+    fn raw_response_parser_rejects_get_empty_body_content_length_mismatch() {
+        let error =
+            parse_editable_raw_response("HTTP/1.1 200 OK\r\nContent-Length: 55\r\n\r\n", None)
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Content-Length 55 does not match raw body length 0"));
+    }
+
+    #[test]
     fn binary_raw_response_parser_infers_base64_from_content_length() {
         let response = parse_editable_raw_response(
             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 2\r\n\r\n/wA=",
@@ -6398,7 +9575,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_target_follows_raw_request_update_only_when_it_was_default() {
+    fn replay_target_stays_independent_when_raw_request_host_changes() {
         let old_request = default_editable_request();
         let new_request = EditableRequest {
             host: "new.example.com".to_string(),
@@ -6408,7 +9585,7 @@ mod tests {
             }],
             ..old_request.clone()
         };
-        let mut default_tab = ReplayTabState {
+        let tab = ReplayTabState {
             base_request: Some(old_request.clone()),
             target_scheme: "https".to_string(),
             target_host: "example.com".to_string(),
@@ -6416,28 +9593,17 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            replay_tab_target_matches_request(&default_tab, default_tab.base_request.as_ref())
-                .unwrap()
-        );
-        sync_replay_tab_target_to_request(&mut default_tab, &new_request).unwrap();
-        assert_eq!(default_tab.target_host, "new.example.com");
+        let target = replay_send_target_for_tab(&tab, &new_request)
+            .unwrap()
+            .expect("changed request host must not absorb the existing target");
 
-        let custom_tab = ReplayTabState {
-            base_request: Some(old_request),
-            target_scheme: "https".to_string(),
-            target_host: "override.example.com".to_string(),
-            target_port: "443".to_string(),
-            ..Default::default()
-        };
-        assert!(
-            !replay_tab_target_matches_request(&custom_tab, custom_tab.base_request.as_ref())
-                .unwrap()
-        );
+        assert_eq!(target.scheme, "https");
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, "443");
     }
 
     #[test]
-    fn replay_send_stale_default_target_is_persisted_as_effective_request_target() {
+    fn replay_send_keeps_existing_target_after_base_request_changes() {
         let old_request = default_editable_request();
         let new_request = EditableRequest {
             host: "new.example.com".to_string(),
@@ -6455,18 +9621,20 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(replay_send_target_for_tab(&tab, &new_request)
+        let target = replay_send_target_for_tab(&tab, &new_request)
             .unwrap()
-            .is_none());
+            .expect("existing target must stay explicit when request host changes");
+        assert_eq!(target.host, "example.com");
 
-        sync_replay_tab_target_to_request(&mut tab, &new_request).unwrap();
         tab.base_request = Some(new_request.clone());
 
-        assert_eq!(tab.target_host, "new.example.com");
+        assert_eq!(tab.target_host, "example.com");
         assert_eq!(tab.target_port, "443");
-        assert!(replay_send_target_for_tab(&tab, &new_request)
-            .unwrap()
-            .is_none());
+        assert!(
+            replay_send_target_for_tab(&tab, tab.base_request.as_ref().unwrap())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -6514,6 +9682,19 @@ mod tests {
 
         let error = replay_send_target_for_tab(&tab, &request).unwrap_err();
         assert!(error.to_string().contains("request host is an IP address"));
+    }
+
+    #[test]
+    fn replay_http_commands_reject_websocket_tabs() {
+        let tab = ReplayTabState {
+            id: uuid::Uuid::new_v4().to_string(),
+            tab_type: "websocket".to_string(),
+            ..ReplayTabState::default()
+        };
+
+        let error = ensure_http_replay_tab(&tab, &tab.id).unwrap_err();
+
+        assert!(error.to_string().contains("WebSocket replay tab"));
     }
 
     #[test]
@@ -6753,6 +9934,470 @@ mod tests {
             Cli::try_parse_from(["sniper-cli", "capture", "oast", "configure", "--enable",])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn cli_output_contract_parses_compact_and_manifest() {
+        let parsed =
+            Cli::try_parse_from(["sniper-cli", "--output", "compact", "manifest"]).unwrap();
+        assert_eq!(parsed.output, OutputFormat::Compact);
+        assert_eq!(parsed.command.operation_name(), "manifest");
+
+        let spec = operation_spec("replay.send").expect("manifest should include replay.send");
+        assert_eq!(spec.side_effect, CliSideEffect::Write);
+        assert!(spec.requires_confirmation);
+    }
+
+    #[test]
+    fn manifest_requires_confirmation_for_every_write_operation() {
+        let unguarded_writes = manifest_operations()
+            .into_iter()
+            .filter(|spec| spec.side_effect == CliSideEffect::Write && !spec.requires_confirmation)
+            .map(|spec| spec.operation)
+            .collect::<Vec<_>>();
+        assert!(
+            unguarded_writes.is_empty(),
+            "write operations must require --dry-run or --yes: {unguarded_writes:?}"
+        );
+    }
+
+    #[test]
+    fn call_maps_json_input_to_existing_history_command() {
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "call",
+            "capture.http.list",
+            "--input",
+            "{\"limit\":5,\"page\":true,\"host\":\"example.com\"}",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(parsed.dry_run);
+        assert_eq!(parsed.command.output_operation_name(), "capture.http.list");
+        let Command::Call(args) = parsed.command else {
+            panic!("expected call command");
+        };
+        let command = command_from_call_args(args).unwrap();
+        let Command::Capture {
+            command:
+                CaptureCommand::Http {
+                    command: HistoryCommand::List(args),
+                },
+        } = command
+        else {
+            panic!("expected capture.http.list command");
+        };
+        assert_eq!(args.limit, Some(5));
+        assert!(args.page);
+        assert_eq!(args.host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn call_write_operations_use_existing_confirmation_contract() {
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "call",
+            "session.switch",
+            "--input",
+            "{\"id\":\"00000000-0000-0000-0000-000000000000\"}",
+        ])
+        .unwrap();
+        let Command::Call(args) = parsed.command else {
+            panic!("expected call command");
+        };
+        let command = command_from_call_args(args).unwrap();
+        assert_eq!(command.operation_name(), "session.switch");
+        assert!(command.requires_confirmation());
+    }
+
+    #[test]
+    fn call_input_can_be_loaded_from_at_file() {
+        let dir = std::env::temp_dir().join(format!("sniper_call_input_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input.json");
+        std::fs::write(&path, "{\"tab_id\":\"tab-1\"}").unwrap();
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "call",
+            "replay.send",
+            "--input",
+            &format!("@{}", path.display()),
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::Call(args) = parsed.command else {
+            panic!("expected call command");
+        };
+        let command = command_from_call_args(args).unwrap();
+        let Command::Replay {
+            command: ReplayCommand::Send(args),
+        } = command
+        else {
+            panic!("expected replay.send command");
+        };
+        assert_eq!(args.tab_id, "tab-1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clap_parse_errors_are_json_classified() {
+        let error = Cli::try_parse_from(["sniper-cli", "replay", "send"]).unwrap_err();
+        let payload = clap_error_payload(&error);
+        assert_eq!(payload.code, "INVALID_INPUT");
+        assert_eq!(payload.exit_code, 2);
+        assert!(payload.message.contains("--tab-id"));
+
+        let raw_args = vec![
+            "--output".to_string(),
+            "compact".to_string(),
+            "replay".to_string(),
+            "send".to_string(),
+        ];
+        assert_eq!(
+            cli_output_format_from_raw_args(&raw_args),
+            OutputFormat::Compact
+        );
+        assert_eq!(cli_parse_error_operation(&raw_args), "replay.send");
+    }
+
+    #[test]
+    fn api_probe_rejections_are_api_unavailable() {
+        let payload = cli_error_payload(
+            "session.list",
+            &anyhow::anyhow!("Sniper API probe returned 404 Not Found"),
+        );
+        assert_eq!(payload.code, "API_UNAVAILABLE");
+        assert_eq!(payload.exit_code, 6);
+        assert!(payload.retryable);
+        assert!(payload.hint.unwrap().contains("Start Sniper Desktop"));
+    }
+
+    #[test]
+    fn missing_call_required_fields_are_invalid_input() {
+        let payload = cli_error_payload(
+            "capture.http.get",
+            &anyhow::anyhow!("missing required field `id` for `capture.http.get`"),
+        );
+        assert_eq!(payload.code, "INVALID_INPUT");
+        assert_eq!(payload.exit_code, 2);
+    }
+
+    #[test]
+    fn call_rejects_unknown_json_fields() {
+        for (operation, input) in [
+            ("capture.http.list", json!({"limt": 1})),
+            (
+                "session.switch",
+                json!({"idd": "00000000-0000-0000-0000-000000000000"}),
+            ),
+            (
+                "capture.oast.configure",
+                json!({"provider": "custom", "tokn": "secret"}),
+            ),
+        ] {
+            let error = command_from_operation_input(operation, &input)
+                .expect_err("call should reject unknown JSON fields");
+            let payload = cli_error_payload(operation, &error);
+            assert_eq!(payload.code, "INVALID_INPUT", "{operation}: {error}");
+        }
+    }
+
+    #[test]
+    fn call_rejects_json_null_input() {
+        let error = command_from_operation_input("fuzzer.run", &Value::Null)
+            .expect_err("call input must match object-only schemas");
+        let payload = cli_error_payload("fuzzer.run", &error);
+        assert_eq!(payload.code, "INVALID_INPUT");
+    }
+
+    #[test]
+    fn manifest_examples_are_accepted_by_call_mapper() {
+        for spec in manifest_operations() {
+            for example in spec.examples {
+                let command = command_from_operation_input(spec.operation, &example)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "manifest example for {} must map to a command: {error}",
+                            spec.operation
+                        )
+                    });
+                assert_eq!(command.operation_name(), spec.operation);
+            }
+        }
+    }
+
+    #[test]
+    fn schema_operation_requires_kind_in_manifest_schema() {
+        let schema_spec = operation_spec("schema").expect("schema operation should exist");
+        assert_eq!(
+            schema_spec.input_schema["required"],
+            json!(["kind", "operation"])
+        );
+        assert_eq!(
+            schema_spec.input_schema["additionalProperties"],
+            json!(false)
+        );
+        assert!(schema_spec.input_schema["properties"].get("kind").is_some());
+    }
+
+    #[test]
+    fn annotate_noop_is_rejected_before_dry_run_plan() {
+        let command = command_from_operation_input(
+            "capture.http.annotate",
+            &json!({"id":"00000000-0000-0000-0000-000000000000"}),
+        )
+        .unwrap();
+        let error = validate_command_preflight(&command)
+            .expect_err("annotation without fields must not dry-run as a valid patch");
+        let payload = cli_error_payload(command.operation_name(), &error);
+        assert_eq!(payload.code, "INVALID_INPUT");
+    }
+
+    #[test]
+    fn call_rejects_legacy_required_source_group_omissions() {
+        for (operation, input) in [
+            ("scope.set", json!({})),
+            ("fuzzer.set_template", json!({})),
+            ("fuzzer.set_payloads", json!({})),
+            ("capture.auto_replace.set", json!({})),
+            ("sequence.create", json!({})),
+        ] {
+            let error = command_from_operation_input(operation, &input)
+                .expect_err("call should preserve required source groups");
+            let payload = cli_error_payload(operation, &error);
+            assert_eq!(payload.code, "INVALID_INPUT", "{operation}: {error}");
+        }
+    }
+
+    #[test]
+    fn call_rejects_legacy_conflicting_groups() {
+        let id = "00000000-0000-0000-0000-000000000000";
+        for (operation, input) in [
+            (
+                "scope.set",
+                json!({"clear": true, "pattern": "*.example.com"}),
+            ),
+            ("replay.open", json!({"transaction_id": id, "stdin": true})),
+            (
+                "replay.update",
+                json!({"tab_id": "tab-1", "request_file": "req.txt", "stdin": true}),
+            ),
+            (
+                "capture.intercept.forward",
+                json!({"id": id, "request_file": "req.txt", "stdin": true}),
+            ),
+            (
+                "capture.response_intercept.forward",
+                json!({"id": id, "response_file": "res.txt", "stdin": true}),
+            ),
+            (
+                "capture.intercept_rule.create",
+                json!({"all": true, "host_pattern": "*.example.com"}),
+            ),
+            (
+                "capture.oast.configure",
+                json!({"enable": true, "disable": true}),
+            ),
+            (
+                "capture.oast.configure",
+                json!({"token": "secret", "token_stdin": true}),
+            ),
+            (
+                "capture.http.annotate",
+                json!({"id": id, "color": "red", "clear_color": true}),
+            ),
+            (
+                "capture.http.annotate",
+                json!({"id": id, "note": "keep", "clear_note": true}),
+            ),
+            (
+                "capture.http.list",
+                json!({"offset": 1, "before_sequence": 99}),
+            ),
+        ] {
+            let error = command_from_operation_input(operation, &input)
+                .expect_err("call should preserve conflicting groups");
+            let payload = cli_error_payload(operation, &error);
+            assert_eq!(payload.code, "INVALID_INPUT", "{operation}: {error}");
+        }
+    }
+
+    #[test]
+    fn call_rejects_legacy_value_parser_violations() {
+        let too_large_oast_interval = MAX_OAST_POLLING_INTERVAL_SECS + 1;
+        for (operation, input) in [
+            ("capture.http.list", json!({"limit": 0})),
+            ("capture.http.list", json!({"status": 99})),
+            ("capture.http.list", json!({"sort_key": "hst"})),
+            ("capture.http.list", json!({"sort_direction": "up"})),
+            ("capture.websocket.list", json!({"limit": 0})),
+            ("capture.websocket.list", json!({"sort_key": "hst"})),
+            ("capture.websocket.list", json!({"sort_direction": "up"})),
+            ("fuzzer.list", json!({"limit": 0})),
+            ("capture.oast.list", json!({"limit": 0})),
+            ("sequence.runs", json!({"limit": 0})),
+            ("capture.oast.configure", json!({"provider": "interact"})),
+            ("capture.oast.configure", json!({"interval": 0})),
+            (
+                "capture.oast.configure",
+                json!({"interval": too_large_oast_interval}),
+            ),
+            (
+                "capture.intercept_rule.create",
+                json!({"all": true, "scope": "req"}),
+            ),
+        ] {
+            let error = command_from_operation_input(operation, &input)
+                .expect_err("call should preserve finite value parsers");
+            let payload = cli_error_payload(operation, &error);
+            assert_eq!(payload.code, "INVALID_INPUT", "{operation}: {error}");
+        }
+    }
+
+    #[test]
+    fn call_accepts_valid_legacy_group_inputs() {
+        assert!(matches!(
+            command_from_operation_input("scope.set", &json!({"clear": true})).unwrap(),
+            Command::Scope {
+                command: TargetCommand::SetScope(_),
+            }
+        ));
+        assert!(matches!(
+            command_from_operation_input(
+                "replay.update",
+                &json!({"tab_id": "tab-1", "scheme": "https"})
+            )
+            .unwrap(),
+            Command::Replay {
+                command: ReplayCommand::Update(_),
+            }
+        ));
+        assert!(matches!(
+            command_from_operation_input(
+                "fuzzer.set_template",
+                &json!({"transaction_id": "00000000-0000-0000-0000-000000000000"})
+            )
+            .unwrap(),
+            Command::Fuzzer {
+                command: FuzzerCommand::SetTemplate(_),
+            }
+        ));
+        assert!(matches!(
+            command_from_operation_input(
+                "capture.intercept_rule.create",
+                &json!({"all": true, "scope": "both"})
+            )
+            .unwrap(),
+            Command::Capture {
+                command: CaptureCommand::InterceptRule {
+                    command: InterceptRuleCommand::Create(_),
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_apply_errors_preserve_structured_details() {
+        let error = cli_partial_apply_error(
+            "fuzzer attack failed",
+            serde_json::json!({
+                "record": {
+                    "id": "attack-1",
+                    "status": "failed"
+                }
+            }),
+        );
+        let payload = cli_error_payload("fuzzer.run", &error);
+
+        assert_eq!(payload.code, "PARTIAL_APPLY");
+        assert_eq!(payload.exit_code, 5);
+        assert!(!payload.retryable);
+        assert_eq!(payload.details["partial_apply"], serde_json::json!(true));
+        assert_eq!(payload.details["idempotent"], serde_json::json!(false));
+        assert_eq!(payload.details["record"]["status"], "failed");
+    }
+
+    #[test]
+    fn dry_run_preview_reports_risky_replay_send_plan() {
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "--dry-run",
+            "replay",
+            "send",
+            "--tab-id",
+            "tab-1",
+        ])
+        .unwrap();
+        let plan = dry_run_command(&parsed.command).unwrap();
+        assert_eq!(plan["dry_run"], serde_json::json!(true));
+        assert_eq!(plan["operation"], "replay.send");
+        assert_eq!(plan["requires_confirmation"], serde_json::json!(true));
+        assert_eq!(plan["api"]["method"], "POST");
+        assert_eq!(plan["api"]["path"], "/api/replay/send");
+    }
+
+    #[test]
+    fn confirmation_errors_are_json_classified() {
+        let payload = cli_error_payload(
+            "replay.send",
+            &anyhow::anyhow!("operation `replay.send` requires --dry-run or --yes"),
+        );
+        assert_eq!(payload.code, "CONFIRMATION_REQUIRED");
+        assert_eq!(payload.exit_code, 2);
+        assert!(!payload.retryable);
+    }
+
+    #[test]
+    fn oast_configure_accepts_token_stdin_and_rejects_token_conflict() {
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "oast",
+            "configure",
+            "--provider",
+            "custom",
+            "--token-stdin",
+        ])
+        .unwrap();
+        let Command::Capture {
+            command:
+                CaptureCommand::Oast {
+                    command: OastCommand::Configure(args),
+                },
+        } = parsed.command
+        else {
+            panic!("expected oast configure");
+        };
+        assert!(args.token_stdin);
+        assert!(args.token.is_none());
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "oast",
+            "configure",
+            "--token",
+            "secret",
+            "--token-stdin",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn oast_configure_rejects_unsafe_token_before_api_discovery() {
+        let parsed = Cli::try_parse_from([
+            "sniper-cli",
+            "capture",
+            "oast",
+            "configure",
+            "--provider",
+            "custom",
+            "--token",
+            "secret",
+            "--yes",
+        ])
+        .unwrap();
+        let error = validate_command_preflight(&parsed.command).unwrap_err();
+        assert!(error.to_string().contains("--token is unsafe"));
     }
 
     #[test]

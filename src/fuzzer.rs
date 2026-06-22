@@ -80,6 +80,8 @@ pub struct FuzzerAttackPayload {
     pub session_id: Option<Uuid>,
     #[serde(default)]
     pub expected_active_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub expected_workspace_revision: Option<u64>,
     pub template: EditableRequest,
     pub payloads: Vec<String>,
     pub source_transaction_id: Option<Uuid>,
@@ -841,6 +843,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir()
                 .join(format!("sniper-fuzzer-http2-failure-{}", Uuid::new_v4())),
@@ -894,6 +897,7 @@ mod tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             ui_addr: "127.0.0.1:0".parse().unwrap(),
             max_entries: 32,
+            max_transaction_entries: 32,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir()
                 .join(format!("sniper-fuzzer-upstream-failure-{}", Uuid::new_v4())),
@@ -953,6 +957,7 @@ mod tests {
                 proxy_addr: "127.0.0.1:0".parse().unwrap(),
                 ui_addr: "127.0.0.1:0".parse().unwrap(),
                 max_entries: 32,
+                max_transaction_entries: 32,
                 body_preview_bytes: 4096,
                 data_dir: data_dir.clone(),
             })

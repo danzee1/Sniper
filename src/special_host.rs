@@ -57,7 +57,13 @@ pub fn respond(
     secure: bool,
     proxy_addr: SocketAddr,
 ) -> SpecialHostResponse {
-    match (method, path) {
+    let route_method = if method == Method::HEAD {
+        &Method::GET
+    } else {
+        method
+    };
+
+    match (route_method, path) {
         (&Method::GET, "/") | (&Method::GET, "") => certificate_portal(state, secure, proxy_addr),
         (&Method::GET, "/cert/root.pem") => {
             let mut response = SpecialHostResponse::new(

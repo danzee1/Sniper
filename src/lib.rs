@@ -55,6 +55,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         proxy_addr = %config.proxy_addr,
         ui_addr = %config.ui_addr,
         max_entries = config.max_entries,
+        max_transaction_entries = config.max_transaction_entries,
         body_preview_bytes = config.body_preview_bytes,
         data_dir = %config.data_dir.display(),
         "starting sniper"

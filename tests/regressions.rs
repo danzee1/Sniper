@@ -35,6 +35,7 @@ async fn proxy_applies_request_match_replace_only_once() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-match-replace-{}",
@@ -112,6 +113,7 @@ async fn proxy_records_request_and_response_http_versions_separately() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-http-version-{}",
@@ -158,6 +160,7 @@ async fn replay_upstream_failure_preserves_request_match_replace_provenance() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-replay-failure-match-replace-{}",
@@ -219,6 +222,7 @@ async fn replay_rejects_truncated_captured_request_reuse() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4,
         data_dir: std::env::temp_dir()
             .join(format!("sniper-test-regression-replay-{}", Uuid::new_v4())),
@@ -272,6 +276,7 @@ async fn replay_rejects_mutated_truncated_captured_request_reuse() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 16,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-replay-mutated-truncated-{}",
@@ -329,6 +334,7 @@ async fn replay_rejects_short_edited_body_from_truncated_capture_even_when_flag_
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 16,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-replay-short-edited-truncated-{}",
@@ -399,6 +405,7 @@ async fn replay_preserves_custom_host_header() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-replay-host-header-{}",
@@ -463,6 +470,7 @@ async fn replay_target_override_uses_override_port_with_explicit_logical_port() 
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-replay-target-port-{}",
@@ -524,6 +532,7 @@ async fn replay_traffic_is_passively_scanned() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-replay-scan-{}",
@@ -586,6 +595,7 @@ async fn intercept_forward_keeps_client_request_alive() {
         proxy_addr: "127.0.0.1:0".parse().unwrap(),
         ui_addr: "127.0.0.1:0".parse().unwrap(),
         max_entries: 100,
+        max_transaction_entries: 100,
         body_preview_bytes: 4096,
         data_dir: std::env::temp_dir().join(format!(
             "sniper-test-regression-intercept-forward-{}",

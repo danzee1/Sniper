@@ -8,6 +8,10 @@ use uuid::Uuid;
 
 use crate::model::{decode_content_encoding, BodyEncoding, EditableRequest, HeaderRecord};
 
+pub const MAX_MATCH_REPLACE_RULES: usize = 500;
+pub const MAX_MATCH_REPLACE_FIELD_BYTES: usize = 256 * 1024;
+pub const MAX_MATCH_REPLACE_RULES_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchReplaceScope {
@@ -69,7 +73,7 @@ impl MatchReplaceStore {
 
     pub fn from_rules(rules: Vec<MatchReplaceRule>) -> Self {
         Self {
-            rules: RwLock::new(rules),
+            rules: RwLock::new(sanitize_match_replace_rules(rules)),
         }
     }
 
@@ -87,7 +91,7 @@ impl MatchReplaceStore {
 
     pub async fn replace_all(&self, rules: Vec<MatchReplaceRule>) -> Vec<MatchReplaceRule> {
         let mut current = self.rules.write().await;
-        *current = rules;
+        *current = sanitize_match_replace_rules(rules);
         current.clone()
     }
 
@@ -114,6 +118,33 @@ impl Default for MatchReplaceStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub fn sanitize_match_replace_rules(rules: Vec<MatchReplaceRule>) -> Vec<MatchReplaceRule> {
+    let mut sanitized = rules
+        .into_iter()
+        .filter(valid_restored_match_replace_rule)
+        .take(MAX_MATCH_REPLACE_RULES)
+        .collect::<Vec<_>>();
+    while serde_json::to_vec(&sanitized)
+        .map(|bytes| bytes.len() > MAX_MATCH_REPLACE_RULES_BYTES)
+        .unwrap_or(true)
+    {
+        if sanitized.pop().is_none() {
+            break;
+        }
+    }
+    sanitized
+}
+
+fn valid_restored_match_replace_rule(rule: &MatchReplaceRule) -> bool {
+    if rule.description.len() > MAX_MATCH_REPLACE_FIELD_BYTES
+        || rule.search.len() > MAX_MATCH_REPLACE_FIELD_BYTES
+        || rule.replace.len() > MAX_MATCH_REPLACE_FIELD_BYTES
+    {
+        return false;
+    }
+    !rule.regex || RegexBuilder::new(&rule.search).build().is_ok()
 }
 
 fn apply_request_rules(request: EditableRequest, rules: Vec<MatchReplaceRule>) -> AppliedRequest {
@@ -274,6 +305,7 @@ fn apply_response_rules(
         .unwrap_or_else(|| body.clone());
     let mut notes = Vec::new();
     let mut body_changed = false;
+    let mut headers_changed = false;
 
     for rule in rules
         .into_iter()
@@ -289,6 +321,7 @@ fn apply_response_rules(
                 if let Ok((value, changed)) = replace_text(&header.name, &rule) {
                     if changed && valid_header_name(&value) {
                         header.name = value;
+                        headers_changed = true;
                         matched = true;
                     }
                 }
@@ -303,6 +336,7 @@ fn apply_response_rules(
                 if let Ok((value, changed)) = replace_text(&header.value, &rule) {
                     if changed && valid_header_value(&value) {
                         header.value = value;
+                        headers_changed = true;
                         matched = true;
                     }
                 }
@@ -337,6 +371,9 @@ fn apply_response_rules(
         if decoded_body_for_rules.is_some() {
             strip_content_encoding_records(&mut headers);
         }
+    }
+
+    if body_changed || headers_changed {
         normalize_content_length_records(&mut headers, body.len());
     }
 
@@ -459,6 +496,47 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(body).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn test_rule(description: String) -> MatchReplaceRule {
+        MatchReplaceRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            description,
+            scope: MatchReplaceScope::Request,
+            target: MatchReplaceTarget::Path,
+            search: "/old".to_string(),
+            replace: "/new".to_string(),
+            regex: false,
+            case_sensitive: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_trims_restored_rules_to_rule_limit() {
+        let rules = (0..=MAX_MATCH_REPLACE_RULES)
+            .map(|index| test_rule(format!("restored rule {index}")))
+            .collect::<Vec<_>>();
+
+        let store = MatchReplaceStore::from_rules(rules);
+
+        assert_eq!(store.len().await, MAX_MATCH_REPLACE_RULES);
+    }
+
+    #[tokio::test]
+    async fn store_drops_restored_invalid_rules() {
+        let valid = test_rule("valid".to_string());
+        let mut invalid_regex = test_rule("invalid regex".to_string());
+        invalid_regex.regex = true;
+        invalid_regex.search = "(".to_string();
+        let mut oversized = test_rule("oversized".to_string());
+        oversized.description = "x".repeat(MAX_MATCH_REPLACE_FIELD_BYTES + 1);
+
+        let store = MatchReplaceStore::from_rules(vec![invalid_regex, valid.clone(), oversized]);
+        let rules = store.snapshot().await;
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, valid.id);
     }
 
     #[tokio::test]
@@ -765,6 +843,34 @@ mod tests {
 
         assert_eq!(applied.body.as_ref(), b"larger-body");
         assert_eq!(applied.headers.get("content-length").unwrap(), "11");
+    }
+
+    #[tokio::test]
+    async fn response_header_value_rule_normalizes_existing_content_length() {
+        let store = MatchReplaceStore::new();
+        store
+            .replace_all(vec![MatchReplaceRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                description: "bad content length edit".to_string(),
+                scope: MatchReplaceScope::Response,
+                target: MatchReplaceTarget::HeaderValue,
+                search: "4".to_string(),
+                replace: "999".to_string(),
+                regex: false,
+                case_sensitive: true,
+            }])
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "4".parse().unwrap());
+        let applied = store
+            .apply_response(headers, Bytes::from_static(b"body"))
+            .await;
+
+        assert_eq!(applied.body.as_ref(), b"body");
+        assert_eq!(applied.headers.get("content-length").unwrap(), "4");
+        assert_eq!(applied.notes.len(), 1);
     }
 
     #[tokio::test]

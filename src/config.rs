@@ -14,12 +14,14 @@ use crate::certificate::default_data_dir;
 
 const STARTUP_SETTINGS_FILE: &str = "startup-settings.json";
 const DEFAULT_MAX_ENTRIES: usize = 5_000;
+const DEFAULT_MAX_TRANSACTION_ENTRIES: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub proxy_addr: SocketAddr,
     pub ui_addr: SocketAddr,
     pub max_entries: usize,
+    pub max_transaction_entries: usize,
     pub body_preview_bytes: usize,
     pub data_dir: PathBuf,
 }
@@ -45,6 +47,11 @@ impl AppConfig {
             proxy_addr: resolve_proxy_addr(&data_dir, &startup)?,
             ui_addr: parse_ui_socket_addr("SNIPER_UI_ADDR", ui_default)?,
             max_entries: parse_usize_min("SNIPER_MAX_ENTRIES", DEFAULT_MAX_ENTRIES, 1)?,
+            max_transaction_entries: parse_usize_min(
+                "SNIPER_MAX_TRANSACTION_ENTRIES",
+                DEFAULT_MAX_TRANSACTION_ENTRIES,
+                1,
+            )?,
             body_preview_bytes: parse_usize("SNIPER_BODY_PREVIEW_BYTES", 10_485_760)?,
             data_dir,
         })
@@ -436,12 +443,60 @@ mod tests {
         let _proxy_guard = EnvVarGuard::remove("SNIPER_PROXY_ADDR");
         let _ui_guard = EnvVarGuard::remove("SNIPER_UI_ADDR");
         let _max_entries_guard = EnvVarGuard::remove("SNIPER_MAX_ENTRIES");
+        let _max_transaction_entries_guard = EnvVarGuard::remove("SNIPER_MAX_TRANSACTION_ENTRIES");
         let _body_preview_guard = EnvVarGuard::remove("SNIPER_BODY_PREVIEW_BYTES");
 
         let config =
             super::AppConfig::from_env_with_defaults("127.0.0.1:18080", "127.0.0.1:0").unwrap();
 
         assert_eq!(config.data_dir, home.join(".sniper"));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn app_config_defaults_to_separate_http_history_retention() {
+        let _guard = lock_env();
+        let home =
+            std::env::temp_dir().join(format!("sniper-config-retention-{}", uuid::Uuid::new_v4()));
+        let _home_guard = EnvVarGuard::set("HOME", home.clone().into_os_string());
+        let _data_dir_guard = EnvVarGuard::remove("SNIPER_DATA_DIR");
+        let _proxy_guard = EnvVarGuard::remove("SNIPER_PROXY_ADDR");
+        let _ui_guard = EnvVarGuard::remove("SNIPER_UI_ADDR");
+        let _max_entries_guard = EnvVarGuard::remove("SNIPER_MAX_ENTRIES");
+        let _max_transaction_entries_guard = EnvVarGuard::remove("SNIPER_MAX_TRANSACTION_ENTRIES");
+        let _body_preview_guard = EnvVarGuard::remove("SNIPER_BODY_PREVIEW_BYTES");
+
+        let config =
+            super::AppConfig::from_env_with_defaults("127.0.0.1:18080", "127.0.0.1:0").unwrap();
+
+        assert_eq!(config.max_entries, 5_000);
+        assert_eq!(config.max_transaction_entries, 100_000);
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn app_config_allows_transaction_retention_override() {
+        let _guard = lock_env();
+        let home = std::env::temp_dir().join(format!(
+            "sniper-config-transaction-retention-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _home_guard = EnvVarGuard::set("HOME", home.clone().into_os_string());
+        let _data_dir_guard = EnvVarGuard::remove("SNIPER_DATA_DIR");
+        let _proxy_guard = EnvVarGuard::remove("SNIPER_PROXY_ADDR");
+        let _ui_guard = EnvVarGuard::remove("SNIPER_UI_ADDR");
+        let _max_entries_guard = EnvVarGuard::set("SNIPER_MAX_ENTRIES", "123");
+        let _max_transaction_entries_guard =
+            EnvVarGuard::set("SNIPER_MAX_TRANSACTION_ENTRIES", "456");
+        let _body_preview_guard = EnvVarGuard::remove("SNIPER_BODY_PREVIEW_BYTES");
+
+        let config =
+            super::AppConfig::from_env_with_defaults("127.0.0.1:18080", "127.0.0.1:0").unwrap();
+
+        assert_eq!(config.max_entries, 123);
+        assert_eq!(config.max_transaction_entries, 456);
 
         let _ = std::fs::remove_dir_all(home);
     }

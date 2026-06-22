@@ -175,6 +175,7 @@ const WORKBENCH_STACK_MIN_HEIGHTS = {
   history: 140,
   messages: 180,
 };
+const DETAIL_LOADING_DELAY_MS = 120;
 const REPEATER_HISTORY_LIMIT = 30;
 const HISTORY_ROW_HEIGHT = 27;
 let measuredHistoryRowHeight = HISTORY_ROW_HEIGHT;
@@ -488,6 +489,7 @@ const state = {
 };
 
 let _historyPagingGeneration = 0;
+let _historyDetailLoadingTimer = null;
 let _websocketLoadGeneration = 0;
 let _websocketDetailGeneration = 0;
 let _eventLogMutationGeneration = 0;
@@ -495,6 +497,7 @@ let _eventLogClearGeneration = 0;
 let _websocketDetailPendingId = null;
 let _websocketDetailPendingSessionId = null;
 let _websocketDetailPendingPromise = null;
+let _websocketDetailLoadingTimer = null;
 let _websocketDetailRefreshTimer = null;
 let _websocketDetailRefreshNeeded = null;
 let _websocketSummaryMutationGeneration = 0;
@@ -1248,6 +1251,7 @@ function bindEvents() {
     ) {
       return;
     }
+    const hadRenderedWebsocketDetail = Boolean(state.selectedWebsocketRecord?.id);
     if (state.selectedWebsocketId !== row.dataset.id) {
       state.selectedFrameIdx = null;
       state.selectedWebsocketRecord = null;
@@ -1256,7 +1260,10 @@ function bindEvents() {
       resetWebsocketFrameScroll();
     }
     state.selectedWebsocketId = row.dataset.id;
-    renderWebsocketSessions();
+    renderWebsocketSessionTable();
+    scheduleWebsocketDetailLoading(row.dataset.id, {
+      immediate: !hadRenderedWebsocketDetail,
+    });
     loadWebsocketDetail(row.dataset.id).catch((error) => console.error(error));
   });
   els.websocketFramesBody?.addEventListener("click", (event) => {
@@ -2511,7 +2518,7 @@ async function _applySettings(response) {
 
   els.proxyAddr.textContent = state.settings.proxy_addr;
   els.uiAddr.textContent = state.settings.ui_addr;
-  els.captureMode.textContent = `${formatSize(state.settings.body_preview_bytes)} preview cap / ${state.settings.max_entries} entries`;
+  els.captureMode.textContent = `${formatSize(state.settings.body_preview_bytes)} preview cap / ${configuredTransactionEntryLimit()} HTTP entries`;
   els.settingsSpecialHostHttp.textContent = state.settings.certificate.special_host_http;
 
   updateProxyStatusIndicator(state.settings.proxy_online);
@@ -2866,7 +2873,19 @@ function hydrateRepeaterHistoryEntry(entry, fallbackRequest) {
 
 function normalizeFuzzerTargetOverride(target) {
   if (!target || typeof target !== "object") return null;
-  const normalized = normalizeRepeaterTargetInput(target.host, target.port, target.scheme || "https");
+  const rawHost = String(target.host || "").trim();
+  const rawPort = normalizePortValue(target.port);
+  const rawScheme = String(target.scheme || "").trim().toLowerCase();
+  const scheme = (rawScheme === "http" || rawScheme === "https") ? rawScheme : "";
+  if (!rawHost) {
+    if (!scheme && !rawPort) return null;
+    return {
+      scheme,
+      host: "",
+      port: rawPort,
+    };
+  }
+  const normalized = normalizeRepeaterTargetInput(rawHost, rawPort, scheme || "https");
   if (!normalized.host) return null;
   return {
     scheme: normalized.scheme || "https",
@@ -4016,6 +4035,7 @@ function resetSessionScopedUiState() {
   window.clearTimeout(_transactionDeltaTimer);
   _transactionDeltaTimer = 0;
   _pendingTransactionSummaries.length = 0;
+  cancelHistoryDetailLoading();
   state.items = [];
   state.historyPaging = createHistoryPagingState();
   state.historyListError = "";
@@ -4050,6 +4070,7 @@ function resetSessionScopedUiState() {
   _websocketDetailPendingId = null;
   _websocketDetailPendingSessionId = null;
   _websocketDetailPendingPromise = null;
+  cancelWebsocketDetailLoading();
   clearWebsocketQueryBackfill();
   clearFilteredWebsocketReload();
   clearWebsocketSearchReload();
@@ -4499,14 +4520,14 @@ function isKnownCount(value) {
   return Number.isFinite(value);
 }
 
-function adjustHistoryPagingAfterLocalRemoval(removedCount = 1) {
+function adjustHistoryPagingAfterLocalRemoval(removedCount = 1, options = {}) {
   const count = Math.max(0, Number(removedCount) || 0);
   if (!count || !state.historyPaging) return;
   const paging = state.historyPaging;
-  if (isKnownCount(paging.total)) {
+  if (options.decrementTotal !== false && isKnownCount(paging.total)) {
     paging.total = Math.max(state.items.length, Number(paging.total) - count);
   }
-  if (isKnownCount(paging.filteredTotal)) {
+  if (options.decrementFilteredTotal !== false && isKnownCount(paging.filteredTotal)) {
     paging.filteredTotal = Math.max(0, Number(paging.filteredTotal) - count);
   }
   paging.offset = state.items.length;
@@ -4691,6 +4712,7 @@ async function selectHistoryTransaction(id, options = {}) {
     }
     return state.selectedRecord;
   }
+  const hadRenderedDetail = Boolean(state.selectedRecord?.id);
   state.selectedId = nextId;
   state.selectedRecord = null;
   state.loadingDetailId = null;
@@ -4699,7 +4721,9 @@ async function selectHistoryTransaction(id, options = {}) {
     renderEmptyDetail();
     return null;
   }
-  renderLoadingDetail("Loading selected transaction...");
+  scheduleHistoryDetailLoading(state.selectedId, "Loading selected transaction...", {
+    immediate: !hadRenderedDetail,
+  });
   if (options.scroll) {
     scrollSelectedHistoryRowIntoView();
   }
@@ -5317,6 +5341,7 @@ function clearWebsocketSelectionPreview(options = {}) {
   state.selectedFrameIdx = null;
   state.selectedWebsocketRecord = null;
   state.selectedWebsocketDetailError = "";
+  cancelWebsocketDetailLoading();
   hideFrameDetail();
   resetWebsocketFrameScroll();
   if (options.render) {
@@ -5716,6 +5741,7 @@ async function loadWebsocketDetail(id, options = {}) {
       }
       state.selectedWebsocketRecord = null;
       state.selectedWebsocketDetailError = "Failed to load selected WebSocket session.";
+      cancelWebsocketDetailLoading();
       renderWebsocketSessions();
       return;
     }
@@ -5779,6 +5805,7 @@ async function loadWebsocketDetail(id, options = {}) {
         : true,
     };
     state.selectedWebsocketDetailError = "";
+    cancelWebsocketDetailLoading();
     renderWebsocketSessions();
   })();
   _websocketDetailPendingId = id;
@@ -6676,9 +6703,6 @@ async function loadMoreTransactions({ background = false } = {}) {
   if (paging.loading || !paging.hasMore) {
     return 0;
   }
-  if (!canUseSequenceCursorForHistoryPaging() && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS) {
-    return 0;
-  }
   const queryState = createHistoryQueryState();
   const querySignature = historyQuerySignature(queryState);
   if (paging.querySignature && paging.querySignature !== querySignature) {
@@ -6738,7 +6762,7 @@ async function loadMoreTransactions({ background = false } = {}) {
 
 async function loadNewerTransactions({ background = false } = {}) {
   const paging = state.historyPaging || (state.historyPaging = createHistoryPagingState());
-  if (paging.loading || !canUseSequenceCursorForHistoryPaging() || paging.trimmedHeadCount <= 0) {
+  if (paging.loading || paging.trimmedHeadCount <= 0) {
     return 0;
   }
   const queryState = createHistoryQueryState();
@@ -6751,6 +6775,7 @@ async function loadNewerTransactions({ background = false } = {}) {
   let shouldRenderAfterLoad = !background;
   const generation = paging.generation;
   const newerOffset = Math.max(0, paging.trimmedHeadCount - paging.pageSize);
+  const usesSequenceCursor = canUseSequenceCursorForHistoryPaging();
   paging.loading = true;
   if (!background) renderHistory();
   try {
@@ -6768,8 +6793,13 @@ async function loadNewerTransactions({ background = false } = {}) {
     }
     const pageItems = jsonArray(page.items);
     const added = mergeHistoryItems(pageItems, { prepend: true });
-    paging.trimmedHeadCount = Math.max(0, paging.trimmedHeadCount - pageItems.length);
-    paging.offset = state.items.length;
+    if (usesSequenceCursor) {
+      paging.trimmedHeadCount = Math.max(0, paging.trimmedHeadCount - pageItems.length);
+      paging.offset = state.items.length;
+    } else {
+      paging.trimmedHeadCount = newerOffset;
+      paging.offset = paging.trimmedHeadCount + state.items.length;
+    }
     paging.total = page.total ?? paging.total;
     paging.filteredTotal = page.filtered_total ?? paging.filteredTotal;
     if (page.hidden_connect_total != null) paging.hiddenConnectTotal = page.hidden_connect_total;
@@ -6840,14 +6870,6 @@ function canMergeRecentTransactions() {
 
 function canUseSequenceCursorForHistoryPaging() {
   return state.sortKey === "index" && state.sortDirection === "desc";
-}
-
-function historySortedCapReached(paging = state.historyPaging) {
-  return Boolean(
-    paging?.hasMore
-    && !canUseSequenceCursorForHistoryPaging()
-    && state.items.length >= HTTP_HISTORY_MAX_LOADED_ITEMS
-  );
 }
 
 function isHttpHistoryVisible() {
@@ -8122,19 +8144,21 @@ function showFindingDetail(finding, record) {
   els.findingsDetailTitle.textContent = finding.title;
 
   // Description + evidence
-  els.findingsDetailDesc.innerHTML = `<span class="findings-desc-text">${escapeHtml(finding.detail)}</span>`;
+  renderFindingDescription(finding);
 
   // Jump button — store record_id
   els.findingsDetailJump.dataset.recordId = finding.record_id;
 
   // Render request/response with highlight
   const evidence = finding.evidence || "";
+  let requestPaneResult = null;
+  let responsePaneResult = null;
   if (record) {
     const reqText = buildFindingsRawMessage(record, "request");
     const resText = buildFindingsRawMessage(record, "response");
     // CM path
     if (els.findingsReqCM) {
-      updateFindingsCodePaneCM(
+      requestPaneResult = updateFindingsCodePaneCM(
         "findingsReq",
         els.findingsReqCM,
         reqText,
@@ -8145,7 +8169,7 @@ function showFindingDetail(finding, record) {
       );
     }
     if (els.findingsResCM) {
-      updateFindingsCodePaneCM(
+      responsePaneResult = updateFindingsCodePaneCM(
         "findingsRes",
         els.findingsResCM,
         resText,
@@ -8162,6 +8186,9 @@ function showFindingDetail(finding, record) {
     if (!els.findingsResCM) {
       renderFindingsCodePane(els.findingsResView, els.findingsResLines, resText, evidence, "response", finding);
     }
+    const fallbackLocation = fallbackFindingLocationFromPaneResults(finding, requestPaneResult, responsePaneResult);
+    renderFindingDescription(finding, fallbackLocation);
+    scrollFindingLocationIntoView(finding.location || fallbackLocation);
   } else {
     if (els.findingsReqCM) {
       updateCodePaneCM("findingsReq", els.findingsReqCM, "Transaction not available.", { mode: "http" });
@@ -8180,17 +8207,97 @@ function showFindingDetail(finding, record) {
 }
 
 function updateFindingsCodePaneCM(key, container, text, evidence, finding, searchInput, searchMeta) {
-  const highlightQuery = findingHighlightQuery(evidence, finding);
-  const result = updateCodePaneCM(key, container, text, {
-    mode: "http",
-    search: highlightQuery,
-    searchClasses: {
-      hit: "tok-finding-evidence-hit",
-      active: "tok-finding-evidence-active",
-    },
-  });
+  const highlightQueries = findingHighlightQueries(evidence, finding);
+  let result = null;
+  for (const highlightQuery of highlightQueries) {
+    result = updateCodePaneCM(key, container, text, {
+      mode: "http",
+      search: highlightQuery,
+      searchClasses: {
+        hit: "tok-finding-evidence-hit",
+        active: "tok-finding-evidence-active",
+      },
+    });
+    if (result.matchCount > 0 || highlightQuery === highlightQueries[highlightQueries.length - 1]) {
+      break;
+    }
+  }
+  if (!result) {
+    result = updateCodePaneCM(key, container, text, { mode: "http" });
+  }
   if (searchInput) searchInput.value = "";
   if (searchMeta) searchMeta.innerHTML = buildSearchMeta(result.lineCount, "raw", result.matchCount);
+  const cv = getCMView(key);
+  const firstMatchLine = cv && result.matchPositions?.length
+    ? cv.view.state.doc.lineAt(result.matchPositions[0]).number
+    : null;
+  return {
+    ...result,
+    firstMatchLine,
+  };
+}
+
+function renderFindingDescription(finding, fallbackLocation = null) {
+  if (!els.findingsDetailDesc) return;
+  const location = normalizeFindingLocation(finding.location || fallbackLocation);
+  const locationLabel = formatFindingLocationLabel(location);
+  const locationHtml = locationLabel
+    ? `<span class="findings-location-chip">${escapeHtml(locationLabel)}</span>`
+    : "";
+  els.findingsDetailDesc.innerHTML = `${locationHtml}<span class="findings-desc-text">${escapeHtml(finding.detail || "")}</span>`;
+}
+
+function normalizeFindingLocation(location) {
+  if (!location || typeof location !== "object") return null;
+  const side = String(location.side || "").toLowerCase();
+  if (side !== "request" && side !== "response") return null;
+  const line = Number(location.line);
+  return {
+    side,
+    section: String(location.section || "").toLowerCase(),
+    line: Number.isFinite(line) && line > 0 ? Math.trunc(line) : null,
+  };
+}
+
+function formatFindingLocationLabel(location) {
+  if (!location) return "";
+  const side = location.side === "request" ? "Request" : "Response";
+  const section = location.section
+    ? location.section.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase())
+    : "";
+  if (location.line) {
+    return section ? `${side} line ${location.line} · ${section}` : `${side} line ${location.line}`;
+  }
+  return section ? `${side} ${section}` : side;
+}
+
+function fallbackFindingLocationFromPaneResults(finding, requestPaneResult, responsePaneResult) {
+  if (finding.location) return null;
+  const responseLine = responsePaneResult?.firstMatchLine;
+  const requestLine = requestPaneResult?.firstMatchLine;
+  const preferRequest = String(finding.category || "") === "auth"
+    || String(finding.evidence || "").toLowerCase().startsWith("authorization:");
+  if (preferRequest && requestLine) {
+    return { side: "request", section: "match", line: requestLine };
+  }
+  if (responseLine) {
+    return { side: "response", section: "match", line: responseLine };
+  }
+  if (requestLine) {
+    return { side: "request", section: "match", line: requestLine };
+  }
+  return null;
+}
+
+function scrollFindingLocationIntoView(location) {
+  const normalized = normalizeFindingLocation(location);
+  if (!normalized?.line) return;
+  const key = normalized.side === "request" ? "findingsReq" : "findingsRes";
+  const cv = getCMView(key);
+  if (!cv) return;
+  const doc = cv.view.state.doc;
+  const line = doc.line(Math.max(1, Math.min(normalized.line, doc.lines)));
+  cv.view.dispatch({ selection: { anchor: line.from }, scrollIntoView: true });
 }
 
 function renderFindingsCodePane(viewEl, lineEl, text, evidence, target, finding) {
@@ -8220,9 +8327,17 @@ function renderFindingsCodePane(viewEl, lineEl, text, evidence, target, finding)
 }
 
 function findingHighlightQuery(evidence, finding) {
+  return findingHighlightQueries(evidence, finding)[0] || "";
+}
+
+function findingHighlightQueries(evidence, finding) {
+  const queries = [];
   const evidenceQuery = firstUsableFindingQuery(evidence);
-  if (evidenceQuery) return evidenceQuery;
-  return extractFindingKeywords(finding).find((keyword) => keyword.length >= 3) || "";
+  if (evidenceQuery) queries.push(evidenceQuery);
+  for (const keyword of extractFindingKeywords(finding)) {
+    if (keyword.length >= 3) queries.push(keyword);
+  }
+  return [...new Set(queries)];
 }
 
 function firstUsableFindingQuery(value) {
@@ -8231,52 +8346,59 @@ function firstUsableFindingQuery(value) {
     .map((line) => line.trim())
     .find((line) => line.length >= 3);
   if (!normalized) return "";
-  return normalized.length > 512 ? normalized.slice(0, 512) : normalized;
+  const untruncated = normalized.endsWith("...")
+    ? normalized.slice(0, -3).trimEnd()
+    : normalized;
+  const redactedBasic = untruncated.match(/^(authorization\s*:\s*basic)\s+\*+$/i);
+  const query = redactedBasic ? redactedBasic[1] : untruncated;
+  return query.length > 512 ? query.slice(0, 512) : query;
 }
 
 function highlightFindingLines(container, evidence, finding) {
   const codeLines = container.querySelectorAll(".code-line");
   let scrollTarget = null;
 
-  // 1) If evidence exists, highlight lines containing the evidence text
-  if (evidence && evidence.length >= 3) {
-    const escapedEvidence = evidence.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // 1) If evidence exists, highlight lines containing the evidence text.
+  for (const query of findingHighlightQueries(evidence, finding)) {
+    const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     let pattern;
-    try { pattern = new RegExp(`(${escapedEvidence})`, "gi"); } catch (_) { pattern = null; }
+    try { pattern = new RegExp(`(${escapedQuery})`, "gi"); } catch (_) { pattern = null; }
+    if (!pattern) continue;
 
-    if (pattern) {
-      codeLines.forEach((line) => {
-        pattern.lastIndex = 0;
-        if (pattern.test(line.textContent)) {
-          line.classList.add("findings-line-hit");
-          if (!scrollTarget) scrollTarget = line;
+    let matched = false;
+    codeLines.forEach((line) => {
+      pattern.lastIndex = 0;
+      if (pattern.test(line.textContent)) {
+        matched = true;
+        line.classList.add("findings-line-hit");
+        if (!scrollTarget) scrollTarget = line;
 
-          // Also inline-mark the exact text
-          const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT, null);
-          const textNodes = [];
-          while (walker.nextNode()) textNodes.push(walker.currentNode);
-          textNodes.forEach((node) => {
-            const txt = node.nodeValue;
-            pattern.lastIndex = 0;
-            if (!pattern.test(txt)) return;
-            pattern.lastIndex = 0;
-            const frag = document.createDocumentFragment();
-            let lastIdx = 0;
-            let m;
-            while ((m = pattern.exec(txt)) !== null) {
-              if (m.index > lastIdx) frag.appendChild(document.createTextNode(txt.slice(lastIdx, m.index)));
-              const mark = document.createElement("mark");
-              mark.className = "findings-highlight";
-              mark.textContent = m[1];
-              frag.appendChild(mark);
-              lastIdx = pattern.lastIndex;
-            }
-            if (lastIdx < txt.length) frag.appendChild(document.createTextNode(txt.slice(lastIdx)));
-            node.parentNode.replaceChild(frag, node);
-          });
-        }
-      });
-    }
+        // Also inline-mark the exact text
+        const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT, null);
+        const textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        textNodes.forEach((node) => {
+          const txt = node.nodeValue;
+          pattern.lastIndex = 0;
+          if (!pattern.test(txt)) return;
+          pattern.lastIndex = 0;
+          const frag = document.createDocumentFragment();
+          let lastIdx = 0;
+          let m;
+          while ((m = pattern.exec(txt)) !== null) {
+            if (m.index > lastIdx) frag.appendChild(document.createTextNode(txt.slice(lastIdx, m.index)));
+            const mark = document.createElement("mark");
+            mark.className = "findings-highlight";
+            mark.textContent = m[1];
+            frag.appendChild(mark);
+            lastIdx = pattern.lastIndex;
+          }
+          if (lastIdx < txt.length) frag.appendChild(document.createTextNode(txt.slice(lastIdx)));
+          node.parentNode.replaceChild(frag, node);
+        });
+      }
+    });
+    if (matched) break;
   }
 
   // 2) For "missing" findings (no evidence), highlight related header lines
@@ -8322,10 +8444,13 @@ function extractFindingKeywords(finding) {
 function jumpToTransaction(recordId) {
   setActiveTool("proxy");
   setActiveProxyTab("http-history");
+  const hadRenderedDetail = Boolean(state.selectedRecord?.id);
   state.selectedId = recordId;
   state.selectedRecord = null;
   renderProxyPanels();
-  renderLoadingDetail("Loading selected transaction...");
+  scheduleHistoryDetailLoading(recordId, "Loading selected transaction...", {
+    immediate: !hadRenderedDetail,
+  });
   loadTransactionDetail(recordId).then(async (record) => {
     if (!record || state.selectedId !== recordId) return;
     const revealed = await ensureHistoryWindowContainsRecord(record);
@@ -9351,11 +9476,9 @@ function renderHistory() {
     summary.push(`${state.items.length}/${paging.filteredTotal} server-matched summaries loaded`);
   }
   if (paging.total && (!isKnownCount(paging.filteredTotal) || paging.total !== paging.filteredTotal)) {
-    summary.push(`${paging.total} total captured`);
+    summary.push(`${paging.total} retained`);
   }
-  if (historySortedCapReached(paging)) {
-    summary.push(`sorted result cap reached; refine filters or sort by # desc`);
-  } else if (!paging.fullyLoaded) {
+  if (!paging.fullyLoaded) {
     summary.push(paging.loading ? "loading older history" : "scroll for older history");
   }
   if (state.query) summary.push(`search: "${state.query}"`);
@@ -9416,7 +9539,7 @@ function renderHistoryVirtual() {
   }
   if (totalCount - endIdx <= HTTP_HISTORY_SCROLL_PREFETCH_ROWS) {
     const atLoadedBottom = scrollTop >= maxScrollTop - rowHeight;
-    scheduleHistoryBackfill(0, { allowAtCap: atLoadedBottom && canUseSequenceCursorForHistoryPaging() });
+    scheduleHistoryBackfill(0, { allowAtCap: atLoadedBottom });
   }
 
   const topPadding = startIdx * rowHeight;
@@ -9607,6 +9730,7 @@ async function selectWebsocketSession(id, options = {}) {
   const nextId = id ?? null;
   if (!nextId) return;
 
+  const hadRenderedWebsocketDetail = Boolean(state.selectedWebsocketRecord?.id);
   if (state.selectedWebsocketId !== nextId) {
     state.selectedFrameIdx = null;
     state.selectedWebsocketRecord = null;
@@ -9615,7 +9739,10 @@ async function selectWebsocketSession(id, options = {}) {
     resetWebsocketFrameScroll();
   }
   state.selectedWebsocketId = nextId;
-  renderWebsocketSessions();
+  renderWebsocketSessionTable();
+  scheduleWebsocketDetailLoading(nextId, {
+    immediate: !hadRenderedWebsocketDetail,
+  });
   if (options.scroll) {
     scrollSelectedWebsocketRowIntoView();
   }
@@ -9944,8 +10071,35 @@ function selectCodePaneContents(targetPane) {
   selection?.addRange(range);
 }
 
+function cancelHistoryDetailLoading() {
+  if (_historyDetailLoadingTimer) {
+    window.clearTimeout(_historyDetailLoadingTimer);
+    _historyDetailLoadingTimer = null;
+  }
+}
+
+function scheduleHistoryDetailLoading(id, message = "Loading selected transaction...", options = {}) {
+  cancelHistoryDetailLoading();
+  if (!id) return;
+  const renderIfCurrent = () => {
+    if (state.selectedId !== id || state.selectedRecord?.id === id) {
+      return;
+    }
+    renderLoadingDetail(message);
+  };
+  if (options.immediate) {
+    renderIfCurrent();
+    return;
+  }
+  _historyDetailLoadingTimer = window.setTimeout(() => {
+    _historyDetailLoadingTimer = null;
+    renderIfCurrent();
+  }, DETAIL_LOADING_DELAY_MS);
+}
+
 function renderDetail(record, options = {}) {
   if (!els.detailTitle) return;
+  cancelHistoryDetailLoading();
   state.loadingDetailId = null;
   if (!options.preserveOriginalToggles) {
     state.showOriginal.request = false;
@@ -10002,6 +10156,7 @@ function renderDetail(record, options = {}) {
 }
 
 function renderEmptyDetail() {
+  cancelHistoryDetailLoading();
   state.selectedRecord = null;
   state.loadingDetailId = null;
   els.detailTitle.textContent = "Inspector";
@@ -10343,6 +10498,32 @@ function renderWebsocketSessionTable(sortedEntries = getSortedWebsocketEntries()
   }
 }
 
+function cancelWebsocketDetailLoading() {
+  if (_websocketDetailLoadingTimer) {
+    window.clearTimeout(_websocketDetailLoadingTimer);
+    _websocketDetailLoadingTimer = null;
+  }
+}
+
+function scheduleWebsocketDetailLoading(id, options = {}) {
+  cancelWebsocketDetailLoading();
+  if (!id) return;
+  const renderIfCurrent = () => {
+    if (state.selectedWebsocketId !== id || state.selectedWebsocketRecord?.id === id) {
+      return;
+    }
+    renderWebsocketSessions();
+  };
+  if (options.immediate) {
+    renderIfCurrent();
+    return;
+  }
+  _websocketDetailLoadingTimer = window.setTimeout(() => {
+    _websocketDetailLoadingTimer = null;
+    renderIfCurrent();
+  }, DETAIL_LOADING_DELAY_MS);
+}
+
 function renderWebsocketSessions(options = {}) {
   const sortedEntries = getSortedWebsocketEntries();
   if (options.ensureSelectedVisible) {
@@ -10352,6 +10533,9 @@ function renderWebsocketSessions(options = {}) {
 
   if (!state.selectedWebsocketRecord) {
     const detailLoading = Boolean(state.selectedWebsocketId);
+    if (!detailLoading) {
+      cancelWebsocketDetailLoading();
+    }
     const noSessionMsg = state.selectedWebsocketDetailError
       || (detailLoading
         ? "Loading selected WebSocket session..."
@@ -10382,6 +10566,7 @@ function renderWebsocketSessions(options = {}) {
     return;
   }
 
+  cancelWebsocketDetailLoading();
   const session = state.selectedWebsocketRecord;
   const reqText = buildRawWebsocketRequest(session);
   const resText = buildRawWebsocketResponse(session);
@@ -10552,7 +10737,7 @@ function buildWebsocketFilterSummary(visibleCount, renderedCount, loadedCount, t
   } else if (totalCount) {
     parts.push((hasMore || capReached)
       ? `${loadedCount}/${totalCount} sessions loaded${capReached ? " (cap reached)" : ""}`
-      : `${totalCount} total captured`);
+      : `${totalCount} retained`);
   } else {
     parts.push("No sessions captured yet");
   }
@@ -10856,7 +11041,7 @@ function renderProxySettings() {
   els.proxySettingsProxyAddr.textContent = state.settings.proxy_addr;
   els.proxySettingsNextProxyAddr.textContent = startup?.proxy_addr || state.settings.proxy_addr;
   els.proxySettingsUiAddr.textContent = state.settings.ui_addr;
-  els.proxySettingsCaptureCap.textContent = `${formatSize(state.settings.body_preview_bytes)} preview / ${state.settings.max_entries} entries`;
+  els.proxySettingsCaptureCap.textContent = `${formatSize(state.settings.body_preview_bytes)} preview / ${configuredTransactionEntryLimit()} HTTP entries`;
   els.proxySettingsBootstrap.textContent = state.settings.certificate.special_host_https;
   // Auto Content-Length (local UI setting, not server-side)
   const aclEl = document.getElementById("proxySettingAutoContentLength");
@@ -12537,8 +12722,6 @@ async function runFuzzerAttack() {
   const sessionId = state.activeSession?.id || null;
   state.fuzzerRunToken = runToken;
   state.fuzzerRunning = true;
-  state._selectedFuzzerResultKey = null;
-  hideFuzzerDetailPanel();
   renderFuzzer();
   const draftVersion = state.fuzzerDraftVersion || 0;
   try {
@@ -12587,6 +12770,7 @@ async function runFuzzerAttack() {
 
     const target = activeFuzzerTargetForRequest(fuzzerReqText);
     const httpVersion = replayHttpVersionFromText(fuzzerReqText) || undefined;
+    const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
     const response = await fetch("/api/fuzzer/attacks", {
       method: "POST",
       headers: {
@@ -12595,6 +12779,7 @@ async function runFuzzerAttack() {
       body: JSON.stringify({
         session_id: sessionId,
         expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+        expected_workspace_revision: expectedWorkspaceRevision,
         template,
         payloads,
         source_transaction_id: state.fuzzerSourceTransactionId,
@@ -12606,7 +12791,12 @@ async function runFuzzerAttack() {
       return;
     }
     if (!response.ok) {
-      const notice = await response.text();
+      const workspaceConflict = await readWorkspaceRevisionConflictPayload(response);
+      if (workspaceConflict) {
+        handleFuzzerWorkspaceRevisionConflict(workspaceConflict);
+        return;
+      }
+      const notice = await readApiErrorMessage(response, `Fuzzer run failed (${response.status})`);
       if (!isCurrentFuzzerRun(runToken, sessionId)) {
         return;
       }
@@ -12650,6 +12840,10 @@ async function runFuzzerAttack() {
     scheduleRefresh();
   } catch (error) {
     if (!isCurrentFuzzerRun(runToken, sessionId)) {
+      return;
+    }
+    if (error instanceof WorkspaceStateConflictError) {
+      handleFuzzerWorkspaceRevisionConflict(error.latest);
       return;
     }
     console.error("Fuzzer run error:", error);
@@ -13018,7 +13212,7 @@ async function runCurrentSequence() {
       return;
     }
     if (!response.ok) {
-      const errText = await response.text();
+      const errText = await readApiErrorMessage(response, `Sequence failed (${response.status})`);
       if (!isCurrentSequenceRun(runGeneration, runSequenceId, sessionId, runDraftVersion)) {
         return;
       }
@@ -13476,8 +13670,34 @@ function validateOastServerUrlForSettings(value) {
 
 async function requireOkResponse(response, fallbackMessage) {
   if (response.ok) return;
-  const message = await response.text().catch(() => "");
+  const message = await readApiErrorMessage(response, fallbackMessage);
   throw new Error(message || fallbackMessage);
+}
+
+async function readApiErrorMessage(response, fallbackMessage = "") {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.toLowerCase().includes("application/json")) {
+    try {
+      const payload = await response.clone().json();
+      const structured = formatStructuredApiErrorMessage(payload);
+      if (structured) return structured;
+    } catch (_error) {
+      // Fall through to plain text.
+    }
+  }
+  const message = await response.text().catch(() => "");
+  return message || fallbackMessage;
+}
+
+function formatStructuredApiErrorMessage(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const error = typeof payload.error === "string" ? payload.error.trim() : "";
+  if (!error) return "";
+  const ownerSessionId = typeof payload.owner_session_id === "string" ? payload.owner_session_id.trim() : "";
+  if (ownerSessionId) return `${error} (owner_session_id ${ownerSessionId})`;
+  const sessionId = typeof payload.session_id === "string" ? payload.session_id.trim() : "";
+  if (sessionId) return `${error} (session_id ${sessionId})`;
+  return error;
 }
 
 async function forwardSelectedIntercept() {
@@ -13631,7 +13851,7 @@ function buildEditableRawResponse(resp) {
   return text;
 }
 
-function parseEditableRawResponse(text, original) {
+function parseEditableRawResponse(text, original, requestMethod = "") {
   const { head, body } = splitRawHttpMessage(text);
   const lines = head.split("\n").filter((line) => line.length > 0);
   const statusLine = lines[0] || "";
@@ -13660,16 +13880,23 @@ function parseEditableRawResponse(text, original) {
   const isText = !original || original.body_encoding === "utf8";
   const bodyEncoding = isText ? "utf8" : "base64";
   const bodyLength = editableResponseBodyLength(bodyText, bodyEncoding);
+  if (responseMustNotIncludeBody(status, requestMethod) && bodyLength > 0) {
+    throw new Error(`Response status ${status} must not include a body`);
+  }
+  const allowRepresentationContentLength = responseContentLengthMayDescribeRepresentation(status, requestMethod)
+    && bodyLength === 0;
 
   // Auto-update Content-Length if enabled
-  if (document.getElementById("proxySettingAutoContentLength")?.checked) {
+  if (document.getElementById("proxySettingAutoContentLength")?.checked && !allowRepresentationContentLength) {
     for (const header of headers) {
       if (headerNameEquals(header, "content-length")) {
         header.value = String(bodyLength);
       }
     }
   }
-  validateRawHttpBodyFraming(headers, bodyLength);
+  validateRawHttpBodyFraming(headers, bodyLength, [bodyLength], {
+    allowRepresentationContentLength,
+  });
 
   return {
     status,
@@ -13777,6 +14004,7 @@ async function forwardSelectedResponseIntercept() {
   const editedResponse = parseEditableRawResponse(
     interceptResText,
     state.selectedResponseInterceptRecord.response,
+    state.selectedResponseInterceptRecord.method,
   );
 
   // Optimistic UI
@@ -14019,14 +14247,34 @@ async function sendReplay() {
   }
 
   const conflictSnapshot = cloneReplayTabState(tab);
+  const sendingTabId = tab.id;
+  const sendingSessionId = state.activeSession?.id || null;
+  const httpVersion = replayEffectiveHttpVersion(request, requestText, tab.httpVersionMode);
+  const replayController = new AbortController();
+  _replaySendControllers.set(sendingTabId, replayController);
+  setReplaySending(true);
+
   let expectedWorkspaceRevision;
   try {
     expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
   } catch (error) {
+    if (_replaySendControllers.get(sendingTabId) !== replayController || replayController.signal.aborted) {
+      return;
+    }
+    _replaySendControllers.delete(sendingTabId);
+    setReplaySending(false);
     if (error instanceof WorkspaceStateConflictError) {
       restoreReplayTabConflictState(tab, conflictSnapshot);
     }
     handleWorkspaceActionError(error);
+    return;
+  }
+  if (_replaySendControllers.get(sendingTabId) !== replayController || replayController.signal.aborted) {
+    return;
+  }
+  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
+    _replaySendControllers.delete(sendingTabId);
+    setReplaySending(false);
     return;
   }
 
@@ -14036,14 +14284,6 @@ async function sendReplay() {
   els.replayFollowRedirectButton?.classList.add("hidden");
   els.replayResponseMeta.textContent = "";
   renderReplayResponseView("");
-  const sendingTabId = tab.id;
-  const sendingSessionId = state.activeSession?.id || null;
-
-  const httpVersion = replayEffectiveHttpVersion(request, requestText, tab.httpVersionMode);
-
-  const replayController = new AbortController();
-  _replaySendControllers.set(sendingTabId, replayController);
-  setReplaySending(true);
 
   let response;
   try {
@@ -14196,6 +14436,16 @@ function handleReplayWorkspaceRevisionConflict(snapshot = null) {
   workspaceSaveConflictLatest = snapshot || null;
   showToast(
     "Workspace changed elsewhere; replay was not sent. Reload the workspace to reconcile.",
+    "error",
+    6000,
+  );
+}
+
+function handleFuzzerWorkspaceRevisionConflict(snapshot = null) {
+  workspaceSaveConflictPending = true;
+  workspaceSaveConflictLatest = snapshot || null;
+  showToast(
+    "Workspace changed elsewhere; fuzzer was not started. Reload the workspace to reconcile.",
     "error",
     6000,
   );
@@ -15048,9 +15298,6 @@ function getRepeaterTargetConfig(tab, request = null) {
     host: normalizedOverride.host || derived.host,
     port: normalizedOverride.port || derived.port,
   };
-  if (repeaterTargetLooksStale(tab, derived, target)) {
-    return derived;
-  }
   return target;
 }
 
@@ -15065,18 +15312,6 @@ function replayTargetOverridePayload(tab, request, target) {
     host: target.host,
     port: target.port,
   };
-}
-
-function repeaterTargetLooksStale(tab, derivedTarget, target) {
-  if (!tab?.baseRequest) {
-    return false;
-  }
-  if (tab.targetManuallyEdited) {
-    return false;
-  }
-  const baseTarget = authorityToTargetState(tab.baseRequest.host, tab.baseRequest.scheme);
-  return targetStatesEquivalent(target, baseTarget)
-    && !targetStatesEquivalent(derivedTarget, baseTarget);
 }
 
 function targetStatesEquivalent(left, right) {
@@ -15196,9 +15431,6 @@ function buildUrlFromTarget(scheme, host, port, path = "/") {
   const rawPath = String(path || "/");
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawPath)) {
     return rawPath;
-  }
-  if (rawPath.startsWith("//")) {
-    return `${normalizedScheme}:${rawPath}`;
   }
   const target = normalizeRepeaterTargetInput(host, port, normalizedScheme);
   const normalizedPort = isDefaultPortForScheme(normalizedScheme, target.port) ? "" : target.port;
@@ -16931,7 +17163,24 @@ function parseEditableRawRequest(text, fallback) {
   return request;
 }
 
-function validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths = [bodyLength]) {
+function responseStatusMustNotIncludeBody(status) {
+  const code = Number(status);
+  return Number.isInteger(code) && (code < 200 || code === 204 || code === 205 || code === 304);
+}
+
+function responseMustNotIncludeBody(status, requestMethod = "") {
+  return responseStatusMustNotIncludeBody(status)
+    || String(requestMethod || "").toUpperCase() === "HEAD";
+}
+
+function responseContentLengthMayDescribeRepresentation(status, requestMethod = "") {
+  const code = Number(status);
+  return Number.isInteger(code)
+    && (code === 304
+      || (String(requestMethod || "").toUpperCase() === "HEAD" && !(code >= 100 && code <= 199) && code !== 204 && code !== 205));
+}
+
+function validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths = [bodyLength], options = {}) {
   if (headers.some((header) => headerNameEquals(header, "transfer-encoding")
     && String(header.value || "").split(",").some((value) => value.trim().toLowerCase() === "chunked"))) {
     throw new Error("Raw HTTP input with Transfer-Encoding: chunked is not supported");
@@ -16953,7 +17202,8 @@ function validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths = [
     contentLength = parsed;
   }
 
-  if (contentLength !== null && !acceptedBodyLengths.includes(contentLength)) {
+  const allowRepresentationContentLength = !!options.allowRepresentationContentLength && bodyLength === 0;
+  if (contentLength !== null && !acceptedBodyLengths.includes(contentLength) && !allowRepresentationContentLength) {
     throw new Error(`Content-Length ${contentLength} does not match raw body length ${bodyLength}`);
   }
 }
@@ -18935,6 +19185,28 @@ function getHistoryItemIndex(id) {
   return Number.isInteger(index) ? index : -1;
 }
 
+function visibleHistoryNoteCount(item) {
+  const noteCount = Number(item?.note_count);
+  return (Number.isFinite(noteCount) ? noteCount : 0) + (item?.has_user_note || item?.user_note ? 1 : 0);
+}
+
+function compareHistorySequence(left, right) {
+  const leftSequence = Number(left?.sequence ?? left?.index ?? 0);
+  const rightSequence = Number(right?.sequence ?? right?.index ?? 0);
+  return (Number.isFinite(leftSequence) ? leftSequence : 0) - (Number.isFinite(rightSequence) ? rightSequence : 0);
+}
+
+function resortLoadedHistoryItemsForCurrentSort() {
+  if (state.sortKey !== "notes") return false;
+  const direction = state.sortDirection === "asc" ? 1 : -1;
+  state.items.sort((left, right) => {
+    const noteComparison = visibleHistoryNoteCount(left) - visibleHistoryNoteCount(right);
+    const comparison = noteComparison || compareHistorySequence(left, right);
+    return comparison * direction;
+  });
+  return true;
+}
+
 function countHiddenConnectItems() {
   const hiddenTotal = state.historyPaging?.hiddenConnectTotal;
   if (isKnownCount(hiddenTotal)) return hiddenTotal;
@@ -19034,6 +19306,10 @@ function formatSize(bytes) {
     index += 1;
   }
   return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function configuredTransactionEntryLimit() {
+  return state.settings?.max_transaction_entries ?? state.settings?.max_entries ?? 0;
 }
 
 function titleCase(value) {
@@ -19593,8 +19869,6 @@ async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
       tab.wsSetupPending = true;
       return;
     }
-    tab.wsSetupPending = false;
-
     for (const item of setupQueue) {
       if (!item.autoSend || item.sent) continue;
       if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
@@ -19620,20 +19894,40 @@ async function runSetupQueue(tab, lifecycleToken = tab?.wsLifecycleToken) {
         if (!isWsReplayTabAlive(tab, lifecycleToken)) return;
         const workspaceConflict = !resp.ok ? await readWorkspaceRevisionConflictPayload(resp) : null;
         if (workspaceConflict) {
+          tab.wsSetupPending = true;
+          renderWsSetupQueue();
+          scheduleWorkspaceStateSave();
           handleReplayWorkspaceRevisionConflict(workspaceConflict);
           return;
         }
-        if (resp.ok) {
-          await refreshWsReplayFramesOnce(tab, { lifecycleToken });
-          item.sent = true;
+        if (!resp.ok) {
+          const notice = await resp.text().catch(() => "");
+          const message = notice || `Setup message send failed (${resp.status})`;
+          tab.wsSetupPending = true;
+          tab.wsSetupNotice = appendWsSetupNotice(tab.wsSetupNotice || "", message);
+          showToast(message, "error", 4000);
           renderWsSetupQueue();
           scheduleWorkspaceStateSave();
+          return;
         }
+        await refreshWsReplayFramesOnce(tab, { lifecycleToken });
+        item.sent = true;
+        renderWsSetupQueue();
+        scheduleWorkspaceStateSave();
       } catch (e) {
-        break;
+        const message = e?.message || "Setup message send failed.";
+        tab.wsSetupPending = true;
+        tab.wsSetupNotice = appendWsSetupNotice(tab.wsSetupNotice || "", message);
+        showToast(message, "error", 4000);
+        renderWsSetupQueue();
+        scheduleWorkspaceStateSave();
+        return;
       }
       // Small delay between messages
       await new Promise((r) => setTimeout(r, 100));
+    }
+    if (isWsReplayTabAlive(tab, lifecycleToken)) {
+      tab.wsSetupPending = setupQueue.some((item) => item.autoSend && !item.sent);
     }
   } finally {
     if (isWsReplayTabAlive(tab, lifecycleToken)) {
@@ -19786,6 +20080,10 @@ async function cleanupWsReplayTab(tab, {
     expectedWorkspaceRevision,
   });
   if (!disconnectResult.ok) {
+    if (disconnectResult.workspaceConflict) {
+      handleReplayWorkspaceRevisionConflict(disconnectResult.workspaceConflict);
+      throw new WorkspaceStateConflictError(disconnectResult.workspaceConflict);
+    }
     if (isWsReplayTabAlive(tab, lifecycleToken)) {
       tab.wsStatus = previousStatus === "connecting" ? "error" : previousStatus;
       tab.wsError = disconnectResult.message || "WebSocket replay disconnect failed.";
@@ -19886,10 +20184,21 @@ async function disconnectWsReplayBackend(id, {
     if (response.ok || response.status === 404) {
       return { ok: true, message: "" };
     }
-    const message = await response.text().catch(() => "");
+    const workspaceConflict = await readWorkspaceRevisionConflictPayload(response);
+    if (workspaceConflict) {
+      return {
+        ok: false,
+        workspaceConflict,
+        message: "Workspace changed elsewhere; WebSocket replay was not disconnected.",
+      };
+    }
+    const message = await readApiErrorMessage(
+      response,
+      `WebSocket replay disconnect failed (${response.status}).`,
+    );
     return {
       ok: false,
-      message: message || `WebSocket replay disconnect failed (${response.status}).`,
+      message,
     };
   } catch (e) {
     return {
@@ -21075,17 +21384,20 @@ async function flushPendingAnnotations(transactionId, options = {}) {
         prepareHistoryItem(state.items[index]);
         if (!summaryMatchesActiveHistoryFilters(state.items[index])) {
           state.items.splice(index, 1);
-          if (state.historyPaging && isKnownCount(state.historyPaging.filteredTotal)) {
-            state.historyPaging.filteredTotal = Math.max(0, state.historyPaging.filteredTotal - 1);
-          }
+          adjustHistoryPagingAfterLocalRemoval(1, { decrementTotal: false });
           if (state.selectedId === transactionId) {
             state.selectedId = null;
             state.selectedRecord = null;
             renderEmptyDetail();
           }
           rebuildHistoryItemIndex();
+          refreshHistoryPagingCursorFromItems();
         } else {
-          state._itemById.set(transactionId, state.items[index]);
+          if (resortLoadedHistoryItemsForCurrentSort()) {
+            rebuildHistoryItemIndex();
+          } else {
+            state._itemById.set(transactionId, state.items[index]);
+          }
         }
         state._itemsVersion += 1;
         invalidateVisibleEntriesCache();
@@ -22717,8 +23029,8 @@ const sniperCMTheme = CM.EditorView.theme({
   /* ── Search highlight ── */
   ".tok-search-hit":   { background: "rgba(132, 151, 173, 0.2)", borderRadius: "4px", padding: "0 1px" },
   ".tok-search-active": { background: "rgba(201, 169, 110, 0.4)", borderRadius: "4px", padding: "0 1px" },
-  ".tok-finding-evidence-hit": { color: "#1a1200", background: "rgba(250, 204, 21, 0.82)", borderRadius: "3px", padding: "0 2px", fontWeight: "700", boxShadow: "0 0 0 1px rgba(250, 204, 21, 0.95), 0 0 8px rgba(250, 204, 21, 0.18)" },
-  ".tok-finding-evidence-active": { color: "#140d00", background: "rgba(255, 214, 10, 0.94)", borderRadius: "3px", padding: "0 2px", fontWeight: "800", boxShadow: "0 0 0 1px rgba(255, 214, 10, 1), 0 0 12px rgba(250, 204, 21, 0.3)" },
+  ".tok-finding-evidence-hit": { color: "#f3e7cc", background: "rgba(201, 169, 110, 0.24)", borderRadius: "3px", padding: "0 2px", fontWeight: "700", boxShadow: "0 0 0 1px rgba(201, 169, 110, 0.44), 0 0 0 1px rgba(0, 0, 0, 0.18)" },
+  ".tok-finding-evidence-active": { color: "#fff3cf", background: "rgba(201, 169, 110, 0.34)", borderRadius: "3px", padding: "0 2px", fontWeight: "800", boxShadow: "0 0 0 1px rgba(230, 199, 139, 0.58), 0 0 8px rgba(201, 169, 110, 0.12)" },
 }, { dark: true });
 
 // ─── HTTP decoration plugin ─────────────────────────────────────────────────
@@ -23260,7 +23572,11 @@ function updateCodePaneCM(key, container, text, options = {}) {
   const searchResult = cv.applySearch(query, { classes: options.searchClasses });
 
   const lineCount = cv.view.state.doc.lines;
-  return { lineCount, matchCount: searchResult.matchCount };
+  return {
+    lineCount,
+    matchCount: searchResult.matchCount,
+    matchPositions: searchResult.matchPositions || [],
+  };
 }
 
 /** Helper: get a CM view from the managed pool by key. */
